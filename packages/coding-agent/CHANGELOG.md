@@ -10,18 +10,23 @@
 - Added the `defaultTools` setting for configuring the initial built-in tool selection globally or per project.
 - Added `--use-theme <name[/name]>` to choose an initial per-run interactive theme without changing saved settings ([#7722](https://github.com/earendil-works/pi/pull/7722) by [@rwachtler](https://github.com/rwachtler)).
 - Added live OMP-style nested Shell, subagent, file mutation, and patch activity rendering inside Riemann IPython cells.
-- Added configurable Riemann context compaction with OMP snapshot archives as the default and the existing semantic checkpoint available as `compaction.strategy: default`.
+- Added configurable Riemann context compaction with semantic checkpoints as the default and OMP snapshot archives available as `compaction.strategy: snapshot`.
 - Added strict `compaction.strategy: openai` for subscription-authenticated OpenAI Codex Responses V2 cloud compaction with durable opaque artifact replay; configured strategies never fall through or create cross-strategy backups.
+- Added mandatory Linux Bubblewrap and macOS Seatbelt isolation for IPython kernels and shell processes, including network namespaces, capability-derived workspace mounts, sanitized environments, and ZeroMQ IPC.
+- Added age- and size-based garbage collection for closed-run artifacts, kernel snapshots, and isolated Git worktrees.
+- Added Linux/macOS sandbox integration, managed Python provisioning, retention, and Bun release-asset tests.
 
 ### Changed
 
 - Replaced the inherited Mistral SDK transport with a native Chat Completions HTTP stream, eliminating its generated client and schema runtime overhead.
-- Documented the generic `AI_AGENT=pi` process marker and how it differs from `PI_CODING_AGENT=true` ([#7747](https://github.com/earendil-works/pi/issues/7747)).
+- Documented the generic `AI_AGENT=riemann` process marker and how it differs from `RIEMANN_CODING_AGENT=true` ([#7747](https://github.com/earendil-works/pi/issues/7747)).
 - Changed Riemann IPython cells to a compact, backgroundless transcript and removed inline thinking and tool-expansion hints while preserving their keyboard shortcuts.
 - Simplified Riemann's model-facing execution prompt, identified the current working environment, listed capability-filtered Python operations directly, and exposed available MCP server names and descriptions by default while preserving lazy activation.
 - Removed the redundant model-facing `mcp.list()` operation and aligned activated MCP Python/catalog namespaces with configured server names so discovery results are directly callable.
 - Made `agents.spawn(task=..., name=...)` usable without discovery by applying parent-bounded standard capabilities and the approved shared-workspace default, renamed the policy override to `workspace_policy`, normalized bare capability namespaces, and listed configured agent profiles in the system prompt.
 - Documented standard `asyncio.gather(...)` concurrency in Riemann's IPython code schema for independent operations.
+
+- Renamed the published CLI, SDK imports, examples, release archives, environment markers, and local release tooling consistently to `riemann-agent`/`riemann`, while rejecting inherited tool-selection flags that cannot alter the single-tool runtime.
 
 ### Fixed
 
@@ -30,6 +35,7 @@
 - Fixed inherited required LaTeX arguments starting on a new line being parsed as empty ([#7760](https://github.com/earendil-works/pi/issues/7760)).
 - Fixed Riemann's host bridge using the deprecated `ipykernel.comm.Comm` API, which leaked a `DeprecationWarning` through cell stderr into model context and the TUI.
 - Fixed Riemann IPython activity rebuilding and re-highlighting unchanged cells on every TUI repaint, which could make the main UI stutter during Python execution.
+- Fixed `artifacts.materialize` bypassing `workspace.write` capability checks and `workspace.search` following file symlinks outside the workspace.
 
 ## [0.84.1] - 2026-08-07
 

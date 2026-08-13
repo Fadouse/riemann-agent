@@ -368,57 +368,20 @@ describe("parseArgs", () => {
 		});
 	});
 
-	describe("tool flags", () => {
-		test("parses --no-tools flag", () => {
-			const result = parseArgs(["--no-tools"]);
-			expect(result.noTools).toBe(true);
+	describe("legacy tool flags", () => {
+		test.each(["--no-tools", "-nt", "--no-builtin-tools", "-nbt"])("rejects %s", (flag) => {
+			const result = parseArgs([flag]);
+			expect(result.diagnostics).toEqual([
+				{ type: "error", message: `${flag} is not supported; Riemann always exposes only the ipython tool` },
+			]);
 		});
 
-		test("parses -nt shorthand", () => {
-			const result = parseArgs(["-nt"]);
-			expect(result.noTools).toBe(true);
-		});
-
-		test("parses --no-builtin-tools flag", () => {
-			const result = parseArgs(["--no-builtin-tools"]);
-			expect(result.noBuiltinTools).toBe(true);
-		});
-
-		test("parses -nbt shorthand", () => {
-			const result = parseArgs(["-nbt"]);
-			expect(result.noBuiltinTools).toBe(true);
-		});
-
-		test("parses --tools flag", () => {
-			const result = parseArgs(["--tools", "read,bash"]);
-			expect(result.tools).toEqual(["read", "bash"]);
-		});
-
-		test("parses -t shorthand", () => {
-			const result = parseArgs(["-t", "read,bash"]);
-			expect(result.tools).toEqual(["read", "bash"]);
-		});
-
-		test("parses --exclude-tools flag", () => {
-			const result = parseArgs(["--exclude-tools", "read,bash"]);
-			expect(result.excludeTools).toEqual(["read", "bash"]);
-		});
-
-		test("parses -xt shorthand", () => {
-			const result = parseArgs(["-xt", "read,bash"]);
-			expect(result.excludeTools).toEqual(["read", "bash"]);
-		});
-
-		test("parses --no-tools with explicit --tools flags", () => {
-			const result = parseArgs(["--no-tools", "--tools", "read,bash"]);
-			expect(result.noTools).toBe(true);
-			expect(result.tools).toEqual(["read", "bash"]);
-		});
-
-		test("parses --no-builtin-tools with explicit --tools flags", () => {
-			const result = parseArgs(["--no-builtin-tools", "--tools", "read,bash"]);
-			expect(result.noBuiltinTools).toBe(true);
-			expect(result.tools).toEqual(["read", "bash"]);
+		test.each(["--tools", "-t", "--exclude-tools", "-xt"])("rejects %s and consumes its value", (flag) => {
+			const result = parseArgs([flag, "read,bash", "prompt"]);
+			expect(result.messages).toEqual(["prompt"]);
+			expect(result.diagnostics).toEqual([
+				{ type: "error", message: `${flag} is not supported; configure Riemann operation capabilities instead` },
+			]);
 		});
 	});
 

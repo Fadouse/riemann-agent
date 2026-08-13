@@ -105,4 +105,26 @@ describe("Riemann workspace capabilities", () => {
 			store.close();
 		}
 	});
+
+	test("does not search through file symlinks outside the workspace", async () => {
+		if (process.platform === "win32") return;
+		const root = await mkdtemp(join(tmpdir(), "riemann-workspace-search-"));
+		const outside = await mkdtemp(join(tmpdir(), "riemann-workspace-search-outside-"));
+		roots.push(root, outside);
+		await writeFile(join(root, "inside.txt"), "find-me inside\n");
+		await writeFile(join(outside, "secret.txt"), "find-me secret\n");
+		await symlink(join(outside, "secret.txt"), join(root, "linked-secret.txt"));
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("search-symlink-test", root);
+		const search = new WorkspaceFunctions(root, run.id, store)
+			.definitions()
+			.find((definition) => definition.name === "search");
+		if (!search) throw new Error("workspace.search is unavailable");
+		try {
+			const result = await search.handler({ query: "find-me" }, new AbortController().signal);
+			expect(result).toEqual([{ path: "inside.txt", line: 1, text: "find-me inside" }]);
+		} finally {
+			store.close();
+		}
+	});
 });

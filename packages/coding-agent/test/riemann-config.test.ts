@@ -29,7 +29,7 @@ describe("Riemann configuration", () => {
 
 		const untrusted = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: false });
 		expect(untrusted.limits.maxAgentsPerRun).toBe(5);
-		expect(untrusted.compaction.strategy).toBe("snapshot");
+		expect(untrusted.compaction.strategy).toBe("default");
 		expect(untrusted.files).toEqual([join(agentDir, "config.yaml")]);
 
 		const trusted = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: true });

@@ -133,3 +133,8 @@ export function ensureManagedPython(): Promise<string> {
 	});
 	return runtimePromise;
 }
+
+/** Reset the process-local provisioning cache. Intended for isolated runtime tests. */
+export function resetManagedPythonCacheForTests(): void {
+	runtimePromise = undefined;
+}

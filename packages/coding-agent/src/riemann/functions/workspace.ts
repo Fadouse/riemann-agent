@@ -289,7 +289,14 @@ export class WorkspaceFunctions {
 					const hits: JsonValue[] = [];
 					for (const file of files.sort()) {
 						if (hits.length >= limit) break;
-						const data = await readFile(join(this.root, file));
+						let data: Buffer;
+						try {
+							const path = await this.resolvePath(file);
+							data = await readFile(path);
+						} catch {
+							// Glob results can be unreadable or symlink outside the workspace.
+							continue;
+						}
 						if (data.includes(0)) continue;
 						const lines = data.toString("utf8").split(/\r?\n/);
 						for (let index = 0; index < lines.length && hits.length < limit; index += 1) {

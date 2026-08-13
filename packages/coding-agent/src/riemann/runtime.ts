@@ -27,6 +27,7 @@ import { createRiemannOpenAICompaction } from "./openai-compaction.ts";
 import { renderRiemannPrompt } from "./prompts.ts";
 import { ensureManagedPython } from "./python/runtime.ts";
 import { ArtifactStore } from "./state/artifacts.ts";
+import { applyRetention, type RetentionReport } from "./state/retention.ts";
 import { RiemannStore, type StoredAgent, type StoredRun } from "./state/store.ts";
 
 interface SharedRun {
@@ -38,6 +39,7 @@ interface SharedRun {
 	rootAgent: StoredAgent;
 	supervisor: AgentSupervisor;
 	agentDir: string;
+	retentionReport: RetentionReport;
 	rootContext: Pick<ExtensionContext, "cwd" | "model" | "modelRegistry" | "thinkingLevel">;
 }
 
@@ -122,7 +124,16 @@ export class RiemannRuntime {
 		this.root = root;
 		this.capabilities = new Set(agent.capabilities);
 		const workspace = new WorkspaceFunctions(agent.workspace, shared.run.id, shared.store);
-		const shell = new ShellFunctions(agent.workspace, shared.artifacts, shared.config.limits.maxArtifactPreviewChars);
+		const shell = new ShellFunctions(
+			agent.workspace,
+			shared.artifacts,
+			shared.config.limits.maxArtifactPreviewChars,
+			{
+				agentDir: shared.agentDir,
+				workspaceWritable: hasCapability(this.capabilities, "workspace.write", "workspace"),
+				networkAllowed: hasCapability(this.capabilities, "shell.network", "shell"),
+			},
+		);
 		const web = new WebFunctions(
 			shared.config.web.searchBackend === "exa" ? exaApiKey : undefined,
 			shared.artifacts,
@@ -141,6 +152,7 @@ export class RiemannRuntime {
 		const config = await loadRiemannConfig({ cwd: ctx.cwd, agentDir, projectTrusted: ctx.isProjectTrusted() });
 		const store = new RiemannStore(agentDir);
 		const run = store.openRun(ctx.sessionManager.getSessionId(), ctx.cwd);
+		const retentionReport = await applyRetention(store, config.retention);
 		const rootAgent = store.ensureRootAgent(run.id, ctx.cwd);
 		const artifacts = new ArtifactStore(store, run.id);
 		const rootContext = {
@@ -163,7 +175,7 @@ export class RiemannRuntime {
 				return child.asChildRuntime();
 			},
 		});
-		shared = { config, store, artifacts, run, rootAgent, supervisor, agentDir, rootContext };
+		shared = { config, store, artifacts, run, rootAgent, supervisor, agentDir, retentionReport, rootContext };
 		return new RiemannRuntime(shared, rootAgent, true, await existingExaKey(config));
 	}
 
@@ -287,6 +299,7 @@ export class RiemannRuntime {
 					{ name: "path", description: "Workspace-relative destination", type: "str", required: true },
 				],
 				returns: "dict",
+				capability: "workspace.write",
 				handler: async (args) => {
 					if (typeof args.handle !== "string" || typeof args.path !== "string") {
 						throw new RiemannHostError("invalid_arguments", "handle and path must be strings");
@@ -318,6 +331,7 @@ export class RiemannRuntime {
 					agent_name: this.agent.name,
 					workspace: this.agent.workspace,
 					config_files: this.shared.config.files,
+					retention: this.shared.retentionReport as unknown as JsonValue,
 				}),
 			},
 		];
@@ -456,7 +470,11 @@ export class RiemannRuntime {
 				bootstrapCode,
 				hostRequest: (request, signal, onUpdate) =>
 					this.registry.dispatch(request, this.capabilities, signal, onUpdate),
-				snapshotPath: join(this.shared.store.snapshotsDir, `${this.agent.id}.dill`),
+				snapshotPath: join(this.shared.store.snapshotsDir, this.agent.id, "kernel.dill"),
+				sandbox: {
+					agentDir: this.shared.agentDir,
+					workspaceWritable: hasCapability(this.capabilities, "workspace.write", "workspace"),
+				},
 				maxOutputChars: Math.max(this.shared.config.limits.maxCellOutputChars * 4, 400_000),
 				onRestore: (result) => {
 					this.pendingRestoreNotice = restoreNotice(result);

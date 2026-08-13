@@ -8,11 +8,17 @@ limits:
   maxCellOutputChars: 100000
   maxArtifactPreviewChars: 12000
 
+retention:
+  maxAgeDays: 30
+  maxArtifactBytes: 1073741824
+  maxSnapshotBytes: 536870912
+  maxWorktreeBytes: 5368709120
+
 compaction:
   # Strategy selection is strict: openai requires openai-codex OAuth, snapshot
   # requires an image-capable model, and default uses semantic checkpoints.
   # Failures are surfaced; Riemann never switches strategies implicitly.
-  strategy: openai
+  strategy: default
 
 models:
   roles:

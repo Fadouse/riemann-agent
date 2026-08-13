@@ -69,6 +69,17 @@ const ConfigSchema = Type.Object(
 				{ additionalProperties: false },
 			),
 		),
+		retention: Type.Optional(
+			Type.Object(
+				{
+					maxAgeDays: Type.Optional(Type.Number({ minimum: 0, maximum: 3_650 })),
+					maxArtifactBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+					maxSnapshotBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+					maxWorktreeBytes: Type.Optional(Type.Integer({ minimum: 0 })),
+				},
+				{ additionalProperties: false },
+			),
+		),
 		compaction: Type.Optional(
 			Type.Object({ strategy: Type.Optional(CompactionStrategySchema) }, { additionalProperties: false }),
 		),
@@ -117,6 +128,12 @@ export interface RiemannConfig {
 		maxCellOutputChars: number;
 		maxArtifactPreviewChars: number;
 	};
+	retention: {
+		maxAgeDays: number;
+		maxArtifactBytes: number;
+		maxSnapshotBytes: number;
+		maxWorktreeBytes: number;
+	};
 	compaction: {
 		strategy: "snapshot" | "default" | "openai";
 	};
@@ -139,7 +156,13 @@ const DEFAULTS: Omit<RiemannConfig, "files"> = {
 		maxCellOutputChars: 100_000,
 		maxArtifactPreviewChars: 12_000,
 	},
-	compaction: { strategy: "snapshot" },
+	retention: {
+		maxAgeDays: 30,
+		maxArtifactBytes: 1_073_741_824,
+		maxSnapshotBytes: 536_870_912,
+		maxWorktreeBytes: 5_368_709_120,
+	},
+	compaction: { strategy: "default" },
 	modelRoles: {},
 	profiles: {},
 	mcpServers: {},
@@ -149,6 +172,7 @@ const DEFAULTS: Omit<RiemannConfig, "files"> = {
 function mergeConfig(base: RiemannConfig, next: RiemannConfigFile, path: string): RiemannConfig {
 	return {
 		limits: { ...base.limits, ...next.limits },
+		retention: { ...base.retention, ...next.retention },
 		compaction: { ...base.compaction, ...next.compaction },
 		modelRoles: { ...base.modelRoles, ...next.models?.roles },
 		profiles: { ...base.profiles, ...next.agents?.profiles },

@@ -3,8 +3,8 @@ import type { ChildProcess } from "node:child_process";
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export interface JupyterConnectionInfo {
-	ip: "127.0.0.1";
-	transport: "tcp";
+	ip: string;
+	transport: "tcp" | "ipc";
 	shell_port: number;
 	iopub_port: number;
 	stdin_port: number;
@@ -104,12 +104,21 @@ export type KernelHostRequestHandler = (
 	onUpdate?: KernelHostRequestUpdate,
 ) => Promise<JsonValue>;
 
+export interface KernelSandboxConfiguration {
+	agentDir: string;
+	workspaceWritable: boolean;
+	platform?: NodeJS.Platform;
+	bubblewrapPath?: string;
+	sandboxExecPath?: string;
+}
+
 export interface KernelManagerOptions {
 	python: string;
 	cwd: string;
 	env?: Record<string, string>;
 	sessionId: string;
 	bootstrapCode: string;
+	sandbox: KernelSandboxConfiguration | false;
 	hostRequest: KernelHostRequestHandler;
 	snapshotPath?: string;
 	startupTimeoutMs?: number;

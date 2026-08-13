@@ -532,19 +532,6 @@ function buildSessionOptions(
 	// API key from CLI - set as a non-persistent runtime override
 	// (handled by caller before createAgentSession)
 
-	// Tools
-	if (parsed.noTools) {
-		options.noTools = "all";
-	} else if (parsed.noBuiltinTools) {
-		options.noTools = "builtin";
-	}
-	if (parsed.tools) {
-		options.tools = [...parsed.tools];
-	}
-	if (parsed.excludeTools) {
-		options.excludeTools = [...parsed.excludeTools];
-	}
-
 	return { options, cliThinkingFromModel, diagnostics };
 }
 

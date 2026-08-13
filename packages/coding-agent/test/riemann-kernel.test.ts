@@ -1,11 +1,12 @@
 import type { ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterAll, describe, expect, test } from "vitest";
 import { IPythonKernelManager } from "../src/riemann/kernel/manager.ts";
-import type { JsonValue } from "../src/riemann/kernel/types.ts";
+import type { JsonValue, KernelSandboxConfiguration } from "../src/riemann/kernel/types.ts";
 import { ensureManagedPython } from "../src/riemann/python/runtime.ts";
 
 const roots: string[] = [];
@@ -28,6 +29,7 @@ async function createKernel(
 	snapshotPath: string,
 	onBlock?: (signal: AbortSignal) => Promise<JsonValue>,
 	onProcess?: (process: ChildProcess | undefined) => void,
+	sandbox: KernelSandboxConfiguration | false = false,
 ): Promise<IPythonKernelManager> {
 	process.env.RIEMANN_CODING_AGENT_DIR = join(root, "agent");
 	const python = await ensureManagedPython();
@@ -60,6 +62,7 @@ async function createKernel(
 		cwd: root,
 		sessionId: "kernel-test",
 		bootstrapCode: `${prelude}\n\n_install_functions(_json.loads(${JSON.stringify(specifications)}))`,
+		sandbox,
 		snapshotPath,
 		onProcess,
 		hostRequest: async (request, signal, onUpdate) => {
@@ -180,4 +183,62 @@ describe("Riemann IPython kernel", () => {
 			await stage("close second", second.close());
 		}
 	}, 60_000);
+	test.skipIf(
+		!(
+			(process.platform === "linux" && existsSync(process.env.RIEMANN_BWRAP_PATH ?? "/usr/bin/bwrap")) ||
+			(process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec"))
+		),
+	)(
+		"enforces filesystem and network isolation in the native system sandbox",
+		async () => {
+			const root = await mkdtemp(join(tmpdir(), "riemann-kernel-sandbox-"));
+			roots.push(root);
+			const workspace = join(root, "workspace");
+			const state = join(root, "state");
+			const outside = join(root, "secret.txt");
+			await Promise.all([mkdir(workspace), mkdir(state), writeFile(outside, "secret")]);
+			await writeFile(join(workspace, "read.txt"), "ok");
+			const sandbox: KernelSandboxConfiguration = {
+				agentDir: join(root, "agent"),
+				workspaceWritable: false,
+				...(process.platform === "linux"
+					? { bubblewrapPath: process.env.RIEMANN_BWRAP_PATH ?? "/usr/bin/bwrap" }
+					: {}),
+			};
+			const kernel = await stage(
+				"create sandboxed kernel",
+				createKernel(workspace, join(state, "kernel.dill"), undefined, undefined, sandbox),
+			);
+			try {
+				const code = `import json, pathlib, socket
+out = {"workspace_read": pathlib.Path("read.txt").read_text()}
+try:
+    pathlib.Path("write.txt").write_text("bad")
+    out["workspace_write"] = "allowed"
+except Exception as error:
+    out["workspace_write"] = type(error).__name__
+try:
+    pathlib.Path(${JSON.stringify(outside)}).read_text()
+    out["outside_read"] = "allowed"
+except Exception as error:
+    out["outside_read"] = type(error).__name__
+try:
+    socket.create_connection(("1.1.1.1", 53), timeout=0.2)
+    out["network"] = "allowed"
+except Exception as error:
+    out["network"] = type(error).__name__
+print(json.dumps(out, sort_keys=True))`;
+				const result = await stage("execute sandbox probes", kernel.execute(code));
+				expect(result.status).toBe("ok");
+				const probe = JSON.parse(result.stdout.trim()) as Record<string, string>;
+				expect(probe).toMatchObject({ workspace_read: "ok" });
+				expect(probe.workspace_write).not.toBe("allowed");
+				expect(probe.outside_read).not.toBe("allowed");
+				expect(probe.network).not.toBe("allowed");
+			} finally {
+				await stage("close sandboxed kernel", kernel.close());
+			}
+		},
+		60_000,
+	);
 });

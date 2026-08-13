@@ -16,7 +16,9 @@
  * Then use ctrl+o to toggle between minimal (collapsed) and full (expanded) views.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import { homedir } from "os";
+import type { ExtensionAPI } from "riemann-agent";
 import {
 	createBashTool,
 	createEditTool,
@@ -25,9 +27,7 @@ import {
 	createLsTool,
 	createReadTool,
 	createWriteTool,
-} from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { homedir } from "os";
+} from "riemann-agent";
 
 /**
  * Shorten a path by replacing home directory with ~

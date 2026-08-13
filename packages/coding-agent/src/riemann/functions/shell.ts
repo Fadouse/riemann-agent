@@ -1,6 +1,9 @@
-import { relative, resolve, sep } from "node:path";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, relative, resolve, sep } from "node:path";
 import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { RiemannHostError } from "../errors.ts";
+import { resolveSandboxExecutable, type SandboxedCommand, sandboxedKernelCommand } from "../kernel/sandbox.ts";
 import type { JsonValue } from "../kernel/types.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
 import type { FunctionDefinition, FunctionUpdateCallback } from "./registry.ts";
@@ -50,15 +53,23 @@ function appendCaptured(chunks: Buffer[], currentBytes: number, chunk: Buffer, m
 	return currentBytes + Math.min(chunk.length, remaining);
 }
 
+export interface ShellSandboxPolicy {
+	agentDir: string;
+	workspaceWritable: boolean;
+	networkAllowed: boolean;
+}
+
 export class ShellFunctions {
 	private readonly root: string;
 	private readonly artifacts: ArtifactStore;
 	private readonly previewChars: number;
+	private readonly sandbox: ShellSandboxPolicy;
 
-	constructor(root: string, artifacts: ArtifactStore, previewChars: number) {
+	constructor(root: string, artifacts: ArtifactStore, previewChars: number, sandbox: ShellSandboxPolicy) {
 		this.root = resolve(root);
 		this.artifacts = artifacts;
 		this.previewChars = previewChars;
+		this.sandbox = sandbox;
 	}
 
 	private resolveCwd(value: JsonValue | undefined): string {
@@ -83,9 +94,33 @@ export class ShellFunctions {
 		},
 	): Promise<JsonValue> {
 		const started = Date.now();
-		const child = spawnProcess(command, commandArgs, {
+		const sandboxDir = await mkdtemp(join(tmpdir(), "riemann-shell-"));
+		await Promise.all([
+			mkdir(join(sandboxDir, "home"), { recursive: true, mode: 0o700 }),
+			mkdir(join(sandboxDir, "tmp"), { recursive: true, mode: 0o700 }),
+		]);
+		let launch: SandboxedCommand;
+		try {
+			const executable = resolveSandboxExecutable(command, options.cwd, process.env.PATH);
+			launch = sandboxedKernelCommand(
+				{
+					agentDir: this.sandbox.agentDir,
+					workspace: this.root,
+					workspaceWritable: this.sandbox.workspaceWritable,
+					networkAllowed: this.sandbox.networkAllowed,
+					python: executable,
+					connectionDir: sandboxDir,
+					environment: options.env,
+				},
+				commandArgs,
+			);
+		} catch (error) {
+			await rm(sandboxDir, { recursive: true, force: true });
+			throw error;
+		}
+		const child = spawnProcess(launch.command, launch.args, {
 			cwd: options.cwd,
-			env: { ...process.env, ...options.env },
+			env: launch.env,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		const stdout: Buffer[] = [];
@@ -149,6 +184,7 @@ export class ShellFunctions {
 			clearTimeout(timeout);
 			if (forceKill) clearTimeout(forceKill);
 			options.signal.removeEventListener("abort", onAbort);
+			await rm(sandboxDir, { recursive: true, force: true });
 		}
 		if (updateTimer) clearTimeout(updateTimer);
 		flushUpdate();

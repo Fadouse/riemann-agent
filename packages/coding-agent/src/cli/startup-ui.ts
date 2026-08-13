@@ -23,9 +23,9 @@ import {
 	type Theme,
 } from "../modes/interactive/theme/theme.ts";
 
-const OFFICIAL_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
-const OFFICIAL_APP_NAME = "pi";
-const OFFICIAL_CONFIG_DIR_NAME = ".pi";
+const OFFICIAL_PACKAGE_NAME = "riemann-agent";
+const OFFICIAL_APP_NAME = "riemann";
+const OFFICIAL_CONFIG_DIR_NAME = ".riemann";
 
 interface DistributionMetadata {
 	packageName: string;

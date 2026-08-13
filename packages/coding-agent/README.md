@@ -7,7 +7,7 @@ The model sees one tool: `ipython`. Workspace I/O, shell processes, web access, 
 ## Runtime properties
 
 - One durable IPython kernel per agent, with top-level `await`.
-- Atomic per-cell checkpoints and automatic restoration after kernel restart.
+- Atomic post-cell Python-state snapshots and automatic restoration after kernel restart; external side effects are not rolled back.
 - Snapshot/CAS file edits, atomic replacement, workspace boundary checks, and symlink escape rejection.
 - SQLite-backed runs, agents, messages, artifacts, and revision capabilities.
 - Content-addressed large-result artifacts.
@@ -18,7 +18,7 @@ The model sees one tool: `ipython`. Workspace I/O, shell processes, web access, 
 
 ## Quick start
 
-Requirements: Node.js 22.19 or newer, Python 3, and either `uv` or Python `venv` plus `pip`.
+Requirements: Node.js 22.19 or newer, Python 3, either `uv` or Python `venv` plus `pip`, and Linux or macOS. Linux additionally requires Bubblewrap (`bwrap`).
 
 ```bash
 npm install
@@ -33,6 +33,22 @@ For source development:
 ```
 
 Riemann provisions a hash-pinned Python environment on first IPython use. User state defaults to `~/.riemann/agent`; override it with `RIEMANN_CODING_AGENT_DIR`.
+
+## System sandbox
+
+Every IPython kernel and `shell.*` process runs inside a mandatory OS sandbox. Linux uses Bubblewrap with separate user, PID, IPC, UTS, cgroup, and network namespaces. macOS uses a deny-by-default Seatbelt profile through `/usr/bin/sandbox-exec`. Riemann fails closed when the native sandbox is unavailable; Windows is not supported.
+
+The kernel communicates with the host only through a bind-mounted ZeroMQ IPC directory. Direct Python network access is denied. The workspace is mounted read-only unless the agent holds `workspace.write`; isolated agents receive only their Git worktree. Managed Python and system executables are read-only, host credentials are removed from the child environment, and Riemann state must reside outside the workspace. `shell.network` is a separate capability: the main agent holds it through `*`, while default children do not.
+
+Large-result artifacts, kernel snapshots, and isolated worktrees belonging to closed runs are garbage-collected by age and size budgets. Active runs are never selected. Configure the budgets under `retention`:
+
+```yaml
+retention:
+  maxAgeDays: 30
+  maxArtifactBytes: 1073741824
+  maxSnapshotBytes: 536870912
+  maxWorktreeBytes: 5368709120
+```
 
 ## Configuration
 
@@ -51,8 +67,10 @@ Context compaction is selected in Riemann configuration:
 
 ```yaml
 compaction:
-  strategy: openai # openai | snapshot | default
+  strategy: default # default | openai | snapshot
 ```
+
+`default` is used when the setting is omitted and creates a model-generated semantic checkpoint.
 
 `openai` strictly uses Codex Responses V2 cloud compaction. It requires the active model to use the `openai-codex` ChatGPT Plus/Pro OAuth provider, sends the discarded context to `https://chatgpt.com/backend-api/codex/responses`, validates exactly one opaque encrypted compaction item, persists it unchanged, and replays it on later matching Codex requests. It does not create a local snapshot or semantic backup and never switches strategy after an auth, model, request, or protocol failure.
 
@@ -128,7 +146,7 @@ Riemann remains based on Pi. The remaining sections document inherited provider,
 
 ## Providers & Models
 
-For each built-in provider, pi maintains a list of tool-capable models. Configured provider catalogs refresh automatically; run `pi update --models` to force an immediate refresh. Authenticate via subscription (`/login`) or API key, then select any model from that provider via `/model` (or Ctrl+L).
+For each built-in provider, pi maintains a list of tool-capable models. Configured provider catalogs refresh automatically; run `riemann update --models` to force an immediate refresh. Authenticate via subscription (`/login`) or API key, then select any model from that provider via `/model` (or Ctrl+L).
 
 **Subscriptions:**
 - Anthropic Claude Pro/Max
@@ -172,7 +190,7 @@ Pi also supports the llama.cpp router server. Configure it with `/login llama.cp
 
 See [docs/providers.md](docs/providers.md) for other provider setup instructions.
 
-**Custom providers & models:** Add providers via `~/.pi/agent/models.json` if they speak a supported API (OpenAI, Anthropic, Google). For custom APIs or OAuth, use extensions. See [docs/models.md](docs/models.md) and [docs/custom-provider.md](docs/custom-provider.md).
+**Custom providers & models:** Add providers via `~/.riemann/agent/models.json` if they speak a supported API (OpenAI, Anthropic, Google). For custom APIs or OAuth, use extensions. See [docs/models.md](docs/models.md) and [docs/custom-provider.md](docs/custom-provider.md).
 
 ---
 
@@ -233,7 +251,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 
 ### Keyboard Shortcuts
 
-See `/hotkeys` for the full list. Customize via `~/.pi/agent/keybindings.json`. See [docs/keybindings.md](docs/keybindings.md).
+See `/hotkeys` for the full list. Customize via `~/.riemann/agent/keybindings.json`. See [docs/keybindings.md](docs/keybindings.md).
 
 **Commonly used:**
 
@@ -271,15 +289,15 @@ Sessions are stored as JSONL files with a tree structure. Each entry has an `id`
 
 ### Management
 
-Sessions auto-save to `~/.pi/agent/sessions/` organized by working directory.
+Sessions auto-save to `~/.riemann/agent/sessions/` organized by working directory.
 
 ```bash
-pi -c                  # Continue most recent session
-pi -r                  # Browse and select from past sessions
-pi --no-session        # Ephemeral mode (don't save)
-pi --name "my task"    # Set session display name at startup
-pi --session <path|id> # Use specific session file or ID
-pi --fork <path|id>    # Fork specific session file or ID into a new session
+riemann -c                  # Continue most recent session
+riemann -r                  # Browse and select from past sessions
+riemann --no-session        # Ephemeral mode (don't save)
+riemann --name "my task"    # Set session display name at startup
+riemann --session <path|id> # Use specific session file or ID
+riemann --fork <path|id>    # Fork specific session file or ID into a new session
 ```
 
 Use `/session` in interactive mode to see the current session ID before reusing it with `--session <id>` or `--fork <id>`.
@@ -319,24 +337,24 @@ Use `/settings` to modify common options, or edit JSON files directly:
 
 | Location | Scope |
 |----------|-------|
-| `~/.pi/agent/settings.json` | Global (all projects) |
-| `.pi/settings.json` | Project (overrides global) |
+| `~/.riemann/agent/settings.json` | Global (all projects) |
+| `.riemann/settings.json` | Project (overrides global) |
 
 See [docs/settings.md](docs/settings.md) for all options.
 
 ### Project Trust
 
-On interactive startup, pi asks before trusting a project folder that contains project-local settings, resources, or project `.agents/skills` and has no saved decision for the folder or a parent folder in `~/.pi/agent/trust.json`. Trusting a project allows pi to load `.pi/settings.json` and `.pi` resources, install missing project packages, and execute project extensions.
+On interactive startup, pi asks before trusting a project folder that contains project-local settings, resources, or project `.agents/skills` and has no saved decision for the folder or a parent folder in `~/.riemann/agent/trust.json`. Trusting a project allows pi to load `.riemann/settings.json` and `.pi` resources, install missing project packages, and execute project extensions.
 
 Before the trust decision, pi loads only context files, user/global extensions, and CLI `-e` extensions so they can handle the `project_trust` event. Project-local extensions, project package-managed extensions, and project settings are loaded only after the project is trusted. This split also applies when switching to a session from a different cwd whose trust has not been resolved in the current process.
 
 Non-interactive modes (`-p`, `--mode json`, and `--mode rpc`) do not show a trust prompt. Without an applicable saved trust decision, they use `defaultProjectTrust` from global settings: `ask` (default) and `never` ignore those project resources, while `always` trusts them. Pass `--approve`/`-a` or `--no-approve`/`-na` to override project trust for one run.
 
-If no extension or saved decision applies, `defaultProjectTrust` controls the fallback behavior. Set it to `"ask"`, `"always"`, or `"never"` in `~/.pi/agent/settings.json`, or change it with `/settings`.
+If no extension or saved decision applies, `defaultProjectTrust` controls the fallback behavior. Set it to `"ask"`, `"always"`, or `"never"` in `~/.riemann/agent/settings.json`, or change it with `/settings`.
 
-`pi config` and package commands use the same project trust flow, except `pi update` never prompts. Pass `--approve` to trust project-local settings for one command or `--no-approve` to ignore them.
+`riemann config` and package commands use the same project trust flow, except `riemann update` never prompts. Pass `--approve` to trust project-local settings for one command or `--no-approve` to ignore them.
 
-Use `/trust` in interactive mode to save a project trust decision for future sessions, including trust for the immediate parent folder. It writes `~/.pi/agent/trust.json` only; the current session is not reloaded, so restart pi for changes to take effect.
+Use `/trust` in interactive mode to save a project trust decision for future sessions, including trust for the immediate parent folder. It writes `~/.riemann/agent/trust.json` only; the current session is not reloaded, so restart pi for changes to take effect.
 
 ### Telemetry and update checks
 
@@ -352,7 +370,7 @@ Use `--offline` or `PI_OFFLINE=1` to disable all startup network operations desc
 ## Context Files
 
 Pi loads `AGENTS.md` (or `CLAUDE.md`) at startup from:
-- `~/.pi/agent/AGENTS.md` (global)
+- `~/.riemann/agent/AGENTS.md` (global)
 - Parent directories (walking up from cwd)
 - Current directory
 
@@ -364,7 +382,7 @@ Disable context file loading with `--no-context-files` (or `-nc`).
 
 ### System Prompt
 
-Replace the default system prompt with `.pi/SYSTEM.md` (project) or `~/.pi/agent/SYSTEM.md` (global). Append without replacing via `APPEND_SYSTEM.md`.
+Replace the default system prompt with `.riemann/SYSTEM.md` (project) or `~/.riemann/agent/SYSTEM.md` (global). Append without replacing via `APPEND_SYSTEM.md`.
 
 ---
 
@@ -375,19 +393,19 @@ Replace the default system prompt with `.pi/SYSTEM.md` (project) or `~/.pi/agent
 Reusable prompts as Markdown files. Type `/name` to expand.
 
 ```markdown
-<!-- ~/.pi/agent/prompts/review.md -->
+<!-- ~/.riemann/agent/prompts/review.md -->
 Review this code for bugs, security issues, and performance problems.
 Focus on: {{focus}}
 ```
 
-Place in `~/.pi/agent/prompts/`, `.pi/prompts/`, or a [pi package](#pi-packages) to share with others. See [docs/prompt-templates.md](docs/prompt-templates.md).
+Place in `~/.riemann/agent/prompts/`, `.riemann/prompts/`, or a [pi package](#pi-packages) to share with others. See [docs/prompt-templates.md](docs/prompt-templates.md).
 
 ### Skills
 
 On-demand capability packages following the [Agent Skills standard](https://agentskills.io). Invoke via `/skill:name` or let the agent load them automatically.
 
 ```markdown
-<!-- ~/.pi/agent/skills/my-skill/SKILL.md -->
+<!-- ~/.riemann/agent/skills/my-skill/SKILL.md -->
 # My Skill
 Use this skill when the user asks about X.
 
@@ -396,7 +414,7 @@ Use this skill when the user asks about X.
 2. Then that
 ```
 
-Place in `~/.pi/agent/skills/`, `~/.agents/skills/`, `.pi/skills/`, or `.agents/skills/` (from `cwd` up through parent directories) or a [pi package](#pi-packages) to share with others. See [docs/skills.md](docs/skills.md).
+Place in `~/.riemann/agent/skills/`, `~/.agents/skills/`, `.riemann/skills/`, or `.agents/skills/` (from `cwd` up through parent directories) or a [pi package](#pi-packages) to share with others. See [docs/skills.md](docs/skills.md).
 
 ### Extensions
 
@@ -428,13 +446,13 @@ The default export can also be `async`. pi waits for async extension factories b
 - Games while waiting (yes, Doom runs)
 - ...anything you can dream up
 
-Place in `~/.pi/agent/extensions/`, `.pi/extensions/`, or a [pi package](#pi-packages) to share with others. See [docs/extensions.md](docs/extensions.md) and [examples/extensions/](examples/extensions/).
+Place in `~/.riemann/agent/extensions/`, `.riemann/extensions/`, or a [pi package](#pi-packages) to share with others. See [docs/extensions.md](docs/extensions.md) and [examples/extensions/](examples/extensions/).
 
 ### Themes
 
 Built-in: `dark`, `light`. Themes hot-reload: modify the active theme file and pi immediately applies changes.
 
-Place in `~/.pi/agent/themes/`, `.pi/themes/`, or a [pi package](#pi-packages) to share with others. See [docs/themes.md](docs/themes.md).
+Place in `~/.riemann/agent/themes/`, `.riemann/themes/`, or a [pi package](#pi-packages) to share with others. See [docs/themes.md](docs/themes.md).
 
 ### Pi Packages
 
@@ -443,30 +461,27 @@ Bundle and share extensions, skills, prompts, and themes via npm or git. Find pa
 > **Security:** Pi packages run with full system access. Extensions execute arbitrary code, and skills can instruct the model to perform any action including running executables. Review source code before installing third-party packages.
 
 ```bash
-pi install npm:@foo/pi-tools
-pi install npm:@foo/pi-tools@1.2.3      # pinned version
-pi install git:github.com/user/repo
-pi install git:github.com/user/repo@v1  # tag or commit
-pi install git:git@github.com:user/repo
-pi install git:git@github.com:user/repo@v1  # tag or commit
-pi install https://github.com/user/repo
-pi install https://github.com/user/repo@v1      # tag or commit
-pi install ssh://git@github.com/user/repo
-pi install ssh://git@github.com/user/repo@v1    # tag or commit
-pi remove npm:@foo/pi-tools
-pi uninstall npm:@foo/pi-tools          # alias for remove
-pi list
-pi update                               # update pi only
-pi update --all                         # update pi and packages
-pi update --extensions                  # update packages only
-pi update --models                      # refresh model catalogs only
-pi update --self                        # update pi only
-pi update --self --force                # reinstall pi even if current
-pi update npm:@foo/pi-tools             # update one package
-pi config                               # enable/disable extensions, skills, prompts, themes
+riemann install npm:@foo/pi-tools
+riemann install npm:@foo/pi-tools@1.2.3      # pinned version
+riemann install git:github.com/user/repo
+riemann install git:github.com/user/repo@v1  # tag or commit
+riemann install git:git@github.com:user/repo
+riemann install git:git@github.com:user/repo@v1  # tag or commit
+riemann install https://github.com/user/repo
+riemann install https://github.com/user/repo@v1      # tag or commit
+riemann install ssh://git@github.com/user/repo
+riemann install ssh://git@github.com/user/repo@v1    # tag or commit
+riemann remove npm:@foo/pi-tools
+riemann uninstall npm:@foo/pi-tools          # alias for remove
+riemann list
+riemann update --extensions                  # update installed packages
+riemann update --extensions                  # update packages only
+riemann update --models                      # refresh model catalogs only
+riemann update npm:@foo/pi-tools             # update one package
+riemann config                               # enable/disable extensions, skills, prompts, themes
 ```
 
-Packages install to `~/.pi/agent/git/` (git) or `~/.pi/agent/npm/` (npm). Use `-l` for project-local installs (`.pi/git/`, `.pi/npm/`). Git `@ref` values are pinned tags or commits; pinned packages are skipped by `pi update --extensions` and `pi update --all`, so use `pi install git:host/user/repo@new-ref` to move an existing package to a new ref. Git packages install dependencies with `npm install --omit=dev` by default, so runtime deps must be listed under `dependencies`; when `npmCommand` is configured, git packages use plain `install` for compatibility with wrappers. If you use a Node version manager and want package installs to reuse a stable npm context, set `npmCommand` in `settings.json`, for example `["mise", "exec", "node@20", "--", "npm"]`.
+Packages install to `~/.riemann/agent/git/` (git) or `~/.riemann/agent/npm/` (npm). Use `-l` for project-local installs (`.riemann/git/`, `.riemann/npm/`). Git `@ref` values are pinned tags or commits; pinned packages are skipped by `riemann update --extensions`, so use `riemann install git:host/user/repo@new-ref` to move an existing package to a new ref. Git packages install dependencies with `npm install --omit=dev` by default, so runtime deps must be listed under `dependencies`; when `npmCommand` is configured, git packages use plain `install` for compatibility with wrappers. If you use a Node version manager and want package installs to reuse a stable npm context, set `npmCommand` in `settings.json`, for example `["mise", "exec", "node@20", "--", "npm"]`.
 
 Create a package by adding a `pi` key to `package.json`:
 
@@ -483,7 +498,7 @@ Create a package by adding a `pi` key to `package.json`:
 }
 ```
 
-Without a `pi` manifest, pi auto-discovers from conventional directories (`extensions/`, `skills/`, `prompts/`, `themes/`).
+Without a `riemann` manifest, pi auto-discovers from conventional directories (`extensions/`, `skills/`, `prompts/`, `themes/`).
 
 See [docs/packages.md](docs/packages.md).
 
@@ -494,7 +509,7 @@ See [docs/packages.md](docs/packages.md).
 ### SDK
 
 ```typescript
-import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, ModelRuntime, SessionManager } from "riemann-agent";
 
 const modelRuntime = await ModelRuntime.create();
 const { session } = await createAgentSession({
@@ -514,7 +529,7 @@ See [docs/sdk.md](docs/sdk.md) and [examples/sdk/](examples/sdk/).
 For non-Node.js integrations, use RPC mode over stdin/stdout:
 
 ```bash
-pi --mode rpc
+riemann --mode rpc
 ```
 
 RPC mode uses strict LF-delimited JSONL framing. Clients must split records on `\n` only. Do not use generic line readers like Node `readline`, which also split on Unicode separators inside JSON payloads.
@@ -546,27 +561,24 @@ Read the [blog post](https://mariozechner.at/posts/2025-11-30-pi-coding-agent/) 
 ## CLI Reference
 
 ```bash
-pi [options] [@files...] [messages...]
+riemann [options] [@files...] [messages...]
 ```
 
 ### Package Commands
 
 ```bash
-pi install <source> [-l]     # Install package, -l for project-local
-pi remove <source> [-l]      # Remove package
-pi uninstall <source> [-l]   # Alias for remove
-pi update [source|self|pi]   # Update pi only, or one package source
-pi update --all              # Update pi and packages
-pi update --extensions       # Update packages only
-pi update --models           # Refresh model catalogs only
-pi update --self             # Update pi only
-pi update --self --force     # Reinstall pi even if current
-pi update --extension <src>  # Update one package
-pi list                      # List installed packages
-pi config                    # Enable/disable package resources
+riemann install <source> [-l]     # Install package, -l for project-local
+riemann remove <source> [-l]      # Remove package
+riemann uninstall <source> [-l]   # Alias for remove
+riemann update [source]           # Update one package source
+riemann update --extensions       # Update packages only
+riemann update --models           # Refresh model catalogs only
+riemann update --extension <src>  # Update one package
+riemann list                      # List installed packages
+riemann config                    # Enable/disable package resources
 ```
 
-`pi config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command. `pi update` never prompts for project trust.
+`riemann config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command. `riemann update` never prompts for project trust.
 
 ### Modes
 
@@ -578,10 +590,10 @@ pi config                    # Enable/disable package resources
 | `--mode rpc` | RPC mode for process integration (see [docs/rpc.md](docs/rpc.md)) |
 | `--export <in> [out]` | Export session to HTML |
 
-In print mode, pi also reads piped stdin and merges it into the initial prompt:
+In print mode, Riemann also reads piped stdin and merges it into the initial prompt:
 
 ```bash
-cat README.md | pi -p "Summarize this text"
+cat README.md | riemann -p "Summarize this text"
 ```
 
 ### Model Options
@@ -607,17 +619,6 @@ cat README.md | pi -p "Summarize this text"
 | `--no-session` | Ephemeral mode (don't save) |
 | `--name <name>`, `-n <name>` | Set session display name at startup |
 
-### Tool Options
-
-| Option | Description |
-|--------|-------------|
-| `--tools <list>`, `-t <list>` | Allowlist specific tool names across built-in, extension, and custom tools |
-| `--exclude-tools <list>`, `-xt <list>` | Disable specific tool names across built-in, extension, and custom tools |
-| `--no-builtin-tools`, `-nbt` | Disable built-in tools by default but keep extension/custom tools enabled |
-| `--no-tools`, `-nt` | Disable all tools by default |
-
-Available built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`
-
 ### Resource Options
 
 | Option | Description |
@@ -638,8 +639,8 @@ Combine `--no-*` with explicit flags to load exactly what you need, ignoring set
 
 | Option | Description |
 |--------|-------------|
-| `--system-prompt <text>` | Replace default prompt (context files and skills still appended) |
-| `--append-system-prompt <text>` | Append to system prompt |
+| `--system-prompt <text>` | Add user instructions inside the Riemann execution contract |
+| `--append-system-prompt <text>` | Append user instructions to the Riemann execution contract |
 | `--tui-mode <mode>` | TUI mode: `regular` (default) or experimental `fullscreen` |
 | `--use-theme <name[/name]>` | Set the initial interactive theme for this run without changing settings |
 | `--verbose` | Force verbose startup |
@@ -653,57 +654,51 @@ Combine `--no-*` with explicit flags to load exactly what you need, ignoring set
 Prefix files with `@` to include in the message:
 
 ```bash
-pi @prompt.md "Answer this"
-pi -p @screenshot.png "What's in this image?"
-pi @code.ts @test.ts "Review these files"
+riemann @prompt.md "Answer this"
+riemann -p @screenshot.png "What's in this image?"
+riemann @code.ts @test.ts "Review these files"
 ```
 
 ### Examples
 
 ```bash
 # Interactive with initial prompt
-pi "List all .ts files in src/"
+riemann "List all .ts files in src/"
 
 # Non-interactive
-pi -p "Summarize this codebase"
+riemann -p "Summarize this codebase"
 
 # Non-interactive with piped stdin
-cat README.md | pi -p "Summarize this text"
+cat README.md | riemann -p "Summarize this text"
 
 # Named one-shot session
-pi --name "release audit" -p "Audit this repository"
+riemann --name "release audit" -p "Audit this repository"
 
 # Different model
-pi --provider openai --model gpt-4o "Help me refactor"
+riemann --provider openai --model gpt-4o "Help me refactor"
 
 # Model with provider prefix (no --provider needed)
-pi --model openai/gpt-4o "Help me refactor"
+riemann --model openai/gpt-4o "Help me refactor"
 
 # Model with thinking level shorthand
-pi --model sonnet:high "Solve this complex problem"
+riemann --model sonnet:high "Solve this complex problem"
 
 # Limit model cycling
-pi --models "claude-*,gpt-4o"
-
-# Read-only mode
-pi --tools read,grep,find,ls -p "Review the code"
-
-# Disable one extension or built-in tool while keeping the rest available
-pi --exclude-tools ask_question
+riemann --models "claude-*,gpt-4o"
 
 # High thinking level
-pi --thinking high "Solve this complex problem"
+riemann --thinking high "Solve this complex problem"
 ```
 
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `AI_AGENT` | Set to `pi` by the CLI and RPC entry points so generic tooling can attribute child processes to Pi |
-| `PI_CODING_AGENT` | Set to `true` by the CLI and RPC entry points so child processes can detect that they run inside Pi |
-| `PI_CODING_AGENT_DIR` | Override config directory (default: `~/.pi/agent`) |
-| `PI_CODING_AGENT_SESSION_DIR` | Override session storage directory (overridden by `--session-dir`) |
-| `PI_PACKAGE_DIR` | Override package directory (useful for Nix/Guix where store paths tokenize poorly) |
+| `AI_AGENT` | Set to `riemann` by the CLI and RPC entry points |
+| `RIEMANN_CODING_AGENT` | Set to `true` by the CLI and RPC entry points |
+| `RIEMANN_CODING_AGENT_DIR` | Override config directory (default: `~/.riemann/agent`) |
+| `RIEMANN_CODING_AGENT_SESSION_DIR` | Override session storage directory (overridden by `--session-dir`) |
+| `RIEMANN_PACKAGE_DIR` | Override package directory (useful for Nix/Guix where store paths tokenize poorly) |
 | `PI_OFFLINE` | Disable startup network operations, including update checks, package update checks, and install/update telemetry |
 | `PI_SKIP_VERSION_CHECK` | Skip the Pi version update check at startup. This prevents the `pi.dev` latest-version request |
 | `PI_TELEMETRY` | Override install/update telemetry and provider attribution headers. Use `1`/`true`/`yes` to enable or `0`/`false`/`no` to disable. This does not disable update checks |

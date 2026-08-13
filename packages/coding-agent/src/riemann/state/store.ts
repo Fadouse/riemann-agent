@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type RiemannDatabase } from "./database.ts";
 
 export type AgentStatus = "queued" | "running" | "idle" | "parked" | "completed" | "failed" | "stopped";
 
@@ -170,7 +170,7 @@ export class RiemannStore {
 	readonly root: string;
 	readonly snapshotsDir: string;
 	readonly artifactsDir: string;
-	private readonly db: DatabaseSync;
+	private readonly db: RiemannDatabase;
 
 	constructor(agentDir: string) {
 		this.root = join(agentDir, "state");
@@ -243,6 +243,10 @@ export class RiemannStore {
 				content_hash TEXT NOT NULL,
 				created_at TEXT NOT NULL
 			);
+			CREATE TABLE IF NOT EXISTS retention_runs (
+				run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+				created_at TEXT NOT NULL
+			);
 		`);
 	}
 
@@ -250,9 +254,12 @@ export class RiemannStore {
 		const existing = this.db.prepare("SELECT * FROM runs WHERE session_id = ?").get(sessionId) as RunRow | undefined;
 		const timestamp = now();
 		if (existing) {
-			this.db
-				.prepare("UPDATE runs SET cwd = ?, status = 'active', updated_at = ? WHERE id = ?")
-				.run(cwd, timestamp, existing.id);
+			const updated = this.db
+				.prepare(
+					"UPDATE runs SET cwd = ?, status = 'active', updated_at = ? WHERE id = ? AND NOT EXISTS (SELECT 1 FROM retention_runs WHERE run_id = ?)",
+				)
+				.run(cwd, timestamp, existing.id, existing.id);
+			if (updated.changes === 0) throw new Error(`Run ${existing.id} is being removed by retention`);
 			return { ...runFromRow(existing), cwd, status: "active", updatedAt: timestamp };
 		}
 		const run: StoredRun = {
@@ -463,6 +470,49 @@ export class RiemannStore {
 	getArtifact(handle: string): StoredArtifact | undefined {
 		const row = this.db.prepare("SELECT * FROM artifacts WHERE handle = ?").get(handle) as ArtifactRow | undefined;
 		return row ? artifactFromRow(row) : undefined;
+	}
+
+	listRuns(): StoredRun[] {
+		const rows = this.db.prepare("SELECT * FROM runs ORDER BY updated_at, id").all();
+		return rows.map((row) => runFromRow(row as unknown as RunRow));
+	}
+
+	listArtifacts(runId: string): StoredArtifact[] {
+		const rows = this.db.prepare("SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at, handle").all(runId);
+		return rows.map((row) => artifactFromRow(row as unknown as ArtifactRow));
+	}
+
+	countArtifactPathReferences(path: string, excludingRunId?: string): number {
+		const row = (
+			excludingRunId
+				? this.db
+						.prepare("SELECT COUNT(*) AS count FROM artifacts WHERE path = ? AND run_id != ?")
+						.get(path, excludingRunId)
+				: this.db.prepare("SELECT COUNT(*) AS count FROM artifacts WHERE path = ?").get(path)
+		) as { count: number };
+		return row.count;
+	}
+
+	reserveClosedRunForRetention(runId: string): boolean {
+		const result = this.db
+			.prepare(
+				"INSERT OR IGNORE INTO retention_runs(run_id, created_at) SELECT id, ? FROM runs WHERE id = ? AND status = 'closed'",
+			)
+			.run(now(), runId);
+		return result.changes > 0;
+	}
+
+	releaseRetentionRun(runId: string): void {
+		this.db.prepare("DELETE FROM retention_runs WHERE run_id = ?").run(runId);
+	}
+
+	deleteReservedRun(runId: string): boolean {
+		const result = this.db
+			.prepare(
+				"DELETE FROM runs WHERE id = ? AND status = 'closed' AND EXISTS (SELECT 1 FROM retention_runs WHERE run_id = ?)",
+			)
+			.run(runId, runId);
+		return result.changes > 0;
 	}
 
 	close(): void {

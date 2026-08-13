@@ -96,6 +96,7 @@ const config: RiemannConfig = {
 		maxCellOutputChars: 100_000,
 		maxArtifactPreviewChars: 12_000,
 	},
+	retention: { maxAgeDays: 30, maxArtifactBytes: 1_000_000, maxSnapshotBytes: 1_000_000, maxWorktreeBytes: 1_000_000 },
 	compaction: { strategy: "snapshot" },
 	modelRoles: {},
 	profiles: {},

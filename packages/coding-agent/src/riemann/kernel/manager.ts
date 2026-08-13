@@ -1,11 +1,12 @@
 import type { ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { Dealer, Subscriber } from "zeromq";
+import type { Dealer, Subscriber } from "zeromq";
 import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
+import { sandboxedKernelCommand } from "./sandbox.ts";
 import type {
 	JsonValue,
 	JupyterConnectionInfo,
@@ -47,7 +48,7 @@ interface ActiveExecution {
 }
 
 function endpoint(info: JupyterConnectionInfo, port: number): string {
-	return `${info.transport}://${info.ip}:${port}`;
+	return info.transport === "ipc" ? `ipc://${info.ip}-${port}` : `${info.transport}://${info.ip}:${port}`;
 }
 
 function stringField(value: JsonValue | undefined): string | undefined {
@@ -151,10 +152,16 @@ export class IPythonKernelManager {
 
 	private async startKernel(): Promise<void> {
 		this.tempDir = await mkdtemp(join(tmpdir(), "riemann-kernel-"));
+		await mkdir(join(this.tempDir, "home"), { recursive: true, mode: 0o700 });
+		await mkdir(join(this.tempDir, "tmp"), { recursive: true, mode: 0o700 });
+		if (this.options.snapshotPath) {
+			await mkdir(dirname(this.options.snapshotPath), { recursive: true, mode: 0o700 });
+		}
 		const connectionPath = join(this.tempDir, "connection.json");
+		const sandbox = this.options.sandbox;
 		const initial: JupyterConnectionInfo = {
-			ip: "127.0.0.1",
-			transport: "tcp",
+			ip: sandbox ? join(this.tempDir, "kernel") : "127.0.0.1",
+			transport: sandbox ? "ipc" : "tcp",
 			shell_port: 0,
 			iopub_port: 0,
 			stdin_port: 0,
@@ -165,9 +172,31 @@ export class IPythonKernelManager {
 			kernel_name: "python3",
 		};
 		await writeFile(connectionPath, `${JSON.stringify(initial, null, 2)}\n`, { mode: 0o600 });
-		const child = spawnProcess(this.options.python, ["-m", "ipykernel_launcher", "-f", connectionPath], {
+		const pythonArgs = ["-B", "-m", "ipykernel_launcher", "-f", connectionPath];
+		const launch = sandbox
+			? sandboxedKernelCommand(
+					{
+						workspace: this.options.cwd,
+						agentDir: sandbox.agentDir,
+						workspaceWritable: sandbox.workspaceWritable,
+						python: this.options.python,
+						connectionDir: this.tempDir,
+						snapshotPath: this.options.snapshotPath,
+						platform: sandbox.platform,
+						bubblewrapPath: sandbox.bubblewrapPath,
+						sandboxExecPath: sandbox.sandboxExecPath,
+						environment: this.options.env,
+					},
+					pythonArgs,
+				)
+			: {
+					command: this.options.python,
+					args: pythonArgs,
+					env: { ...process.env, ...this.options.env },
+				};
+		const child = spawnProcess(launch.command, launch.args, {
 			cwd: this.options.cwd,
-			env: { ...process.env, ...this.options.env, PYDEVD_DISABLE_FILE_VALIDATION: "1" },
+			env: { ...launch.env, PYDEVD_DISABLE_FILE_VALIDATION: "1" },
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		this.process = child;
@@ -208,9 +237,10 @@ export class IPythonKernelManager {
 		}
 		if (!this.connection) throw new Error("Timed out waiting for IPython connection ports");
 
-		this.shell = new Dealer({ routingId: `riemann-shell-${this.session}` });
-		this.control = new Dealer({ routingId: `riemann-control-${this.session}` });
-		this.iopub = new Subscriber();
+		const { Dealer: DealerSocket, Subscriber: SubscriberSocket } = await import("zeromq");
+		this.shell = new DealerSocket({ routingId: `riemann-shell-${this.session}` });
+		this.control = new DealerSocket({ routingId: `riemann-control-${this.session}` });
+		this.iopub = new SubscriberSocket();
 		this.iopub.subscribe();
 		this.shell.connect(endpoint(this.connection, this.connection.shell_port));
 		this.control.connect(endpoint(this.connection, this.connection.control_port));

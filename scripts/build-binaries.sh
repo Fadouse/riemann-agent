@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build pi binaries for all platforms locally.
+# Build Riemann Agent binaries for all platforms locally.
 # Mirrors .github/workflows/build-binaries.yml
 #
 # Usage:
@@ -16,16 +16,17 @@
 #
 # Output:
 #   packages/coding-agent/binaries/
-#     pi-darwin-arm64.tar.gz
-#     pi-darwin-x64.tar.gz
-#     pi-linux-x64.tar.gz
-#     pi-linux-arm64.tar.gz
-#     pi-windows-x64.zip
-#     pi-windows-arm64.zip
+#     riemann-darwin-arm64.tar.gz
+#     riemann-darwin-x64.tar.gz
+#     riemann-linux-x64.tar.gz
+#     riemann-linux-arm64.tar.gz
+#     riemann-windows-x64.zip
+#     riemann-windows-arm64.zip
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+REPO_ROOT="$(pwd)"
 
 SKIP_INSTALL=false
 SKIP_DEPS=false
@@ -171,11 +172,11 @@ for platform in "${PLATFORMS[@]}"; do
     # worker must be present in the compiled executable.
     #
     # Disable cwd bunfig.toml autoload so project preload scripts cannot crash the
-    # standalone binary before pi starts (see #7684).
+    # standalone binary before Riemann starts (see #7684).
     if [[ "$platform" == windows-* ]]; then
-        bun build --compile --no-compile-autoload-bunfig --target="$bun_target" ./dist/bun/cli.js ./src/utils/image-resize-worker.ts --outfile "$OUTPUT_DIR/$platform/pi.exe"
+        bun build --compile --no-compile-autoload-bunfig --external canvas --external zeromq --target="$bun_target" ./dist/bun/cli.js ./src/utils/image-resize-worker.ts --outfile "$OUTPUT_DIR/$platform/riemann.exe"
     else
-        bun build --compile --no-compile-autoload-bunfig --target="$bun_target" ./dist/bun/cli.js ./src/utils/image-resize-worker.ts --outfile "$OUTPUT_DIR/$platform/pi"
+        bun build --compile --no-compile-autoload-bunfig --external canvas --external zeromq --target="$bun_target" ./dist/bun/cli.js ./src/utils/image-resize-worker.ts --outfile "$OUTPUT_DIR/$platform/riemann"
     fi
 done
 
@@ -194,6 +195,10 @@ for platform in "${PLATFORMS[@]}"; do
     cp -r dist/core/export-html "$OUTPUT_DIR/$platform/"
     cp -r docs "$OUTPUT_DIR/$platform/"
     cp -r examples "$OUTPUT_DIR/$platform/"
+    mkdir -p "$OUTPUT_DIR/$platform/riemann-prompts"
+    cp -r src/riemann/prompts/* "$OUTPUT_DIR/$platform/riemann-prompts/"
+    mkdir -p "$OUTPUT_DIR/$platform/riemann-python"
+    cp src/riemann/python/requirements.lock src/riemann/python/prelude.py "$OUTPUT_DIR/$platform/riemann-python/"
 
     case "$platform" in
         darwin-arm64)
@@ -227,6 +232,13 @@ for platform in "${PLATFORMS[@]}"; do
     cp "../../node_modules/@mariozechner/$clipboard_native_package/$clipboard_native_file" \
         "$OUTPUT_DIR/$platform/node_modules/@mariozechner/clipboard/"
 
+    # The kernel loads ZeroMQ only after IPython starts; keep the N-API module external
+    # so --help/--version work in Bun and copy its complete POSIX platform package.
+    if [[ "$platform" != windows-* ]]; then
+        mkdir -p "$OUTPUT_DIR/$platform/node_modules"
+        cp -r ../../node_modules/zeromq "$OUTPUT_DIR/$platform/node_modules/"
+    fi
+
     # Copy terminal input native helpers next to compiled binaries.
     if [[ "$platform" == darwin-* ]]; then
         mkdir -p "$OUTPUT_DIR/$platform/native/darwin/prebuilds/$platform"
@@ -249,12 +261,12 @@ cd "$OUTPUT_DIR"
 for platform in "${PLATFORMS[@]}"; do
     if [[ "$platform" == windows-* ]]; then
         # Windows (zip)
-        echo "Creating pi-$platform.zip..."
-        (cd "$platform" && zip -r ../pi-$platform.zip .)
+        echo "Creating riemann-$platform.zip..."
+        (cd "$platform" && zip -r ../riemann-$platform.zip .)
     else
         # Unix platforms (tar.gz) - use wrapper directory for mise compatibility
-        echo "Creating pi-$platform.tar.gz..."
-        mv "$platform" pi && tar -czf pi-$platform.tar.gz pi && mv pi "$platform"
+        echo "Creating riemann-$platform.tar.gz..."
+        mv "$platform" riemann && tar -czf riemann-$platform.tar.gz riemann && mv riemann "$platform"
     fi
 done
 
@@ -263,10 +275,11 @@ echo "==> Extracting archives for testing..."
 for platform in "${PLATFORMS[@]}"; do
     rm -rf "$platform"
     if [[ "$platform" == windows-* ]]; then
-        mkdir -p "$platform" && (cd "$platform" && unzip -q ../pi-$platform.zip)
+        mkdir -p "$platform" && (cd "$platform" && unzip -q ../riemann-$platform.zip)
     else
-        tar -xzf pi-$platform.tar.gz && mv pi "$platform"
+        tar -xzf riemann-$platform.tar.gz && mv riemann "$platform"
     fi
+    node "$REPO_ROOT/scripts/check-riemann-binary-release.mjs" "$OUTPUT_DIR/$platform" "$platform"
 done
 
 echo ""
@@ -277,8 +290,8 @@ echo ""
 echo "Extracted directories for testing:"
 for platform in "${PLATFORMS[@]}"; do
     if [[ "$platform" == windows-* ]]; then
-        echo "  $OUTPUT_DIR/$platform/pi.exe"
+        echo "  $OUTPUT_DIR/$platform/riemann.exe"
     else
-        echo "  $OUTPUT_DIR/$platform/pi"
+        echo "  $OUTPUT_DIR/$platform/riemann"
     fi
 done

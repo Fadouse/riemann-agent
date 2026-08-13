@@ -6,7 +6,7 @@ The model is exposed to one tool, `ipython`. Every other capability—workspace 
 
 Core behavior:
 
-- Atomic cell checkpoints and recovery after a kernel crash.
+- Atomic post-cell Python-state snapshots and recovery after a kernel crash.
 - Snapshot/CAS workspace edits with atomic writes and conflict detection.
 - SQLite-backed run, agent, message, artifact, and capability state.
 - Lazy MCP activation and dynamically installed Python namespaces.
@@ -31,20 +31,20 @@ See [`packages/coding-agent/README.md`](packages/coding-agent/README.md) for con
 | **[@earendil-works/pi-telemetry](packages/telemetry)** | Vendor-neutral telemetry contracts, reference adapter, conformance tests, and typed schemas |
 | **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
 | **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
-| **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
+| **[riemann-agent](packages/coding-agent)** | Persistent IPython-first coding agent CLI |
 | **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
 
 For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
 
-## Permissions & Containerization
+## System sandbox
 
-Pi does not include a built-in permission system for restricting filesystem, process, network, or credential access. By default, it runs with the permissions of the user and process that launched it.
+Riemann runs every IPython kernel and host shell process in a mandatory native sandbox:
 
-If you need stronger boundaries, containerize or sandbox Pi. See [packages/coding-agent/docs/containerization.md](packages/coding-agent/docs/containerization.md) for three patterns:
+- Linux: Bubblewrap with filesystem mounts and isolated network/process namespaces. Install `bwrap` before starting Riemann.
+- macOS: the built-in Seatbelt sandbox through `/usr/bin/sandbox-exec`.
+- Other platforms: startup of an execution kernel fails explicitly; there is no unsandboxed fallback.
 
-- **Gondolin extension**: keep `pi` and provider auth on the host while routing built-in tools and `!` commands into a local Linux micro-VM.
-- **Plain Docker**: run the whole `pi` process in a local container for simple isolation.
-- **OpenShell**: run the whole `pi` process in a policy-controlled sandbox.
+Direct Python network access is denied, workspace writes follow the agent capability set, and read-only/isolated child workspaces are enforced by the operating system. The main agent can explicitly use `shell.network`; default children cannot. Containers may still be used as an additional deployment boundary.
 
 ## Contributing
 
@@ -67,8 +67,8 @@ GitHub releases include a versioned source archive covered by the release's `SHA
 
 ```bash
 VERSION="<release-version>"
-tar -xzf "pi-${VERSION}-source.tar.gz"
-cd "pi-${VERSION}"
+tar -xzf "riemann-${VERSION}-source.tar.gz"
+cd "riemann-${VERSION}"
 ./scripts/build-binaries.sh --offline-model-data --platform linux-x64 --out "$PWD/out"
 ```
 
