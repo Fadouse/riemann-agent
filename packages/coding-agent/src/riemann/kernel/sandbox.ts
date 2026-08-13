@@ -134,7 +134,6 @@ function linuxCommand(policy: KernelSandboxPolicy, pythonArgs: string[]): Sandbo
 		"/lib",
 		"/lib64",
 		"/etc",
-		"/opt",
 		interpreterLinkRoot(policy.python) ?? "",
 	])) {
 		args.push("--ro-bind", path, path);
@@ -146,7 +145,9 @@ function linuxCommand(policy: KernelSandboxPolicy, pythonArgs: string[]): Sandbo
 	const workspace = resolve(policy.workspace);
 	args.push("--ro-bind", workspace, workspace);
 	if (policy.workspaceWritable) args.push("--bind", workspace, workspace);
-	if (!runtime.startsWith("/nix/")) args.push("--ro-bind", runtime, runtime);
+	if (runtime !== "/" && !runtime.startsWith("/nix/") && !isInside(workspace, runtime)) {
+		args.push("--ro-bind", runtime, runtime);
+	}
 	args.push("--bind", resolve(policy.connectionDir), resolve(policy.connectionDir));
 	if (policy.snapshotPath) {
 		const snapshotDirectory = dirname(resolve(policy.snapshotPath));
@@ -168,6 +169,7 @@ function seatbeltPath(path: string): string {
 }
 
 export function macOSSandboxProfile(policy: KernelSandboxPolicy): string {
+	const runtime = dirname(dirname(resolve(policy.python)));
 	const readable = [
 		"/System",
 		"/usr",
@@ -178,7 +180,7 @@ export function macOSSandboxProfile(policy: KernelSandboxPolicy): string {
 		"/dev",
 		"/nix",
 		"/run/current-system",
-		dirname(dirname(resolve(policy.python))),
+		...(runtime === "/" ? [] : [runtime]),
 		resolve(policy.workspace),
 		resolve(policy.connectionDir),
 		...(policy.snapshotPath ? [dirname(resolve(policy.snapshotPath))] : []),
