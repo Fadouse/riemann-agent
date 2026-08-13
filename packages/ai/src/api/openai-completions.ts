@@ -1283,6 +1283,7 @@ export function convertMessages(
 								type: "image_url",
 								image_url: {
 									url: `data:${block.mimeType};base64,${block.data}`,
+									...(block.detail && block.detail !== "original" ? { detail: block.detail } : {}),
 								},
 							});
 						}

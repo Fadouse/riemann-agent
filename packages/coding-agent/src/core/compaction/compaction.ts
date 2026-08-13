@@ -94,6 +94,8 @@ export interface CompactionResult<T = unknown> {
 	usage?: Usage;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
+	/** Opaque extension data persisted across compactions and restored into model context. */
+	preserveData?: Record<string, unknown>;
 }
 
 function combineUsage(first: Usage, second: Usage): Usage {
@@ -696,11 +698,15 @@ export interface CompactionPreparation {
 	messagesToSummarize: AgentMessage[];
 	/** Messages that will be turned into turn prefix summary (if splitting) */
 	turnPrefixMessages: AgentMessage[];
+	/** Messages retained verbatim after this compaction. */
+	recentMessages?: AgentMessage[];
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
 	/** Summary from previous compaction, for iterative update */
 	previousSummary?: string;
+	/** Opaque payload persisted by the previous compaction. */
+	previousPreserveData?: Record<string, unknown>;
 	/** File operations extracted from messagesToSummarize */
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
@@ -724,10 +730,12 @@ export function prepareCompaction(
 	}
 
 	let previousSummary: string | undefined;
+	let previousPreserveData: Record<string, unknown> | undefined;
 	let boundaryStart = 0;
 	if (prevCompactionIndex >= 0) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
 		previousSummary = prevCompaction.summary;
+		previousPreserveData = prevCompaction.preserveData;
 		const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
 		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 	}
@@ -762,6 +770,12 @@ export function prepareCompaction(
 		}
 	}
 
+	const recentMessages: AgentMessage[] = [];
+	for (let i = cutPoint.firstKeptEntryIndex; i < boundaryEnd; i++) {
+		const msg = getMessageFromEntryForCompaction(pathEntries[i]);
+		if (msg) recentMessages.push(msg);
+	}
+
 	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
 		return undefined;
 	}
@@ -780,9 +794,11 @@ export function prepareCompaction(
 		firstKeptEntryId,
 		messagesToSummarize,
 		turnPrefixMessages,
+		recentMessages,
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,
+		previousPreserveData,
 		fileOps,
 		settings,
 	};

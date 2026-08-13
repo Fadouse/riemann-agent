@@ -67,13 +67,14 @@ describe("AssistantMessageComponent", () => {
 			createAssistantMessage([{ type: "thinking", thinking: "private reasoning" }], { stopReason: "length" }),
 			true,
 		);
-		const rendered = component.render(80).join("\n");
+		const rendered = stripAnsi(component.render(80).join("\n"));
 
-		expect(rendered).toContain("Thinking...");
+		expect(rendered).toContain("private reasoning");
+		expect(rendered).not.toContain("Thinking...");
 		expect(rendered).toContain("Response was truncated before completion.");
 	});
 
-	test("coalesces adjacent thinking blocks into one hidden thinking label", () => {
+	test("coalesces adjacent thinking blocks into one recap without a toggle hint", () => {
 		initTheme("dark");
 
 		const component = new AssistantMessageComponent(
@@ -87,7 +88,9 @@ describe("AssistantMessageComponent", () => {
 		);
 		const rendered = stripAnsi(component.render(80).join("\n"));
 
-		expect(rendered.match(/Thinking\.\.\./g)).toHaveLength(1);
+		expect(rendered).not.toContain("Thinking...");
+		expect(rendered).toContain("first thought");
+		expect(rendered).not.toContain("to expand");
 		expect(rendered).toContain("answer");
 	});
 
@@ -108,6 +111,8 @@ describe("AssistantMessageComponent", () => {
 
 		expect(lines.some((line) => line.includes(" hello"))).toBe(true);
 		expect(lines.some((line) => line.includes(" reasoning"))).toBe(true);
+		expect(lines.join("\n")).not.toContain("Thinking...");
+		expect(lines.join("\n")).not.toContain("to collapse");
 
 		component.setOutputPad(0);
 		const updatedLines = component.render(80).map((line) => stripAnsi(line));

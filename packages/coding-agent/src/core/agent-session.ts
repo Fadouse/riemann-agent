@@ -1841,6 +1841,7 @@ export class AgentSession {
 			let tokensBefore: number;
 			let usage: Usage | undefined;
 			let details: unknown;
+			let preserveData: Record<string, unknown> | undefined;
 
 			if (extensionCompaction) {
 				// Extension provided compaction content
@@ -1849,6 +1850,7 @@ export class AgentSession {
 				tokensBefore = extensionCompaction.tokensBefore;
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
+				preserveData = extensionCompaction.preserveData;
 			} else {
 				// Generate compaction result
 				const result = await compact(
@@ -1869,13 +1871,22 @@ export class AgentSession {
 				tokensBefore = result.tokensBefore;
 				usage = result.usage;
 				details = result.details;
+				preserveData = result.preserveData;
 			}
 
 			if (this._compactionAbortController.signal.aborted) {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				usage,
+				preserveData,
+			);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
@@ -1903,6 +1914,7 @@ export class AgentSession {
 				estimatedTokensAfter,
 				usage,
 				details,
+				preserveData,
 			};
 			// compaction_end listeners may submit queued prompts, so expose idle state before notifying them.
 			this._compactionAbortController = undefined;
@@ -2113,6 +2125,7 @@ export class AgentSession {
 			let tokensBefore: number;
 			let usage: Usage | undefined;
 			let details: unknown;
+			let preserveData: Record<string, unknown> | undefined;
 
 			if (extensionCompaction) {
 				// Extension provided compaction content
@@ -2121,6 +2134,7 @@ export class AgentSession {
 				tokensBefore = extensionCompaction.tokensBefore;
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
+				preserveData = extensionCompaction.preserveData;
 			} else {
 				// Generate compaction result
 				const compactResult = await compact(
@@ -2141,6 +2155,7 @@ export class AgentSession {
 				tokensBefore = compactResult.tokensBefore;
 				usage = compactResult.usage;
 				details = compactResult.details;
+				preserveData = compactResult.preserveData;
 			}
 
 			if (this._autoCompactionAbortController.signal.aborted) {
@@ -2154,7 +2169,15 @@ export class AgentSession {
 				return false;
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				usage,
+				preserveData,
+			);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
@@ -2182,6 +2205,7 @@ export class AgentSession {
 				estimatedTokensAfter,
 				usage,
 				details,
+				preserveData,
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
 

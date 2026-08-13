@@ -91,6 +91,17 @@ export interface OpenAICodexResponsesOptions extends StreamOptions {
 	toolChoice?: "auto" | "none" | "required";
 }
 
+export interface OpenAICodexCompactionResult {
+	compactionItem: {
+		type: "compaction";
+		encrypted_content: string;
+		id?: string;
+		created_by?: string;
+	};
+	responseId?: string;
+	usage?: Usage;
+}
+
 type CodexResponseStatus = "completed" | "incomplete" | "failed" | "cancelled" | "queued" | "in_progress";
 
 interface RequestBody {
@@ -522,6 +533,166 @@ export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStream
 		reasoningEffort,
 	} satisfies OpenAICodexResponsesOptions);
 };
+
+/**
+ * Run Codex Responses V2 compaction through the ChatGPT subscription transport.
+ * The returned encrypted item is opaque and must be replayed unchanged.
+ */
+export async function compactOpenAICodexResponses(
+	model: Model<"openai-codex-responses">,
+	context: Context,
+	options?: OpenAICodexResponsesOptions,
+): Promise<OpenAICodexCompactionResult> {
+	if (model.provider !== "openai-codex") {
+		throw new Error(`Codex subscription compaction requires provider "openai-codex", got "${model.provider}"`);
+	}
+	const apiKey = options?.apiKey;
+	if (!apiKey) throw new Error("Codex subscription compaction requires an OAuth access token");
+
+	const accountId = extractAccountId(apiKey);
+	const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
+	const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
+	const body = buildRequestBody(model, context, options, codexSessionId);
+	body.input = [...(body.input ?? []), { type: "compaction_trigger" }] as ResponseInput;
+	body.store = false;
+	body.stream = true;
+
+	const bodyJson = JSON.stringify(body);
+	const headers = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);
+	const compressedBody = compressRequestBodyZstd(bodyJson);
+	if (compressedBody) headers.set("content-encoding", "zstd");
+	const requestBody: Uint8Array | string = compressedBody ?? bodyJson;
+	const requestTimeout = AbortSignal.timeout(options?.timeoutMs ?? 180_000);
+	const combinedSignal = combineAbortSignals([options?.signal, requestTimeout]);
+	const requestSignal = combinedSignal.signal ?? requestTimeout;
+
+	try {
+		let response: Response | undefined;
+		const maxRetries = options?.maxRetries ?? 2;
+		for (let attempt = 0; attempt <= maxRetries; attempt++) {
+			try {
+				response = await (options?.fetch ?? globalThis.fetch)(resolveCodexUrl(model.baseUrl), {
+					method: "POST",
+					headers,
+					body: requestBody,
+					signal: requestSignal,
+				});
+			} catch (error) {
+				if (requestSignal.aborted || attempt >= maxRetries) throw error;
+				await sleep(BASE_DELAY_MS * 2 ** attempt, requestSignal);
+				continue;
+			}
+			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			if (response.ok) break;
+
+			const errorText = await response.text();
+			if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
+				const requestedDelay = getRetryAfterDelayMs(response.headers);
+				const delayMs =
+					requestedDelay === undefined
+						? BASE_DELAY_MS * 2 ** attempt
+						: validateRetryDelayMs(requestedDelay, options);
+				await sleep(delayMs, requestSignal);
+				continue;
+			}
+			const info = await parseErrorResponse(
+				new Response(errorText, { status: response.status, statusText: response.statusText }),
+			);
+			throw new Error(info.friendlyMessage || info.message);
+		}
+		if (!response?.ok) throw new Error("Codex subscription compaction failed after retries");
+
+		let outputItemCount = 0;
+		const compactionItems: OpenAICodexCompactionResult["compactionItem"][] = [];
+		let sawCompleted = false;
+		let responseId: string | undefined;
+		let usage: Usage | undefined;
+		for await (const event of parseSSE(response, requestSignal)) {
+			const type = typeof event.type === "string" ? event.type : "";
+			if (type === "response.output_item.done") {
+				outputItemCount++;
+				const item = event.item;
+				if (isCodexCompactionItem(item)) compactionItems.push(item);
+				continue;
+			}
+			if (type === "response.completed" || type === "response.done") {
+				sawCompleted = true;
+				const completed = isRecord(event.response) ? event.response : undefined;
+				responseId = completed && typeof completed.id === "string" ? completed.id : undefined;
+				usage = completed ? codexCompactionUsage(completed.usage) : undefined;
+				continue;
+			}
+			if (type === "response.failed" || type === "response.incomplete" || type === "error") {
+				throw new Error(codexCompactionFailure(event, type));
+			}
+		}
+		if (!sawCompleted) throw new Error("Codex compaction stream closed before response.completed");
+		if (compactionItems.length !== 1) {
+			throw new Error(
+				`Codex compaction expected exactly one compaction output item, got ${compactionItems.length} from ${outputItemCount} output items`,
+			);
+		}
+		return {
+			compactionItem: compactionItems[0],
+			...(responseId ? { responseId } : {}),
+			...(usage ? { usage } : {}),
+		};
+	} finally {
+		combinedSignal.cleanup();
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isCodexCompactionItem(value: unknown): value is OpenAICodexCompactionResult["compactionItem"] {
+	if (!isRecord(value) || value.type !== "compaction" || typeof value.encrypted_content !== "string") return false;
+	if (value.encrypted_content.length === 0) return false;
+	return (
+		(value.id === undefined || typeof value.id === "string") &&
+		(value.created_by === undefined || typeof value.created_by === "string")
+	);
+}
+
+function codexCompactionUsage(value: unknown): Usage | undefined {
+	if (!isRecord(value)) return undefined;
+	const inputTokens = typeof value.input_tokens === "number" ? value.input_tokens : undefined;
+	const outputTokens = typeof value.output_tokens === "number" ? value.output_tokens : undefined;
+	const totalTokens = typeof value.total_tokens === "number" ? value.total_tokens : undefined;
+	if (inputTokens === undefined || outputTokens === undefined || totalTokens === undefined) return undefined;
+	const inputDetails = isRecord(value.input_tokens_details) ? value.input_tokens_details : undefined;
+	const outputDetails = isRecord(value.output_tokens_details) ? value.output_tokens_details : undefined;
+	const cacheRead = inputDetails && typeof inputDetails.cached_tokens === "number" ? inputDetails.cached_tokens : 0;
+	const reasoning =
+		outputDetails && typeof outputDetails.reasoning_tokens === "number" ? outputDetails.reasoning_tokens : 0;
+	return {
+		input: Math.max(0, inputTokens - cacheRead),
+		output: outputTokens,
+		cacheRead,
+		cacheWrite: 0,
+		reasoning,
+		totalTokens,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function codexCompactionFailure(event: Record<string, unknown>, type: string): string {
+	const response = isRecord(event.response) ? event.response : undefined;
+	const error = isRecord(event.error)
+		? event.error
+		: response && isRecord(response.error)
+			? response.error
+			: undefined;
+	const code =
+		error && typeof error.code === "string"
+			? error.code
+			: error && typeof error.type === "string"
+				? error.type
+				: undefined;
+	const message = error && typeof error.message === "string" ? error.message : undefined;
+	return `Codex compaction stream ${type}${code ? ` (${code})` : ""}${message ? `: ${message}` : ""}`;
+}
 
 // ============================================================================
 // Request Building

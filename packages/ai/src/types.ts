@@ -355,6 +355,8 @@ export interface ImageContent {
 	type: "image";
 	data: string; // base64 encoded image data
 	mimeType: string; // e.g., "image/jpeg", "image/png"
+	/** Provider image-resolution hint. Unsupported providers may ignore it. */
+	detail?: "auto" | "low" | "high" | "original";
 }
 
 export interface ToolCall {
@@ -406,9 +408,22 @@ export interface DeferredHandle {
 	data?: JsonValue;
 }
 
+export interface OpenAIResponsesHistoryPayload {
+	type: "openaiResponsesHistory";
+	/** Payloads are replayed only when this matches the active provider. */
+	provider?: string;
+	/** Opaque artifacts are replayed only to the model that created them when set. */
+	model?: string;
+	items: Array<Record<string, unknown>>;
+}
+
+export type ProviderPayload = OpenAIResponsesHistoryPayload;
+
 export interface UserMessage {
 	role: "user";
 	content: string | (TextContent | ImageContent)[];
+	/** Provider-native history replayed by compatible transports and ignored by others. */
+	providerPayload?: ProviderPayload;
 	timestamp: number; // Unix timestamp in milliseconds
 }
 

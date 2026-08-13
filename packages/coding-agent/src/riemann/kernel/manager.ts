@@ -1,0 +1,597 @@
+import type { ChildProcess } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { Dealer, Subscriber } from "zeromq";
+import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
+import type {
+	JsonValue,
+	JupyterConnectionInfo,
+	JupyterMessage,
+	KernelDisplay,
+	KernelError,
+	KernelExecuteOptions,
+	KernelExecuteResult,
+	KernelHostRequest,
+	KernelHostRequestError,
+	KernelHostRequestEvent,
+	KernelManagerOptions,
+	KernelRestoreResult,
+} from "./types.ts";
+import { decodeJupyterMessage, encodeJupyterMessage } from "./wire.ts";
+
+const CONNECTION_WAIT_MS = 50;
+const SHUTDOWN_GRACE_MS = 1_500;
+const HOST_COMM_TARGET = "riemann.host";
+
+interface ActiveExecution {
+	id: string;
+	startedAt: number;
+	stdout: string;
+	stderr: string;
+	displays: KernelDisplay[];
+	result?: KernelDisplay;
+	error?: KernelError;
+	executionCount?: number;
+	status: "ok" | "error" | "aborted";
+	idle: boolean;
+	replied: boolean;
+	settled: boolean;
+	resolve: (result: KernelExecuteResult) => void;
+	abort?: () => void;
+	hostControllers: Set<AbortController>;
+	onHostRequest?: KernelExecuteOptions["onHostRequest"];
+	hostNotificationQueue: Promise<void>;
+}
+
+function endpoint(info: JupyterConnectionInfo, port: number): string {
+	return `${info.transport}://${info.ip}:${port}`;
+}
+
+function stringField(value: JsonValue | undefined): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+function numberField(value: JsonValue | undefined): number | undefined {
+	return typeof value === "number" ? value : undefined;
+}
+
+function parseDisplay(message: JupyterMessage): KernelDisplay | undefined {
+	const data = message.content.data;
+	const metadata = message.content.metadata;
+	if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
+	if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) return undefined;
+	return { data, metadata };
+}
+
+function parseError(message: JupyterMessage): KernelError | undefined {
+	const ename = stringField(message.content.ename);
+	const evalue = stringField(message.content.evalue);
+	const traceback = message.content.traceback;
+	if (
+		!ename ||
+		evalue === undefined ||
+		!Array.isArray(traceback) ||
+		traceback.some((line) => typeof line !== "string")
+	) {
+		return undefined;
+	}
+	return { ename, evalue, traceback: traceback as string[] };
+}
+
+function stripAnsi(value: string): string {
+	return value.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
+}
+
+export class IPythonKernelManager {
+	private readonly options: KernelManagerOptions;
+	private readonly session = randomUUID();
+	private process?: ChildProcess;
+	private tempDir?: string;
+	private connection?: JupyterConnectionInfo;
+	private shell?: Dealer;
+	private control?: Dealer;
+	private iopub?: Subscriber;
+	private startup?: Promise<void>;
+	private execution?: ActiveExecution;
+	private shellLoop?: Promise<void>;
+	private controlLoop?: Promise<void>;
+	private iopubLoop?: Promise<void>;
+	private closed = false;
+	private kernelReady = false;
+
+	constructor(options: KernelManagerOptions) {
+		this.options = options;
+	}
+
+	async start(): Promise<void> {
+		if (this.closed) throw new Error("IPython kernel manager is closed");
+		if (this.kernelReady && this.process?.exitCode === null) return;
+		this.startup ??= (async () => {
+			await this.cleanupKernelResources();
+			await this.startKernel();
+		})()
+			.catch(async (error) => {
+				await this.cleanupKernelResources();
+				throw error;
+			})
+			.finally(() => {
+				this.startup = undefined;
+			});
+		return this.startup;
+	}
+
+	private async cleanupKernelResources(): Promise<void> {
+		const process = this.process;
+		const tempDir = this.tempDir;
+		const loops = [this.shellLoop, this.controlLoop, this.iopubLoop].filter(
+			(loop): loop is Promise<void> => loop !== undefined,
+		);
+		this.process = undefined;
+		this.tempDir = undefined;
+		this.connection = undefined;
+		this.kernelReady = false;
+		this.shell?.close();
+		this.control?.close();
+		this.iopub?.close();
+		this.shell = undefined;
+		this.control = undefined;
+		this.iopub = undefined;
+		this.shellLoop = undefined;
+		this.controlLoop = undefined;
+		this.iopubLoop = undefined;
+		if (process?.exitCode === null) process.kill("SIGKILL");
+		if (process) await Promise.race([waitForChildProcess(process), delay(SHUTDOWN_GRACE_MS)]);
+		await Promise.allSettled(loops);
+		this.options.onProcess?.(undefined);
+		if (tempDir) await rm(tempDir, { recursive: true, force: true });
+	}
+
+	private async startKernel(): Promise<void> {
+		this.tempDir = await mkdtemp(join(tmpdir(), "riemann-kernel-"));
+		const connectionPath = join(this.tempDir, "connection.json");
+		const initial: JupyterConnectionInfo = {
+			ip: "127.0.0.1",
+			transport: "tcp",
+			shell_port: 0,
+			iopub_port: 0,
+			stdin_port: 0,
+			control_port: 0,
+			hb_port: 0,
+			signature_scheme: "hmac-sha256",
+			key: randomBytes(32).toString("hex"),
+			kernel_name: "python3",
+		};
+		await writeFile(connectionPath, `${JSON.stringify(initial, null, 2)}\n`, { mode: 0o600 });
+		const child = spawnProcess(this.options.python, ["-m", "ipykernel_launcher", "-f", connectionPath], {
+			cwd: this.options.cwd,
+			env: { ...process.env, ...this.options.env, PYDEVD_DISABLE_FILE_VALIDATION: "1" },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		this.process = child;
+		this.options.onProcess?.(child);
+		let processStderr = "";
+		child.stderr?.on("data", (chunk: Buffer) => {
+			processStderr = (processStderr + chunk.toString("utf8")).slice(-16_384);
+		});
+		const exited = waitForChildProcess(child).then((exitCode) => {
+			if (!this.closed && this.process === child) {
+				this.kernelReady = false;
+				this.failActive(new Error(`IPython kernel exited with code ${exitCode}: ${processStderr.trim()}`));
+			}
+		});
+		const deadline = Date.now() + (this.options.startupTimeoutMs ?? 30_000);
+		while (Date.now() < deadline) {
+			if (child.exitCode !== null) {
+				await exited;
+				throw new Error(`IPython kernel exited during startup: ${processStderr.trim()}`);
+			}
+			try {
+				const parsed: unknown = JSON.parse(await readFile(connectionPath, "utf8"));
+				if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+					const info = parsed as JupyterConnectionInfo;
+					if (
+						[info.shell_port, info.iopub_port, info.control_port].every(
+							(port) => Number.isInteger(port) && port > 0,
+						)
+					) {
+						this.connection = info;
+						break;
+					}
+				}
+			} catch {
+				// ipykernel may be replacing the connection file.
+			}
+			await delay(CONNECTION_WAIT_MS);
+		}
+		if (!this.connection) throw new Error("Timed out waiting for IPython connection ports");
+
+		this.shell = new Dealer({ routingId: `riemann-shell-${this.session}` });
+		this.control = new Dealer({ routingId: `riemann-control-${this.session}` });
+		this.iopub = new Subscriber();
+		this.iopub.subscribe();
+		this.shell.connect(endpoint(this.connection, this.connection.shell_port));
+		this.control.connect(endpoint(this.connection, this.connection.control_port));
+		this.iopub.connect(endpoint(this.connection, this.connection.iopub_port));
+		this.shellLoop = this.readSocket(this.shell, "shell");
+		this.controlLoop = this.readSocket(this.control, "control");
+		this.iopubLoop = this.readSocket(this.iopub, "iopub");
+
+		await this.waitForKernel();
+		const bootstrap = await this.execute(this.options.bootstrapCode, { internal: true });
+		if (bootstrap.status !== "ok")
+			throw new Error(`IPython bootstrap failed: ${bootstrap.error?.evalue ?? bootstrap.stderr}`);
+		await this.restoreSnapshot();
+	}
+
+	private async waitForKernel(): Promise<void> {
+		if (!this.shell || !this.connection) throw new Error("Kernel sockets are unavailable");
+		const request = encodeJupyterMessage({
+			type: "kernel_info_request",
+			session: this.session,
+			username: this.options.sessionId,
+			key: this.connection.key,
+		});
+		await this.shell.send(request.frames);
+		const deadline = Date.now() + (this.options.startupTimeoutMs ?? 30_000);
+		while (Date.now() < deadline) {
+			if (this.kernelReady) return;
+			await delay(CONNECTION_WAIT_MS);
+		}
+		throw new Error("Timed out waiting for IPython kernel_info_reply");
+	}
+
+	private async readSocket(socket: Dealer | Subscriber, channel: "shell" | "control" | "iopub"): Promise<void> {
+		try {
+			for await (const frames of socket) {
+				if (!this.connection) continue;
+				const message = decodeJupyterMessage(frames as Buffer[], this.connection.key);
+				if (message) await this.handleMessage(channel, message);
+			}
+		} catch (error) {
+			if (!this.closed) this.failActive(error instanceof Error ? error : new Error(String(error)));
+		}
+	}
+
+	private async handleMessage(channel: "shell" | "control" | "iopub", message: JupyterMessage): Promise<void> {
+		if (message.header.msg_type === "kernel_info_reply") {
+			this.kernelReady = true;
+			return;
+		}
+		if (message.header.msg_type === "comm_open" && stringField(message.content.target_name) === HOST_COMM_TARGET) {
+			await this.handleHostRequest(channel, message);
+			return;
+		}
+		const execution = this.execution;
+		if (!execution || message.parentHeader.msg_id !== execution.id) return;
+		switch (message.header.msg_type) {
+			case "stream": {
+				const text = stringField(message.content.text) ?? "";
+				if (message.content.name === "stderr") execution.stderr = this.capOutput(execution.stderr + text);
+				else execution.stdout = this.capOutput(execution.stdout + text);
+				break;
+			}
+			case "display_data": {
+				const display = parseDisplay(message);
+				if (display) execution.displays.push(display);
+				break;
+			}
+			case "execute_result": {
+				execution.result = parseDisplay(message);
+				execution.executionCount = numberField(message.content.execution_count);
+				break;
+			}
+			case "error":
+				execution.error = parseError(message);
+				execution.status = "error";
+				break;
+			case "execute_reply":
+				execution.replied = true;
+				execution.executionCount ??= numberField(message.content.execution_count);
+				if (message.content.status === "error") {
+					execution.status = "error";
+					execution.error ??= parseError(message);
+				} else if (message.content.status === "aborted") {
+					execution.status = "aborted";
+				}
+				this.settleIfComplete(execution);
+				break;
+			case "status":
+				if (message.content.execution_state === "idle") {
+					execution.idle = true;
+					this.settleIfComplete(execution);
+				}
+				break;
+		}
+	}
+
+	private capOutput(value: string): string {
+		const cap = this.options.maxOutputChars ?? 100_000;
+		if (value.length <= cap) return value;
+		return `${value.slice(0, cap)}\n[output truncated by Riemann Agent]`;
+	}
+
+	private abortHostRequests(execution: ActiveExecution, reason: Error): void {
+		for (const controller of execution.hostControllers) controller.abort(reason);
+		execution.hostControllers.clear();
+	}
+
+	private notifyHostRequest(execution: ActiveExecution, event: KernelHostRequestEvent): Promise<void> {
+		const observer = execution.onHostRequest;
+		if (!observer) return Promise.resolve();
+		const notification = execution.hostNotificationQueue.then(() => observer(event)).catch(() => undefined);
+		execution.hostNotificationQueue = notification;
+		return notification;
+	}
+
+	private settleIfComplete(execution: ActiveExecution): void {
+		if (execution.settled || !execution.replied || !execution.idle) return;
+		execution.settled = true;
+		this.abortHostRequests(execution, new Error("IPython cell finished"));
+		execution.abort?.();
+		if (this.execution === execution) this.execution = undefined;
+		execution.resolve({
+			status: execution.status,
+			stdout: execution.stdout,
+			stderr: execution.stderr,
+			result: execution.result,
+			displays: execution.displays,
+			error: execution.error,
+			executionCount: execution.executionCount,
+			durationMs: Date.now() - execution.startedAt,
+		});
+	}
+
+	private async handleHostRequest(_channel: "shell" | "control" | "iopub", message: JupyterMessage): Promise<void> {
+		const commId = stringField(message.content.comm_id);
+		const data = message.content.data;
+		if (!commId || typeof data !== "object" || data === null || Array.isArray(data)) return;
+		const type = stringField(data.type);
+		const args = data.args;
+		if (!type || typeof args !== "object" || args === null || Array.isArray(args)) return;
+		const execution = this.execution;
+		const controller = new AbortController();
+		if (!execution || message.parentHeader.msg_id !== execution.id) {
+			controller.abort(new Error("The originating IPython cell is no longer active"));
+		} else {
+			execution.hostControllers.add(controller);
+		}
+		const request: KernelHostRequest = { type, args, cellId: stringField(message.parentHeader.msg_id) };
+		const startedAt = Date.now();
+		let reply: Record<string, JsonValue>;
+		if (controller.signal.aborted || !execution) {
+			reply = {
+				status: "error",
+				error: { code: "aborted", message: "The originating IPython cell is no longer active" },
+			};
+		} else {
+			await this.notifyHostRequest(execution, { phase: "start", requestId: commId, request, startedAt });
+			try {
+				const value = await this.options.hostRequest(request, controller.signal, (update) => {
+					void this.notifyHostRequest(execution, { phase: "update", requestId: commId, request, update });
+				});
+				reply = { status: "ok", value };
+				await this.notifyHostRequest(execution, {
+					phase: "end",
+					requestId: commId,
+					request,
+					durationMs: Date.now() - startedAt,
+					result: value,
+				});
+			} catch (error) {
+				const details =
+					error instanceof Error && "details" in error ? (error as { details?: JsonValue }).details : undefined;
+				const requestError: KernelHostRequestError = {
+					code:
+						error instanceof Error && "code" in error
+							? String((error as { code?: unknown }).code)
+							: "runtime_error",
+					message: error instanceof Error ? error.message : String(error),
+					...(details === undefined ? {} : { details }),
+				};
+				reply = {
+					status: "error",
+					error: {
+						code: requestError.code,
+						message: requestError.message,
+						...(requestError.details === undefined ? {} : { details: requestError.details }),
+					},
+				};
+				await this.notifyHostRequest(execution, {
+					phase: "end",
+					requestId: commId,
+					request,
+					durationMs: Date.now() - startedAt,
+					error: requestError,
+				});
+			} finally {
+				execution.hostControllers.delete(controller);
+			}
+		}
+		const socket = this.control ?? this.shell;
+		if (!socket || !this.connection || this.closed) return;
+		const response = encodeJupyterMessage({
+			type: "comm_msg",
+			content: { comm_id: commId, data: reply },
+			parentHeader: message.header,
+			session: this.session,
+			username: this.options.sessionId,
+			key: this.connection.key,
+		});
+		await socket.send(response.frames);
+	}
+
+	async execute(code: string, options: KernelExecuteOptions = {}): Promise<KernelExecuteResult> {
+		if (!options.internal) await this.start();
+		if (!this.shell || !this.connection) throw new Error("IPython kernel is unavailable");
+		if (this.execution) throw new Error("IPython kernel is already executing a cell");
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("Operation aborted");
+		const request = encodeJupyterMessage({
+			type: "execute_request",
+			content: {
+				code,
+				silent: false,
+				store_history: !options.internal,
+				user_expressions: {},
+				allow_stdin: false,
+				stop_on_error: true,
+			},
+			session: this.session,
+			username: this.options.sessionId,
+			key: this.connection.key,
+		});
+		let resolveExecution!: ActiveExecution["resolve"];
+		const promise = new Promise<KernelExecuteResult>((resolve) => {
+			resolveExecution = resolve;
+		});
+		const execution: ActiveExecution = {
+			id: request.id,
+			startedAt: Date.now(),
+			stdout: "",
+			stderr: "",
+			displays: [],
+			status: "ok",
+			idle: false,
+			replied: false,
+			settled: false,
+			resolve: resolveExecution,
+			hostControllers: new Set(),
+			onHostRequest: options.onHostRequest,
+			hostNotificationQueue: Promise.resolve(),
+		};
+		if (options.signal) {
+			const onAbort = () => void this.interrupt().catch(() => undefined);
+			options.signal.addEventListener("abort", onAbort, { once: true });
+			execution.abort = () => options.signal?.removeEventListener("abort", onAbort);
+		}
+		this.execution = execution;
+		try {
+			await this.shell.send(request.frames);
+		} catch (error) {
+			this.failActive(error instanceof Error ? error : new Error(String(error)));
+		}
+		return promise;
+	}
+
+	async interrupt(): Promise<void> {
+		if (this.execution) this.abortHostRequests(this.execution, new Error("IPython cell interrupted"));
+		if (!this.control || !this.connection) return;
+		const request = encodeJupyterMessage({
+			type: "interrupt_request",
+			session: this.session,
+			username: this.options.sessionId,
+			key: this.connection.key,
+		});
+		await this.control.send(request.frames);
+	}
+
+	private failActive(error: Error): void {
+		const execution = this.execution;
+		if (!execution || execution.settled) return;
+		execution.error = { ename: error.name, evalue: error.message, traceback: [] };
+		execution.status = "error";
+		execution.replied = true;
+		execution.idle = true;
+		this.settleIfComplete(execution);
+	}
+
+	private parseSnapshotResult(result: KernelExecuteResult): KernelRestoreResult {
+		const marker = "__RIEMANN_SNAPSHOT__";
+		const stdoutLines = result.stdout.split(/\r?\n/);
+		let line: string | undefined;
+		for (let index = stdoutLines.length - 1; index >= 0; index -= 1) {
+			const candidate = stdoutLines[index];
+			if (candidate?.startsWith(marker)) {
+				line = candidate;
+				break;
+			}
+		}
+		if (!line) {
+			return {
+				restored: [],
+				skipped: [],
+				error: stripAnsi(result.error?.evalue ?? result.stderr.trim() ?? "Snapshot operation returned no result"),
+			};
+		}
+		try {
+			const value: unknown = JSON.parse(line.slice(marker.length));
+			if (typeof value !== "object" || value === null || Array.isArray(value)) {
+				throw new Error("snapshot result must be an object");
+			}
+			const restored = "restored" in value ? value.restored : undefined;
+			const skipped = "skipped" in value ? value.skipped : undefined;
+			const error = "error" in value ? value.error : undefined;
+			if (!Array.isArray(restored) || restored.some((name) => typeof name !== "string") || !Array.isArray(skipped)) {
+				throw new Error("snapshot result has invalid restored or skipped fields");
+			}
+			const parsedSkipped: Array<{ name: string; reason: string }> = [];
+			for (const item of skipped) {
+				if (
+					typeof item !== "object" ||
+					item === null ||
+					Array.isArray(item) ||
+					!("name" in item) ||
+					typeof item.name !== "string" ||
+					!("reason" in item) ||
+					typeof item.reason !== "string"
+				) {
+					throw new Error("snapshot result contains an invalid skipped entry");
+				}
+				parsedSkipped.push({ name: item.name, reason: item.reason });
+			}
+			if (error !== undefined && typeof error !== "string")
+				throw new Error("snapshot result error must be a string");
+			return { restored: restored as string[], skipped: parsedSkipped, ...(error ? { error } : {}) };
+		} catch (error) {
+			return {
+				restored: [],
+				skipped: [],
+				error: `Could not parse snapshot result: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
+
+	private async restoreSnapshot(): Promise<void> {
+		if (!this.options.snapshotPath) return;
+		const escapedPath = JSON.stringify(this.options.snapshotPath);
+		const result = await this.execute(
+			`import dill as _riemann_dill, json as _riemann_json, pathlib as _riemann_pathlib\n_riemann_restore = {"restored": [], "skipped": []}\n_riemann_snapshot_path = _riemann_pathlib.Path(${escapedPath})\nif _riemann_snapshot_path.exists():\n    try:\n        with _riemann_snapshot_path.open("rb") as _riemann_file:\n            _riemann_values = _riemann_dill.load(_riemann_file)\n        for _riemann_name, _riemann_value in _riemann_values.items():\n            globals()[_riemann_name] = _riemann_value\n            _riemann_restore["restored"].append(_riemann_name)\n    except Exception as _riemann_error:\n        _riemann_restore["error"] = f"{type(_riemann_error).__name__}: {_riemann_error}"\nprint("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps(_riemann_restore, sort_keys=True))`,
+			{ internal: true },
+		);
+		this.options.onRestore?.(this.parseSnapshotResult(result));
+	}
+
+	async snapshot(): Promise<KernelRestoreResult> {
+		if (!this.options.snapshotPath) return { restored: [], skipped: [], error: "Snapshots are disabled" };
+		if (this.execution)
+			return { restored: [], skipped: [], error: "Cannot snapshot while an IPython cell is running" };
+		const escapedPath = JSON.stringify(this.options.snapshotPath);
+		const code = `import builtins as _riemann_builtins, dill as _riemann_dill, json as _riemann_json, os as _riemann_os, pathlib as _riemann_pathlib, tempfile as _riemann_tempfile\n_riemann_snapshot_path = _riemann_pathlib.Path(${escapedPath})\n_riemann_snapshot_path.parent.mkdir(parents=True, exist_ok=True)\n_riemann_values, _riemann_skipped = {}, []\n_riemann_reserved = {name for name in globals() if name.startswith("_")} | {"In", "Out", "get_ipython", "exit", "quit"} | set(globals().get("_RIEMANN_PROTECTED", set()))\nfor _riemann_name, _riemann_value in list(globals().items()):\n    if _riemann_name in _riemann_reserved or isinstance(_riemann_value, type(_riemann_builtins)):\n        continue\n    try:\n        _riemann_dill.dumps(_riemann_value)\n        _riemann_values[_riemann_name] = _riemann_value\n    except Exception as _riemann_error:\n        _riemann_skipped.append({"name": _riemann_name, "reason": f"{type(_riemann_error).__name__}: {_riemann_error}"})\n_riemann_fd, _riemann_tmp = _riemann_tempfile.mkstemp(dir=str(_riemann_snapshot_path.parent), prefix=".snapshot-", suffix=".tmp")\ntry:\n    with _riemann_os.fdopen(_riemann_fd, "wb") as _riemann_file:\n        _riemann_dill.dump(_riemann_values, _riemann_file)\n        _riemann_file.flush()\n        _riemann_os.fsync(_riemann_file.fileno())\n    _riemann_os.replace(_riemann_tmp, _riemann_snapshot_path)\nfinally:\n    if _riemann_os.path.exists(_riemann_tmp): _riemann_os.unlink(_riemann_tmp)\nprint("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps({"restored": sorted(_riemann_values), "skipped": _riemann_skipped}, sort_keys=True))`;
+		const result = await this.execute(code, { internal: true });
+		if (result.status !== "ok") return { restored: [], skipped: [], error: result.error?.evalue ?? result.stderr };
+		return this.parseSnapshotResult(result);
+	}
+
+	async close(): Promise<void> {
+		if (this.closed) return;
+		this.closed = true;
+		this.failActive(new Error("IPython kernel closed"));
+		if (this.control && this.connection) {
+			const request = encodeJupyterMessage({
+				type: "shutdown_request",
+				content: { restart: false },
+				session: this.session,
+				username: this.options.sessionId,
+				key: this.connection.key,
+			});
+			await this.control.send(request.frames).catch(() => undefined);
+		}
+		await Promise.race([
+			this.process ? waitForChildProcess(this.process) : Promise.resolve(),
+			delay(SHUTDOWN_GRACE_MS),
+		]);
+		await this.cleanupKernelResources();
+	}
+}

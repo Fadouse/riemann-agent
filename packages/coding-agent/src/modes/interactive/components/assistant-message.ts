@@ -1,5 +1,13 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
+import {
+	type Component,
+	Container,
+	Markdown,
+	type MarkdownTheme,
+	Spacer,
+	Text,
+	truncateToWidth,
+} from "@earendil-works/pi-tui";
 import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { createMarkdownTransform } from "./markdown-transform.ts";
@@ -7,6 +15,60 @@ import { createMarkdownTransform } from "./markdown-transform.ts";
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+
+function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
+	const quiet = (text: string) => theme.fg("thinkingText", text);
+	return {
+		...baseTheme,
+		heading: quiet,
+		link: quiet,
+		linkUrl: quiet,
+		code: quiet,
+		codeBlock: quiet,
+		codeBlockBorder: quiet,
+		quote: quiet,
+		quoteBorder: quiet,
+		hr: quiet,
+		listBullet: quiet,
+		highlightCode: (code: string) => code.split("\n").map((line) => quiet(line)),
+	};
+}
+
+function thinkingRecap(thinking: string, fallback: string, maxWidth = 120): string {
+	const lines = thinking
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0);
+	const lastHeader = [...lines].reverse().find((line) => /^\*\*[^*]+\*\*:?$/.test(line) || /^#{1,6}\s+\S/.test(line));
+	const source = lastHeader ?? lines[0] ?? fallback;
+	const plain = source
+		.replace(/^#{1,6}\s+/, "")
+		.replace(/\*\*([^*]+)\*\*/g, "$1")
+		.replace(/\*([^*]+)\*/g, "$1")
+		.replace(/`([^`]+)`/g, "$1")
+		.replace(/\s+/g, " ")
+		.replace(/:$/, "")
+		.trim();
+	return truncateToWidth(plain || fallback, Math.max(20, maxWidth));
+}
+
+class CollapsedThinkingRow implements Component {
+	private readonly recap: string;
+	private readonly padding: number;
+
+	constructor(recap: string, padding: number) {
+		this.recap = recap;
+		this.padding = padding;
+	}
+
+	render(width: number): string[] {
+		const safeWidth = Math.max(1, width);
+		const indent = " ".repeat(this.padding);
+		return [truncateToWidth(`${indent}${theme.fg("thinkingText", this.recap)}`, safeWidth, "")];
+	}
+
+	invalidate(): void {}
+}
 
 /**
  * Component that renders a complete assistant message
@@ -136,23 +198,19 @@ export class AssistantMessageComponent extends Container {
 					.slice(i + 1)
 					.some((c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()));
 
+				const combinedThinking = thinkingBlocks.join("\n\n");
 				if (this.hideThinkingBlock) {
-					// Show one static label for each run of thinking blocks when hidden.
 					this.contentContainer.addChild(
-						new Text(theme.italic(theme.fg("thinkingText", this.hiddenThinkingLabel)), this.outputPad, 0),
+						new CollapsedThinkingRow(thinkingRecap(combinedThinking, this.hiddenThinkingLabel), this.outputPad),
 					);
 				} else {
-					// Render each run of thinking blocks as one Markdown section.
 					this.contentContainer.addChild(
 						new Markdown(
-							thinkingBlocks.join("\n\n"),
+							combinedThinking,
 							this.outputPad,
 							0,
-							this.markdownTheme,
-							{
-								color: (text: string) => theme.fg("thinkingText", text),
-								italic: true,
-							},
+							getThinkingMarkdownTheme(this.markdownTheme),
+							{ color: (text: string) => theme.fg("thinkingText", text) },
 							{
 								transform: createMarkdownTransform(
 									"assistant-thinking",

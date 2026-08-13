@@ -54,7 +54,7 @@ function buildToolResult(toolCallId: string, timestamp: number): ToolResultMessa
 		toolName: "read",
 		content: [
 			{ type: "text", text: "Read image file [image/png]" },
-			{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+			{ type: "image", data: "ZmFrZQ==", mimeType: "image/png", detail: "high" },
 		],
 		isError: false,
 		timestamp,
@@ -113,10 +113,11 @@ describe("openai-completions convertMessages", () => {
 		expect(imageMessage.role).toBe("user");
 		expect(Array.isArray(imageMessage.content)).toBe(true);
 
-		const imageParts = (imageMessage.content as Array<{ type?: string }>).filter(
+		const imageParts = (imageMessage.content as Array<{ type?: string; image_url?: { detail?: string } }>).filter(
 			(part) => part?.type === "image_url",
 		);
-		expect(imageParts.length).toBe(2);
+		expect(imageParts).toHaveLength(2);
+		expect(imageParts.every((part) => part.image_url?.detail === "high")).toBe(true);
 	});
 
 	it("uses '(no tool output)' placeholder for empty tool results without images", () => {

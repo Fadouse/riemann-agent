@@ -96,7 +96,7 @@ function convertToolResultOutput<TApi extends Api>(
 	for (const image of images) {
 		output.push({
 			type: "input_image",
-			detail: "auto",
+			detail: image.detail ?? "auto",
 			image_url: `data:${image.mimeType};base64,${image.data}`,
 		});
 	}
@@ -184,6 +184,16 @@ export function convertResponsesMessages<TApi extends Api>(
 	let msgIndex = 0;
 	for (const msg of transformedMessages) {
 		if (msg.role === "user") {
+			const providerPayload = msg.providerPayload;
+			if (
+				providerPayload?.type === "openaiResponsesHistory" &&
+				Array.isArray(providerPayload.items) &&
+				(providerPayload.provider ?? model.provider) === model.provider &&
+				(providerPayload.model ?? model.id) === model.id
+			) {
+				messages.push(...(providerPayload.items as unknown as ResponseInput));
+				continue;
+			}
 			if (typeof msg.content === "string") {
 				messages.push({
 					role: "user",
@@ -199,7 +209,7 @@ export function convertResponsesMessages<TApi extends Api>(
 					}
 					return {
 						type: "input_image",
-						detail: "auto",
+						detail: item.detail ?? "auto",
 						image_url: `data:${item.mimeType};base64,${item.data}`,
 					} satisfies ResponseInputImage;
 				});

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional image resolution hints and forwarded them through OpenAI Responses and compatible Chat Completions transports.
+- Added subscription-backed OpenAI Codex Responses V2 compaction and provider-native history payload replay.
+
 ### Changed
 
 - Automatically converted supported strict tool schemas to provider-compatible closed objects with required nullable optional fields while preserving original tool definitions, and treated `null` values for optional non-nullable tool arguments as omitted.

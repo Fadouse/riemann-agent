@@ -1,6 +1,7 @@
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAIResponses } from "../src/api/openai-responses.ts";
+import { convertResponsesMessages } from "../src/api/openai-responses-shared.ts";
 import { getModel } from "../src/compat.ts";
 import type { Model } from "../src/types.ts";
 
@@ -70,6 +71,55 @@ async function captureOpenAIResponseHeaders(
 describe("openai-responses provider defaults", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("forwards image resolution hints", () => {
+		const model = getModel("openai", "gpt-5.4");
+		const input = convertResponsesMessages(
+			model,
+			{
+				messages: [
+					{
+						role: "user",
+						content: [{ type: "image", data: "ZmFrZQ==", mimeType: "image/png", detail: "original" }],
+						timestamp: 1,
+					},
+				],
+			},
+			new Set(["openai"]),
+		);
+
+		expect(input).toMatchObject([
+			{
+				role: "user",
+				content: [{ type: "input_image", detail: "original" }],
+			},
+		]);
+	});
+
+	it("does not replay provider-native history across providers", () => {
+		const model = getModel("openai", "gpt-5.4");
+		const input = convertResponsesMessages(
+			model,
+			{
+				messages: [
+					{
+						role: "user",
+						content: "auditable fallback",
+						providerPayload: {
+							type: "openaiResponsesHistory",
+							provider: "openai-codex",
+							items: [{ type: "compaction", encrypted_content: "opaque" }],
+						},
+						timestamp: 1,
+					},
+				],
+			},
+			new Set(["openai"]),
+		);
+
+		expect(input).toMatchObject([{ role: "user", content: [{ type: "input_text", text: "auditable fallback" }] }]);
+		expect(JSON.stringify(input)).not.toContain("encrypted_content");
 	});
 
 	it("omits reasoning when no reasoning is requested", async () => {

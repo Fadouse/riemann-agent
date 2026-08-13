@@ -6,6 +6,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	closeOpenAICodexWebSocketSessions,
+	compactOpenAICodexResponses,
 	getOpenAICodexWebSocketDebugStats,
 	resetOpenAICodexWebSocketDebugStats,
 	stream as streamOpenAICodexResponses,
@@ -97,6 +98,87 @@ function buildSSEPayload({
 }
 
 describe("openai-codex streaming", () => {
+	it("runs subscription V2 compaction and returns one opaque artifact", async () => {
+		const token = mockToken();
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.5",
+			name: "GPT-5.5",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		};
+		const sse = `${[
+			`data: ${JSON.stringify({
+				type: "response.output_item.done",
+				item: { type: "compaction", id: "cmp_new", encrypted_content: "opaque-new" },
+			})}`,
+			`data: ${JSON.stringify({
+				type: "response.completed",
+				response: {
+					id: "resp_compact",
+					status: "completed",
+					usage: {
+						input_tokens: 120,
+						output_tokens: 8,
+						total_tokens: 128,
+						input_tokens_details: { cached_tokens: 20 },
+						output_tokens_details: { reasoning_tokens: 4 },
+					},
+				},
+			})}`,
+		].join("\n\n")}\n\n`;
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			expect(input.toString()).toBe("https://chatgpt.com/backend-api/codex/responses");
+			const headers = init?.headers instanceof Headers ? init.headers : new Headers(init?.headers);
+			expect(headers.get("Authorization")).toBe(`Bearer ${token}`);
+			expect(headers.get("chatgpt-account-id")).toBe("acc_test");
+			expect(headers.get("session-id")).toBe("session-1");
+			const body = decodeCodexRequestBody(init?.body);
+			expect(body).toMatchObject({ model: "gpt-5.5", store: false, stream: true });
+			expect(body?.input).toEqual([
+				{ type: "compaction", id: "cmp_old", encrypted_content: "opaque-old" },
+				{
+					role: "user",
+					content: [{ type: "input_text", text: "new history" }],
+				},
+				{ type: "compaction_trigger" },
+			]);
+			return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+		});
+
+		const result = await compactOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: "Riemann system",
+				messages: [
+					{
+						role: "user",
+						content: "fallback text",
+						providerPayload: {
+							type: "openaiResponsesHistory",
+							provider: "openai-codex",
+							items: [{ type: "compaction", id: "cmp_old", encrypted_content: "opaque-old" }],
+						},
+						timestamp: 1,
+					},
+					{ role: "user", content: "new history", timestamp: 2 },
+				],
+			},
+			{ apiKey: token, fetch: fetchMock, maxRetries: 0, sessionId: "session-1" },
+		);
+
+		expect(result).toMatchObject({
+			compactionItem: { type: "compaction", id: "cmp_new", encrypted_content: "opaque-new" },
+			responseId: "resp_compact",
+			usage: { input: 100, output: 8, cacheRead: 20, reasoning: 4, totalTokens: 128 },
+		});
+		expect(fetchMock).toHaveBeenCalledOnce();
+	});
 	it("streams SSE responses into AssistantMessageEventStream", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;

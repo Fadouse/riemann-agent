@@ -1,27 +1,28 @@
-<p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
-  </a>
-</p>
-<p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
-</p>
+# Riemann Agent
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Riemann Agent is a persistent, IPython-first agentic coding system based on the Pi agent harness.
 
-# Pi Agent Harness
+The model is exposed to one tool, `ipython`. Every other capability—workspace I/O, shell execution, web access, MCP, durable artifacts, and child-agent coordination—is registered as an asynchronous Python function inside a persistent kernel.
 
-This is the home of the Pi agent harness project including our self extensible coding agent.
+Core behavior:
 
-* **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
-* **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
-* **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
+- Atomic cell checkpoints and recovery after a kernel crash.
+- Snapshot/CAS workspace edits with atomic writes and conflict detection.
+- SQLite-backed run, agent, message, artifact, and capability state.
+- Lazy MCP activation and dynamically installed Python namespaces.
+- Durable asynchronous child agents with direct messages, steering, limits, model roles, capability narrowing, and shared/read-only/isolated workspaces.
+- Compact model context: large results stay in Python variables or content-addressed artifacts; summaries carry deterministic durable state.
+- Pi's provider support, authentication, TUI, sessions, settings, RPC mode, and extension framework.
 
-To learn more about Pi:
+Start from source:
 
-* [Visit pi.dev](https://pi.dev), the project website with demos
-* [Read the documentation](https://pi.dev/docs/latest), but you can also ask the agent to explain itself
+```bash
+npm install
+npm run build
+node packages/coding-agent/dist/cli.js
+```
+
+See [`packages/coding-agent/README.md`](packages/coding-agent/README.md) for configuration, Python API examples, architecture, and inherited Pi documentation.
 
 ## All Packages
 

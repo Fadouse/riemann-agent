@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional runtime-only content blocks to compaction summary messages for reconstructed snapshot archives.
+- Added runtime-only provider-native payloads to compaction summary messages for OpenAI encrypted artifact replay.
+
 ### Fixed
 
 - Fixed `streamProxy()` dropping finalized tool-call metadata such as OpenAI Responses namespaces ([#7709](https://github.com/earendil-works/pi/issues/7709)).

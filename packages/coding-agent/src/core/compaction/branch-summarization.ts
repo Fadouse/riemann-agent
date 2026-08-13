@@ -9,6 +9,7 @@ import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { RetryCallbacks, RetryPolicy } from "@earendil-works/pi-ai";
 import { contentText } from "@earendil-works/pi-ai";
 import type { Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
+import { getPreservedArchive, historyBlocks } from "../../riemann/snapshot-compaction.ts";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -166,8 +167,15 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 		case "branch_summary":
 			return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
 
-		case "compaction":
-			return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
+		case "compaction": {
+			const archive = getPreservedArchive(entry.preserveData);
+			return createCompactionSummaryMessage(
+				entry.summary,
+				entry.tokensBefore,
+				entry.timestamp,
+				archive ? historyBlocks(archive) : undefined,
+			);
+		}
 
 		// These don't contribute to conversation content
 		case "thinking_level_change":

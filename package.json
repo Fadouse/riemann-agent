@@ -1,5 +1,5 @@
 {
-	"name": "pi-monorepo",
+	"name": "riemann-agent-monorepo",
 	"private": true,
 	"type": "module",
 	"workspaces": [

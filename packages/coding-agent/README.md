@@ -1,42 +1,109 @@
-<p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
-  </a>
-</p>
-<p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
-</p>
+# Riemann Agent
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](../../CONTRIBUTING.md).
+Riemann Agent is a persistent, IPython-first agentic system built on the Pi coding-agent runtime.
+
+The model sees one tool: `ipython`. Workspace I/O, shell processes, web access, MCP tools, artifacts, and child agents are typed asynchronous Python functions installed into the persistent kernel. This keeps intermediate results in variables instead of repeatedly serializing them through model context.
+
+## Runtime properties
+
+- One durable IPython kernel per agent, with top-level `await`.
+- Atomic per-cell checkpoints and automatic restoration after kernel restart.
+- Snapshot/CAS file edits, atomic replacement, workspace boundary checks, and symlink escape rejection.
+- SQLite-backed runs, agents, messages, artifacts, and revision capabilities.
+- Content-addressed large-result artifacts.
+- Lazy MCP activation; discovered tools use a Python/catalog namespace derived from the configured server name, with collision-safe fallback.
+- Asynchronous child agents with durable handles, inboxes, steering, concurrency limits, model roles, capability narrowing, shared/read-only/isolated workspaces, park, revive, and stop.
+- Strictly configured context compaction: subscription-backed OpenAI Codex, OMP snapshot archives, or Riemann semantic checkpoints.
+- Pi's TUI, session management, model providers, authentication, settings, RPC mode, and extension ecosystem.
+
+## Quick start
+
+Requirements: Node.js 22.19 or newer, Python 3, and either `uv` or Python `venv` plus `pip`.
+
+```bash
+npm install
+npm run build
+node packages/coding-agent/dist/cli.js
+```
+
+For source development:
+
+```bash
+./pi-test.sh
+```
+
+Riemann provisions a hash-pinned Python environment on first IPython use. User state defaults to `~/.riemann/agent`; override it with `RIEMANN_CODING_AGENT_DIR`.
+
+## Configuration
+
+Global configuration: `~/.riemann/agent/config.yaml`.
+
+Trusted project configuration: `<workspace>/.riemann/config.yaml`. Project values merge over global values. Copy `examples/riemann-config.yaml` as a starting point.
+
+```bash
+mkdir -p ~/.riemann/agent
+cp packages/coding-agent/examples/riemann-config.yaml ~/.riemann/agent/config.yaml
+```
+
+Remove or disable the example Exa and MCP entries until their credentials and commands are configured. Secrets support `${ENVIRONMENT_VARIABLE}` expansion. Every enabled MCP server is listed to the model by default using only its configured name and required non-empty `description`; set `exposeToModel: false` to hide one. Commands, URLs, headers, environment variables, and discovered tool schemas remain hidden until activation. Activation remains lazy, and there is no redundant `mcp.list()` model operation.
+
+Context compaction is selected in Riemann configuration:
+
+```yaml
+compaction:
+  strategy: openai # openai | snapshot | default
+```
+
+`openai` strictly uses Codex Responses V2 cloud compaction. It requires the active model to use the `openai-codex` ChatGPT Plus/Pro OAuth provider, sends the discarded context to `https://chatgpt.com/backend-api/codex/responses`, validates exactly one opaque encrypted compaction item, persists it unchanged, and replays it on later matching Codex requests. It does not create a local snapshot or semantic backup and never switches strategy after an auth, model, request, or protocol failure.
+
+The Codex subscription endpoint is a private first-party ChatGPT backend, not the documented public OpenAI API contract. Data handling follows the active ChatGPT workspace policy. `openai` does not use an `OPENAI_API_KEY`; start Riemann, run `/login`, and select OpenAI Codex (ChatGPT Plus/Pro).
+
+Strategy selection is literal: `snapshot` requires an image-capable model and always uses OMP bitmap archives; `default` always uses Riemann's approved semantic compaction prompt. Custom `/compact <instructions>` is supported only by `default`. An incompatible strategy or failed compaction is reported as an error; Riemann does not hide a strategy switch in control flow.
+
+## Python operations
+
+The system prompt identifies the current date, working directory, OS, Linux distribution (for example NixOS or Debian), kernel, architecture, and shell so the model can select commands compatible with the actual host. It also lists every built-in async Python operation available to the current agent, filtered by its capability allowlist. These namespaces are preinstalled globals in the persistent IPython environment: bind results to variables and compose multiple operations with normal Python and top-level `await`. Use `help(workspace.edit)` or `await catalog.describe(name="workspace.edit")` only when the compact signature and description are insufficient. `await catalog.search(query="...")` remains available for task-based discovery.
+
+```python
+snap = await workspace.read(path=\"src/main.ts\")
+display(snap.lines(1, 80))
+
+result = await shell.run(command=\"npm\", args=[\"test\"], timeout=300)
+display((result.exit_code, result.stderr[-2000:]))
+
+docs = await mcp.activate(name=\"filesystem_docs\")
+matches = await catalog.search(query=\"filesystem documentation\")
+display(matches)
+handle = await agents.spawn(
+    task=\"Review the changed API and report concrete defects.\",
+    name=\"reviewer\",
+)
+review = await handle.wait(timeout=600)
+
+```
+
+Without a profile, `agents.spawn(task=..., name=...)` shares the current workspace and grants the standard child capabilities bounded by the parent's own allowlist. Use `workspace_policy=\"read-only\"` or `workspace_policy=\"isolated\"` only when the task needs that override; isolated mode requires a Git worktree. Capability overrides accept exact operations such as `web.search` and namespace shorthand such as `web`, which is normalized to `web.*`. Configured profile names and descriptions are listed directly in the system prompt.
+
+Large values should remain in variables or artifacts; display only the slice needed for the next decision. A cancelled cell can have completed an external side effect, so inspect durable state before retrying.
+
+## Architecture
+
+`src/riemann/` contains the Riemann-specific runtime:
+
+- `kernel/`: Jupyter Wire Protocol, kernel lifecycle, cancellation, checkpoint and restore.
+- `functions/`: typed host-function registry plus workspace, shell, and web capabilities.
+- `mcp/`: lazy stdio/Streamable HTTP clients and dynamic Python namespace installation.
+- `agents/`: durable child admission, lifecycle, messaging, sessions, model roles, and worktrees.
+- `state/`: SQLite metadata and content-addressed artifacts.
+- `python/`: pinned managed runtime and the kernel bridge.
+- `prompts/`: approved main, child, and compaction prompts.
+
+Riemann remains based on Pi. The remaining sections document inherited provider, TUI, session, settings, extension, and SDK behavior.
 
 ---
 
-Pi is a minimal terminal coding harness. Adapt pi to your workflows, not the other way around, without having to fork and modify pi internals. Extend it with TypeScript [Extensions](#extensions), [Skills](#skills), [Prompt Templates](#prompt-templates), and [Themes](#themes). Put your extensions, skills, prompt templates, and themes in [Pi Packages](#pi-packages) and share them with others via npm or git.
+## Inherited Pi documentation
 
-Pi ships with powerful defaults but skips features like sub agents and plan mode. Instead, you can ask pi to build what you want or install a third party pi package that matches your workflow.
-
-Pi runs in four modes: interactive, print or JSON, RPC for process integration, and an SDK for embedding in your own apps.
-
-## Share your OSS coding agent sessions
-
-If you use pi for open source work, please share your coding agent sessions.
-
-Public OSS session data helps improve models, prompts, tools, and evaluations using real development workflows.
-
-For the full explanation, see [this post on X](https://x.com/badlogicgames/status/2037811643774652911).
-
-To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
-
-You can also watch [this video](https://x.com/badlogicgames/status/2041151967695634619), where I show how I publish my `pi-mono` sessions.
-
-I regularly publish my own `pi-mono` work sessions here:
-
-- [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
 - [Providers & Models](#providers--models)
 - [Interactive Mode](#interactive-mode)
   - [Editor](#editor)
@@ -58,41 +125,6 @@ I regularly publish my own `pi-mono` work sessions here:
 - [Philosophy](#philosophy)
 - [CLI Reference](#cli-reference)
 
----
-
-## Quick Start
-
-```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
-```
-
-`--ignore-scripts` disables dependency lifecycle scripts during install. Pi does not require install scripts for normal npm installs.
-
-Installer alternative:
-
-```bash
-curl -fsSL https://pi.dev/install.sh | sh
-```
-
-Authenticate with an API key:
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-pi
-```
-
-Or use your existing subscription:
-
-```bash
-pi
-/login  # Then select provider
-```
-
-Then just talk to pi. By default, pi gives the model four tools: `read`, `write`, `edit`, and `bash`. The model uses these to fulfill your requests. Add capabilities via [skills](#skills), [prompt templates](#prompt-templates), [extensions](#extensions), or [pi packages](#pi-packages).
-
-**Platform notes:** [Windows](docs/windows.md) | [Termux (Android)](docs/termux.md) | [tmux](docs/tmux.md) | [Terminal setup](docs/terminal-setup.md) | [Shell aliases](docs/shell-aliases.md)
-
----
 
 ## Providers & Models
 
@@ -271,13 +303,13 @@ Use `/session` in interactive mode to see the current session ID before reusing 
 
 ### Compaction
 
-Long sessions can exhaust context windows. Compaction summarizes older messages while keeping recent ones.
+Long sessions can exhaust context windows. Configure exactly one `compaction.strategy`: `openai` for subscription-backed Codex cloud compaction, `snapshot` for OMP bitmap archives, or `default` for Riemann's model-generated semantic checkpoint. Strategies never fall through to one another.
 
-**Manual:** `/compact` or `/compact <custom instructions>`
+**Manual:** `/compact` uses the configured strategy. `/compact <custom instructions>` requires `strategy: default`; other strategies return an explicit error.
 
 **Automatic:** Enabled by default. Triggers on context overflow (recovers and retries) or when approaching the limit (proactive). Configure via `/settings` or `settings.json`.
 
-Compaction is lossy. The full history remains in the JSONL file; use `/tree` to revisit. Customize compaction behavior via [extensions](#extensions). See [docs/compaction.md](docs/compaction.md) for internals.
+Compaction is lossy: OpenAI artifacts are opaque, snapshot archives have bounded frame and payload budgets, and semantic checkpoints summarize. The append-only JSONL history remains available; use `/tree` to revisit it. See [docs/compaction.md](docs/compaction.md) for inherited internals.
 
 ---
 

@@ -4,6 +4,7 @@ import { createAllToolDefinitions, type ToolName } from "../../../core/tools/ind
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
 import { convertToPng } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
+import { getIPythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.ts";
 
 export interface ToolExecutionOptions {
 	showImages?: boolean;
@@ -16,6 +17,8 @@ export class ToolExecutionComponent extends Container {
 	private selfRenderContainer: Container;
 	private callRendererComponent?: Component;
 	private resultRendererComponent?: Component;
+	private ipythonCellComponent?: IPythonCellComponent;
+	private ipythonMounted = false;
 	private rendererState: any = {};
 	private imageComponents: Image[] = [];
 	private imageSpacers: Spacer[] = [];
@@ -103,6 +106,9 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private getRenderShell(): "default" | "self" {
+		if (this.shouldUseIPythonRenderer()) {
+			return "self";
+		}
 		if (!this.builtInToolDefinition) {
 			return this.toolDefinition?.renderShell ?? "default";
 		}
@@ -110,6 +116,10 @@ export class ToolExecutionComponent extends Container {
 			return this.builtInToolDefinition.renderShell ?? "default";
 		}
 		return this.toolDefinition.renderShell ?? this.builtInToolDefinition.renderShell ?? "default";
+	}
+
+	private shouldUseIPythonRenderer(): boolean {
+		return this.toolName === "ipython" && !this.toolDefinition?.renderCall && !this.toolDefinition?.renderResult;
 	}
 
 	private getRenderContext(lastComponent: Component | undefined): ToolRenderContext {
@@ -215,7 +225,7 @@ export class ToolExecutionComponent extends Container {
 
 	override invalidate(): void {
 		super.invalidate();
-		this.updateDisplay();
+		if (!this.shouldUseIPythonRenderer()) this.updateDisplay();
 	}
 
 	override render(width: number): string[] {
@@ -259,7 +269,34 @@ export class ToolExecutionComponent extends Container {
 
 		let hasContent = false;
 		this.hideComponent = false;
-		if (this.hasRendererDefinition()) {
+		if (this.hasRendererDefinition() && this.shouldUseIPythonRenderer()) {
+			const state = {
+				code: getIPythonCodeFromArgs(this.args),
+				content: this.result?.content,
+				details: this.result?.details,
+				isPartial: this.isPartial,
+				isError: this.result?.isError ?? false,
+				expanded: this.expanded,
+				executionStarted: this.executionStarted,
+				argsComplete: this.argsComplete,
+				activities:
+					this.result?.details &&
+					typeof this.result.details === "object" &&
+					Array.isArray(this.result.details.activities)
+						? this.result.details.activities
+						: undefined,
+			};
+			if (!this.ipythonCellComponent) {
+				this.ipythonCellComponent = new IPythonCellComponent(state);
+			} else {
+				this.ipythonCellComponent.update(state);
+			}
+			if (!this.ipythonMounted && this.ipythonCellComponent) {
+				this.selfRenderContainer.addChild(this.ipythonCellComponent);
+				this.ipythonMounted = true;
+			}
+			hasContent = true;
+		} else if (this.hasRendererDefinition()) {
 			const renderContainer = this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox;
 			if (renderContainer instanceof Box) {
 				renderContainer.setBgFn(bgFn);

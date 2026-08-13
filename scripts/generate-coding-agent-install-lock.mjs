@@ -12,10 +12,11 @@ const rootLockfilePath = join(repoRoot, "package-lock.json");
 const outputPackageJsonPath = join(outputDir, "package.json");
 const outputLockfilePath = join(outputDir, "package-lock.json");
 const internalPackagePrefix = "@earendil-works/pi-";
-const installPackageName = "@earendil-works/pi-coding-agent-install";
+const installPackageName = "riemann-agent-install";
 const allowedInstallScriptPackages = new Map([
 	["@google/genai@1.52.0", "preinstall is a no-op in the published package"],
 	["protobufjs@7.6.5", "postinstall only warns about protobufjs version scheme mismatches"],
+	["zeromq@6.5.0", "install verifies the bundled native addon and builds it locally only when no compatible prebuild loads"],
 ]);
 
 const args = new Set(process.argv.slice(2));
@@ -136,14 +137,14 @@ function isExactVersionSpec(spec) {
 	return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(spec);
 }
 
-function getInternalWorkspaces(lockPackages) {
+function getInternalWorkspaces(lockPackages, codingAgentName) {
 	const workspaces = new Map();
 
 	for (const [lockPath, entry] of Object.entries(lockPackages)) {
 		if (!lockPath.startsWith("packages/") || lockPath.includes("/node_modules/") || !entry.name || !entry.version) {
 			continue;
 		}
-		if (!entry.name.startsWith(internalPackagePrefix)) {
+		if (!entry.name.startsWith(internalPackagePrefix) && entry.name !== codingAgentName) {
 			continue;
 		}
 
@@ -233,7 +234,7 @@ function createInstallerPackageJson(codingAgentPackage) {
 		name: installPackageName,
 		version: codingAgentPackage.version,
 		private: true,
-		description: "Lockfile root used by the Pi installer and updater.",
+		description: "Lockfile root used by the Riemann Agent installer and updater.",
 		dependencies: {
 			[codingAgentPackage.name]: codingAgentPackage.version,
 		},
@@ -294,7 +295,7 @@ function validateGeneratedFiles(installerPackageJson, installLock, internalNames
 		if (entry.dev || entry.devOptional || entry.extraneous) {
 			errors.push(`${lockPath || "root"} contains dev/extraneous metadata`);
 		}
-		if (packageName?.startsWith(internalPackagePrefix) && entry.version !== installerPackageJson.version) {
+		if (packageName && internalNames.has(packageName) && entry.version !== installerPackageJson.version) {
 			errors.push(`${lockPath} internal package version ${entry.version} does not match ${installerPackageJson.version}`);
 		}
 		if (entry.hasInstallScript) {
@@ -364,7 +365,7 @@ function generateInstallLock() {
 	const lockPackages = rootLock.packages;
 	const codingAgentPackage = readJson(join(codingAgentDir, "package.json"));
 	const installerPackageJson = createInstallerPackageJson(codingAgentPackage);
-	const internalWorkspaces = getInternalWorkspaces(lockPackages);
+	const internalWorkspaces = getInternalWorkspaces(lockPackages, codingAgentPackage.name);
 	const installLockPackages = {
 		"": createRootLockEntry(installerPackageJson),
 	};

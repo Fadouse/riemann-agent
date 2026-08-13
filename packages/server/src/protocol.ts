@@ -31,9 +31,9 @@ type _AiModelInputsFitProtocol = Assert<AiModelInput extends ProtocolModelInput 
 type _ProtocolModelInputsFitAi = Assert<ProtocolModelInput extends AiModelInput ? true : false>;
 /**
  * Enumerate mapped and intentionally omitted pi-ai fields so additions fail compilation here.
- * Provider replay metadata, diagnostics, cache-write retention splits, model transport settings,
- * model sampling defaults, pricing tiers, and deferred-tool availability remain intentionally
- * server-side.
+ * Provider replay metadata, diagnostics, cache-write retention splits, image-resolution hints,
+ * model transport settings, model sampling defaults, pricing tiers, and deferred-tool
+ * availability remain intentionally server-side.
  */
 type _AiTextContentFieldsAccountedFor = Assert<ExactKeys<AiTextContent, "type" | "text" | "textSignature">>;
 type _AiThinkingContentFieldsAccountedFor = Assert<
@@ -42,7 +42,7 @@ type _AiThinkingContentFieldsAccountedFor = Assert<
 		"type" | "thinking" | "thinkingSignature" | "redacted"
 	>
 >;
-type _AiImageContentFieldsAccountedFor = Assert<ExactKeys<AiImageContent, "type" | "data" | "mimeType">>;
+type _AiImageContentFieldsAccountedFor = Assert<ExactKeys<AiImageContent, "type" | "data" | "mimeType" | "detail">>;
 type _AiToolCallFieldsAccountedFor = Assert<
 	ExactKeys<ToolCall, "type" | "id" | "name" | "arguments" | "thoughtSignature" | "namespace">
 >;
@@ -77,7 +77,9 @@ type _AiModelFieldsAccountedFor = Assert<
 type _AiModelCostFieldsAccountedFor = Assert<
 	ExactKeys<Model<Api>["cost"], "input" | "output" | "cacheRead" | "cacheWrite" | "tiers">
 >;
-type _AiUserMessageFieldsAccountedFor = Assert<ExactKeys<UserMessage, "role" | "content" | "timestamp">>;
+type _AiUserMessageFieldsAccountedFor = Assert<
+	ExactKeys<UserMessage, "role" | "content" | "providerPayload" | "timestamp">
+>;
 type _AiAssistantMessageFieldsAccountedFor = Assert<
 	ExactKeys<
 		AssistantMessage,

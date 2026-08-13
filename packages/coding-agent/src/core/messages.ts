@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, ProviderPayload, TextContent } from "@earendil-works/pi-ai";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -63,6 +63,10 @@ export interface CompactionSummaryMessage {
 	role: "compactionSummary";
 	summary: string;
 	tokensBefore: number;
+	/** Runtime-only ordered text/image archive blocks for snapshot compaction. */
+	blocks?: (TextContent | ImageContent)[];
+	/** Runtime-only provider-native history reconstructed from compaction state. */
+	providerPayload?: ProviderPayload;
 	timestamp: number;
 }
 
@@ -110,11 +114,15 @@ export function createCompactionSummaryMessage(
 	summary: string,
 	tokensBefore: number,
 	timestamp: string,
+	blocks?: (TextContent | ImageContent)[],
+	providerPayload?: ProviderPayload,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
 		summary: summary,
 		tokensBefore,
+		blocks: blocks && blocks.length > 0 ? blocks : undefined,
+		providerPayload,
 		timestamp: new Date(timestamp).getTime(),
 	};
 }
@@ -176,9 +184,16 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "compactionSummary":
 					return {
 						role: "user",
-						content: [
-							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
-						],
+						content:
+							m.blocks !== undefined
+								? [{ type: "text" as const, text: m.summary }, ...m.blocks]
+								: [
+										{
+											type: "text" as const,
+											text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX,
+										},
+									],
+						providerPayload: m.providerPayload,
 						timestamp: m.timestamp,
 					};
 				case "user":

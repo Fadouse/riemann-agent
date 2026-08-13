@@ -1,0 +1,52 @@
+version: 1
+
+limits:
+  maxAgentsPerRun: 8
+  maxConcurrentPerRun: 4
+  maxConcurrentPerModel: 2
+  maxDepth: 3
+  maxCellOutputChars: 100000
+  maxArtifactPreviewChars: 12000
+
+compaction:
+  # Strategy selection is strict: openai requires openai-codex OAuth, snapshot
+  # requires an image-capable model, and default uses semantic checkpoints.
+  # Failures are surfaced; Riemann never switches strategies implicitly.
+  strategy: openai
+
+models:
+  roles:
+    fast: anthropic/claude-haiku-4-5
+    deep: anthropic/claude-sonnet-4-5
+
+agents:
+  profiles:
+    reviewer:
+      description: Review a bounded change without writing files.
+      modelRole: deep
+      thinkingLevel: high
+      workspace: read-only
+      capabilities:
+        - workspace.read
+        - agents.list
+        - agents.send
+        - agents.inbox
+      maxDepth: 0
+      parkOnComplete: false
+
+mcp:
+  servers:
+    filesystem_docs:
+      description: Example stdio MCP server; disabled until configured.
+      enabled: false
+      command: npx
+      args:
+        - -y
+        - '@modelcontextprotocol/server-filesystem'
+        - .
+      startupTimeoutMs: 15000
+      toolTimeoutMs: 60000
+
+web:
+  searchBackend: exa
+  exaApiKey: '${EXA_API_KEY}'

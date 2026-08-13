@@ -1,4 +1,4 @@
-import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, ProviderPayload, TextContent } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "../types.ts";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
@@ -48,6 +48,10 @@ export interface CompactionSummaryMessage {
 	role: "compactionSummary";
 	summary: string;
 	tokensBefore: number;
+	/** Runtime-only ordered text/image archive blocks for snapshot compaction. */
+	blocks?: (TextContent | ImageContent)[];
+	/** Runtime-only provider-native history reconstructed from compaction state. */
+	providerPayload?: ProviderPayload;
 	timestamp: number;
 }
 
@@ -95,11 +99,13 @@ export function createCompactionSummaryMessage(
 	summary: string,
 	tokensBefore: number,
 	timestamp: string | number,
+	providerPayload?: ProviderPayload,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
 		summary,
 		tokensBefore,
+		providerPayload,
 		timestamp: typeof timestamp === "number" ? timestamp : new Date(timestamp).getTime(),
 	};
 }

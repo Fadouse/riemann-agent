@@ -83,7 +83,7 @@ function getPackageCommandUsage(command: PackageCommand): string {
 		case "remove":
 			return `${APP_NAME} remove <source> [-l] [--approve|--no-approve]`;
 		case "update":
-			return `${APP_NAME} update [source|self|pi] [--self|--extensions|--models|--all] [--extension <source>] [--approve|--no-approve] [--force]`;
+			return `${APP_NAME} update [source] [--extensions|--models] [--extension <source>] [--approve|--no-approve]`;
 		case "list":
 			return `${APP_NAME} list [--approve|--no-approve]`;
 	}
@@ -151,24 +151,19 @@ Examples:
 			console.log(`${chalk.bold("Usage:")}
   ${getPackageCommandUsage("update")}
 
-Update pi, installed packages, or model catalogs.
+Update installed packages or model catalogs.
 
 Options:
-  --self                  Update pi only (default when no target is given)
-  --extensions            Update installed packages only
-  --models                Refresh model catalogs only
-  --all                   Update pi and installed packages
+  --extensions            Update installed packages
+  --models                Refresh model catalogs
   --extension <source>    Update one package only
   -a, --approve           Trust project-local files for this command
   -na, --no-approve       Ignore project-local files for this command
-  --force                 Reinstall pi even if the current version is latest
 
 Short forms:
-  ${APP_NAME} update                Update pi only
-  ${APP_NAME} update --all          Update pi and all extensions
-  ${APP_NAME} update --models       Refresh model catalogs only
-  ${APP_NAME} update <source>       Update one package
-  ${APP_NAME} update pi             Update pi only (self works as alias to pi)
+  ${APP_NAME} update --extensions    Update all extensions
+  ${APP_NAME} update --models        Refresh model catalogs
+  ${APP_NAME} update <source>        Update one package
 `);
 			return;
 
@@ -316,57 +311,31 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 	}
 
 	let updateTarget: UpdateTarget | undefined;
-	let showExtensionsSkippedNote = false;
+	const showExtensionsSkippedNote = false;
 	if (command === "update") {
-		if (allFlag && (selfFlag || extensionsFlag || modelsFlag || extensionFlagSource)) {
-			conflictingOptions =
-				conflictingOptions ?? "--all cannot be combined with --self, --extensions, --models, or --extension";
+		if (selfFlag || allFlag || force) {
+			conflictingOptions = conflictingOptions ?? "Riemann Agent self-update is not available in this source build";
 		}
-		if (allFlag && source) {
-			conflictingOptions = conflictingOptions ?? "--all cannot be combined with a positional source";
-		}
-
 		if (modelsFlag) {
-			if (selfFlag || extensionsFlag || allFlag || extensionFlagSource) {
+			if (extensionsFlag || extensionFlagSource || source) {
 				conflictingOptions =
-					conflictingOptions ?? "--models cannot be combined with --self, --extensions, --all, or --extension";
-			}
-			if (source) {
-				conflictingOptions = conflictingOptions ?? "--models cannot be combined with a positional source";
+					conflictingOptions ??
+					"--models cannot be combined with --extensions, --extension, or a positional source";
 			}
 			updateTarget = { type: "models" };
 		} else if (extensionFlagSource) {
-			if (selfFlag || extensionsFlag || allFlag) {
+			if (extensionsFlag || source) {
 				conflictingOptions =
-					conflictingOptions ?? "--extension cannot be combined with --self, --extensions, or --all";
-			}
-			if (source) {
-				conflictingOptions = conflictingOptions ?? "--extension cannot be combined with a positional source";
+					conflictingOptions ?? "--extension cannot be combined with --extensions or a positional source";
 			}
 			updateTarget = { type: "extensions", source: extensionFlagSource };
 		} else if (source) {
-			const sourceIsSelf = source === "self" || source === "pi";
-			if (sourceIsSelf) {
-				updateTarget = extensionsFlag ? { type: "all" } : { type: "self" };
-			} else {
-				if (extensionsFlag || selfFlag || allFlag) {
-					conflictingOptions =
-						conflictingOptions ??
-						"positional update targets cannot be combined with --self, --extensions, or --all";
-				}
-				updateTarget = { type: "extensions", source };
+			if (extensionsFlag) {
+				conflictingOptions = conflictingOptions ?? "a positional source cannot be combined with --extensions";
 			}
-		} else if (allFlag) {
-			updateTarget = { type: "all" };
-		} else if (selfFlag && extensionsFlag) {
-			updateTarget = { type: "all" };
-		} else if (selfFlag) {
-			updateTarget = { type: "self" };
-		} else if (extensionsFlag) {
-			updateTarget = { type: "extensions" };
+			updateTarget = { type: "extensions", source };
 		} else {
-			updateTarget = { type: "self" };
-			showExtensionsSkippedNote = true;
+			updateTarget = { type: "extensions" };
 		}
 	}
 
