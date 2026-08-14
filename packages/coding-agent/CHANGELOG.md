@@ -1,6 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## [0.84.2] - 2026-08-14
+
+### New Features
+
+- **Fullscreen transcript search** — Search and navigate matches in fullscreen mode. See [TUI Fullscreen Viewport](docs/keybindings.md#tui-fullscreen-viewport).
+- **Configurable default tools** — Choose startup built-in tools globally or per project. See [Tools](docs/settings.md#tools).
+- **Configurable fullscreen exit output** — Print the transcript or only a resume hint on exit. See [Interactive Mode](docs/usage.md#interactive-mode).
 
 ### Added
 
@@ -17,9 +23,14 @@
 - Added age- and size-based garbage collection for closed-run artifacts, kernel snapshots, and detached Subagent Git worktrees.
 - Added Linux/macOS sandbox integration, managed Python provisioning, retention, and Bun release-asset tests.
 - Added an Oh My Pi-inspired Riemann settings panel for global agent limits, compaction, retention, read-only agent-profile inventory, and controlled MCP server settings.
+- Added `expandPromptTemplates` to extension `pi.sendUserMessage()` options for explicitly dispatching commands and expanding skills and prompt templates. See [`pi.sendUserMessage()`](docs/extensions.md#pisendusermessagecontent-options) ([#7857](https://github.com/earendil-works/pi/pull/7857) by [@mrexodia](https://github.com/mrexodia)).
+- Added inherited `createGatewayBindingFetch()` for routing Cloudflare AI Gateway requests through a Workers AI binding without an API token ([#7901](https://github.com/earendil-works/pi/pull/7901) by [@Maximo-Guk](https://github.com/Maximo-Guk)).
+- Added inherited `AssistantMessage.endTurn` to preserve OpenAI Codex's terminal `end_turn` signal for diagnostics ([#7766](https://github.com/earendil-works/pi/pull/7766)).
+- Added inherited unbound single-line transcript scrolling actions for fullscreen mode. See [TUI Fullscreen Viewport](docs/keybindings.md#tui-fullscreen-viewport) ([#7903](https://github.com/earendil-works/pi/pull/7903) by [@midastruth](https://github.com/midastruth)).
 
 ### Changed
 
+- Changed inherited Kimi Coding requests to use pi's runtime `User-Agent` header.
 - Replaced the inherited Mistral SDK transport with a native Chat Completions HTTP stream, eliminating its generated client and schema runtime overhead.
 - Documented the generic `AI_AGENT=riemann` process marker and how it differs from `RIEMANN_CODING_AGENT=true` ([#7747](https://github.com/earendil-works/pi/issues/7747)).
 - Changed Riemann IPython cells to a compact, backgroundless transcript and removed inline thinking and tool-expansion hints while preserving their keyboard shortcuts.
@@ -28,11 +39,14 @@
 - Made `agents.spawn(task=..., name=...)` usable without discovery by applying parent-bounded standard capabilities, normalized bare capability namespaces, and listed configured agent profiles in the system prompt.
 - Separated Agent filesystem permissions (`host` or `workspace`) from Subagent directory topology (`shared` or `worktree`), with `host` for the main Agent and `shared` plus `workspace` for Subagents by default.
 - Documented standard `asyncio.gather(...)` concurrency in Riemann's IPython code schema for independent operations.
-
 - Renamed the published CLI, SDK imports, examples, release archives, environment markers, and local release tooling consistently to `riemann-agent`/`riemann`, while rejecting inherited tool-selection flags that cannot alter the single-tool runtime.
+- Changed inherited OpenAI Responses deferred tool loading to prefer message-anchored `additional_tools` where supported while retaining tool-search and top-level fallbacks ([#7709](https://github.com/earendil-works/pi/issues/7709)).
+- Reduced inherited fullscreen rendering allocation churn by painting full-width layout rows directly instead of recompositing them on every frame.
 
 ### Fixed
 
+- Fixed managed-tool downloads delaying TUI startup and hiding diagnostics in fullscreen mode by mounting the TUI first and showing download progress and warnings inside it.
+- Fixed opening a model selector immediately after startup cancelling and restarting the in-progress model catalog refresh.
 - Fixed inherited GitHub Copilot login triggering API rate limits while enabling model policies by limiting concurrent policy updates ([#6187](https://github.com/earendil-works/pi/issues/6187)).
 - Fixed fullscreen transcript search snapping back to the current match during manual scrolling and fragmented mouse input leaking into the search query.
 - Fixed inherited required LaTeX arguments starting on a new line being parsed as empty ([#7760](https://github.com/earendil-works/pi/issues/7760)).
@@ -44,6 +58,26 @@
 - Fixed settled Riemann Subagents remaining indefinitely in the bottom Fleet; settled rows now linger for four seconds and disappear while remaining available in `/agents`.
 - Fixed shared and recursively spawned Subagents failing IPython calls when the Riemann state directory was nested inside their workspace; workspace-scoped sandboxes and host file operations now mask the state subtree, selectively expose the read-only managed runtime, stage durable snapshots outside the sandbox, and shut down nested runtimes without hanging or downgrading completed Agents.
 - Fixed `artifacts.materialize` bypassing `workspace.write` capability checks and `workspace.search` following file symlinks outside the workspace.
+- Updated the transitive `nanoid` development dependency to address a denial-of-service vulnerability.
+- Fixed fallback rendering for extension tool results to collapse long output and honor tool expansion ([#7979](https://github.com/earendil-works/pi/issues/7979)).
+- Fixed JSON and RPC `message_update` events dropping cumulative usage during streaming. See [JSON Event Mode](docs/json.md) and [RPC `message_update`](docs/rpc.md#message_update-streaming) ([#7982](https://github.com/earendil-works/pi/pull/7982) by [@christianklotz](https://github.com/christianklotz)).
+- Fixed `pi.sendMessage(..., { triggerTurn: false })` steering an active run instead of only recording the custom message ([#8022](https://github.com/earendil-works/pi/pull/8022) by [@cristinaponcela](https://github.com/cristinaponcela)).
+- Fixed the `defaultTools` setting dropping extension and SDK custom tools when selecting built-in defaults.
+- Fixed the subagent example rejecting YAML array syntax for the `tools` frontmatter field ([#7598](https://github.com/earendil-works/pi/pull/7598) by [@alexsavio](https://github.com/alexsavio)).
+- Fixed the subagent example dropping parent session model, thinking, and tool configuration ([#7897](https://github.com/earendil-works/pi/pull/7897) by [@virtuald](https://github.com/virtuald)).
+- Fixed custom system prompts concatenating the current working directory with later appended prompt content ([#7887](https://github.com/earendil-works/pi/pull/7887) by [@distributedlock](https://github.com/distributedlock)).
+- Fixed inherited OpenAI Responses function and custom tool calls losing namespaces during streaming, proxying, and replay ([#7709](https://github.com/earendil-works/pi/issues/7709)).
+- Fixed inherited upstream request buffer failures not triggering automatic assistant retries.
+- Fixed inherited built-in and custom DeepSeek API models sending output limits through an unsupported field.
+- Fixed inherited Amazon Bedrock replay rejecting tool arguments that contain empty object keys while preserving all valid nested values ([#7882](https://github.com/earendil-works/pi/pull/7882) by [@muyiyr](https://github.com/muyiyr)).
+- Fixed inherited DeepSeek compatibility detection for base URLs whose hostname contains uppercase letters ([#7933](https://github.com/earendil-works/pi/pull/7933) by [@yearth](https://github.com/yearth)).
+- Fixed inherited Google Generative AI and Vertex AI responses with tool calls incorrectly treating output-limit or provider-error stops as normal tool use ([#8059](https://github.com/earendil-works/pi/issues/8059)).
+- Fixed inherited fullscreen mouse drag selection and OSC 8 link activation in terminals that report generic SGR mouse release button codes ([#7963](https://github.com/earendil-works/pi/issues/7963)).
+- Fixed inherited focused fullscreen overlays not receiving mouse wheel or viewport scroll keys such as PageUp and PageDown ([#7894](https://github.com/earendil-works/pi/issues/7894)).
+- Fixed inherited LaTeX control spaces split across line endings causing complete expressions to fall back to raw source.
+- Fixed split `Alt+Enter` input over SSH being misread as Escape, added `PI_TUI_ESC_TIMEOUT` for high-latency terminals, and limited that timeout to lone Escape input ([#7899](https://github.com/earendil-works/pi/pull/7899) by [@powerfooI](https://github.com/powerfooI)).
+- Fixed inherited idle fullscreen sessions repainting and clearing text selection when the terminal loses focus ([#7892](https://github.com/earendil-works/pi/pull/7892) by [@terrorobe](https://github.com/terrorobe)).
+- Fixed fullscreen selection copy to use the host clipboard and report failure instead of claiming success when OSC 52 is unsupported ([#8110](https://github.com/earendil-works/pi/pull/8110) by [@Panoplos](https://github.com/Panoplos)).
 
 ## [0.84.1] - 2026-08-07
 
