@@ -29,18 +29,47 @@ const TEST_AGENTS = [
 	{ id: "agent-3", name: "quick-git" },
 ] as const;
 
-function testAgentWire(workspace: string, agent: (typeof TEST_AGENTS)[number]): Record<string, JsonValue> {
+const TEST_AGENT_TIMESTAMP = "2026-08-14T00:00:00.000Z";
+
+function testAgentWire(agent: (typeof TEST_AGENTS)[number], status = "idle"): Record<string, JsonValue> {
+	const turnId = `${agent.id}-turn`;
 	return {
 		$riemann: "agent_info",
 		id: agent.id,
 		name: agent.name,
-		status: "completed",
+		turn_id: turnId,
+		status,
 		parent_id: "main-agent",
-		depth: 1,
-		model_role: "inherit",
-		workspace,
-		workspace_mode: "shared",
-		permissions: "workspace",
+		task: `Task for ${agent.name}`,
+		profile: null,
+		model: "faux/test-model",
+		workspace: "/tmp/riemann-agent-test",
+		active_turn_id: status === "queued" || status === "running" ? turnId : null,
+		last_turn_id: turnId,
+		last_outcome: status === "stopped" ? "cancelled" : "ok",
+		created_at: TEST_AGENT_TIMESTAMP,
+		updated_at: TEST_AGENT_TIMESTAMP,
+	};
+}
+
+function testAgentResultWire(
+	agent: (typeof TEST_AGENTS)[number],
+	turnId: string,
+	outcome: "ok" | "cancelled" = "ok",
+): Record<string, JsonValue> {
+	return {
+		$riemann: "agent_result",
+		id: agent.id,
+		name: agent.name,
+		turn_id: turnId,
+		status: outcome === "cancelled" ? "stopped" : "idle",
+		outcome,
+		result: outcome === "ok" ? `Completed ${agent.name}` : "",
+		error: null,
+		transcript_handle: `artifact://${agent.id}-transcript`,
+		patch_handle: null,
+		started_at: TEST_AGENT_TIMESTAMP,
+		completed_at: TEST_AGENT_TIMESTAMP,
 	};
 }
 
@@ -87,25 +116,8 @@ async function createKernel(
 			name: "list",
 			namespace: "agents",
 			qualified_name: "agents.list",
-			description: "Return complete AgentInfo payloads.",
+			description: "Return reusable AgentInfo payloads.",
 			parameters: [],
-		},
-		{
-			name: "wait",
-			namespace: "agents",
-			qualified_name: "agents.wait",
-			description: "Return a nested AgentInfo result envelope.",
-			parameters: [
-				{ name: "agent_id", required: true },
-				{ name: "timeout", required: false },
-			],
-		},
-		{
-			name: "result",
-			namespace: "agents",
-			qualified_name: "agents.result",
-			description: "Return the current nested AgentInfo result envelope.",
-			parameters: [{ name: "agent_id", required: true }],
 		},
 	]);
 	return new IPythonKernelManager({
@@ -124,21 +136,39 @@ async function createKernel(
 			}
 			if (request.type === "testing.block" && onBlock) return onBlock(signal);
 			if (request.type === "testing.invalid_agent") {
-				return { ...testAgentWire(root, TEST_AGENTS[0]), unexpected_field: "future schema field" };
+				return { ...testAgentWire(TEST_AGENTS[0]), unexpected_field: "future schema field" };
 			}
 			if (request.type === "agents.list") {
-				return TEST_AGENTS.map((agent) => testAgentWire(root, agent));
+				return TEST_AGENTS.map((agent) => testAgentWire(agent));
 			}
-			if (request.type === "agents.wait" || request.type === "agents.result") {
-				const agentId = request.args.agent_id;
-				const agent = TEST_AGENTS.find((candidate) => candidate.id === agentId);
-				if (!agent) throw new Error(`Unknown test agent: ${agentId}`);
+			if (request.type === "agents.info") {
+				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.args.agent_id);
+				if (!agent) throw new Error(`Unknown test agent: ${request.args.agent_id}`);
+				return testAgentWire(agent);
+			}
+			if (request.type === "agents.wait") {
+				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.args.agent_id);
+				if (!agent || typeof request.args.turn_id !== "string")
+					throw new Error(`Unknown test Agent Turn: ${request.args.agent_id}/${request.args.turn_id}`);
+				return testAgentResultWire(agent, request.args.turn_id);
+			}
+			if (request.type === "agents.send") {
+				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.args.agent_id);
+				if (!agent) throw new Error(`Unknown test agent: ${request.args.agent_id}`);
 				return {
-					agent: testAgentWire(root, agent),
-					result: `${agent.name} done`,
-					error: null,
+					$riemann: "agent_handle",
+					id: agent.id,
+					name: agent.name,
+					turn_id: `${agent.id}-next-turn`,
 				};
 			}
+			if (request.type === "agents.stop") {
+				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.args.agent_id);
+				if (!agent || typeof request.args.turn_id !== "string")
+					throw new Error(`Unknown test Agent Turn: ${request.args.agent_id}/${request.args.turn_id}`);
+				return testAgentResultWire(agent, request.args.turn_id, "cancelled");
+			}
+			if (request.type === "agents.release") return null;
 			throw new Error(`Unexpected request: ${request.type}`);
 		},
 	});
@@ -172,7 +202,7 @@ describe("Riemann IPython kernel", () => {
 			await stage("close event kernel", kernel.close());
 		}
 	}, 30_000);
-	test("round-trips complete AgentInfo payloads and settles decoding failures", async () => {
+	test("round-trips reusable Agent handles and settles decoding failures", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-agent-wire-"));
 		roots.push(root);
 		const kernel = await stage("create agent wire kernel", createKernel(root, join(root, "snapshot.dill")));
@@ -181,38 +211,70 @@ describe("Riemann IPython kernel", () => {
 				"decode agent list",
 				kernel.execute(
 					`listed = await agents.list()
-[(item.id, item.name, item.status, item.workspace_mode, item.permissions) for item in listed]`,
+(len(listed), listed[0].id, listed[0].turn_id, listed[-1].id, all(hasattr(item, name) for item in listed for name in ("info", "wait", "send", "stop", "release")))`,
 				),
 			);
 			expect(listed.status).toBe("ok");
-			expect(listed.result?.data["text/plain"]).toContain(
-				"('agent-1', 'quick-env', 'completed', 'shared', 'workspace')",
+			expect(listed.result?.data["text/plain"]).toBe("(3, 'agent-1', 'agent-1-turn', 'agent-3', True)");
+
+			const info = await stage(
+				"refresh Agent info",
+				kernel.execute(
+					`info = await listed[0].info()
+(info.id, info.turn_id, info.task, info.model, info.active_turn_id, info.last_turn_id) == ("agent-1", "agent-1-turn", "Task for quick-env", "faux/test-model", None, "agent-1-turn")`,
+				),
 			);
-			expect(listed.result?.data["text/plain"]).toContain(
-				"('agent-3', 'quick-git', 'completed', 'shared', 'workspace')",
-			);
+			expect(info.status).toBe("ok");
+			expect(info.result?.data["text/plain"]).toBe("True");
 
 			const waited = await stage(
-				"decode parallel agent waits",
+				"wait for exact Agent Turn",
 				kernel.execute(
-					`import asyncio
-waits = await asyncio.gather(*(agents.wait(agent_id=item.id, timeout=1) for item in listed))
-[(entry["agent"].name, entry["agent"].workspace_mode, entry["result"]) for entry in waits]`,
+					`waited = await listed[0].wait(timeout=2)
+(waited.id, waited.turn_id, waited.status, waited.outcome, waited.result, waited.transcript_handle) == ("agent-1", "agent-1-turn", "idle", "ok", "Completed quick-env", "artifact://agent-1-transcript")`,
 				),
 			);
 			expect(waited.status).toBe("ok");
-			expect(waited.result?.data["text/plain"]).toContain("('quick-env', 'shared', 'quick-env done')");
-			expect(waited.result?.data["text/plain"]).toContain("('quick-git', 'shared', 'quick-git done')");
+			expect(waited.result?.data["text/plain"]).toBe("True");
 
-			const result = await stage(
-				"decode current agent result",
+			const sent = await stage(
+				"send next Agent task",
 				kernel.execute(
-					`outcome = await agents.result(agent_id="agent-2")
-(outcome["agent"].id, outcome["agent"].permissions, outcome["result"], outcome["error"])`,
+					`next_handle = await listed[0].send("inspect the regression")
+(next_handle.id, next_handle.name, next_handle.turn_id)`,
 				),
 			);
-			expect(result.status).toBe("ok");
-			expect(result.result?.data["text/plain"]).toBe("('agent-2', 'workspace', 'quick-system done', None)");
+			expect(sent.status).toBe("ok");
+			expect(sent.result?.data["text/plain"]).toBe("('agent-1', 'quick-env', 'agent-1-next-turn')");
+
+			const stopped = await stage(
+				"stop Agent handle",
+				kernel.execute(
+					`stopped = await listed[1].stop(timeout=2)
+(stopped.id, stopped.turn_id, stopped.status, stopped.outcome)`,
+				),
+			);
+			expect(stopped.status).toBe("ok");
+			expect(stopped.result?.data["text/plain"]).toBe("('agent-2', 'agent-2-turn', 'stopped', 'cancelled')");
+
+			const released = await stage(
+				"release Agent handle",
+				kernel.execute(
+					`released = await listed[2].release()
+released is None`,
+				),
+			);
+			expect(released.status).toBe("ok");
+			expect(released.result?.data["text/plain"]).toBe("True");
+
+			const surface = await stage(
+				"inspect reduced Agent namespace",
+				kernel.execute(
+					`(hasattr(agents, "wait"), hasattr(agents, "result"), hasattr(agents, "inbox"), hasattr(agents, "park"), hasattr(agents, "revive"))`,
+				),
+			);
+			expect(surface.status).toBe("ok");
+			expect(surface.result?.data["text/plain"]).toBe("(False, False, False, False, False)");
 
 			const malformed = await stage(
 				"settle incompatible agent payload",

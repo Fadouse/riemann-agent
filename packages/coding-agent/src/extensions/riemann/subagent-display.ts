@@ -1,12 +1,11 @@
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { keyText } from "../../modes/interactive/components/keybinding-hints.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { SubagentUiSnapshot } from "../../riemann/agents/supervisor.ts";
 import type { AgentStatus } from "../../riemann/state/store.ts";
 
-export const ACTIVE_SUBAGENT_STATUSES = new Set<AgentStatus>(["queued", "running", "idle"]);
+export const ACTIVE_SUBAGENT_STATUSES = new Set<AgentStatus>(["queued", "running"]);
 export const MAX_FLEET_AGENT_ROWS = 5;
-
-const TOOL_OUTPUT_LIMIT = 500;
 
 export function isActiveSubagent(agent: SubagentUiSnapshot): boolean {
 	return ACTIVE_SUBAGENT_STATUSES.has(agent.status);
@@ -67,7 +66,9 @@ export function renderSubagentFleet(
 	const safeWidth = Math.max(1, width);
 	const selected = selectionActive ? Math.max(0, Math.min(agents.length, selectedIndex)) : -1;
 	const { start, visible } = fleetWindow(Math.max(0, selectedIndex), agents.length);
-	const hint = selectionActive ? "↑↓ select · enter view · esc back" : "esc to interrupt · ← for agents · ↓ to manage";
+	const hint = selectionActive
+		? `${keyText("tui.select.up")}/${keyText("tui.select.down")} select · ${keyText("tui.select.confirm")} view · ${keyText("tui.select.cancel")} back`
+		: `${keyText("app.interrupt")} to interrupt · ${keyText("tui.editor.cursorLeft")} for agents · ${keyText("tui.select.down")} to manage`;
 	const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, safeWidth, ""), ""];
 	lines.push(truncateToWidth(`  ${fleetBullet(0, selected, theme)} main`, safeWidth, ""));
 	if (start > 0) lines.push(rightAlign("", theme.fg("dim", `↑ ${start} more`), safeWidth));
@@ -84,100 +85,52 @@ export function renderSubagentFleet(
 }
 
 export function subagentStatusText(agent: SubagentUiSnapshot): string {
-	if (agent.status === "completed") return "Done";
-	if (agent.status === "failed") return `Error: ${agent.error ?? "unknown"}`;
-	if (agent.status === "stopped") return "Stopped";
-	if (agent.status === "parked") return "Parked";
 	if (agent.status === "queued") return "queued";
-	if (agent.currentTool) return `${agent.currentTool}…`;
-	return "Working…";
+	if (agent.status === "running") return agent.currentTool ? `${agent.currentTool}…` : "Working…";
+	if (agent.status === "stopped") return "Stopped";
+	if (agent.lastOutcome === "error") return `Error: ${agent.error ?? "unknown"}`;
+	if (agent.lastOutcome === "cancelled") return "Cancelled";
+	if (agent.lastOutcome === "ok") return "Done";
+	return "Idle";
 }
 
 export function subagentStatusIcon(agent: SubagentUiSnapshot, theme: Theme): string {
-	if (agent.status === "running" || agent.status === "idle") return theme.fg("accent", "●");
-	if (agent.status === "completed") return theme.fg("success", "✓");
-	if (agent.status === "failed") return theme.fg("error", "✗");
-	if (agent.status === "parked") return theme.fg("warning", "Ⅱ");
-	if (agent.status === "stopped") return theme.fg("dim", "■");
-	return theme.fg("dim", "○");
+	if (agent.status === "running") return theme.fg("accent", "●");
+	if (agent.status === "queued") return theme.fg("dim", "○");
+	if (agent.status === "stopped" || agent.lastOutcome === "cancelled") return theme.fg("dim", "■");
+	if (agent.lastOutcome === "error") return theme.fg("error", "✗");
+	if (agent.lastOutcome === "ok") return theme.fg("success", "✓");
+	return theme.fg("warning", "Ⅱ");
 }
 
 export function latestAssistantText(agent: SubagentUiSnapshot): string | undefined {
 	const candidates = agent.streamingMessage ? [...agent.messages, agent.streamingMessage] : agent.messages;
 	for (let index = candidates.length - 1; index >= 0; index -= 1) {
 		const candidate = candidates[index];
-		if (!isRecord(candidate) || candidate.role !== "assistant" || !Array.isArray(candidate.content)) continue;
+		if (
+			typeof candidate !== "object" ||
+			candidate === null ||
+			!("role" in candidate) ||
+			candidate.role !== "assistant" ||
+			!("content" in candidate) ||
+			!Array.isArray(candidate.content)
+		) {
+			continue;
+		}
 		const text = candidate.content
 			.flatMap((part) =>
-				isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : [],
+				typeof part === "object" &&
+				part !== null &&
+				"type" in part &&
+				part.type === "text" &&
+				"text" in part &&
+				typeof part.text === "string"
+					? [part.text]
+					: [],
 			)
 			.join("\n")
 			.trim();
 		if (text) return text;
 	}
 	return agent.result;
-}
-
-export function renderAgentMessage(value: unknown, width: number, hideThinking: boolean, theme: Theme): string[] {
-	if (!isRecord(value)) return [theme.fg("dim", "[unrecognized message]")];
-	const role = typeof value.role === "string" ? value.role : "message";
-	if (role === "user") {
-		return [theme.fg("accent", "[User]"), ...wrapTextWithAnsi(extractText(value.content).trim(), width)];
-	}
-	if (role === "assistant") {
-		const lines = [theme.bold("[Assistant]")];
-		const content = Array.isArray(value.content) ? value.content : [];
-		for (const part of content) {
-			if (!isRecord(part)) continue;
-			if (part.type === "text" && typeof part.text === "string") {
-				lines.push(...wrapTextWithAnsi(part.text.trim(), width));
-			} else if (part.type === "thinking" && !hideThinking) {
-				lines.push(theme.fg("dim", "[Thinking]"));
-				if (typeof part.thinking === "string") {
-					lines.push(...wrapTextWithAnsi(part.thinking.trim(), width).map((line) => theme.fg("dim", line)));
-				}
-			} else if (part.type === "redactedThinking" && !hideThinking) {
-				lines.push(theme.fg("dim", "[Redacted thinking]"));
-			} else if (part.type === "toolCall") {
-				lines.push(theme.fg("muted", `  [Tool: ${String(part.name ?? part.toolName ?? "unknown")}]`));
-			}
-		}
-		return lines;
-	}
-	if (role === "toolResult") {
-		const text = truncateToolOutput(extractText(value.content));
-		return [
-			theme.fg("dim", "[Result]"),
-			...wrapTextWithAnsi(text.trim(), width).map((line) => theme.fg("dim", line)),
-		];
-	}
-	if (role === "bashExecution") {
-		const command = typeof value.command === "string" ? value.command : "";
-		const output = truncateToolOutput(typeof value.output === "string" ? value.output : "");
-		return [
-			theme.fg("muted", `  $ ${command}`),
-			...wrapTextWithAnsi(output.trim(), width).map((line) => theme.fg("dim", line)),
-		];
-	}
-	const generic = truncateToolOutput(extractText(value.content) || "[content omitted]");
-	return [theme.fg("dim", `[${role}]`), ...wrapTextWithAnsi(generic.trim(), width)];
-}
-
-function extractText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((part): part is Record<string, unknown> => isRecord(part) && part.type !== "image")
-		.map((part) => (typeof part.text === "string" ? part.text : ""))
-		.filter((text) => text.length > 0)
-		.join("\n");
-}
-
-function truncateToolOutput(value: string): string {
-	if (visibleWidth(value) <= TOOL_OUTPUT_LIMIT) return value;
-	return `${truncateToWidth(value, TOOL_OUTPUT_LIMIT, "")}... (truncated)`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }

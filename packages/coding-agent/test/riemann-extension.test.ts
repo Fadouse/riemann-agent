@@ -2,17 +2,79 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ExtensionContext, ToolDefinition } from "../src/core/extensions/types.ts";
-import riemannExtension from "../src/extensions/riemann/index.ts";
+import { deliverAgentEvents, default as riemannExtension } from "../src/extensions/riemann/index.ts";
+import type { AgentEventDelivery } from "../src/riemann/agents/supervisor.ts";
+import { RiemannRuntime } from "../src/riemann/runtime.ts";
 
 const roots: string[] = [];
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe("Riemann session extension", () => {
+	test("persists each completion receipt and sends one immediate minimal steering reminder", () => {
+		const entries: Array<{ type: string; customType: string; data: unknown }> = [];
+		const sent: Array<{
+			customType: string;
+			content: unknown;
+			details: unknown;
+			options: unknown;
+		}> = [];
+		const notices: AgentEventDelivery["events"][] = [];
+		const api = {
+			appendEntry(customType: string, data: unknown) {
+				entries.push({ type: "custom", customType, data });
+			},
+			sendMessage(message: { customType: string; content?: unknown; details?: unknown }, options: unknown) {
+				sent.push({
+					customType: message.customType,
+					content: message.content,
+					details: message.details,
+					options,
+				});
+			},
+		};
+		const ctx = {
+			sessionManager: { getEntries: () => entries },
+		} as unknown as ExtensionContext;
+		const delivery: AgentEventDelivery = {
+			events: [
+				{
+					id: "event-1",
+					agentId: "agent-1",
+					name: "reviewer",
+					turnId: "turn-1",
+					outcome: "ok",
+				},
+			],
+		};
+
+		deliverAgentEvents(api as never, ctx, delivery, (events) => notices.push(events));
+		deliverAgentEvents(api as never, ctx, delivery, (events) => notices.push(events));
+
+		expect(entries).toEqual([
+			{
+				type: "custom",
+				customType: "riemann-agent-events",
+				data: { eventIds: ["event-1"] },
+			},
+		]);
+		expect(sent).toEqual([
+			{
+				customType: "riemann-agent-completion",
+				content:
+					"[Riemann Agent completion]\n\nAgent reviewer (agent-1) completed turn turn-1: ok. Inspect with `await agents.list()` and `await handle.wait()`.",
+				details: { eventIds: ["event-1"] },
+				options: { triggerTurn: true, deliverAs: "steer" },
+			},
+		]);
+		expect(notices).toEqual([delivery.events]);
+	});
+
 	test("exposes only IPython and checkpoints a session through the live runtime", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-extension-"));
 		roots.push(root);
@@ -85,9 +147,11 @@ describe("Riemann session extension", () => {
 			model,
 			modelRegistry: { find: () => undefined },
 			thinkingLevel: "off",
-			sessionManager: { getSessionId: () => "extension-test-session" },
+			sessionManager: { getSessionId: () => "extension-test-session", getEntries: () => [] },
 			isProjectTrusted: () => true,
+			isIdle: () => true,
 		} as unknown as ExtensionContext;
+		const sessionStartContext = { ...ctx, model: undefined } as ExtensionContext;
 		try {
 			riemannExtension(api as never);
 			expect(registered.map((tool) => tool.name)).toEqual(["ipython"]);
@@ -98,9 +162,11 @@ describe("Riemann session extension", () => {
 			expect(JSON.stringify(registered[0]?.parameters)).not.toContain("IPython");
 			expect(JSON.stringify(registered[0]?.parameters)).toContain("asyncio.gather");
 			expect(sessionStart).toBeDefined();
-			await sessionStart?.({}, ctx);
+			await sessionStart?.({}, sessionStartContext);
 			expect(beforeStart).toBeDefined();
+			const updateRootContext = vi.spyOn(RiemannRuntime.prototype, "updateRootContext");
 			const prepared = await beforeStart?.({ systemPromptOptions: {} }, ctx);
+			expect(updateRootContext).toHaveBeenLastCalledWith(ctx);
 			expect(prepared && typeof prepared === "object" && "systemPrompt" in prepared).toBe(true);
 			if (!prepared || typeof prepared !== "object" || !("systemPrompt" in prepared)) {
 				throw new Error("Riemann system prompt was not prepared");
@@ -115,9 +181,20 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).toContain("already available as globals");
 			expect(systemPrompt).toContain("compose operations with normal Python");
 			expect(systemPrompt).toContain("## Available operations");
-			expect(systemPrompt).toContain("`workspace.read(path) -> TextSnapshot`");
-			expect(systemPrompt).toContain("`shell.run(");
-			expect(systemPrompt).toContain("`agents.spawn(task, name=None, profile=None, workspace=None");
+			expect(systemPrompt).toContain("`await workspace.read(path) -> TextSnapshot`");
+			expect(systemPrompt).toContain("`await shell.run(");
+			expect(systemPrompt).toContain("`await agents.spawn(task, name=None, profile=None) -> AgentHandle`");
+			expect(systemPrompt).toContain(
+				"`await agents.run(task, name=None, profile=None, timeout=None) -> AgentResult`",
+			);
+			expect(systemPrompt).toContain("`await handle.wait(timeout=None) -> AgentResult`");
+			expect(systemPrompt).toContain("`await agents.list() -> list[AgentInfo]`");
+			expect(systemPrompt).toContain(
+				"`import asyncio; handles = await asyncio.gather(agents.spawn(...), agents.spawn(...))`",
+			);
+			expect(systemPrompt).not.toContain("`agents.wait(");
+			expect(systemPrompt).not.toContain("`agents.result(");
+			expect(systemPrompt).not.toContain("`agents.inbox(");
 			expect(systemPrompt).not.toContain("workspace_policy");
 			expect(systemPrompt).toContain("## Configured agent profiles");
 			expect(systemPrompt).toContain('- "researcher": Research public sources without modifying files.');
@@ -134,11 +211,14 @@ describe("Riemann session extension", () => {
 				{
 					code: [
 						"assert not hasattr(mcp, 'list')",
-						"identity = await agents.self()",
+						"assert not hasattr(agents, 'wait')",
+						"assert hasattr(agents, 'run')",
+						"assert not hasattr(agents, 'result')",
+						"assert not hasattr(agents, 'inbox')",
+						"assert not hasattr(agents, 'park')",
+						"assert not hasattr(agents, 'revive')",
 						"mesh = await agents.list()",
-						"assert len(mesh) == 1 and mesh[0].id == identity.id, mesh",
-						"assert identity.workspace_mode == 'shared', identity",
-						"assert identity.permissions == 'host', identity",
+						"assert mesh == [], mesh",
 						"snap = await workspace.create(path='value.txt', text='before\\n')",
 						"snap = await workspace.edit(snapshot=snap, operations=[{'kind':'replace','start':0,'end':6,'text':'after'}])",
 						"process = await shell.run(command='node', args=['-e', \"console.log('streamed')\"])",

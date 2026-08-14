@@ -4469,6 +4469,10 @@ export class InteractiveMode {
 						fullscreenScrollbar: this.settingsManager.getFullscreenScrollbar(),
 						warnings: this.settingsManager.getWarnings(),
 						riemann,
+						availableAgentModels: this.session.modelRuntime
+							.getAvailableSnapshot()
+							.map((model) => `${model.provider}/${model.id}`)
+							.sort(),
 					},
 					{
 						onAutoCompactChange: (enabled) => {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -11,7 +11,7 @@ afterEach(async () => {
 });
 
 describe("Riemann configuration", () => {
-	test("merges trusted project values over global values and ignores untrusted project config", async () => {
+	test("bounds trusted project Agent slots by the global limit", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-config-"));
 		roots.push(root);
 		const agentDir = join(root, "agent");
@@ -20,33 +20,64 @@ describe("Riemann configuration", () => {
 		await mkdir(agentDir, { recursive: true });
 		await writeFile(
 			join(agentDir, "config.yaml"),
-			"version: 1\nlimits:\n  maxAgentsPerRun: 5\nweb:\n  searchBackend: disabled\n",
+			"version: 1\nagents:\n  maxAgents: 8\n  defaults:\n    model: openai/global-agent\nweb:\n  searchBackend: disabled\n",
 		);
 		await writeFile(
 			join(project, ".riemann", "config.yaml"),
-			"version: 1\nlimits:\n  maxAgentsPerRun: 7\ncompaction:\n  strategy: openai\nagents:\n  main:\n    permissions: workspace\n  defaults:\n    workspace: worktree\n    permissions: workspace\n",
+			"version: 1\nagents:\n  maxAgents: 12\n  main:\n    permissions: workspace\n  defaults:\n    model: anthropic/project-agent\n    workspace: worktree\n    permissions: workspace\ncompaction:\n  strategy: openai\n",
 		);
 
 		const untrusted = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: false });
-		expect(untrusted.limits.maxAgentsPerRun).toBe(5);
+		expect(untrusted.maxAgents).toBe(8);
+		expect(untrusted.maxConcurrentAgents).toBe(4);
 		expect(untrusted.compaction.strategy).toBe("default");
 		expect(untrusted.mainAgent.permissions).toBe("host");
 		expect(untrusted.files).toEqual([join(agentDir, "config.yaml")]);
+		expect(untrusted.agentDefaults.model).toBe("openai/global-agent");
 
-		const trusted = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: true });
-		expect(trusted.limits.maxAgentsPerRun).toBe(7);
-		expect(trusted.compaction.strategy).toBe("openai");
-		expect(trusted.mainAgent.permissions).toBe("workspace");
-		expect(trusted.agentDefaults).toEqual({ workspace: "worktree", permissions: "workspace" });
-		expect(trusted.web.searchBackend).toBe("disabled");
-		expect(trusted.files).toEqual([join(agentDir, "config.yaml"), join(project, ".riemann", "config.yaml")]);
-		expect([...trusted.projectOverrides]).toEqual([
-			"limits.maxAgentsPerRun",
+		const bounded = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: true });
+		expect(bounded.maxAgents).toBe(8);
+		expect(bounded.compaction.strategy).toBe("openai");
+		expect(bounded.mainAgent.permissions).toBe("workspace");
+		expect(bounded.agentDefaults).toEqual({
+			model: "anthropic/project-agent",
+			workspace: "worktree",
+			permissions: "workspace",
+		});
+		expect(bounded.web.searchBackend).toBe("disabled");
+		expect(bounded.projectOverrides.has("agents.maxAgents")).toBe(false);
+
+		await writeFile(
+			join(project, ".riemann", "config.yaml"),
+			"version: 1\nagents:\n  maxAgents: 2\n  main:\n    permissions: workspace\n  defaults:\n    model: anthropic/project-agent\n    workspace: worktree\n    permissions: workspace\ncompaction:\n  strategy: openai\n",
+		);
+		const lowered = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: true });
+		expect(lowered.maxAgents).toBe(2);
+		expect(lowered.maxConcurrentAgents).toBe(2);
+		expect(lowered.files).toEqual([join(agentDir, "config.yaml"), join(project, ".riemann", "config.yaml")]);
+		expect([...lowered.projectOverrides]).toEqual([
+			"agents.maxAgents",
 			"compaction.strategy",
 			"agents.main.permissions",
+			"agents.defaults.model",
 			"agents.defaults.workspace",
 			"agents.defaults.permissions",
 		]);
+	});
+
+	test("uses four reusable Agent slots by default and allows delegation to be disabled", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-config-defaults-"));
+		roots.push(root);
+		const agentDir = join(root, "agent");
+
+		const defaults = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
+		expect(defaults.maxAgents).toBe(4);
+		expect(defaults.maxConcurrentAgents).toBe(4);
+
+		await updateGlobalRiemannSetting(agentDir, "agents.maxAgents", 0);
+		const disabled = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
+		expect(disabled.maxAgents).toBe(0);
+		expect(disabled.maxConcurrentAgents).toBe(0);
 	});
 
 	test("requires descriptions for enabled MCP servers visible by default", async () => {
@@ -88,47 +119,56 @@ describe("Riemann configuration", () => {
 			"version: 1\nmcp:\n  servers:\n    docs:\n      description: Documentation\n      command: docs-server\n",
 		);
 
-		await updateGlobalRiemannSetting(agentDir, "limits.maxDepth", 6);
+		await updateGlobalRiemannSetting(agentDir, "agents.maxAgents", 8);
 		await updateGlobalRiemannSetting(agentDir, "mcp.servers.docs.enabled", false);
 		await updateGlobalRiemannSetting(agentDir, "mcp.servers.docs.enabledTools", ["search", "fetch"]);
+		await updateGlobalRiemannSetting(agentDir, "agents.defaults.model", "openai/worker");
 
 		const config = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
-		expect(config.limits.maxDepth).toBe(6);
+		expect(config.maxAgents).toBe(8);
 		expect(config.mcpServers.docs).toMatchObject({
 			command: "docs-server",
 			enabled: false,
 			enabledTools: ["search", "fetch"],
 		});
+		expect(config.agentDefaults.model).toBe("openai/worker");
+		await updateGlobalRiemannSetting(agentDir, "agents.defaults.model", undefined);
+		expect(
+			(await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false })).agentDefaults.model,
+		).toBeUndefined();
 
 		await updateGlobalRiemannSetting(agentDir, "mcp.servers.docs.v2.enabled", false);
 		const dotted = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
 		expect(dotted.mcpServers["docs.v2"]?.enabled).toBe(false);
 	});
 
-	test("creates the global config when it does not exist", async () => {
+	test("creates the version-one global config when it does not exist", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-config-create-"));
 		roots.push(root);
 		const agentDir = join(root, "agent");
 
 		await updateGlobalRiemannSetting(agentDir, "compaction.strategy", "snapshot");
+		await updateGlobalRiemannSetting(agentDir, "agents.maxAgents", 1);
 		await updateGlobalRiemannSetting(agentDir, "agents.main.permissions", "workspace");
 		await updateGlobalRiemannSetting(agentDir, "agents.defaults.workspace", "worktree");
 		await updateGlobalRiemannSetting(agentDir, "agents.defaults.permissions", "host");
 
 		const config = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
 		expect(config.compaction.strategy).toBe("snapshot");
+		expect(config.maxAgents).toBe(1);
 		expect(config.mainAgent.permissions).toBe("workspace");
 		expect(config.agentDefaults).toEqual({ workspace: "worktree", permissions: "host" });
+		expect(await readFile(join(agentDir, "config.yaml"), "utf8")).toContain("version: 1");
 	});
 
-	test("rejects legacy mixed workspace and permission modes", async () => {
+	test("rejects removed limits and profile lifecycle settings", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-config-legacy-agent-"));
 		roots.push(root);
 		const agentDir = join(root, "agent");
 		await mkdir(agentDir, { recursive: true });
 		await writeFile(
 			join(agentDir, "config.yaml"),
-			"version: 1\nagents:\n  profiles:\n    legacy:\n      workspace: isolated\n",
+			"version: 1\nlimits:\n  maxAgentsPerRun: 8\nagents:\n  profiles:\n    legacy:\n      maxDepth: 3\n      parkOnComplete: true\n",
 		);
 
 		await expect(loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false })).rejects.toThrow(

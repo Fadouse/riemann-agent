@@ -53,7 +53,7 @@ describe("Riemann state retention", () => {
 				runId: closed.id,
 				parentId: store.ensureRootAgent(closed.id, repository).id,
 				name: "worktree",
-				status: "completed",
+				status: "idle",
 				prompt: "",
 				modelRole: "inherit",
 				workspace: repository,

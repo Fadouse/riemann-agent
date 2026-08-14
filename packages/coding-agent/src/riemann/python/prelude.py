@@ -34,6 +34,33 @@ class NotFoundError(RiemannError):
     pass
 
 
+class AgentConflictError(ConflictError):
+    pass
+
+
+class AgentNotFoundError(NotFoundError):
+    pass
+
+
+class AgentLimitError(RiemannError):
+    pass
+
+
+class AgentPermissionError(RiemannError):
+    pass
+
+
+class AgentTimeoutError(RiemannError):
+    pass
+
+
+class AgentAbortedError(RiemannError):
+    pass
+
+
+class AgentUnavailableError(RiemannError):
+    pass
+
 @_dataclasses.dataclass(frozen=True)
 class Artifact:
     handle: str
@@ -99,53 +126,64 @@ class Document:
 
 
 @_dataclasses.dataclass(frozen=True)
-class AgentInfo:
-    id: str
-    name: str
-    status: str
-    parent_id: str | None
-    depth: int
-    model_role: str
-    workspace: str
-    workspace_mode: str
-    permissions: str
-
-
-@_dataclasses.dataclass(frozen=True)
-class AgentMessage:
-    id: str
-    sender_id: str
-    recipient_id: str
-    body: str
-    created_at: str
-    reply_to: str | None = None
-
-
-@_dataclasses.dataclass(frozen=True)
 class AgentHandle:
     id: str
     name: str
+    turn_id: str
 
-    async def wait(self, *, timeout: float | None = None):
-        return await _riemann_call("agents.wait", {"agent_id": self.id, "timeout": timeout})
+    async def info(self) -> "AgentInfo":
+        return await _riemann_call("agents.info", {"agent_id": self.id})
 
-    async def send(self, message: str, *, reply_to: str | None = None):
+    async def wait(self, timeout: float | None = None) -> "AgentResult":
+        arguments = {"agent_id": self.id, "turn_id": self.turn_id}
+        if timeout is not None:
+            arguments["timeout"] = timeout
+        return await _riemann_call("agents.wait", arguments)
+
+    async def send(self, message: str) -> "AgentHandle":
         return await _riemann_call(
-            "agents.send", {"agent_id": self.id, "message": message, "reply_to": reply_to}
+            "agents.send",
+            {"agent_id": self.id, "turn_id": self.turn_id, "message": message},
         )
 
-    async def result(self):
-        return await _riemann_call("agents.result", {"agent_id": self.id})
+    async def stop(self, timeout: float | None = None) -> "AgentResult":
+        arguments = {"agent_id": self.id, "turn_id": self.turn_id}
+        if timeout is not None:
+            arguments["timeout"] = timeout
+        return await _riemann_call("agents.stop", arguments)
 
-    async def park(self):
-        return await _riemann_call("agents.park", {"agent_id": self.id})
+    async def release(self) -> None:
+        return await _riemann_call(
+            "agents.release",
+            {"agent_id": self.id, "turn_id": self.turn_id},
+        )
 
-    async def revive(self):
-        return await _riemann_call("agents.revive", {"agent_id": self.id})
 
-    async def stop(self):
-        return await _riemann_call("agents.stop", {"agent_id": self.id})
+@_dataclasses.dataclass(frozen=True)
+class AgentInfo(AgentHandle):
+    status: str
+    parent_id: str | None
+    task: str
+    profile: str | None
+    model: str
+    workspace: str
+    active_turn_id: str | None
+    last_turn_id: str
+    last_outcome: str | None
+    created_at: str
+    updated_at: str
 
+
+@_dataclasses.dataclass(frozen=True)
+class AgentResult(AgentHandle):
+    status: str
+    outcome: str
+    result: str
+    error: str | None
+    transcript_handle: str
+    patch_handle: str | None
+    started_at: str
+    completed_at: str
 
 class _RiemannNamespace(_types.SimpleNamespace):
     def __init__(self, name: str):
@@ -159,8 +197,13 @@ class _RiemannNamespace(_types.SimpleNamespace):
 
 _ERROR_TYPES = {
     "approval_required": ApprovalRequired,
-    "conflict": ConflictError,
-    "not_found": NotFoundError,
+    "conflict": AgentConflictError,
+    "not_found": AgentNotFoundError,
+    "limit_exceeded": AgentLimitError,
+    "permission_denied": AgentPermissionError,
+    "timeout": AgentTimeoutError,
+    "aborted": AgentAbortedError,
+    "unavailable": AgentUnavailableError,
 }
 
 _DOMAIN_TYPES = {
@@ -171,20 +214,27 @@ _DOMAIN_TYPES = {
     "document": Document,
     "agent_handle": AgentHandle,
     "agent_info": AgentInfo,
-    "agent_message": AgentMessage,
+    "agent_result": AgentResult,
 }
 _RIEMANN_PROTECTED = {
     "RiemannError",
     "ConflictError",
     "ApprovalRequired",
     "NotFoundError",
+    "AgentConflictError",
+    "AgentNotFoundError",
+    "AgentLimitError",
+    "AgentPermissionError",
+    "AgentTimeoutError",
+    "AgentAbortedError",
+    "AgentUnavailableError",
     "Artifact",
     "TextSnapshot",
     "ProcessResult",
     "SearchHit",
     "Document",
     "AgentInfo",
-    "AgentMessage",
+    "AgentResult",
     "AgentHandle",
 }
 
@@ -196,7 +246,7 @@ def _to_wire(value):
     if isinstance(value, Artifact):
         return {"$riemann": "artifact_ref", "handle": value.handle}
     if isinstance(value, AgentHandle):
-        return {"$riemann": "agent_ref", "id": value.id}
+        return {"$riemann": "agent_ref", "id": value.id, "turn_id": value.turn_id}
     if _dataclasses.is_dataclass(value):
         return {field.name: _to_wire(getattr(value, field.name)) for field in _dataclasses.fields(value)}
     if isinstance(value, _Path):

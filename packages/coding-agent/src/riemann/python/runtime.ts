@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { accessSync, constants, existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import lockfile from "proper-lockfile";
 import { getPackageDir, isBunBinary } from "../../config.ts";
 import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
@@ -25,6 +25,20 @@ function requirementsPath(): string {
 
 function pythonIn(runtimeDir: string): string {
 	return process.platform === "win32" ? join(runtimeDir, "Scripts", "python.exe") : join(runtimeDir, "bin", "python");
+}
+
+function hostPython(): string {
+	const configured = process.env.RIEMANN_PYTHON?.trim();
+	if (configured) return configured;
+	const name = process.platform === "win32" ? "python.exe" : "python3";
+	for (const directory of process.env.PATH?.split(delimiter) ?? []) {
+		const candidate = join(directory, name);
+		try {
+			accessSync(candidate, constants.X_OK);
+			return candidate;
+		} catch {}
+	}
+	return name;
 }
 
 async function readMarker(path: string): Promise<RuntimeMarker | undefined> {
@@ -69,7 +83,7 @@ async function runProvisionCommand(command: string, args: string[], cwd: string)
 
 async function provisionRuntime(stagingDir: string, requirements: string): Promise<void> {
 	try {
-		await runProvisionCommand("uv", ["venv", stagingDir, "--python", "python3"], getRiemannAgentDir());
+		await runProvisionCommand("uv", ["venv", stagingDir, "--python", hostPython()], getRiemannAgentDir());
 		await runProvisionCommand(
 			"uv",
 			["pip", "install", "--python", pythonIn(stagingDir), "--require-hashes", "-r", requirements],

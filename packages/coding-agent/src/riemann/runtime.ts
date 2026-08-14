@@ -5,7 +5,12 @@ import { getPackageDir, isBunBinary } from "../config.ts";
 import type { CompactionPreparation, CompactionResult } from "../core/compaction/index.ts";
 import type { ExtensionContext, ToolDefinition } from "../core/extensions/types.ts";
 import { RiemannActivityTracker } from "./activity.ts";
-import { AgentSupervisor, type ChildRiemannRuntime, type SubagentUiSnapshot } from "./agents/supervisor.ts";
+import {
+	type AgentEventDelivery,
+	AgentSupervisor,
+	type ChildRiemannRuntime,
+	type SubagentUiSnapshot,
+} from "./agents/supervisor.ts";
 import { createRiemannCompaction, createRiemannSnapshotCompaction } from "./compaction.ts";
 import { expandConfigSecret, getRiemannAgentDir, loadRiemannConfig, type RiemannConfig } from "./config.ts";
 import { formatEnvironmentContext } from "./environment.ts";
@@ -41,6 +46,10 @@ interface SharedRun {
 	agentDir: string;
 	retentionReport: RetentionReport;
 	rootContext: Pick<ExtensionContext, "cwd" | "model" | "modelRegistry" | "thinkingLevel">;
+}
+
+export interface RiemannRootOptions {
+	deliverAgentEvents?: (delivery: AgentEventDelivery) => Promise<void>;
 }
 
 function preludePath(): string {
@@ -149,7 +158,7 @@ export class RiemannRuntime {
 		for (const definition of this.utilityDefinitions()) this.registry.register(definition);
 	}
 
-	static async createRoot(ctx: ExtensionContext): Promise<RiemannRuntime> {
+	static async createRoot(ctx: ExtensionContext, options: RiemannRootOptions = {}): Promise<RiemannRuntime> {
 		const agentDir = getRiemannAgentDir();
 		const config = await loadRiemannConfig({ cwd: ctx.cwd, agentDir, projectTrusted: ctx.isProjectTrusted() });
 		const store = new RiemannStore(agentDir);
@@ -172,6 +181,7 @@ export class RiemannRuntime {
 			rootContext,
 			agentDir,
 			config,
+			deliverAgentEvents: options.deliverAgentEvents,
 			createChildRuntime: async (agent) => {
 				const child = await RiemannRuntime.createChild(shared, agent);
 				return child.asChildRuntime();
@@ -183,6 +193,13 @@ export class RiemannRuntime {
 
 	private static async createChild(shared: SharedRun, agent: StoredAgent): Promise<RiemannRuntime> {
 		return new RiemannRuntime(shared, agent, false, await existingExaKey(shared.config));
+	}
+
+	updateRootContext(ctx: Pick<ExtensionContext, "model" | "modelRegistry" | "thinkingLevel">): void {
+		if (!this.root) return;
+		this.shared.rootContext.model = ctx.model;
+		this.shared.rootContext.modelRegistry = ctx.modelRegistry;
+		this.shared.rootContext.thinkingLevel = ctx.thinkingLevel;
 	}
 
 	listSubagentsForUi(): SubagentUiSnapshot[] {
@@ -203,6 +220,16 @@ export class RiemannRuntime {
 	async stopSubagentFromUi(agentId: string): Promise<void> {
 		if (!this.root) throw new RiemannHostError("permission_denied", "Only the root runtime can stop Subagents");
 		await this.shared.supervisor.stopSubagentFromUi(agentId);
+	}
+
+	async releaseSubagentFromUi(agentId: string): Promise<void> {
+		if (!this.root) throw new RiemannHostError("permission_denied", "Only the root runtime can release Subagents");
+		await this.shared.supervisor.releaseSubagentFromUi(agentId);
+	}
+
+	async flushAgentEvents(): Promise<void> {
+		if (!this.root) return;
+		await this.shared.supervisor.flushAgentEvents();
 	}
 
 	private async resolveArtifactDestination(input: string): Promise<string> {
@@ -374,6 +401,10 @@ export class RiemannRuntime {
 					filesystem_scope: this.agent.permissions,
 					main_agent_permissions: this.shared.config.mainAgent.permissions,
 					subagent_defaults: this.shared.config.agentDefaults,
+					agent_slots: {
+						max: this.shared.config.maxAgents,
+						max_concurrent: this.shared.config.maxConcurrentAgents,
+					},
 					retention: this.shared.retentionReport as unknown as JsonValue,
 				}),
 			},
@@ -403,7 +434,7 @@ export class RiemannRuntime {
 
 	private durableState(): JsonValue {
 		const agents = this.shared.store.listAgents(this.shared.run.id);
-		const unread = this.shared.store.listInbox(this.agent.id, { unreadOnly: true });
+		const pendingEvents = this.shared.store.listPendingAgentEvents(this.agent.id);
 		return {
 			version: 1,
 			run: {
@@ -414,27 +445,20 @@ export class RiemannRuntime {
 			self: {
 				id: this.agent.id,
 				name: this.agent.name,
-				workspace: this.agent.workspace,
-				workspace_mode: this.agent.workspaceMode,
-				permissions: this.agent.permissions,
 			},
 			agents: agents.map((agent) => ({
 				id: agent.id,
 				name: agent.name,
 				parent_id: agent.parentId,
 				status: agent.status,
-				model_role: agent.modelRole,
-				workspace: agent.workspace,
-				workspace_mode: agent.workspaceMode,
-				permissions: agent.permissions,
+				active_turn_id: agent.activeTurnId,
+				last_turn_id: agent.lastTurnId,
+				last_outcome: agent.lastOutcome,
 				result_available: agent.result !== null,
-				error: agent.error,
+				transcript_handle: agent.transcriptHandle,
+				patch_handle: agent.patchHandle,
 			})),
-			unread_messages: unread.map((message) => ({
-				id: message.id,
-				sender_id: message.senderId,
-				created_at: message.createdAt,
-			})),
+			pending_agent_events: pendingEvents.map((event) => event.id),
 			compaction: {
 				strategy: this.shared.config.compaction.strategy,
 			},

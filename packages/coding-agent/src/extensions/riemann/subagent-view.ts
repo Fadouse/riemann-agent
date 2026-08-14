@@ -1,24 +1,26 @@
+import type { AssistantMessage, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import {
 	type Component,
 	type Focusable,
 	Input,
 	isKeyRepeat,
-	Key,
-	matchesKey,
 	type TUI,
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { ExtensionContext } from "../../core/extensions/types.ts";
 import type { KeybindingsManager } from "../../core/keybindings.ts";
-import type { Theme } from "../../modes/interactive/theme/theme.ts";
+import { AssistantMessageComponent } from "../../modes/interactive/components/assistant-message.ts";
+import { keyText } from "../../modes/interactive/components/keybinding-hints.ts";
+import { ToolExecutionComponent } from "../../modes/interactive/components/tool-execution.ts";
+import { UserMessageComponent } from "../../modes/interactive/components/user-message.ts";
+import { getMarkdownTheme, type Theme } from "../../modes/interactive/theme/theme.ts";
 import type { SubagentUiSnapshot } from "../../riemann/agents/supervisor.ts";
 import type { RiemannRuntime } from "../../riemann/runtime.ts";
 import {
 	formatFleetElapsed,
 	formatFleetTokens,
 	isActiveSubagent,
-	renderAgentMessage,
 	subagentStatusIcon,
 	subagentStatusText,
 } from "./subagent-display.ts";
@@ -30,19 +32,37 @@ const UPDATE_COALESCE_MS = 32;
 
 interface ViewerKeys {
 	cancel(data: string): boolean;
+	close(data: string): boolean;
 	scrollUp(data: string): boolean;
 	scrollDown(data: string): boolean;
 	pageUp(data: string): boolean;
 	pageDown(data: string): boolean;
+	home(data: string): boolean;
+	end(data: string): boolean;
+	message(data: string): boolean;
+	stop(data: string): boolean;
+	release(data: string): boolean;
+	toggleThinking(data: string): boolean;
+	toggleTools(data: string): boolean;
 }
 
 function createViewerKeys(keybindings: KeybindingsManager): ViewerKeys {
 	return {
 		cancel: (data) => keybindings.matches(data, "tui.select.cancel"),
-		scrollUp: (data) => keybindings.matches(data, "tui.select.up") || matchesKey(data, "k"),
-		scrollDown: (data) => keybindings.matches(data, "tui.select.down") || matchesKey(data, "j"),
-		pageUp: (data) => keybindings.matches(data, "tui.select.pageUp") || matchesKey(data, "shift+up"),
-		pageDown: (data) => keybindings.matches(data, "tui.select.pageDown") || matchesKey(data, "shift+down"),
+		close: (data) => keybindings.matches(data, "app.agents.close"),
+		scrollUp: (data) =>
+			keybindings.matches(data, "tui.select.up") || keybindings.matches(data, "app.agents.previous"),
+		scrollDown: (data) =>
+			keybindings.matches(data, "tui.select.down") || keybindings.matches(data, "app.agents.next"),
+		pageUp: (data) => keybindings.matches(data, "tui.select.pageUp"),
+		pageDown: (data) => keybindings.matches(data, "tui.select.pageDown"),
+		home: (data) => keybindings.matches(data, "app.agents.home"),
+		end: (data) => keybindings.matches(data, "app.agents.end"),
+		message: (data) => keybindings.matches(data, "app.agents.message"),
+		stop: (data) => keybindings.matches(data, "app.agents.stop"),
+		release: (data) => keybindings.matches(data, "app.agents.release"),
+		toggleThinking: (data) => keybindings.matches(data, "app.agents.toggleThinking"),
+		toggleTools: (data) => keybindings.matches(data, "app.tools.expand"),
 	};
 }
 
@@ -86,15 +106,18 @@ export class SubagentConversationViewer implements Component, Focusable {
 	private lastInnerWidth = 1;
 	private hideThinking = true;
 	private stopArmed = false;
+	private releaseArmed = false;
+	private toolsExpanded = false;
 	private sending = false;
 	private stopping = false;
+	private releasing = false;
 	private closed = false;
 	private composer: Input | undefined;
 	private clockTimer: NodeJS.Timeout | undefined;
 	private updateTimer: NodeJS.Timeout | undefined;
 	private contentRevision = 0;
 	private contentCache:
-		| { width: number; revision: number; hideThinking: boolean; lines: readonly string[] }
+		| { width: number; revision: number; hideThinking: boolean; toolsExpanded: boolean; lines: readonly string[] }
 		| undefined;
 	private _focused = false;
 
@@ -125,33 +148,33 @@ export class SubagentConversationViewer implements Component, Focusable {
 			this.tui.requestRender();
 			return;
 		}
-		if (this.keys.cancel(data)) {
+		if (this.keys.cancel(data) || this.keys.close(data)) {
 			if (isKeyRepeat(data)) return;
 			this.close();
 			return;
 		}
-		if (matchesKey(data, "q")) {
-			this.close();
-			return;
-		}
-		if (matchesKey(data, Key.ctrl("t"))) {
+		if (this.keys.toggleThinking(data)) {
 			this.hideThinking = !this.hideThinking;
 			this.markContentDirty();
 			this.tui.requestRender();
 			return;
 		}
-		if (matchesKey(data, Key.ctrl("s"))) {
-			this.stopArmed = false;
-			void this.stop();
+		if (this.keys.toggleTools(data)) {
+			this.toolsExpanded = !this.toolsExpanded;
+			this.markContentDirty();
+			this.tui.requestRender();
 			return;
 		}
-		if (matchesKey(data, Key.enter) || matchesKey(data, "m")) {
+		if (this.keys.message(data)) {
 			this.stopArmed = false;
+			this.releaseArmed = false;
 			this.openComposer();
 			return;
 		}
-		if (matchesKey(data, "x")) {
+		if (this.keys.stop(data)) {
+			if (isKeyRepeat(data)) return;
 			if (!this.canStop()) return;
+			this.releaseArmed = false;
 			if (this.stopArmed) {
 				this.stopArmed = false;
 				void this.stop();
@@ -161,8 +184,22 @@ export class SubagentConversationViewer implements Component, Focusable {
 			}
 			return;
 		}
-		if (this.stopArmed) {
+		if (this.keys.release(data)) {
+			if (isKeyRepeat(data)) return;
+			if (!this.canRelease()) return;
 			this.stopArmed = false;
+			if (this.releaseArmed) {
+				this.releaseArmed = false;
+				void this.release();
+			} else {
+				this.releaseArmed = true;
+				this.tui.requestRender();
+			}
+			return;
+		}
+		if (this.stopArmed || this.releaseArmed) {
+			this.stopArmed = false;
+			this.releaseArmed = false;
 			this.tui.requestRender();
 		}
 		const snapshot = this.snapshot();
@@ -181,10 +218,10 @@ export class SubagentConversationViewer implements Component, Focusable {
 		} else if (this.keys.pageDown(data)) {
 			this.scrollOffset = Math.min(maxScroll, this.scrollOffset + viewport);
 			this.autoScroll = this.scrollOffset >= maxScroll;
-		} else if (matchesKey(data, Key.home)) {
+		} else if (this.keys.home(data)) {
 			this.scrollOffset = 0;
 			this.autoScroll = false;
-		} else if (matchesKey(data, Key.end)) {
+		} else if (this.keys.end(data)) {
 			this.scrollOffset = maxScroll;
 			this.autoScroll = true;
 		} else {
@@ -213,7 +250,7 @@ export class SubagentConversationViewer implements Component, Focusable {
 			lines.push(row(this.theme.fg("error", "Subagent not found")), middle);
 		} else {
 			lines.push(row(this.header(snapshot)));
-			lines.push(row(this.theme.fg("dim", `  ↳ ${snapshot.modelRole} · ${snapshot.workspace}`)));
+			lines.push(row(this.theme.fg("dim", `  ↳ ${snapshot.model} · ${snapshot.workspace}`)));
 			lines.push(middle);
 		}
 		const contentLines = this.buildContentLines(innerWidth, snapshot);
@@ -228,7 +265,10 @@ export class SubagentConversationViewer implements Component, Focusable {
 			this.composer.focused = this.focused;
 			lines.push(row(this.composer.render(innerWidth)[0] ?? ""));
 			const left = this.theme.fg("accent", this.sending ? "… sending" : "✎ message");
-			const right = this.theme.fg("dim", "Enter send · Esc cancel");
+			const right = this.theme.fg(
+				"dim",
+				`${keyText("tui.select.confirm")} send · ${keyText("tui.select.cancel")} cancel`,
+			);
 			const gap = Math.max(1, innerWidth - visibleWidth(left) - visibleWidth(right));
 			lines.push(row(`${left}${" ".repeat(gap)}${right}`));
 		} else {
@@ -246,10 +286,14 @@ export class SubagentConversationViewer implements Component, Focusable {
 	dispose(): void {
 		this.closed = true;
 		this.unsubscribe();
-		if (this.clockTimer) clearInterval(this.clockTimer);
-		if (this.updateTimer) clearTimeout(this.updateTimer);
-		this.clockTimer = undefined;
-		this.updateTimer = undefined;
+		if (this.clockTimer) {
+			clearInterval(this.clockTimer);
+			this.clockTimer = undefined;
+		}
+		if (this.updateTimer) {
+			clearTimeout(this.updateTimer);
+			this.updateTimer = undefined;
+		}
 		if (this.composer) this.composer.focused = false;
 	}
 
@@ -276,28 +320,94 @@ export class SubagentConversationViewer implements Component, Focusable {
 			cached &&
 			cached.width === width &&
 			cached.revision === this.contentRevision &&
-			cached.hideThinking === this.hideThinking
+			cached.hideThinking === this.hideThinking &&
+			cached.toolsExpanded === this.toolsExpanded
 		) {
 			return cached.lines;
 		}
 		const messages = [...agent.messages];
 		if (agent.streamingMessage && !messages.includes(agent.streamingMessage)) messages.push(agent.streamingMessage);
-		const lines: string[] = [];
-		for (const [index, message] of messages.entries()) {
-			if (index > 0) lines.push(this.theme.fg("dim", "───"));
-			lines.push(...renderAgentMessage(message, width, this.hideThinking, this.theme));
-		}
+		const lines = this.renderTranscript(messages, width, agent.workspace);
 		if (lines.length === 0 && agent.result) {
-			lines.push(this.theme.bold("[Assistant]"), ...agent.result.split("\n"));
+			lines.push(...agent.result.split("\n"));
 		} else if (lines.length === 0 && agent.error) {
-			lines.push(this.theme.fg("error", `[Error] ${agent.error}`));
+			lines.push(this.theme.fg("error", agent.error));
 		} else if (lines.length === 0) {
 			lines.push(this.theme.fg("dim", "(waiting for first message...)"));
 		}
 		if (isActiveSubagent(agent)) {
 			lines.push("", `${this.theme.fg("accent", "▍ ")}${this.theme.fg("dim", subagentStatusText(agent))}`);
 		}
-		this.contentCache = { width, revision: this.contentRevision, hideThinking: this.hideThinking, lines };
+		this.contentCache = {
+			width,
+			revision: this.contentRevision,
+			hideThinking: this.hideThinking,
+			toolsExpanded: this.toolsExpanded,
+			lines,
+		};
+		return lines;
+	}
+
+	private renderTranscript(messages: readonly unknown[], width: number, cwd: string): string[] {
+		const toolResults = new Map<string, ToolResultMessage>();
+		for (const message of messages) {
+			if (typeof message === "object" && message !== null && "role" in message && message.role === "toolResult") {
+				const result = message as ToolResultMessage;
+				toolResults.set(result.toolCallId, result);
+			}
+		}
+		const lines: string[] = [];
+		const append = (rendered: readonly string[]) => {
+			if (rendered.length === 0) return;
+			if (lines.length > 0) lines.push("");
+			lines.push(...rendered);
+		};
+		for (const message of messages) {
+			if (typeof message !== "object" || message === null || !("role" in message)) continue;
+			if (message.role === "user") {
+				const user = message as UserMessage;
+				const text =
+					typeof user.content === "string"
+						? user.content
+						: user.content
+								.filter((content) => content.type === "text")
+								.map((content) => content.text)
+								.join("\n");
+				append(new UserMessageComponent(text, getMarkdownTheme(), 0).render(width));
+				continue;
+			}
+			if (message.role !== "assistant") continue;
+			const assistant = message as AssistantMessage;
+			append(
+				new AssistantMessageComponent(assistant, this.hideThinking, getMarkdownTheme(), "Thinking...", 0).render(
+					width,
+				),
+			);
+			for (const content of assistant.content) {
+				if (content.type !== "toolCall") continue;
+				const tool = new ToolExecutionComponent(
+					content.name,
+					content.id,
+					content.arguments,
+					{},
+					undefined,
+					this.tui,
+					cwd,
+				);
+				tool.setArgsComplete();
+				tool.markExecutionStarted();
+				tool.setExpanded(this.toolsExpanded);
+				const result = toolResults.get(content.id);
+				if (result) {
+					tool.updateResult({
+						content: result.content,
+						details: result.details,
+						isError: result.isError,
+					});
+				}
+				append(tool.render(width));
+			}
+		}
 		return lines;
 	}
 
@@ -308,15 +418,32 @@ export class SubagentConversationViewer implements Component, Focusable {
 
 	private footer(total: number, viewport: number, start: number, width: number): string {
 		const actions: string[] = [];
-		if (this.canCompose()) actions.push(this.theme.fg("dim", "Enter steer"));
+		if (this.canCompose()) actions.push(`${keyText("app.agents.message")} message`);
 		if (this.canStop()) {
-			actions.push(this.stopArmed ? this.theme.fg("error", "x again to STOP") : this.theme.fg("dim", "x stop"));
+			actions.push(
+				this.stopArmed
+					? this.theme.fg("error", `${keyText("app.agents.stop")} again to STOP`)
+					: `${keyText("app.agents.stop")} stop`,
+			);
 		}
-		actions.push(this.theme.fg("dim", "^T thinking"));
+		if (this.canRelease()) {
+			actions.push(
+				this.releaseArmed
+					? this.theme.fg("error", `${keyText("app.agents.release")} again to RELEASE SLOT`)
+					: `${keyText("app.agents.release")} release`,
+			);
+		}
+		actions.push(
+			`${keyText("app.agents.toggleThinking")} thinking:${this.hideThinking ? "compact" : "full"}`,
+			`${keyText("app.tools.expand")} tools:${this.toolsExpanded ? "full" : "compact"}`,
+		);
 		const percent = total <= viewport ? "100%" : `${Math.round(((start + viewport) / total) * 100)}%`;
-		const left = [this.theme.fg("dim", `${total} lines · ${percent}`), ...actions].join(this.theme.fg("dim", " · "));
-		const right = this.theme.fg("dim", "↑↓ scroll · PgUp/PgDn · Esc close");
-		if (visibleWidth(left) + visibleWidth(right) + 1 > width) return truncateToWidth(right, width, "");
+		const left = this.theme.fg("dim", `${total} lines · ${percent} · ${actions.join(" · ")}`);
+		const right = this.theme.fg(
+			"dim",
+			`${keyText("tui.select.up")}/${keyText("tui.select.down")} scroll · ${keyText("tui.select.pageUp")}/${keyText("tui.select.pageDown")} page · ${keyText("tui.select.cancel")} close`,
+		);
+		if (visibleWidth(left) + visibleWidth(right) + 1 > width) return truncateToWidth(left, width, "");
 		return `${left}${" ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)))}${right}`;
 	}
 
@@ -328,6 +455,11 @@ export class SubagentConversationViewer implements Component, Focusable {
 	private canStop(): boolean {
 		const status = this.snapshot()?.status;
 		return !this.stopping && (status === "queued" || status === "running" || status === "idle");
+	}
+
+	private canRelease(): boolean {
+		const snapshot = this.snapshot();
+		return snapshot !== undefined && !this.releasing && !isActiveSubagent(snapshot);
 	}
 
 	private openComposer(value = ""): void {
@@ -379,6 +511,21 @@ export class SubagentConversationViewer implements Component, Focusable {
 		}
 	}
 
+	private async release(): Promise<void> {
+		if (!this.canRelease()) return;
+		this.releasing = true;
+		this.tui.requestRender();
+		try {
+			await this.runtime.releaseSubagentFromUi(this.agentId);
+			this.close();
+		} catch (error) {
+			this.context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+		} finally {
+			this.releasing = false;
+			if (!this.closed) this.tui.requestRender();
+		}
+	}
+
 	private markContentDirty(): void {
 		this.contentRevision += 1;
 		this.contentCache = undefined;
@@ -398,8 +545,10 @@ export class SubagentConversationViewer implements Component, Focusable {
 	private syncClock(): void {
 		const snapshot = this.snapshot();
 		if (this.closed || !snapshot || !isActiveSubagent(snapshot)) {
-			if (this.clockTimer) clearInterval(this.clockTimer);
-			this.clockTimer = undefined;
+			if (this.clockTimer) {
+				clearInterval(this.clockTimer);
+				this.clockTimer = undefined;
+			}
 			return;
 		}
 		if (this.clockTimer) return;

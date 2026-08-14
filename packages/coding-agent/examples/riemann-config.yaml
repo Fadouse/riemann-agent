@@ -1,50 +1,21 @@
 version: 1
 
-limits:
-  maxAgentsPerRun: 8
-  maxConcurrentPerRun: 4
-  maxConcurrentPerModel: 2
-  maxDepth: 3
-  maxCellOutputChars: 100000
-  maxArtifactPreviewChars: 12000
-
-retention:
-  maxAgeDays: 30
-  maxArtifactBytes: 1073741824
-  maxSnapshotBytes: 536870912
-  maxWorktreeBytes: 5368709120
-
 compaction:
-  # Strategy selection is strict: openai requires openai-codex OAuth, snapshot
-  # requires an image-capable model, and default uses semantic checkpoints.
-  # Failures are surfaced; Riemann never switches strategies implicitly.
+  # default uses semantic checkpoints; snapshot requires an image-capable model;
+  # openai requires OpenAI Codex OAuth. Riemann never switches implicitly.
   strategy: default
 
-models:
-  roles:
-    fast: anthropic/claude-haiku-4-5
-    deep: anthropic/claude-sonnet-4-5
-
 agents:
+  # Reusable child identities in one run. The Main Agent is not counted.
+  # Up to four run concurrently; use 0 to disable delegation.
+  maxAgents: 4
   main:
     permissions: host
   defaults:
+    # Omit model to inherit the Main Agent model.
+    model: anthropic/claude-sonnet-4-5
     workspace: shared
     permissions: workspace
-  profiles:
-    reviewer:
-      description: Review a bounded change without writing files.
-      modelRole: deep
-      thinkingLevel: high
-      workspace: worktree
-      permissions: workspace
-      capabilities:
-        - workspace.read
-        - agents.list
-        - agents.send
-        - agents.inbox
-      maxDepth: 0
-      parkOnComplete: false
 
 mcp:
   servers:

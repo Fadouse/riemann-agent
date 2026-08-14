@@ -1,4 +1,5 @@
 import type { BuildSystemPromptOptions, ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
+import type { AgentEventDelivery } from "../../riemann/agents/supervisor.ts";
 import {
 	IPYTHON_TOOL_DESCRIPTION,
 	IPYTHON_TOOL_PROMPT_SNIPPET,
@@ -7,6 +8,72 @@ import {
 } from "../../riemann/ipython.ts";
 import { RiemannRuntime } from "../../riemann/runtime.ts";
 import { installSubagentUi, type SubagentUiController } from "./subagent-ui.ts";
+
+const AGENT_EVENT_RECEIPT_TYPE = "riemann-agent-events";
+const AGENT_COMPLETION_MESSAGE_TYPE = "riemann-agent-completion";
+
+function persistedAgentEventIds(ctx: ExtensionContext): Set<string> {
+	const ids = new Set<string>();
+	for (const entry of ctx.sessionManager.getEntries()) {
+		let metadata: unknown;
+		if (entry.type === "custom" && entry.customType === AGENT_EVENT_RECEIPT_TYPE) {
+			metadata = entry.data;
+		} else if (entry.type === "custom_message" && entry.customType === AGENT_EVENT_RECEIPT_TYPE) {
+			metadata = entry.details;
+		} else {
+			continue;
+		}
+		if (
+			typeof metadata !== "object" ||
+			metadata === null ||
+			!("eventIds" in metadata) ||
+			!Array.isArray(metadata.eventIds)
+		)
+			continue;
+		for (const id of metadata.eventIds) {
+			if (typeof id === "string") ids.add(id);
+		}
+	}
+	return ids;
+}
+
+function completionReminder(events: AgentEventDelivery["events"]): string {
+	return [
+		"[Riemann Agent completion]",
+		"",
+		...events.map(
+			(event) =>
+				`Agent ${event.name} (${event.agentId}) completed turn ${event.turnId}: ${event.outcome}. Inspect with \`await agents.list()\` and \`await handle.wait()\`.`,
+		),
+	].join("\n");
+}
+
+export function deliverAgentEvents(
+	pi: Parameters<ExtensionFactory>[0],
+	ctx: ExtensionContext,
+	delivery: AgentEventDelivery,
+	notify: (events: AgentEventDelivery["events"]) => void,
+): void {
+	const persisted = persistedAgentEventIds(ctx);
+	const missing = delivery.events.filter((event) => !persisted.has(event.id));
+	if (missing.length === 0) return;
+	const eventIds = missing.map((event) => event.id);
+	pi.sendMessage(
+		{
+			customType: AGENT_COMPLETION_MESSAGE_TYPE,
+			content: completionReminder(missing),
+			display: false,
+			details: { eventIds },
+		},
+		{ triggerTurn: true, deliverAs: "steer" },
+	);
+	pi.appendEntry(AGENT_EVENT_RECEIPT_TYPE, { eventIds });
+	const stored = persistedAgentEventIds(ctx);
+	if (eventIds.some((id) => !stored.has(id))) {
+		throw new Error("Could not persist Riemann Agent completion receipts");
+	}
+	notify(missing);
+}
 
 function appendProjectContext(prompt: string, options: BuildSystemPromptOptions): string {
 	const sections = [prompt];
@@ -45,8 +112,14 @@ const riemannExtension: ExtensionFactory = (pi) => {
 	let subagentUi: SubagentUiController | undefined;
 
 	const getRuntime = async (ctx: ExtensionContext): Promise<RiemannRuntime> => {
-		if (runtime) return runtime;
-		runtime = await RiemannRuntime.createRoot(ctx);
+		if (runtime) {
+			runtime.updateRootContext(ctx);
+			return runtime;
+		}
+		runtime = await RiemannRuntime.createRoot(ctx, {
+			deliverAgentEvents: async (delivery) =>
+				deliverAgentEvents(pi, ctx, delivery, (events) => subagentUi?.notifyAgentEvents(events)),
+		});
 		return runtime;
 	};
 
@@ -104,6 +177,7 @@ const riemannExtension: ExtensionFactory = (pi) => {
 
 	pi.on("agent_settled", async () => {
 		await runtime?.snapshot();
+		await runtime?.flushAgentEvents();
 	});
 
 	pi.on("session_shutdown", closeRuntime);

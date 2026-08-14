@@ -27,13 +27,10 @@ const AgentProfileSchema = Type.Object(
 		prompt: Type.Optional(Type.String()),
 		promptFile: Type.Optional(Type.String()),
 		model: Type.Optional(Type.String()),
-		modelRole: Type.Optional(Type.String()),
 		thinkingLevel: Type.Optional(ThinkingLevelSchema),
 		capabilities: Type.Optional(Type.Array(Type.String())),
 		workspace: Type.Optional(SubagentWorkspaceSchema),
 		permissions: Type.Optional(AgentPermissionsSchema),
-		maxDepth: Type.Optional(Type.Integer({ minimum: 0 })),
-		parkOnComplete: Type.Optional(Type.Boolean()),
 	},
 	{ additionalProperties: false },
 );
@@ -58,48 +55,20 @@ const McpServerSchema = Type.Object(
 const ConfigSchema = Type.Object(
 	{
 		version: Type.Literal(1),
-		limits: Type.Optional(
-			Type.Object(
-				{
-					maxAgentsPerRun: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
-					maxConcurrentPerRun: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })),
-					maxConcurrentPerModel: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
-					maxDepth: Type.Optional(Type.Integer({ minimum: 0, maximum: 8 })),
-					maxCellOutputChars: Type.Optional(Type.Integer({ minimum: 1_000 })),
-					maxArtifactPreviewChars: Type.Optional(Type.Integer({ minimum: 1_000 })),
-				},
-				{ additionalProperties: false },
-			),
-		),
-		retention: Type.Optional(
-			Type.Object(
-				{
-					maxAgeDays: Type.Optional(Type.Number({ minimum: 0, maximum: 3_650 })),
-					maxArtifactBytes: Type.Optional(Type.Integer({ minimum: 0 })),
-					maxSnapshotBytes: Type.Optional(Type.Integer({ minimum: 0 })),
-					maxWorktreeBytes: Type.Optional(Type.Integer({ minimum: 0 })),
-				},
-				{ additionalProperties: false },
-			),
-		),
 		compaction: Type.Optional(
 			Type.Object({ strategy: Type.Optional(CompactionStrategySchema) }, { additionalProperties: false }),
-		),
-		models: Type.Optional(
-			Type.Object(
-				{ roles: Type.Optional(Type.Record(Type.String(), Type.String())) },
-				{ additionalProperties: false },
-			),
 		),
 		agents: Type.Optional(
 			Type.Object(
 				{
+					maxAgents: Type.Optional(Type.Integer({ minimum: 0, maximum: 16 })),
 					main: Type.Optional(
 						Type.Object({ permissions: Type.Optional(AgentPermissionsSchema) }, { additionalProperties: false }),
 					),
 					defaults: Type.Optional(
 						Type.Object(
 							{
+								model: Type.Optional(Type.String({ minLength: 1 })),
 								workspace: Type.Optional(SubagentWorkspaceSchema),
 								permissions: Type.Optional(AgentPermissionsSchema),
 							},
@@ -137,16 +106,8 @@ export type AgentPermissions = Static<typeof AgentPermissionsSchema>;
 export type SubagentWorkspace = Static<typeof SubagentWorkspaceSchema>;
 
 export type RiemannSettingPath =
-	| "limits.maxAgentsPerRun"
-	| "limits.maxConcurrentPerRun"
-	| "limits.maxConcurrentPerModel"
-	| "limits.maxDepth"
-	| "limits.maxCellOutputChars"
-	| "limits.maxArtifactPreviewChars"
-	| "retention.maxAgeDays"
-	| "retention.maxArtifactBytes"
-	| "retention.maxSnapshotBytes"
-	| "retention.maxWorktreeBytes"
+	| "agents.maxAgents"
+	| "agents.defaults.model"
 	| "compaction.strategy"
 	| "agents.main.permissions"
 	| "agents.defaults.workspace"
@@ -159,11 +120,9 @@ export type RiemannSettingPath =
 	| `mcp.servers.${string}.disabledTools`;
 
 export interface RiemannConfig {
+	maxAgents: number;
+	maxConcurrentAgents: number;
 	limits: {
-		maxAgentsPerRun: number;
-		maxConcurrentPerRun: number;
-		maxConcurrentPerModel: number;
-		maxDepth: number;
 		maxCellOutputChars: number;
 		maxArtifactPreviewChars: number;
 	};
@@ -182,8 +141,8 @@ export interface RiemannConfig {
 	agentDefaults: {
 		workspace: SubagentWorkspace;
 		permissions: AgentPermissions;
+		model?: string;
 	};
-	modelRoles: Record<string, string>;
 	profiles: Record<string, AgentProfileConfig>;
 	mcpServers: Record<string, McpServerConfig>;
 	web: {
@@ -195,11 +154,9 @@ export interface RiemannConfig {
 }
 
 const DEFAULTS: Omit<RiemannConfig, "files"> = {
+	maxAgents: 4,
+	maxConcurrentAgents: 4,
 	limits: {
-		maxAgentsPerRun: 8,
-		maxConcurrentPerRun: 4,
-		maxConcurrentPerModel: 2,
-		maxDepth: 3,
 		maxCellOutputChars: 100_000,
 		maxArtifactPreviewChars: 12_000,
 	},
@@ -212,7 +169,6 @@ const DEFAULTS: Omit<RiemannConfig, "files"> = {
 	compaction: { strategy: "default" },
 	mainAgent: { permissions: "host" },
 	agentDefaults: { workspace: "shared", permissions: "workspace" },
-	modelRoles: {},
 	profiles: {},
 	mcpServers: {},
 	web: { searchBackend: "exa" },
@@ -220,13 +176,14 @@ const DEFAULTS: Omit<RiemannConfig, "files"> = {
 };
 
 function mergeConfig(base: RiemannConfig, next: RiemannConfigFile, path: string): RiemannConfig {
+	const maxAgents = next.agents?.maxAgents ?? base.maxAgents;
 	return {
-		limits: { ...base.limits, ...next.limits },
-		retention: { ...base.retention, ...next.retention },
+		...base,
+		maxAgents,
+		maxConcurrentAgents: Math.min(maxAgents, 4),
 		compaction: { ...base.compaction, ...next.compaction },
 		mainAgent: { ...base.mainAgent, ...next.agents?.main },
 		agentDefaults: { ...base.agentDefaults, ...next.agents?.defaults },
-		modelRoles: { ...base.modelRoles, ...next.models?.roles },
 		profiles: { ...base.profiles, ...next.agents?.profiles },
 		mcpServers: { ...base.mcpServers, ...next.mcp?.servers },
 		web: { ...base.web, ...next.web },
@@ -237,10 +194,10 @@ function mergeConfig(base: RiemannConfig, next: RiemannConfigFile, path: string)
 
 function configuredSettingPaths(config: RiemannConfigFile): Set<RiemannSettingPath> {
 	const paths = new Set<RiemannSettingPath>();
-	for (const key of Object.keys(config.limits ?? {})) paths.add(`limits.${key}` as RiemannSettingPath);
-	for (const key of Object.keys(config.retention ?? {})) paths.add(`retention.${key}` as RiemannSettingPath);
+	if (config.agents?.maxAgents !== undefined) paths.add("agents.maxAgents");
 	if (config.compaction?.strategy !== undefined) paths.add("compaction.strategy");
 	if (config.agents?.main?.permissions !== undefined) paths.add("agents.main.permissions");
+	if (config.agents?.defaults?.model !== undefined) paths.add("agents.defaults.model");
 	if (config.agents?.defaults?.workspace !== undefined) paths.add("agents.defaults.workspace");
 	if (config.agents?.defaults?.permissions !== undefined) paths.add("agents.defaults.permissions");
 	for (const [name, server] of Object.entries(config.mcp?.servers ?? {})) {
@@ -295,12 +252,19 @@ export async function loadRiemannConfig(options: {
 	const globalPath = join(options.agentDir, "config.yaml");
 	const globalConfig = await parseConfigFile(globalPath);
 	if (globalConfig) config = mergeConfig(config, globalConfig, globalPath);
+	const globalMaxAgents = config.maxAgents;
 	if (options.projectTrusted) {
 		const projectPath = join(options.cwd, ".riemann", "config.yaml");
 		const projectConfig = await parseConfigFile(projectPath);
 		if (projectConfig) {
 			config = mergeConfig(config, projectConfig, projectPath);
-			config.projectOverrides = configuredSettingPaths(projectConfig);
+			config.maxAgents = Math.min(globalMaxAgents, projectConfig.agents?.maxAgents ?? globalMaxAgents);
+			config.maxConcurrentAgents = Math.min(config.maxAgents, 4);
+			const projectOverrides = configuredSettingPaths(projectConfig);
+			if ((projectConfig.agents?.maxAgents ?? globalMaxAgents) >= globalMaxAgents) {
+				projectOverrides.delete("agents.maxAgents");
+			}
+			config.projectOverrides = projectOverrides;
 		}
 	}
 	return config;
@@ -345,7 +309,8 @@ function setNestedValue(target: Record<string, unknown>, path: readonly string[]
 	}
 	const key = path.at(-1);
 	if (!key) throw new Error("Riemann setting path must not be empty");
-	current[key] = value;
+	if (value === undefined) delete current[key];
+	else current[key] = value;
 }
 
 export async function updateGlobalRiemannSetting(

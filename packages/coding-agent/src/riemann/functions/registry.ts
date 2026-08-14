@@ -20,6 +20,8 @@ export interface FunctionDefinition {
 	capability?: string;
 	promptSnippet?: string;
 	includeInSystemPrompt?: boolean;
+	/** Install a Python namespace proxy. Internal handle methods set this false. */
+	installInPythonNamespace?: boolean;
 	promptGuidelines?: readonly string[];
 	handler: (
 		args: Record<string, JsonValue>,
@@ -69,7 +71,7 @@ function promptInventoryLine(definition: FunctionDefinition): string {
 		.map((parameter) => (parameter.required ? parameter.name : `${parameter.name}=None`))
 		.join(", ");
 	const description = (definition.promptSnippet ?? definition.description).replace(/\s+/g, " ").trim();
-	return `- \`${qualifiedName}(${parameters}) -> ${definition.returns}\`: ${description}`;
+	return `- \`await ${qualifiedName}(${parameters}) -> ${definition.returns}\`: ${description}`;
 }
 
 export class FunctionRegistry {
@@ -117,6 +119,7 @@ export class FunctionRegistry {
 
 	pythonSpecifications(namespace?: string, capabilities?: ReadonlySet<string>): PythonFunctionSpecification[] {
 		return this.list(capabilities)
+			.filter((definition) => definition.installInPythonNamespace !== false)
 			.filter((definition) => namespace === undefined || definition.namespace === namespace)
 			.map((definition) => ({
 				name: definition.name,
@@ -130,6 +133,7 @@ export class FunctionRegistry {
 	search(query: string, limit = 8, capabilities?: ReadonlySet<string>): JsonValue {
 		const terms = words(query);
 		return this.list(capabilities)
+			.filter((definition) => definition.installInPythonNamespace !== false)
 			.map((definition) => {
 				const qualifiedName = `${definition.namespace}.${definition.name}`;
 				const haystack = words(
@@ -154,7 +158,12 @@ export class FunctionRegistry {
 
 	describe(name: string, capabilities?: ReadonlySet<string>): JsonValue {
 		const definition = this.definitions.get(name);
-		if (!definition || !isFunctionAvailable(definition, capabilities)) throw new Error(`Function not found: ${name}`);
+		if (
+			!definition ||
+			definition.installInPythonNamespace === false ||
+			!isFunctionAvailable(definition, capabilities)
+		)
+			throw new Error(`Function not found: ${name}`);
 		return {
 			name,
 			description: definition.description,

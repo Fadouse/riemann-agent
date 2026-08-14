@@ -161,6 +161,20 @@ This routing remains configurable through the ordinary action bindings. For exam
 | `app.message.followUp` | `alt+enter` | Queue follow-up message |
 | `app.message.dequeue` | `alt+up` | Restore queued messages to editor |
 
+### Agent Hub and Viewer
+
+| Keybinding id | Default | Description |
+|--------|---------|-------------|
+| `app.agents.close` | `q` | Close the Agent Hub or viewer |
+| `app.agents.previous` | `k` | Select the previous Agent |
+| `app.agents.next` | `j` | Select the next Agent |
+| `app.agents.message` | `enter`, `m` | Open the selected Agent or compose a message |
+| `app.agents.stop` | `x` | Arm or confirm stopping the selected Agent turn |
+| `app.agents.release` | `r` | Arm or confirm releasing the selected settled slot |
+| `app.agents.toggleThinking` | `ctrl+t` | Collapse or expand Agent thinking |
+| `app.agents.home` | `home` | Scroll the Agent transcript to the start |
+| `app.agents.end` | `end` | Scroll the Agent transcript to the end |
+
 ### Tree Navigation
 
 | Keybinding id | Default | Description |

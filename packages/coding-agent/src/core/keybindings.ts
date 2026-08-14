@@ -53,6 +53,15 @@ export interface AppKeybindings {
 	"app.tree.filter.all": true;
 	"app.tree.filter.cycleForward": true;
 	"app.tree.filter.cycleBackward": true;
+	"app.agents.close": true;
+	"app.agents.previous": true;
+	"app.agents.next": true;
+	"app.agents.message": true;
+	"app.agents.stop": true;
+	"app.agents.release": true;
+	"app.agents.toggleThinking": true;
+	"app.agents.home": true;
+	"app.agents.end": true;
 }
 
 export type AppKeybinding = keyof AppKeybindings;
@@ -204,6 +213,15 @@ export const KEYBINDINGS = {
 		defaultKeys: "shift+ctrl+o",
 		description: "Tree filter: cycle backward",
 	},
+	"app.agents.close": { defaultKeys: "q", description: "Close Agents Hub or viewer" },
+	"app.agents.previous": { defaultKeys: "k", description: "Select previous Agent" },
+	"app.agents.next": { defaultKeys: "j", description: "Select next Agent" },
+	"app.agents.message": { defaultKeys: ["enter", "m"], description: "Message selected Agent" },
+	"app.agents.stop": { defaultKeys: "x", description: "Stop selected Agent turn" },
+	"app.agents.release": { defaultKeys: "r", description: "Release selected Agent slot" },
+	"app.agents.toggleThinking": { defaultKeys: "ctrl+t", description: "Toggle Agent thinking blocks" },
+	"app.agents.home": { defaultKeys: "home", description: "Scroll Agent transcript to start" },
+	"app.agents.end": { defaultKeys: "end", description: "Scroll Agent transcript to end" },
 } as const satisfies KeybindingDefinitions;
 
 const KEYBINDING_NAME_MIGRATIONS = {

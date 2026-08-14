@@ -106,7 +106,7 @@ describe("Riemann IPython transcript", () => {
 	});
 	test("shows the configured interrupt key while a cell is running", () => {
 		const component = new IPythonCellComponent({
-			code: "await agents.wait(agent_id='worker')",
+			code: "await asyncio.sleep(60)",
 			details: { status: "running" },
 			isPartial: true,
 			executionStarted: true,
@@ -116,7 +116,7 @@ describe("Riemann IPython transcript", () => {
 		expect(stripAnsi(component.render(100).join("\n"))).toContain("escape to interrupt");
 
 		component.update({
-			code: "await agents.wait(agent_id='worker')",
+			code: "await asyncio.sleep(60)",
 			details: { status: "aborted" },
 			isPartial: false,
 			executionStarted: true,

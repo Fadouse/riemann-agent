@@ -1,4 +1,4 @@
-import { type Component, type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, setKeybindings, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import type {
 	ExtensionCommandContext,
@@ -6,7 +6,7 @@ import type {
 	ExtensionWidgetOptions,
 } from "../src/core/extensions/types.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
-import { renderAgentMessage, renderSubagentFleet } from "../src/extensions/riemann/subagent-display.ts";
+import { renderSubagentFleet } from "../src/extensions/riemann/subagent-display.ts";
 import { installSubagentUi, showSubagentsHub } from "../src/extensions/riemann/subagent-ui.ts";
 import { SubagentConversationViewer } from "../src/extensions/riemann/subagent-view.ts";
 import { initTheme, type Theme, theme } from "../src/modes/interactive/theme/theme.ts";
@@ -18,9 +18,11 @@ function snapshot(overrides: Partial<SubagentUiSnapshot> = {}): SubagentUiSnapsh
 	return {
 		id: "agent-1",
 		name: "reviewer",
+		turnId: "turn-1",
 		status: "running",
 		task: "Review parser changes",
 		modelRole: "reviewer",
+		model: "openai/gpt-test",
 		workspace: "/workspace",
 		createdAt: "2026-08-13T12:00:00.000Z",
 		updatedAt: "2026-08-13T12:00:00.000Z",
@@ -35,7 +37,10 @@ function snapshot(overrides: Partial<SubagentUiSnapshot> = {}): SubagentUiSnapsh
 }
 
 describe("Riemann Subagent UI", () => {
-	beforeAll(() => initTheme("dark"));
+	beforeAll(() => {
+		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
+	});
 
 	test("renders the reference Fleet below the editor with bounded agent rows", () => {
 		const agents = Array.from({ length: 7 }, (_, index) =>
@@ -43,7 +48,7 @@ describe("Riemann Subagent UI", () => {
 		);
 		const lines = renderSubagentFleet(agents, theme, Date.parse("2026-08-13T12:00:12.000Z"), 80, 7, true);
 		const rendered = stripAnsi(lines.join("\n"));
-		expect(rendered).toContain("↑↓ select · enter view · esc back");
+		expect(rendered).toContain("select");
 		expect(rendered).toContain("○ main");
 		expect(rendered).toContain("● worker-6");
 		expect(rendered).toContain("↑ 2 more");
@@ -52,24 +57,62 @@ describe("Riemann Subagent UI", () => {
 		expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
 	});
 
-	test("renders child messages while keeping thinking collapsed by default", () => {
-		const message = {
-			role: "assistant",
-			content: [
-				{ type: "thinking", thinking: "private analysis" },
-				{ type: "text", text: "Found two concrete defects." },
-				{ type: "toolCall", name: "ipython" },
-			],
-		};
-		const collapsed = stripAnsi(renderAgentMessage(message, 80, true, theme).join("\n"));
-		expect(collapsed).toContain("[Assistant]");
+	test("renders child transcripts with the standard assistant and tool components", () => {
+		const messages = [
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "**Reviewing parser**\nprivate analysis" },
+					{ type: "text", text: "Found two concrete defects." },
+					{ type: "toolCall", id: "tool-1", name: "ipython", arguments: { code: "print('ok')" } },
+				],
+				api: "openai-responses",
+				provider: "openai",
+				model: "gpt-test",
+				usage: {
+					input: 10,
+					output: 20,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 30,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			},
+			{
+				role: "toolResult",
+				toolCallId: "tool-1",
+				toolName: "ipython",
+				content: [{ type: "text", text: "ok" }],
+				details: { status: "ok", durationMs: 5 },
+				isError: false,
+				timestamp: Date.now(),
+			},
+		];
+		const runtime = {
+			listSubagentsForUi: () => [snapshot({ messages })],
+			subscribeSubagentUi: () => () => undefined,
+		} as unknown as RiemannRuntime;
+		const viewer = new SubagentConversationViewer({
+			context: { mode: "tui", ui: { notify: () => undefined } } as unknown as ExtensionContext,
+			runtime,
+			agentId: "agent-1",
+			tui: { terminal: { rows: 40 }, requestRender: () => undefined } as unknown as TUI,
+			theme,
+			keybindings: new KeybindingsManager(),
+			done: () => undefined,
+		});
+		const collapsed = stripAnsi(viewer.render(100).join("\n"));
 		expect(collapsed).toContain("Found two concrete defects.");
-		expect(collapsed).toContain("[Tool: ipython]");
+		expect(collapsed).toContain("python");
+		expect(collapsed).toContain("print('ok')");
+		expect(collapsed).not.toContain("[Assistant]");
 		expect(collapsed).not.toContain("private analysis");
 
-		const expanded = stripAnsi(renderAgentMessage(message, 80, false, theme).join("\n"));
-		expect(expanded).toContain("[Thinking]");
-		expect(expanded).toContain("private analysis");
+		viewer.handleInput("\x14");
+		expect(stripAnsi(viewer.render(100).join("\n"))).toContain("private analysis");
+		viewer.dispose();
 	});
 
 	test("lingers settled Agents briefly, then removes the bottom Fleet while preserving active footer state", async () => {
@@ -116,9 +159,9 @@ describe("Riemann Subagent UI", () => {
 
 			agents = [
 				snapshot({
-					status: "completed",
+					status: "idle",
+					lastOutcome: "ok",
 					result: "Completed review",
-					live: false,
 					updatedAt: new Date().toISOString(),
 				}),
 			];
@@ -139,19 +182,57 @@ describe("Riemann Subagent UI", () => {
 		expect(listener).toBeUndefined();
 	});
 
-	test("shows settled agents in the Hub and closes without interrupting the active cell", async () => {
+	test("shows terminal completion notices that link to the durable Hub", () => {
+		const notices: Array<{ message: string; level: string | undefined }> = [];
+		const runtime = {
+			listSubagentsForUi: () => [],
+			subscribeSubagentUi: () => () => undefined,
+		} as unknown as RiemannRuntime;
+		const context = {
+			mode: "tui",
+			ui: {
+				setWidget: () => undefined,
+				setStatus: () => undefined,
+				onTerminalInput: () => () => undefined,
+				getEditorText: () => "",
+				notify: (message: string, level?: string) => notices.push({ message, level }),
+			},
+		} as unknown as ExtensionContext;
+		const controller = installSubagentUi(runtime, context);
+		controller.notifyAgentEvents([
+			{
+				id: "event-1",
+				agentId: "agent-1",
+				name: "reviewer",
+				turnId: "turn-1",
+				outcome: "ok",
+			},
+		]);
+		expect(notices).toEqual([
+			{ message: "Agent reviewer (agent-1) completed turn turn-1: ok · /agents to inspect", level: "info" },
+		]);
+		controller.dispose();
+	});
+
+	test("requires confirmation to release a settled Hub slot and closes without interrupting the active cell", async () => {
 		const agents = [
 			snapshot({
-				status: "completed",
+				status: "idle",
+				lastOutcome: "ok",
 				result: "Repository structure report",
 				live: false,
 			}),
 		];
+		let releases = 0;
 		const runtime = {
 			listSubagentsForUi: () => agents,
 			subscribeSubagentUi: () => () => undefined,
+			releaseSubagentFromUi: async () => {
+				releases += 1;
+			},
 		} as unknown as RiemannRuntime;
 		let rendered = "";
+		let armed = "";
 		let aborts = 0;
 		let closes = 0;
 		const context = {
@@ -181,6 +262,12 @@ describe("Riemann Subagent UI", () => {
 						rendered = stripAnsi(component.render(80).join("\n"));
 						component.handleInput?.("\x1b[27;1:2u");
 						if (closes !== 0) throw new Error("Key repeat closed the Agents Hub");
+						component.handleInput?.("r");
+						component.handleInput?.("\x1b[114;1:2u");
+						if (releases !== 0) throw new Error("Key repeat released the Agent");
+						armed = stripAnsi(component.render(80).join("\n"));
+						if (releases !== 0) throw new Error("First release key press released the Agent");
+						component.handleInput?.("r");
 						component.handleInput?.("\x1b");
 						(component as Component & { dispose?: () => void }).dispose?.();
 					}),
@@ -192,6 +279,8 @@ describe("Riemann Subagent UI", () => {
 		expect(rendered).toContain("0 active · 1 total");
 		expect(rendered).toContain("reviewer");
 		expect(rendered).not.toContain("x stop");
+		expect(armed).toContain("again to RELEASE SLOT");
+		expect(releases).toBe(1);
 		expect(aborts).toBe(0);
 		expect(closes).toBe(1);
 	});

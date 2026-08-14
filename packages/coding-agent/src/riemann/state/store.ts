@@ -3,7 +3,11 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync, type RiemannDatabase } from "./database.ts";
 
-export type AgentStatus = "queued" | "running" | "idle" | "parked" | "completed" | "failed" | "stopped";
+export type AgentStatus = "queued" | "running" | "idle" | "stopped";
+export type AgentOutcome = "ok" | "error" | "cancelled";
+export type AgentTurnStatus = "queued" | "running" | "settled";
+export type AgentDeliveryMode = "notify" | "return";
+export type AgentDeliveryMethod = "wait" | "notify" | "return";
 
 export interface StoredRun {
 	id: string;
@@ -27,8 +31,14 @@ export interface StoredAgent {
 	permissions: "host" | "workspace";
 	depth: number;
 	capabilities: string[];
+	activeTurnId: string | null;
+	lastTurnId: string | null;
 	result: string | null;
 	error: string | null;
+	lastOutcome: AgentOutcome | null;
+	transcriptHandle: string | null;
+	patchHandle: string | null;
+	releasedAt: string | null;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -55,6 +65,84 @@ export interface StoredArtifact {
 	createdAt: string;
 }
 
+export interface AgentEventPayload {
+	agentId: string;
+	name: string;
+	turnId: string;
+	outcome: AgentOutcome;
+}
+
+export interface StoredAgentEvent {
+	id: string;
+	runId: string;
+	recipientId: string;
+	payload: AgentEventPayload;
+	createdAt: string;
+	deliveredAt: string | null;
+}
+export interface StoredAgentTurn {
+	id: string;
+	runId: string;
+	agentId: string;
+	task: string;
+	status: AgentTurnStatus;
+	deliveryMode: AgentDeliveryMode;
+	deliveredVia: AgentDeliveryMethod | null;
+	outcome: AgentOutcome | null;
+	result: string | null;
+	error: string | null;
+	transcriptHandle: string | null;
+	patchHandle: string | null;
+	createdAt: string;
+	startedAt: string | null;
+	completedAt: string | null;
+	deliveredAt: string | null;
+	updatedAt: string;
+}
+
+export interface AgentCreateInput {
+	runId: string;
+	parentId: string | null;
+	name: string;
+	status: AgentStatus;
+	prompt: string;
+	modelRole: string;
+	workspace: string;
+	workspaceMode: "shared" | "worktree";
+	permissions: "host" | "workspace";
+	depth: number;
+	capabilities: string[];
+}
+export interface AgentTurnCreateInput {
+	agentId: string;
+	task: string;
+	prompt: string;
+	deliveryMode: AgentDeliveryMode;
+}
+
+export interface AgentTurnSettlementInput {
+	agentId: string;
+	turnId: string;
+	outcome: AgentOutcome;
+	result: string;
+	error: string | null;
+	transcriptHandle: string;
+	patchHandle: string | null;
+	delivery: AgentDeliveryMethod | "notify";
+	event?: {
+		recipientId: string;
+		payload: AgentEventPayload;
+	};
+}
+
+export interface AgentTurnSettlement {
+	agent: StoredAgent;
+	turn: StoredAgentTurn;
+	event?: StoredAgentEvent;
+}
+
+export type AgentSlotReservation = { ok: true; agent: StoredAgent } | { ok: false; reason: "limit" | "name" };
+
 interface RunRow {
 	id: string;
 	session_id: string;
@@ -77,9 +165,34 @@ interface AgentRow {
 	permissions: "host" | "workspace";
 	depth: number;
 	capabilities_json: string;
+	active_turn_id: string | null;
+	last_turn_id: string | null;
 	result: string | null;
 	error: string | null;
+	last_outcome: AgentOutcome | null;
+	transcript_handle: string | null;
+	patch_handle: string | null;
+	released_at: string | null;
 	created_at: string;
+	updated_at: string;
+}
+interface AgentTurnRow {
+	id: string;
+	run_id: string;
+	agent_id: string;
+	task: string;
+	status: AgentTurnStatus;
+	delivery_mode: AgentDeliveryMode;
+	delivered_via: AgentDeliveryMethod | null;
+	outcome: AgentOutcome | null;
+	result: string | null;
+	error: string | null;
+	transcript_handle: string | null;
+	patch_handle: string | null;
+	created_at: string;
+	started_at: string | null;
+	completed_at: string | null;
+	delivered_at: string | null;
 	updated_at: string;
 }
 
@@ -105,6 +218,16 @@ interface ArtifactRow {
 	created_at: string;
 }
 
+interface AgentEventRow {
+	id: string;
+	run_id: string;
+	recipient_id: string;
+	turn_id: string | null;
+	payload_json: string;
+	created_at: string;
+	delivered_at: string | null;
+}
+
 function now(): string {
 	return new Date().toISOString();
 }
@@ -112,6 +235,28 @@ function now(): string {
 function parseStringArray(value: string): string[] {
 	const parsed: unknown = JSON.parse(value);
 	return Array.isArray(parsed) && parsed.every((item) => typeof item === "string") ? parsed : [];
+}
+
+function parseAgentEventPayload(value: string): AgentEventPayload {
+	const parsed: unknown = JSON.parse(value);
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error("Stored Agent event payload is not an object");
+	}
+	const record = parsed as Record<string, unknown>;
+	if (
+		typeof record.agentId !== "string" ||
+		typeof record.turnId !== "string" ||
+		typeof record.name !== "string" ||
+		(record.outcome !== "ok" && record.outcome !== "error" && record.outcome !== "cancelled")
+	) {
+		throw new Error("Stored Agent event payload is invalid");
+	}
+	return {
+		agentId: record.agentId,
+		name: record.name,
+		turnId: record.turnId,
+		outcome: record.outcome,
+	};
 }
 
 function runFromRow(row: RunRow): StoredRun {
@@ -139,9 +284,36 @@ function agentFromRow(row: AgentRow): StoredAgent {
 		permissions: row.permissions,
 		depth: row.depth,
 		capabilities: parseStringArray(row.capabilities_json),
+		activeTurnId: row.active_turn_id,
+		lastTurnId: row.last_turn_id,
 		result: row.result,
 		error: row.error,
+		lastOutcome: row.last_outcome,
+		transcriptHandle: row.transcript_handle,
+		patchHandle: row.patch_handle,
+		releasedAt: row.released_at,
 		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
+}
+function agentTurnFromRow(row: AgentTurnRow): StoredAgentTurn {
+	return {
+		id: row.id,
+		runId: row.run_id,
+		agentId: row.agent_id,
+		task: row.task,
+		status: row.status,
+		deliveryMode: row.delivery_mode,
+		deliveredVia: row.delivered_via,
+		outcome: row.outcome,
+		result: row.result,
+		error: row.error,
+		transcriptHandle: row.transcript_handle,
+		patchHandle: row.patch_handle,
+		createdAt: row.created_at,
+		startedAt: row.started_at,
+		completedAt: row.completed_at,
+		deliveredAt: row.delivered_at,
 		updatedAt: row.updated_at,
 	};
 }
@@ -169,6 +341,17 @@ function artifactFromRow(row: ArtifactRow): StoredArtifact {
 		name: row.name,
 		path: row.path,
 		createdAt: row.created_at,
+	};
+}
+
+function agentEventFromRow(row: AgentEventRow): StoredAgentEvent {
+	return {
+		id: row.id,
+		runId: row.run_id,
+		recipientId: row.recipient_id,
+		payload: parseAgentEventPayload(row.payload_json),
+		createdAt: row.created_at,
+		deliveredAt: row.delivered_at,
 	};
 }
 
@@ -216,13 +399,40 @@ export class RiemannStore {
 				permissions TEXT NOT NULL DEFAULT 'workspace',
 				depth INTEGER NOT NULL,
 				capabilities_json TEXT NOT NULL,
+				active_turn_id TEXT,
+				last_turn_id TEXT,
 				result TEXT,
 				error TEXT,
+				last_outcome TEXT CHECK(last_outcome IN ('ok','error','cancelled')),
+				transcript_handle TEXT,
+				patch_handle TEXT,
+				released_at TEXT,
 				created_at TEXT NOT NULL,
 				updated_at TEXT NOT NULL,
 				UNIQUE(run_id, name)
 			);
 			CREATE INDEX IF NOT EXISTS agents_run_status ON agents(run_id, status);
+			CREATE TABLE IF NOT EXISTS agent_turns (
+				id TEXT PRIMARY KEY,
+				run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+				agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+				task TEXT NOT NULL,
+				status TEXT NOT NULL CHECK(status IN ('queued','running','settled')),
+				delivery_mode TEXT NOT NULL CHECK(delivery_mode IN ('notify','return')),
+				delivered_via TEXT CHECK(delivered_via IN ('wait','notify','return')),
+				outcome TEXT CHECK(outcome IN ('ok','error','cancelled')),
+				result TEXT,
+				error TEXT,
+				transcript_handle TEXT,
+				patch_handle TEXT,
+				created_at TEXT NOT NULL,
+				started_at TEXT,
+				completed_at TEXT,
+				delivered_at TEXT,
+				updated_at TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS agent_turns_agent_created ON agent_turns(agent_id, created_at, id);
+			CREATE INDEX IF NOT EXISTS agent_turns_status ON agent_turns(run_id, status);
 			CREATE TABLE IF NOT EXISTS messages (
 				id TEXT PRIMARY KEY,
 				run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -234,6 +444,17 @@ export class RiemannStore {
 				delivered_at TEXT
 			);
 			CREATE INDEX IF NOT EXISTS messages_recipient_delivery ON messages(recipient_id, delivered_at, created_at);
+			CREATE TABLE IF NOT EXISTS agent_events (
+				id TEXT PRIMARY KEY,
+				run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+				recipient_id TEXT NOT NULL REFERENCES agents(id),
+				turn_id TEXT REFERENCES agent_turns(id),
+				payload_json TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				delivered_at TEXT
+			);
+			CREATE INDEX IF NOT EXISTS agent_events_recipient_delivery
+				ON agent_events(recipient_id, delivered_at, created_at);
 			CREATE TABLE IF NOT EXISTS artifacts (
 				handle TEXT PRIMARY KEY,
 				run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -262,6 +483,120 @@ export class RiemannStore {
 		}
 		if (!agentColumns.some((column) => column.name === "permissions")) {
 			this.db.exec("ALTER TABLE agents ADD COLUMN permissions TEXT NOT NULL DEFAULT 'workspace'");
+		}
+		if (!agentColumns.some((column) => column.name === "last_outcome")) {
+			this.db.exec("ALTER TABLE agents ADD COLUMN last_outcome TEXT");
+		}
+		if (!agentColumns.some((column) => column.name === "transcript_handle")) {
+			this.db.exec("ALTER TABLE agents ADD COLUMN transcript_handle TEXT");
+		}
+		if (!agentColumns.some((column) => column.name === "patch_handle")) {
+			this.db.exec("ALTER TABLE agents ADD COLUMN patch_handle TEXT");
+		}
+		if (!agentColumns.some((column) => column.name === "released_at")) {
+			this.db.exec("ALTER TABLE agents ADD COLUMN released_at TEXT");
+		}
+		if (!agentColumns.some((column) => column.name === "active_turn_id")) {
+			this.db.exec("ALTER TABLE agents ADD COLUMN active_turn_id TEXT");
+		}
+		if (!agentColumns.some((column) => column.name === "last_turn_id")) {
+			this.db.exec("ALTER TABLE agents ADD COLUMN last_turn_id TEXT");
+		}
+		const eventColumns = this.db.prepare("PRAGMA table_info(agent_events)").all() as Array<{ name: string }>;
+		if (!eventColumns.some((column) => column.name === "turn_id")) {
+			this.db.exec("ALTER TABLE agent_events ADD COLUMN turn_id TEXT");
+		}
+		this.db.exec(`
+			UPDATE agents
+			SET
+				last_outcome = CASE
+					WHEN status = 'completed' THEN COALESCE(last_outcome, 'ok')
+					WHEN status = 'failed' THEN COALESCE(last_outcome, 'error')
+					WHEN status = 'parked' THEN COALESCE(last_outcome, 'cancelled')
+					ELSE last_outcome
+				END,
+				status = CASE
+					WHEN status IN ('completed', 'failed') THEN 'idle'
+					WHEN status = 'parked' THEN 'stopped'
+					ELSE status
+				END;
+		`);
+		this.backfillAgentTurns();
+		this.db.exec("UPDATE schema_version SET version = 3");
+	}
+
+	private backfillAgentTurns(): void {
+		const agents = this.db.prepare("SELECT * FROM agents WHERE parent_id IS NOT NULL").all() as unknown as AgentRow[];
+		const events = this.db
+			.prepare("SELECT * FROM agent_events ORDER BY created_at, id")
+			.all() as unknown as AgentEventRow[];
+		const eventAgentIds = new Map<string, string>();
+		for (const event of events) {
+			const parsed: unknown = JSON.parse(event.payload_json);
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
+			const agentId = (parsed as Record<string, unknown>).agentId;
+			if (typeof agentId === "string") eventAgentIds.set(event.id, agentId);
+		}
+		const turnIds = new Map<string, string>();
+		const existingTurns = this.db
+			.prepare("SELECT agent_id, id FROM agent_turns ORDER BY created_at, id")
+			.all() as Array<{ agent_id: string; id: string }>;
+		for (const turn of existingTurns) turnIds.set(turn.agent_id, turn.id);
+
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const insertTurn = this.db.prepare(
+				"INSERT INTO agent_turns(id, run_id, agent_id, task, status, delivery_mode, delivered_via, outcome, result, error, transcript_handle, patch_handle, created_at, started_at, completed_at, delivered_at, updated_at) VALUES(?, ?, ?, ?, ?, 'notify', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			);
+			const updateAgent = this.db.prepare("UPDATE agents SET active_turn_id = ?, last_turn_id = ? WHERE id = ?");
+			for (const row of agents) {
+				let turnId = turnIds.get(row.id);
+				const active = row.status === "queued" || row.status === "running";
+				if (!turnId) {
+					turnId = randomUUID();
+					const pendingEvent = events.some(
+						(event) => eventAgentIds.get(event.id) === row.id && event.delivered_at === null,
+					);
+					const outcome: AgentOutcome | null = active
+						? null
+						: (row.last_outcome ?? (row.status === "stopped" ? "cancelled" : row.error ? "error" : "ok"));
+					const deliveredVia: AgentDeliveryMethod | null = active || pendingEvent ? null : "notify";
+					insertTurn.run(
+						turnId,
+						row.run_id,
+						row.id,
+						row.prompt,
+						active ? row.status : "settled",
+						deliveredVia,
+						outcome,
+						row.result,
+						row.error,
+						row.transcript_handle,
+						row.patch_handle,
+						row.created_at,
+						row.created_at,
+						active ? null : row.updated_at,
+						deliveredVia ? row.updated_at : null,
+						row.updated_at,
+					);
+					turnIds.set(row.id, turnId);
+				}
+				updateAgent.run(active ? turnId : null, turnId, row.id);
+			}
+
+			const updateEvent = this.db.prepare("UPDATE agent_events SET turn_id = ?, payload_json = ? WHERE id = ?");
+			for (const event of events) {
+				const agentId = eventAgentIds.get(event.id);
+				const turnId = agentId ? turnIds.get(agentId) : undefined;
+				if (!turnId) continue;
+				const parsed = JSON.parse(event.payload_json) as Record<string, unknown>;
+				parsed.turnId = turnId;
+				updateEvent.run(turnId, JSON.stringify(parsed), event.id);
+			}
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
 		}
 	}
 
@@ -318,31 +653,25 @@ export class RiemannStore {
 		});
 	}
 
-	createAgent(input: {
-		runId: string;
-		parentId: string | null;
-		name: string;
-		status: AgentStatus;
-		prompt: string;
-		modelRole: string;
-		workspace: string;
-		workspaceMode: "shared" | "worktree";
-		permissions: "host" | "workspace";
-		depth: number;
-		capabilities: string[];
-	}): StoredAgent {
+	createAgent(input: AgentCreateInput): StoredAgent {
 		const timestamp = now();
 		const agent: StoredAgent = {
 			id: randomUUID(),
 			...input,
+			activeTurnId: null,
+			lastTurnId: null,
 			result: null,
 			error: null,
+			lastOutcome: null,
+			transcriptHandle: null,
+			patchHandle: null,
+			releasedAt: null,
 			createdAt: timestamp,
 			updatedAt: timestamp,
 		};
 		this.db
 			.prepare(
-				"INSERT INTO agents(id, run_id, parent_id, name, status, prompt, model_role, workspace, workspace_mode, permissions, depth, capabilities_json, result, error, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+				"INSERT INTO agents(id, run_id, parent_id, name, status, prompt, model_role, workspace, workspace_mode, permissions, depth, capabilities_json, active_turn_id, last_turn_id, result, error, last_outcome, transcript_handle, patch_handle, released_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)",
 			)
 			.run(
 				agent.id,
@@ -363,22 +692,271 @@ export class RiemannStore {
 		return agent;
 	}
 
+	reserveAgentSlot(input: AgentCreateInput, maxAgents: number): AgentSlotReservation {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const existing = this.db
+				.prepare("SELECT * FROM agents WHERE run_id = ? AND name = ?")
+				.get(input.runId, input.name) as AgentRow | undefined;
+			if (existing && existing.released_at === null) {
+				this.db.exec("ROLLBACK");
+				return { ok: false, reason: "name" };
+			}
+			const count = this.db
+				.prepare(
+					"SELECT COUNT(*) AS count FROM agents WHERE run_id = ? AND parent_id IS NOT NULL AND released_at IS NULL",
+				)
+				.get(input.runId) as { count: number };
+			if (count.count >= maxAgents) {
+				this.db.exec("ROLLBACK");
+				return { ok: false, reason: "limit" };
+			}
+			if (existing) {
+				this.db
+					.prepare("UPDATE agents SET name = ?, updated_at = ? WHERE id = ?")
+					.run(`${existing.name}~released-${existing.id.slice(0, 8)}`, now(), existing.id);
+			}
+			const agent = this.createAgent(input);
+			this.db.exec("COMMIT");
+			return { ok: true, agent };
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+	}
+
 	getAgent(id: string): StoredAgent | undefined {
 		const row = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as AgentRow | undefined;
 		return row ? agentFromRow(row) : undefined;
 	}
 
-	listAgents(runId: string): StoredAgent[] {
-		const rows = this.db.prepare("SELECT * FROM agents WHERE run_id = ? ORDER BY created_at, id").all(runId);
+	listAgents(runId: string, options: { includeReleased?: boolean } = {}): StoredAgent[] {
+		const rows = (
+			options.includeReleased
+				? this.db.prepare("SELECT * FROM agents WHERE run_id = ? ORDER BY created_at, id")
+				: this.db.prepare("SELECT * FROM agents WHERE run_id = ? AND released_at IS NULL ORDER BY created_at, id")
+		).all(runId);
 		return rows.map((row) => agentFromRow(row as unknown as AgentRow));
+	}
+
+	getAgentTurn(id: string): StoredAgentTurn | undefined {
+		const row = this.db.prepare("SELECT * FROM agent_turns WHERE id = ?").get(id) as AgentTurnRow | undefined;
+		return row ? agentTurnFromRow(row) : undefined;
+	}
+
+	listAgentTurns(agentId: string): StoredAgentTurn[] {
+		const rows = this.db.prepare("SELECT * FROM agent_turns WHERE agent_id = ? ORDER BY created_at, id").all(agentId);
+		return rows.map((row) => agentTurnFromRow(row as unknown as AgentTurnRow));
+	}
+
+	startAgentTurn(input: AgentTurnCreateInput): { agent: StoredAgent; turn: StoredAgentTurn } {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const row = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(input.agentId) as AgentRow | undefined;
+			if (!row) throw new Error(`Agent not found: ${input.agentId}`);
+			if (row.released_at !== null) throw new Error(`Agent is released: ${row.name}`);
+			if (
+				row.active_turn_id !== null ||
+				(row.status !== "idle" && row.status !== "stopped" && row.last_turn_id !== null)
+			) {
+				throw new Error(`Agent already has an active Turn: ${row.name}`);
+			}
+			const timestamp = now();
+			const turn: StoredAgentTurn = {
+				id: randomUUID(),
+				runId: row.run_id,
+				agentId: row.id,
+				task: input.task,
+				status: "queued",
+				deliveryMode: input.deliveryMode,
+				deliveredVia: null,
+				outcome: null,
+				result: null,
+				error: null,
+				transcriptHandle: null,
+				patchHandle: null,
+				createdAt: timestamp,
+				startedAt: null,
+				completedAt: null,
+				deliveredAt: null,
+				updatedAt: timestamp,
+			};
+			this.db
+				.prepare(
+					"INSERT INTO agent_turns(id, run_id, agent_id, task, status, delivery_mode, delivered_via, outcome, result, error, transcript_handle, patch_handle, created_at, started_at, completed_at, delivered_at, updated_at) VALUES(?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?)",
+				)
+				.run(turn.id, turn.runId, turn.agentId, turn.task, turn.deliveryMode, turn.createdAt, turn.updatedAt);
+			this.db
+				.prepare(
+					"UPDATE agents SET status = 'queued', prompt = ?, active_turn_id = ?, last_turn_id = ?, result = NULL, error = NULL, last_outcome = NULL, transcript_handle = NULL, patch_handle = NULL, updated_at = ? WHERE id = ?",
+				)
+				.run(input.prompt, turn.id, turn.id, timestamp, row.id);
+			const agent = this.getAgent(row.id);
+			if (!agent) throw new Error(`Agent disappeared while starting a Turn: ${row.id}`);
+			this.db.exec("COMMIT");
+			return { agent, turn };
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+	}
+
+	markAgentTurnRunning(agentId: string, turnId: string): StoredAgentTurn {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const row = this.db.prepare("SELECT * FROM agent_turns WHERE id = ?").get(turnId) as AgentTurnRow | undefined;
+			if (!row || row.agent_id !== agentId) throw new Error(`Agent Turn not found: ${turnId}`);
+			if (row.status === "settled") throw new Error(`Agent Turn is already settled: ${turnId}`);
+			const agent = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
+			if (!agent || agent.active_turn_id !== turnId) throw new Error(`Agent Turn is no longer active: ${turnId}`);
+			const timestamp = now();
+			this.db
+				.prepare(
+					"UPDATE agent_turns SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?",
+				)
+				.run(timestamp, timestamp, turnId);
+			this.db.prepare("UPDATE agents SET status = 'running', updated_at = ? WHERE id = ?").run(timestamp, agentId);
+			const updated = this.getAgentTurn(turnId);
+			if (!updated) throw new Error(`Agent Turn disappeared while starting: ${turnId}`);
+			this.db.exec("COMMIT");
+			return updated;
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+	}
+
+	settleAgentTurn(input: AgentTurnSettlementInput): AgentTurnSettlement {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const row = this.db.prepare("SELECT * FROM agent_turns WHERE id = ?").get(input.turnId) as
+				| AgentTurnRow
+				| undefined;
+			if (!row || row.agent_id !== input.agentId) throw new Error(`Agent Turn not found: ${input.turnId}`);
+			const agentRow = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(input.agentId) as
+				| AgentRow
+				| undefined;
+			if (!agentRow) throw new Error(`Agent not found: ${input.agentId}`);
+			if (row.status === "settled") {
+				const existingEvent = this.db.prepare("SELECT * FROM agent_events WHERE turn_id = ?").get(input.turnId) as
+					| AgentEventRow
+					| undefined;
+				this.db.exec("COMMIT");
+				return {
+					agent: agentFromRow(agentRow),
+					turn: agentTurnFromRow(row),
+					...(existingEvent ? { event: agentEventFromRow(existingEvent) } : {}),
+				};
+			}
+			if (agentRow.active_turn_id !== input.turnId) {
+				throw new Error(`Agent Turn is no longer active: ${input.turnId}`);
+			}
+			const timestamp = now();
+			const deliveredVia = input.delivery === "notify" ? null : input.delivery;
+			this.db
+				.prepare(
+					"UPDATE agent_turns SET status = 'settled', delivered_via = ?, outcome = ?, result = ?, error = ?, transcript_handle = ?, patch_handle = ?, started_at = COALESCE(started_at, created_at), completed_at = ?, delivered_at = ?, updated_at = ? WHERE id = ?",
+				)
+				.run(
+					deliveredVia,
+					input.outcome,
+					input.result,
+					input.error,
+					input.transcriptHandle,
+					input.patchHandle,
+					timestamp,
+					deliveredVia ? timestamp : null,
+					timestamp,
+					input.turnId,
+				);
+			this.db
+				.prepare(
+					"UPDATE agents SET status = ?, active_turn_id = NULL, last_turn_id = ?, result = ?, error = ?, last_outcome = ?, transcript_handle = ?, patch_handle = ?, updated_at = ? WHERE id = ?",
+				)
+				.run(
+					input.outcome === "cancelled" ? "stopped" : "idle",
+					input.turnId,
+					input.result,
+					input.error,
+					input.outcome,
+					input.transcriptHandle,
+					input.patchHandle,
+					timestamp,
+					input.agentId,
+				);
+			let event: StoredAgentEvent | undefined;
+			if (input.delivery === "notify") {
+				if (!input.event || input.event.payload.turnId !== input.turnId) {
+					throw new Error(`Notify settlement requires a matching event payload: ${input.turnId}`);
+				}
+				event = {
+					id: randomUUID(),
+					runId: row.run_id,
+					recipientId: input.event.recipientId,
+					payload: input.event.payload,
+					createdAt: timestamp,
+					deliveredAt: null,
+				};
+				this.db
+					.prepare(
+						"INSERT INTO agent_events(id, run_id, recipient_id, turn_id, payload_json, created_at, delivered_at) VALUES(?, ?, ?, ?, ?, ?, NULL)",
+					)
+					.run(
+						event.id,
+						event.runId,
+						event.recipientId,
+						input.turnId,
+						JSON.stringify(event.payload),
+						event.createdAt,
+					);
+			}
+			const agent = this.getAgent(input.agentId);
+			const turn = this.getAgentTurn(input.turnId);
+			if (!agent || !turn) throw new Error(`Agent Turn disappeared while settling: ${input.turnId}`);
+			this.db.exec("COMMIT");
+			return { agent, turn, ...(event ? { event } : {}) };
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+	}
+
+	claimAgentTurnForWait(agentId: string, turnId: string): StoredAgentTurn {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const row = this.db.prepare("SELECT * FROM agent_turns WHERE id = ?").get(turnId) as AgentTurnRow | undefined;
+			if (!row || row.agent_id !== agentId) throw new Error(`Agent Turn not found: ${turnId}`);
+			if (row.status === "settled" && row.delivered_via === null) {
+				const timestamp = now();
+				this.db
+					.prepare("UPDATE agent_events SET delivered_at = ? WHERE turn_id = ? AND delivered_at IS NULL")
+					.run(timestamp, turnId);
+				this.db
+					.prepare(
+						"UPDATE agent_turns SET delivered_via = 'wait', delivered_at = ?, updated_at = ? WHERE id = ? AND delivered_via IS NULL",
+					)
+					.run(timestamp, timestamp, turnId);
+			}
+			const turn = this.getAgentTurn(turnId);
+			if (!turn) throw new Error(`Agent Turn disappeared while claiming: ${turnId}`);
+			this.db.exec("COMMIT");
+			return turn;
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
 	}
 
 	updateAgent(
 		id: string,
 		patch: {
 			status?: AgentStatus;
+			prompt?: string;
 			result?: string | null;
 			error?: string | null;
+			lastOutcome?: AgentOutcome | null;
+			transcriptHandle?: string | null;
+			patchHandle?: string | null;
 			workspace?: string;
 			permissions?: "host" | "workspace";
 		},
@@ -386,25 +964,74 @@ export class RiemannStore {
 		const current = this.getAgent(id);
 		if (!current) throw new Error(`Agent not found: ${id}`);
 		const status = patch.status ?? current.status;
+		const prompt = patch.prompt ?? current.prompt;
 		const result = patch.result === undefined ? current.result : patch.result;
 		const error = patch.error === undefined ? current.error : patch.error;
+		const lastOutcome = patch.lastOutcome === undefined ? current.lastOutcome : patch.lastOutcome;
+		const transcriptHandle = patch.transcriptHandle === undefined ? current.transcriptHandle : patch.transcriptHandle;
+		const patchHandle = patch.patchHandle === undefined ? current.patchHandle : patch.patchHandle;
 		const workspace = patch.workspace ?? current.workspace;
 		const permissions = patch.permissions ?? current.permissions;
 		const updatedAt = now();
 		this.db
 			.prepare(
-				"UPDATE agents SET status = ?, result = ?, error = ?, workspace = ?, permissions = ?, updated_at = ? WHERE id = ?",
+				"UPDATE agents SET status = ?, prompt = ?, result = ?, error = ?, last_outcome = ?, transcript_handle = ?, patch_handle = ?, workspace = ?, permissions = ?, updated_at = ? WHERE id = ?",
 			)
-			.run(status, result, error, workspace, permissions, updatedAt, id);
-		return { ...current, status, result, error, workspace, permissions, updatedAt };
+			.run(
+				status,
+				prompt,
+				result,
+				error,
+				lastOutcome,
+				transcriptHandle,
+				patchHandle,
+				workspace,
+				permissions,
+				updatedAt,
+				id,
+			);
+		return {
+			...current,
+			status,
+			prompt,
+			result,
+			error,
+			lastOutcome,
+			transcriptHandle,
+			patchHandle,
+			workspace,
+			permissions,
+			updatedAt,
+		};
+	}
+
+	releaseAgent(id: string): StoredAgent {
+		const current = this.getAgent(id);
+		if (!current) throw new Error(`Agent not found: ${id}`);
+		const releasedAt = now();
+		this.db.prepare("UPDATE agents SET released_at = ?, updated_at = ? WHERE id = ?").run(releasedAt, releasedAt, id);
+		return { ...current, releasedAt, updatedAt: releasedAt };
 	}
 
 	markInterruptedAgents(runId: string): void {
-		this.db
-			.prepare(
-				"UPDATE agents SET status = 'parked', error = COALESCE(error, 'host process interrupted'), updated_at = ? WHERE run_id = ? AND status IN ('queued','running','idle') AND parent_id IS NOT NULL",
-			)
-			.run(now(), runId);
+		const timestamp = now();
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			this.db
+				.prepare(
+					"UPDATE agent_turns SET status = 'settled', delivered_via = COALESCE(delivered_via, 'return'), outcome = 'cancelled', error = COALESCE(error, 'host process interrupted'), completed_at = COALESCE(completed_at, ?), delivered_at = COALESCE(delivered_at, ?), updated_at = ? WHERE run_id = ? AND status IN ('queued','running')",
+				)
+				.run(timestamp, timestamp, timestamp, runId);
+			this.db
+				.prepare(
+					"UPDATE agents SET status = 'stopped', active_turn_id = NULL, last_outcome = 'cancelled', error = COALESCE(error, 'host process interrupted'), updated_at = ? WHERE run_id = ? AND status IN ('queued','running') AND parent_id IS NOT NULL",
+				)
+				.run(timestamp, runId);
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
 	}
 
 	sendMessage(input: {
@@ -464,6 +1091,68 @@ export class RiemannStore {
 			return messages.map((message) => ({ ...message, deliveredAt: message.deliveredAt ?? deliveredAt }));
 		}
 		return messages;
+	}
+
+	markMessageDelivered(id: string): void {
+		this.db.prepare("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL").run(now(), id);
+	}
+
+	enqueueAgentEvent(input: { runId: string; recipientId: string; payload: AgentEventPayload }): StoredAgentEvent {
+		const event: StoredAgentEvent = {
+			id: randomUUID(),
+			runId: input.runId,
+			recipientId: input.recipientId,
+			payload: input.payload,
+			createdAt: now(),
+			deliveredAt: null,
+		};
+		this.db
+			.prepare(
+				"INSERT INTO agent_events(id, run_id, recipient_id, turn_id, payload_json, created_at, delivered_at) VALUES(?, ?, ?, ?, ?, ?, NULL)",
+			)
+			.run(
+				event.id,
+				event.runId,
+				event.recipientId,
+				event.payload.turnId,
+				JSON.stringify(event.payload),
+				event.createdAt,
+			);
+		return event;
+	}
+
+	listPendingAgentEvents(recipientId: string): StoredAgentEvent[] {
+		const rows = this.db
+			.prepare("SELECT * FROM agent_events WHERE recipient_id = ? AND delivered_at IS NULL ORDER BY created_at, id")
+			.all(recipientId);
+		return rows.map((row) => agentEventFromRow(row as unknown as AgentEventRow));
+	}
+
+	markAgentEventsDelivered(ids: readonly string[]): void {
+		if (ids.length === 0) return;
+		const deliveredAt = now();
+		const eventStatement = this.db.prepare(
+			"UPDATE agent_events SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL",
+		);
+		const turnStatement = this.db.prepare(
+			"UPDATE agent_turns SET delivered_via = 'notify', delivered_at = ?, updated_at = ? WHERE id = ? AND delivered_via IS NULL",
+		);
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			for (const id of ids) {
+				const event = this.db.prepare("SELECT turn_id FROM agent_events WHERE id = ?").get(id) as
+					| { turn_id: string | null }
+					| undefined;
+				const updated = eventStatement.run(deliveredAt, id);
+				if (updated.changes > 0 && event?.turn_id) {
+					turnStatement.run(deliveredAt, deliveredAt, event.turn_id);
+				}
+			}
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
 	}
 
 	putFileCapability(input: { runId: string; token: string; path: string; contentHash: string }): void {

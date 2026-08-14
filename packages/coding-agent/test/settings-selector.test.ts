@@ -24,11 +24,9 @@ describe("SettingsSelectorComponent", () => {
 			availableThinkingLevels: [],
 			availableThemes: [],
 			riemann: {
+				maxAgents: 8,
+				maxConcurrentAgents: 4,
 				limits: {
-					maxAgentsPerRun: 8,
-					maxConcurrentPerRun: 4,
-					maxConcurrentPerModel: 2,
-					maxDepth: 3,
 					maxCellOutputChars: 100_000,
 					maxArtifactPreviewChars: 12_000,
 				},
@@ -41,7 +39,6 @@ describe("SettingsSelectorComponent", () => {
 				compaction: { strategy: "default" },
 				mainAgent: { permissions: "host" },
 				agentDefaults: { workspace: "shared", permissions: "workspace" },
-				modelRoles: {},
 				profiles: {},
 				mcpServers: {},
 				web: { searchBackend: "exa" },
@@ -102,12 +99,11 @@ describe("SettingsSelectorComponent", () => {
 			warnings: {},
 			availableThinkingLevels: [],
 			availableThemes: [],
+			availableAgentModels: ["openai/worker"],
 			riemann: {
+				maxAgents: 8,
+				maxConcurrentAgents: 4,
 				limits: {
-					maxAgentsPerRun: 8,
-					maxConcurrentPerRun: 4,
-					maxConcurrentPerModel: 2,
-					maxDepth: 3,
 					maxCellOutputChars: 100_000,
 					maxArtifactPreviewChars: 12_000,
 				},
@@ -120,7 +116,6 @@ describe("SettingsSelectorComponent", () => {
 				compaction: { strategy: "default" },
 				mainAgent: { permissions: "host" },
 				agentDefaults: { workspace: "shared", permissions: "workspace" },
-				modelRoles: {},
 				profiles: {},
 				mcpServers: {},
 				web: { searchBackend: "exa" },
@@ -134,19 +129,21 @@ describe("SettingsSelectorComponent", () => {
 		for (const label of ["Interface", "Interaction", "Model", "Context", "Agents", "MCP Servers"]) {
 			const rendered = selector.render(120).join("\n");
 			expect(rendered).toContain(`[ ${label} ]`);
+			if (label === "Context") {
+				expect(rendered).toContain("Compaction strategy");
+			}
 			if (label === "Agents") {
-				expect(rendered).toContain("Main Agent permissions");
-				expect(rendered).toContain("Subagent workspace");
-				expect(rendered).toContain("Subagent permissions");
-				expect(rendered).toContain("host");
+				expect(rendered).toContain("Agent slots");
+				expect(rendered).toContain("Default Agent model");
+				expect(rendered).not.toContain("Main Agent permissions");
+				expect(rendered).not.toContain("Subagent workspace");
+				expect(rendered).not.toContain("Subagent permissions");
 				selector.handleInput("\r");
-				await vi.waitFor(() =>
-					expect(onRiemannChange).toHaveBeenCalledWith("agents.main.permissions", "workspace"),
-				);
+				await vi.waitFor(() => expect(onRiemannChange).toHaveBeenCalledWith("agents.maxAgents", 16));
 				selector.handleInput("\x1b[B");
 				selector.handleInput("\r");
 				await vi.waitFor(() =>
-					expect(onRiemannChange).toHaveBeenCalledWith("agents.defaults.workspace", "worktree"),
+					expect(onRiemannChange).toHaveBeenCalledWith("agents.defaults.model", "openai/worker"),
 				);
 			}
 			selector.handleInput("\x1b[C");

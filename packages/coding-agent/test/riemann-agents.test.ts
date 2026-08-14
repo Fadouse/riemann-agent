@@ -1,17 +1,25 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { fauxAssistantMessage, fauxProvider, type Model } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test } from "vitest";
 import { execCommand } from "../src/core/exec.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
-import { AgentSupervisor, type ChildAgentSession, type ChildRiemannRuntime } from "../src/riemann/agents/supervisor.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import {
+	type AgentEventDelivery,
+	AgentSupervisor,
+	type ChildAgentSession,
+	type ChildRiemannRuntime,
+} from "../src/riemann/agents/supervisor.ts";
 import type { RiemannConfig } from "../src/riemann/config.ts";
 import type { FunctionDefinition } from "../src/riemann/functions/registry.ts";
 import { IPythonSchema } from "../src/riemann/ipython.ts";
 import type { JsonValue } from "../src/riemann/kernel/types.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
+import { DatabaseSync } from "../src/riemann/state/database.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
 
 const roots: string[] = [];
@@ -31,6 +39,14 @@ function functionByName(definitions: FunctionDefinition[], name: string): Functi
 	return definition;
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for Agent state");
+		await delay(5);
+	}
+}
+
 async function git(cwd: string, args: string[]): Promise<string> {
 	const result = await execCommand("git", ["-C", cwd, ...args], cwd, { timeout: 30_000 });
 	if (result.code !== 0) throw new Error(result.stderr);
@@ -41,18 +57,19 @@ class FakeChildSession implements ChildAgentSession {
 	readonly state: { messages: unknown[] } = { messages: [] };
 	isStreaming = true;
 	readonly steering: string[] = [];
+	readonly prompts: string[] = [];
+	private aborted = false;
 	private resolveCompletion!: () => void;
 	private readonly completion = new Promise<void>((resolve) => {
 		this.resolveCompletion = resolve;
 	});
 
-	async prompt(): Promise<void> {
+	async prompt(text: string): Promise<void> {
+		this.prompts.push(text);
+		this.state.messages.push({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
 		await this.completion;
 		this.isStreaming = false;
-		this.state.messages.push({
-			role: "assistant",
-			content: [{ type: "text", text: "child completed with evidence" }],
-		});
+		if (!this.aborted) this.state.messages.push(fauxAssistantMessage(`child completed: ${text}`));
 	}
 
 	async steer(text: string): Promise<void> {
@@ -60,6 +77,7 @@ class FakeChildSession implements ChildAgentSession {
 	}
 
 	async abort(): Promise<void> {
+		this.aborted = true;
 		this.resolveCompletion();
 	}
 
@@ -109,114 +127,168 @@ function fakeRuntime(close: () => Promise<void> = async () => undefined): ChildR
 }
 
 const config: RiemannConfig = {
+	maxAgents: 4,
+	maxConcurrentAgents: 4,
 	limits: {
-		maxAgentsPerRun: 8,
-		maxConcurrentPerRun: 4,
-		maxConcurrentPerModel: 2,
-		maxDepth: 3,
 		maxCellOutputChars: 100_000,
 		maxArtifactPreviewChars: 12_000,
 	},
-	retention: { maxAgeDays: 30, maxArtifactBytes: 1_000_000, maxSnapshotBytes: 1_000_000, maxWorktreeBytes: 1_000_000 },
+	retention: {
+		maxAgeDays: 30,
+		maxArtifactBytes: 1_000_000,
+		maxSnapshotBytes: 1_000_000,
+		maxWorktreeBytes: 1_000_000,
+	},
 	compaction: { strategy: "snapshot" },
 	mainAgent: { permissions: "host" },
 	agentDefaults: { workspace: "shared", permissions: "workspace" },
-	modelRoles: {},
-	profiles: { privileged: { permissions: "host" } },
+	profiles: {
+		privileged: { permissions: "host" },
+		isolated: { workspace: "worktree" },
+	},
 	mcpServers: {},
 	web: { searchBackend: "disabled" },
 	files: [],
 	projectOverrides: new Set(),
 };
 
-describe("Riemann agent mesh", () => {
-	test("spawns asynchronously, routes durable messages, and waits for terminal completion", async () => {
-		const root = await mkdtemp(join(tmpdir(), "riemann-agent-mesh-"));
-		roots.push(root);
-		const agentDir = join(root, ".agent");
-		const store = new RiemannStore(agentDir);
-		const run = store.openRun("mesh-test", root);
-		const main = store.ensureRootAgent(run.id, root);
-		const model = getModel("openai", "gpt-4o-mini");
-		if (!model) throw new Error("Built-in test model is unavailable");
-		const sessions = new Map<string, FakeChildSession>();
-		let releaseWorkerClose!: () => void;
-		const workerClose = new Promise<void>((resolve) => {
-			releaseWorkerClose = resolve;
-		});
-		let resolveWorkerCloseStarted!: () => void;
-		const workerCloseStarted = new Promise<void>((resolve) => {
-			resolveWorkerCloseStarted = resolve;
-		});
-		const supervisor = new AgentSupervisor({
-			store,
-			artifacts: new ArtifactStore(store, run.id),
-			runId: run.id,
-			rootAgent: main,
-			rootContext: {
-				cwd: root,
-				model,
-				modelRegistry: { find: () => undefined } as unknown as ModelRegistry,
-				thinkingLevel: "off",
-			},
-			agentDir,
-			config: { ...config, limits: { ...config.limits, maxConcurrentPerRun: 1 } },
-			createChildRuntime: async (agent) =>
-				fakeRuntime(
-					agent.name === "worker"
-						? async () => {
-								resolveWorkerCloseStarted();
-								await workerClose;
-							}
-						: undefined,
-				),
-			createChildSession: async (agent) => {
-				const session = new FakeChildSession();
-				sessions.set(agent.id, session);
-				return session;
-			},
-		});
-		const signal = new AbortController().signal;
+interface SupervisorHarness {
+	root: string;
+	agentDir: string;
+	store: RiemannStore;
+	runId: string;
+	mainId: string;
+	supervisor: AgentSupervisor;
+	sessions: Map<string, FakeChildSession[]>;
+	resumeFlags: Map<string, boolean[]>;
+	deliveries: AgentEventDelivery[];
+	modelIds: string[];
+}
+
+interface SupervisorHarnessOptions {
+	defaultSession?: boolean;
+	rootModel?: Model<any>;
+	modelRegistry?: ModelRegistry;
+}
+
+async function createHarness(
+	overrides: Partial<Pick<RiemannConfig, "maxAgents" | "maxConcurrentAgents" | "agentDefaults">> = {},
+	deliver?: (delivery: AgentEventDelivery) => Promise<void>,
+	configuredChildModel?: Model<any>,
+	options: SupervisorHarnessOptions = {},
+): Promise<SupervisorHarness> {
+	const root = await mkdtemp(join(tmpdir(), "riemann-agent-"));
+	roots.push(root);
+	const agentDir = join(root, ".agent");
+	const store = new RiemannStore(agentDir);
+	const run = store.openRun(`run-${roots.length}`, root);
+	const main = store.ensureRootAgent(run.id, root);
+	const model = options.rootModel ?? getModel("openai", "gpt-4o-mini");
+	if (!model) throw new Error("Built-in test model is unavailable");
+	const sessions = new Map<string, FakeChildSession[]>();
+	const resumeFlags = new Map<string, boolean[]>();
+	const deliveries: AgentEventDelivery[] = [];
+	const modelIds: string[] = [];
+	const supervisor = new AgentSupervisor({
+		store,
+		artifacts: new ArtifactStore(store, run.id),
+		runId: run.id,
+		rootAgent: main,
+		rootContext: {
+			cwd: root,
+			model,
+			modelRegistry:
+				options.modelRegistry ??
+				({
+					find: (provider: string, id: string) =>
+						configuredChildModel?.provider === provider && configuredChildModel.id === id
+							? configuredChildModel
+							: undefined,
+				} as unknown as ModelRegistry),
+			thinkingLevel: "off",
+		},
+		agentDir,
+		config: { ...config, ...overrides },
+		createChildRuntime: async () => fakeRuntime(),
+		...(options.defaultSession
+			? {}
+			: {
+					createChildSession: async (agent, childModel, _runtime, resume) => {
+						const session = new FakeChildSession();
+						sessions.set(agent.id, [...(sessions.get(agent.id) ?? []), session]);
+						resumeFlags.set(agent.id, [...(resumeFlags.get(agent.id) ?? []), resume]);
+						modelIds.push(`${childModel.provider}/${childModel.id}`);
+						return session;
+					},
+				}),
+		deliverAgentEvents: async (delivery) => {
+			deliveries.push(delivery);
+			await deliver?.(delivery);
+		},
+	});
+	return {
+		root,
+		agentDir,
+		store,
+		runId: run.id,
+		mainId: main.id,
+		supervisor,
+		sessions,
+		resumeFlags,
+		deliveries,
+		modelIds,
+	};
+}
+
+describe("Riemann reusable Agent slots", () => {
+	test("exposes the actor API, delivers completion, and reuses one durable identity", async () => {
+		const harness = await createHarness({ maxAgents: 2, maxConcurrentAgents: 1 });
+		const { supervisor, store, mainId, sessions, resumeFlags, deliveries } = harness;
 		try {
-			const spawnDefinition = functionByName(supervisor.definitions(main.id), "spawn");
-			expect(spawnDefinition.parameters.map((parameter) => parameter.name)).toEqual([
+			const definitions = supervisor.definitions(mainId);
+			expect(definitions.map((definition) => definition.name)).toEqual([
+				"list",
+				"run",
+				"spawn",
+				"info",
+				"wait",
+				"send",
+				"stop",
+				"release",
+			]);
+			expect(
+				definitions
+					.filter((definition) => definition.installInPythonNamespace !== false)
+					.map((definition) => definition.name),
+			).toEqual(["list", "run", "spawn"]);
+			expect(
+				definitions
+					.filter((definition) => definition.includeInSystemPrompt !== false)
+					.map((definition) => definition.name),
+			).toEqual(["list", "run", "spawn"]);
+			expect(functionByName(definitions, "spawn").parameters.map((parameter) => parameter.name)).toEqual([
 				"task",
 				"name",
 				"profile",
-				"workspace",
-				"capabilities",
-				"model_role",
 			]);
-			expect(spawnDefinition.promptSnippet).toContain("task and name suffice");
-			const handle = objectValue(
-				await supervisor.spawn(main.id, {
-					task: "Produce a bounded result",
-					name: "worker",
-				}),
-			);
-			const childId = handle.id;
-			if (typeof childId !== "string") throw new Error("Spawn did not return an agent id");
-			await delay(0);
-			const storedChild = store.getAgent(childId);
-			expect(storedChild).toMatchObject({
-				status: "running",
-				workspace: root,
-				permissions: "workspace",
-				capabilities: [
-					"workspace.read",
-					"workspace.write",
-					"shell.run",
-					"web.search",
-					"web.fetch",
-					"agents.*",
-					"mcp.*",
-				],
-			});
 
+			const firstHandle = objectValue(
+				await supervisor.spawn(mainId, { task: "Produce a bounded result", name: "reviewer" }),
+			);
+			const childId = firstHandle.id;
+			if (typeof childId !== "string") throw new Error("Spawn did not return an Agent id");
+			const firstTurnId = firstHandle.turn_id;
+			if (typeof firstTurnId !== "string") throw new Error("Spawn did not return a Turn id");
+			expect(supervisor.definitions(childId)).toEqual([]);
+			await waitFor(() => supervisor.listSubagentsForUi().find((agent) => agent.id === childId)?.live === true);
+			expect(store.getAgent(childId)).toMatchObject({
+				workspace: harness.root,
+				permissions: "workspace",
+				capabilities: ["workspace.read", "workspace.write", "shell.run", "web.search", "web.fetch", "mcp.*"],
+			});
 			expect(supervisor.listSubagentsForUi()).toContainEqual(
 				expect.objectContaining({
 					id: childId,
-					name: "worker",
 					status: "running",
 					task: "Produce a bounded result",
 					turnCount: 2,
@@ -225,145 +297,515 @@ describe("Riemann agent mesh", () => {
 					live: true,
 				}),
 			);
-			let uiNotifications = 0;
-			const unsubscribeUi = supervisor.subscribeSubagentUi(() => {
-				uiNotifications += 1;
+
+			sessions.get(childId)?.at(-1)?.finish();
+			await waitFor(() => store.getAgent(childId)?.status === "idle");
+			await supervisor.flushAgentEvents();
+			const settled = store.getAgent(childId);
+			expect(settled).toMatchObject({
+				id: childId,
+				status: "idle",
+				lastOutcome: "ok",
+				result: "child completed: Produce a bounded result",
 			});
-			await supervisor.steerSubagentFromUi(childId, "steer from the Agent Viewer");
-			unsubscribeUi();
-			expect(sessions.get(childId)?.steering[0]).toContain("steer from the Agent Viewer");
-			expect(uiNotifications).toBeGreaterThan(0);
+			expect(settled?.transcriptHandle).toMatch(/^artifact:\/\//);
+			expect(deliveries.at(-1)?.events).toEqual([
+				{
+					id: expect.any(String),
+					agentId: childId,
+					name: "reviewer",
+					turnId: firstTurnId,
+					outcome: "ok",
+				},
+			]);
+			expect(JSON.stringify(deliveries.at(-1))).not.toContain("child completed: Produce a bounded result");
+			expect(JSON.stringify(deliveries.at(-1))).not.toContain(settled?.transcriptHandle);
+			expect(store.listPendingAgentEvents(mainId)).toHaveLength(0);
+			await waitFor(() => supervisor.listSubagentsForUi().find((agent) => agent.id === childId)?.live === false);
+			expect(supervisor.listSubagentsForUi().find((agent) => agent.id === childId)?.messages).not.toHaveLength(0);
 
-			const childFunctions = supervisor.definitions(childId);
-			await functionByName(childFunctions, "send").handler(
-				{ agent_id: main.id, message: "child found a concrete dependency" },
-				signal,
+			const reusedHandle = objectValue(
+				await supervisor.spawn(mainId, { task: "Review the regression test", name: "reviewer" }),
 			);
-			const inbox = await functionByName(supervisor.definitions(main.id), "inbox").handler({}, signal);
-			expect(Array.isArray(inbox) && objectValue(inbox[0] ?? null).body).toBe("child found a concrete dependency");
+			expect(reusedHandle.id).toBe(childId);
+			expect(reusedHandle.turn_id).not.toBe(firstTurnId);
+			await waitFor(() => store.getAgent(childId)?.status === "running");
+			expect(resumeFlags.get(childId)).toEqual([false, true]);
+			expect(sessions.get(childId)?.at(-1)?.prompts).toEqual(["Review the regression test"]);
+			sessions.get(childId)?.at(-1)?.finish();
+			await waitFor(() => store.getAgent(childId)?.status === "idle");
 
-			await functionByName(supervisor.definitions(main.id), "send").handler(
-				{ agent_id: childId, message: "parent steering message" },
-				signal,
-			);
-			expect(sessions.get(childId)?.steering).toEqual(
-				expect.arrayContaining([expect.stringContaining("parent steering message")]),
-			);
-			const waitController = new AbortController();
-			const cancelledWait = functionByName(supervisor.definitions(main.id), "wait").handler(
-				{ agent_id: childId },
-				waitController.signal,
-			);
-			waitController.abort(new Error("cancelled by user"));
-			await expect(cancelledWait).rejects.toThrow("cancelled by user");
-			const cancelledHandle = objectValue(
-				await supervisor.spawn(main.id, {
-					task: "Remain queued until cancelled",
-					name: "cancelled-worker",
-				}),
-			);
-			const cancelledId = cancelledHandle.id;
-			if (typeof cancelledId !== "string") throw new Error("Queued spawn did not return an agent id");
-			expect(store.getAgent(cancelledId)?.status).toBe("queued");
-			await supervisor.stopSubagentFromUi(cancelledId);
-			expect(store.getAgent(cancelledId)?.status).toBe("stopped");
+			await supervisor.steerSubagentFromUi(childId, "Inspect the final diff");
+			await waitFor(() => store.getAgent(childId)?.status === "running");
+			expect(store.listAgents(harness.runId).filter((agent) => agent.parentId !== null)).toHaveLength(1);
+			expect(resumeFlags.get(childId)).toEqual([false, true, true]);
+			expect(sessions.get(childId)?.at(-1)?.prompts[0]).toContain("Inspect the final diff");
+			await supervisor.stopSubagentFromUi(childId);
+			expect(store.getAgent(childId)).toMatchObject({ status: "stopped", lastOutcome: "cancelled" });
 
-			const successorHandle = objectValue(
-				await supervisor.spawn(main.id, {
-					task: "Start after the active worker finishes",
-					name: "successor",
-				}),
-			);
-			const successorId = successorHandle.id;
-			if (typeof successorId !== "string") throw new Error("Successor spawn did not return an agent id");
-			expect(store.getAgent(successorId)?.status).toBe("queued");
-
-			sessions.get(childId)?.finish();
-			const waitedPromise = functionByName(supervisor.definitions(main.id), "wait").handler(
-				{ agent_id: childId, timeout: 5 },
-				signal,
-			);
-			await workerCloseStarted;
-			const settledBeforeClose = await Promise.race([waitedPromise.then(() => true), delay(100).then(() => false)]);
-			releaseWorkerClose();
-			const waited = objectValue(await waitedPromise);
-			expect(settledBeforeClose).toBe(true);
-			const agent = objectValue(waited.agent ?? null);
-			expect(agent.status).toBe("completed");
-			expect(waited.result).toBe("child completed with evidence");
-			await delay(0);
-			expect(store.getAgent(successorId)?.status).toBe("running");
-			await functionByName(supervisor.definitions(main.id), "stop").handler({ agent_id: successorId }, signal);
-
-			const webHandle = objectValue(
-				await supervisor.spawn(main.id, {
-					task: "Research a public source",
-					name: "web-worker",
-					workspace: "shared",
-					capabilities: ["web"],
-				}),
-			);
-			const webChildId = webHandle.id;
-			if (typeof webChildId !== "string") throw new Error("Spawn did not return an agent id");
-			expect(store.getAgent(webChildId)).toMatchObject({
-				workspace: root,
-				capabilities: ["web.*"],
-			});
-			await functionByName(supervisor.definitions(main.id), "stop").handler({ agent_id: webChildId }, signal);
-
-			const restrictedParent = store.createAgent({
-				runId: run.id,
-				parentId: main.id,
-				name: "restricted-parent",
-				status: "running",
-				prompt: "",
-				modelRole: "inherit",
-				workspace: root,
-				workspaceMode: "shared",
-				permissions: "workspace",
-				depth: 1,
-				capabilities: ["agents.spawn", "web.search"],
-			});
-			const nestedHandle = objectValue(
-				await supervisor.spawn(restrictedParent.id, {
-					task: "Research within parent permissions",
-					name: "nested-worker",
-				}),
-			);
-			const nestedChildId = nestedHandle.id;
-			if (typeof nestedChildId !== "string") throw new Error("Spawn did not return an agent id");
-			expect(store.getAgent(nestedChildId)).toMatchObject({
-				workspace: root,
-				capabilities: ["web.search"],
-			});
-			await functionByName(supervisor.definitions(main.id), "stop").handler({ agent_id: nestedChildId }, signal);
 			await expect(
-				supervisor.spawn(restrictedParent.id, {
-					task: "Attempt to exceed parent scope",
-					name: "overprivileged-worker",
-					profile: "privileged",
-				}),
-			).rejects.toMatchObject({ code: "permission_denied" });
+				supervisor.spawn(childId, { task: "Attempt recursive delegation", name: "nested" }),
+			).rejects.toMatchObject({ code: "limit_exceeded" });
 		} finally {
 			await supervisor.close();
 			store.close();
 		}
-	}, 15_000);
+	});
 
-	test("preserves a completed status when shutdown overlaps child teardown", async () => {
-		const root = await mkdtemp(join(tmpdir(), "riemann-agent-close-status-"));
+	test("waits for one exact Turn and claims its completion without an automatic wake", async () => {
+		const harness = await createHarness();
+		const { supervisor, store, mainId, sessions, deliveries } = harness;
+		const definitions = supervisor.definitions(mainId);
+		const waitDefinition = functionByName(definitions, "wait");
+		const sendDefinition = functionByName(definitions, "send");
+		const stopDefinition = functionByName(definitions, "stop");
+		try {
+			const first = objectValue(await supervisor.spawn(mainId, { task: "first turn", name: "worker" }));
+			if (typeof first.id !== "string" || typeof first.turn_id !== "string") throw new Error("Missing first handle");
+			await waitFor(() => store.getAgent(first.id as string)?.status === "running");
+			const firstWait = waitDefinition.handler(
+				{ agent_id: first.id, turn_id: first.turn_id },
+				new AbortController().signal,
+			);
+			sessions.get(first.id)?.at(-1)?.finish();
+			const firstResult = objectValue(await firstWait);
+			expect(firstResult).toMatchObject({
+				$riemann: "agent_result",
+				id: first.id,
+				turn_id: first.turn_id,
+				status: "idle",
+				outcome: "ok",
+				result: "child completed: first turn",
+			});
+			expect(store.listPendingAgentEvents(mainId)).toHaveLength(0);
+			expect(deliveries).toHaveLength(0);
+
+			const second = objectValue(await supervisor.spawn(mainId, { task: "second turn", name: "worker" }));
+			if (typeof second.turn_id !== "string") throw new Error("Missing second Turn id");
+			expect(second.turn_id).not.toBe(first.turn_id);
+			expect(
+				objectValue(
+					await waitDefinition.handler(
+						{ agent_id: first.id, turn_id: first.turn_id },
+						new AbortController().signal,
+					),
+				).turn_id,
+			).toBe(first.turn_id);
+			await expect(
+				sendDefinition.handler(
+					{ agent_id: first.id, turn_id: first.turn_id, message: "stale steering" },
+					new AbortController().signal,
+				),
+			).rejects.toMatchObject({ code: "conflict" });
+			await expect(
+				waitDefinition.handler(
+					{ agent_id: second.id, turn_id: second.turn_id, timeout: 0.01 },
+					new AbortController().signal,
+				),
+			).rejects.toMatchObject({ code: "timeout" });
+			expect(store.getAgent(second.id as string)?.status).toBe("running");
+
+			const stopped = objectValue(
+				await stopDefinition.handler(
+					{ agent_id: second.id, turn_id: second.turn_id, timeout: 1 },
+					new AbortController().signal,
+				),
+			);
+			expect(stopped).toMatchObject({
+				$riemann: "agent_result",
+				turn_id: second.turn_id,
+				status: "stopped",
+				outcome: "cancelled",
+			});
+			expect(store.listPendingAgentEvents(mainId)).toHaveLength(0);
+			expect(deliveries).toHaveLength(0);
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("delivers unclaimed completion immediately without waiting for the parent to become idle", async () => {
+		const harness = await createHarness();
+		const { supervisor, store, mainId, sessions, deliveries } = harness;
+		try {
+			const handle = objectValue(await supervisor.spawn(mainId, { task: "background turn", name: "worker" }));
+			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
+			await waitFor(() => store.getAgent(handle.id as string)?.status === "running");
+			sessions.get(handle.id)?.at(-1)?.finish();
+			await waitFor(() => deliveries.length === 1);
+			expect(store.getAgent(handle.id as string)?.status).toBe("idle");
+			expect(store.listPendingAgentEvents(mainId)).toHaveLength(0);
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("runs synchronously and stops the owned Turn when its caller aborts or times out", async () => {
+		const harness = await createHarness();
+		const { supervisor, store, mainId, sessions, deliveries } = harness;
+		const runDefinition = functionByName(supervisor.definitions(mainId), "run");
+		try {
+			const completed = runDefinition.handler(
+				{ task: "synchronous turn", name: "sync-worker" },
+				new AbortController().signal,
+			);
+			await waitFor(() => store.listAgents(harness.runId).some((agent) => agent.name === "sync-worker"));
+			const syncAgent = store.listAgents(harness.runId).find((agent) => agent.name === "sync-worker");
+			if (!syncAgent) throw new Error("Missing synchronous Agent");
+			await waitFor(() => store.getAgent(syncAgent.id)?.status === "running");
+			sessions.get(syncAgent.id)?.at(-1)?.finish();
+			expect(objectValue(await completed)).toMatchObject({
+				$riemann: "agent_result",
+				id: syncAgent.id,
+				status: "idle",
+				outcome: "ok",
+				result: "child completed: synchronous turn",
+			});
+
+			const abortedController = new AbortController();
+			const aborted = runDefinition.handler(
+				{ task: "abort this turn", name: "abort-worker" },
+				abortedController.signal,
+			);
+			await waitFor(
+				() => store.listAgents(harness.runId).find((agent) => agent.name === "abort-worker")?.status === "running",
+			);
+			abortedController.abort(new Error("caller interrupted"));
+			await expect(aborted).rejects.toMatchObject({ code: "aborted" });
+			await waitFor(
+				() => store.listAgents(harness.runId).find((agent) => agent.name === "abort-worker")?.status === "stopped",
+			);
+
+			await expect(
+				runDefinition.handler(
+					{ task: "time out this turn", name: "timeout-worker", timeout: 0.01 },
+					new AbortController().signal,
+				),
+			).rejects.toMatchObject({ code: "timeout" });
+			await waitFor(
+				() =>
+					store.listAgents(harness.runId).find((agent) => agent.name === "timeout-worker")?.status === "stopped",
+			);
+			expect(store.listPendingAgentEvents(mainId)).toHaveLength(0);
+			expect(deliveries).toHaveLength(0);
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("uses the configured default child model without requiring a profile", async () => {
+		const childModel = getModel("openai", "gpt-4o");
+		if (!childModel) throw new Error("Configured test model is unavailable");
+		const harness = await createHarness(
+			{
+				agentDefaults: {
+					workspace: "shared",
+					permissions: "workspace",
+					model: `${childModel.provider}/${childModel.id}`,
+				},
+			},
+			undefined,
+			childModel,
+		);
+		const { supervisor, store, mainId, sessions, modelIds } = harness;
+		try {
+			const handle = objectValue(await supervisor.spawn(mainId, { task: "Use the default model", name: "worker" }));
+			if (typeof handle.id !== "string") throw new Error("Spawn did not return an Agent id");
+			const childId = handle.id;
+			await waitFor(() => modelIds.length === 1);
+			expect(modelIds).toEqual([`${childModel.provider}/${childModel.id}`]);
+			sessions.get(childId)?.at(-1)?.finish();
+			await waitFor(() => store.getAgent(childId)?.status === "idle");
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("runs an inherited extension provider in the default child session", async () => {
+		const faux = fauxProvider({
+			provider: "faux-child",
+			models: [{ id: "faux-child-model", name: "Faux child model", reasoning: false }],
+		});
+		faux.setResponses([fauxAssistantMessage("child session ready")]);
+		const childModel = faux.getModel();
+		const modelRegistry = {
+			find: (provider: string, id: string) =>
+				provider === childModel.provider && id === childModel.id ? childModel : undefined,
+			getRegisteredProviderIds: () => [faux.provider.id],
+			getRegisteredNativeProvider: (provider: string) => (provider === faux.provider.id ? faux.provider : undefined),
+			getRegisteredProviderConfig: () => undefined,
+		} as unknown as ModelRegistry;
+		const harness = await createHarness({}, undefined, undefined, {
+			defaultSession: true,
+			rootModel: childModel,
+			modelRegistry,
+		});
+		const { supervisor, store, mainId, agentDir } = harness;
+		await mkdir(agentDir, { recursive: true });
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ [faux.provider.id]: { type: "api_key", key: "faux-key" } }),
+		);
+		try {
+			const handle = objectValue(
+				await supervisor.spawn(mainId, { task: "Complete the child turn", name: "worker" }),
+			);
+			if (typeof handle.id !== "string") throw new Error("Spawn did not return an Agent id");
+			const childId = handle.id;
+			await waitFor(() => store.getAgent(childId)?.status === "idle", 10_000);
+			expect(store.getAgent(childId)).toMatchObject({
+				status: "idle",
+				lastOutcome: "ok",
+				result: expect.stringContaining("child session ready"),
+			});
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("enforces the global slot cap across idle and stopped Agents until the user releases one", async () => {
+		const harness = await createHarness({ maxAgents: 2, maxConcurrentAgents: 1 });
+		const { supervisor, store, mainId, sessions } = harness;
+		try {
+			const first = objectValue(await supervisor.spawn(mainId, { task: "first", name: "first" }));
+			const second = objectValue(await supervisor.spawn(mainId, { task: "second", name: "second" }));
+			if (typeof first.id !== "string" || typeof second.id !== "string") throw new Error("Missing Agent ids");
+			const firstId = first.id;
+			const secondId = second.id;
+			await waitFor(() => store.getAgent(firstId)?.status === "running");
+			expect(store.getAgent(secondId)?.status).toBe("queued");
+			await expect(supervisor.spawn(mainId, { task: "third", name: "third" })).rejects.toMatchObject({
+				code: "limit_exceeded",
+			});
+
+			await supervisor.stopSubagentFromUi(secondId);
+			expect(store.getAgent(secondId)?.status).toBe("stopped");
+			await expect(supervisor.spawn(mainId, { task: "third", name: "third" })).rejects.toMatchObject({
+				code: "limit_exceeded",
+			});
+
+			await supervisor.releaseSubagentFromUi(secondId);
+			expect(store.getAgent(secondId)?.releasedAt).not.toBeNull();
+			expect(supervisor.listSubagentsForUi().some((agent) => agent.id === secondId)).toBe(false);
+			const replacement = objectValue(await supervisor.spawn(mainId, { task: "replacement", name: "second" }));
+			if (typeof replacement.id !== "string") throw new Error("Missing replacement Agent id");
+			expect(replacement.id).not.toBe(secondId);
+			expect(store.listAgents(harness.runId).filter((agent) => agent.parentId !== null)).toHaveLength(2);
+
+			sessions.get(firstId)?.at(-1)?.finish();
+			await waitFor(() => store.getAgent(replacement.id as string)?.status === "running");
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("keeps failed delivery events durable and emits each completion payload once on retry", async () => {
+		let attempts = 0;
+		const harness = await createHarness({}, async () => {
+			attempts += 1;
+			if (attempts === 1) throw new Error("delivery unavailable");
+		});
+		const { supervisor, store, mainId, sessions } = harness;
+		try {
+			const handle = objectValue(await supervisor.spawn(mainId, { task: "complete once", name: "worker" }));
+			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
+			const childId = handle.id;
+			await waitFor(() => store.getAgent(childId)?.status === "running");
+			sessions.get(childId)?.at(-1)?.finish();
+			await waitFor(() => store.getAgent(childId)?.status === "idle");
+			await waitFor(() => attempts >= 1);
+			expect(store.listPendingAgentEvents(mainId)).toHaveLength(1);
+
+			await supervisor.flushAgentEvents();
+			expect(attempts).toBe(2);
+			expect(store.listPendingAgentEvents(mainId)).toHaveLength(0);
+			expect(
+				new Set(harness.deliveries.map((delivery) => delivery.events.map((event) => event.id).join(","))).size,
+			).toBe(1);
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("backfills immutable Turns and pending completion events from the pre-Turn database", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-agent-turn-migration-"));
+		roots.push(root);
+		const agentDir = join(root, ".agent");
+		const stateDir = join(agentDir, "state");
+		await mkdir(stateDir, { recursive: true });
+		const database = new DatabaseSync(join(stateDir, "riemann.db"));
+		const timestamp = "2026-08-14T00:00:00.000Z";
+		database.exec(`
+			CREATE TABLE schema_version (version INTEGER NOT NULL);
+			INSERT INTO schema_version(version) VALUES(2);
+			CREATE TABLE runs (
+				id TEXT PRIMARY KEY,
+				session_id TEXT NOT NULL UNIQUE,
+				cwd TEXT NOT NULL,
+				status TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+			CREATE TABLE agents (
+				id TEXT PRIMARY KEY,
+				run_id TEXT NOT NULL,
+				parent_id TEXT,
+				name TEXT NOT NULL,
+				status TEXT NOT NULL,
+				prompt TEXT NOT NULL,
+				model_role TEXT NOT NULL,
+				workspace TEXT NOT NULL,
+				workspace_mode TEXT NOT NULL,
+				permissions TEXT NOT NULL,
+				depth INTEGER NOT NULL,
+				capabilities_json TEXT NOT NULL,
+				result TEXT,
+				error TEXT,
+				last_outcome TEXT,
+				transcript_handle TEXT,
+				patch_handle TEXT,
+				released_at TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				UNIQUE(run_id, name)
+			);
+			CREATE TABLE agent_events (
+				id TEXT PRIMARY KEY,
+				run_id TEXT NOT NULL,
+				recipient_id TEXT NOT NULL,
+				payload_json TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				delivered_at TEXT
+			);
+		`);
+		database
+			.prepare("INSERT INTO runs VALUES(?, ?, ?, 'active', ?, ?)")
+			.run("legacy-run", "legacy-session", root, timestamp, timestamp);
+		const insertAgent = database.prepare(
+			"INSERT INTO agents VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		);
+		insertAgent.run(
+			"legacy-main",
+			"legacy-run",
+			null,
+			"Main",
+			"running",
+			"",
+			"main",
+			root,
+			"shared",
+			"host",
+			0,
+			JSON.stringify(["*"]),
+			null,
+			null,
+			null,
+			null,
+			null,
+			null,
+			timestamp,
+			timestamp,
+		);
+		insertAgent.run(
+			"legacy-child",
+			"legacy-run",
+			"legacy-main",
+			"worker",
+			"idle",
+			"legacy task",
+			"inherit",
+			root,
+			"shared",
+			"workspace",
+			1,
+			JSON.stringify(["workspace.read"]),
+			"legacy result",
+			null,
+			"ok",
+			"artifact://legacy-transcript",
+			null,
+			null,
+			timestamp,
+			timestamp,
+		);
+		database.prepare("INSERT INTO agent_events VALUES(?, ?, ?, ?, ?, NULL)").run(
+			"legacy-event",
+			"legacy-run",
+			"legacy-main",
+			JSON.stringify({
+				agentId: "legacy-child",
+				name: "worker",
+				outcome: "ok",
+				resultPreview: "legacy result",
+				transcriptHandle: "artifact://legacy-transcript",
+				patchHandle: null,
+			}),
+			timestamp,
+		);
+		database.close();
+
+		const store = new RiemannStore(agentDir);
+		try {
+			const child = store.getAgent("legacy-child");
+			expect(child?.activeTurnId).toBeNull();
+			expect(child?.lastTurnId).toEqual(expect.any(String));
+			const turn = child?.lastTurnId ? store.getAgentTurn(child.lastTurnId) : undefined;
+			expect(turn).toMatchObject({
+				agentId: "legacy-child",
+				task: "legacy task",
+				status: "settled",
+				outcome: "ok",
+				result: "legacy result",
+			});
+			expect(store.listPendingAgentEvents("legacy-main")).toEqual([
+				expect.objectContaining({
+					id: "legacy-event",
+					payload: {
+						agentId: "legacy-child",
+						name: "worker",
+						turnId: child?.lastTurnId,
+						outcome: "ok",
+					},
+				}),
+			]);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("loads a settled conversation from its persisted child Session", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-agent-transcript-"));
 		roots.push(root);
 		const agentDir = join(root, ".agent");
 		const store = new RiemannStore(agentDir);
-		const run = store.openRun("close-status-test", root);
+		const run = store.openRun("persisted-transcript", root);
 		const main = store.ensureRootAgent(run.id, root);
+		const child = store.createAgent({
+			runId: run.id,
+			parentId: main.id,
+			name: "persisted",
+			status: "idle",
+			prompt: "persisted task",
+			modelRole: "inherit",
+			workspace: root,
+			workspaceMode: "shared",
+			permissions: "workspace",
+			depth: 1,
+			capabilities: ["workspace.read"],
+		});
+		const sessionDir = join(agentDir, "state", "child-sessions", child.id);
+		await mkdir(sessionDir, { recursive: true });
+		const session = SessionManager.create(root, sessionDir);
+		session.appendMessage(fauxAssistantMessage("persisted child answer"));
 		const model = getModel("openai", "gpt-4o-mini");
 		if (!model) throw new Error("Built-in test model is unavailable");
-		const sessions = new Map<string, FakeChildSession>();
-		let releaseRuntimeClose!: () => void;
-		const runtimeClose = new Promise<void>((resolve) => {
-			releaseRuntimeClose = resolve;
-		});
 		const supervisor = new AgentSupervisor({
 			store,
 			artifacts: new ArtifactStore(store, run.id),
@@ -377,37 +819,18 @@ describe("Riemann agent mesh", () => {
 			},
 			agentDir,
 			config,
-			createChildRuntime: async () => fakeRuntime(async () => runtimeClose),
-			createChildSession: async (agent) => {
-				const session = new FakeChildSession();
-				sessions.set(agent.id, session);
-				return session;
-			},
+			createChildRuntime: async () => fakeRuntime(),
 		});
 		try {
-			const handle = objectValue(
-				await supervisor.spawn(main.id, { task: "Complete during close", name: "status-race" }),
-			);
-			const childId = handle.id;
-			if (typeof childId !== "string") throw new Error("Spawn did not return an agent id");
-			await delay(0);
-			sessions.get(childId)?.finish();
-			await functionByName(supervisor.definitions(main.id), "wait").handler(
-				{ agent_id: childId, timeout: 5 },
-				new AbortController().signal,
-			);
-			const closing = supervisor.close();
-			releaseRuntimeClose();
-			await closing;
-			expect(store.getAgent(childId)?.status).toBe("completed");
+			const messages = supervisor.listSubagentsForUi().find((agent) => agent.id === child.id)?.messages ?? [];
+			expect(JSON.stringify(messages)).toContain("persisted child answer");
 		} finally {
-			releaseRuntimeClose();
 			await supervisor.close();
 			store.close();
 		}
 	});
 
-	test("creates a distinct Git worktree for worktree Subagents", async () => {
+	test("captures an isolated worktree patch artifact and removes the worktree only on release", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-agent-worktree-"));
 		roots.push(root);
 		const repository = join(root, "repository");
@@ -416,18 +839,21 @@ describe("Riemann agent mesh", () => {
 		await git(repository, ["init"]);
 		await git(repository, ["config", "user.email", "riemann@example.invalid"]);
 		await git(repository, ["config", "user.name", "Riemann Test"]);
-		await writeFile(join(repository, "tracked.txt"), "tracked");
+		await writeFile(join(repository, "tracked.txt"), "tracked\n");
 		await git(repository, ["add", "tracked.txt"]);
 		await git(repository, ["commit", "-m", "initial"]);
 
 		const store = new RiemannStore(agentDir);
 		const run = store.openRun("worktree-test", repository);
 		const main = store.ensureRootAgent(run.id, repository, "host");
+		const artifacts = new ArtifactStore(store, run.id);
 		const model = getModel("openai", "gpt-4o-mini");
 		if (!model) throw new Error("Built-in test model is unavailable");
+		const sessions = new Map<string, FakeChildSession>();
+		const deliveries: AgentEventDelivery[] = [];
 		const supervisor = new AgentSupervisor({
 			store,
-			artifacts: new ArtifactStore(store, run.id),
+			artifacts,
 			runId: run.id,
 			rootAgent: main,
 			rootContext: {
@@ -437,71 +863,43 @@ describe("Riemann agent mesh", () => {
 				thinkingLevel: "off",
 			},
 			agentDir,
-			config: { ...config, agentDefaults: { workspace: "worktree", permissions: "workspace" } },
+			config: { ...config, maxAgents: 1, maxConcurrentAgents: 1 },
 			createChildRuntime: async () => fakeRuntime(),
-			createChildSession: async () => new FakeChildSession(),
+			createChildSession: async (agent) => {
+				const childSession = new FakeChildSession();
+				sessions.set(agent.id, childSession);
+				return childSession;
+			},
+			deliverAgentEvents: async (delivery) => {
+				deliveries.push(delivery);
+			},
 		});
 		try {
-			const handle = objectValue(await supervisor.spawn(main.id, { task: "work independently", name: "worker" }));
-			const childId = handle.id;
-			if (typeof childId !== "string") throw new Error("Spawn did not return an agent id");
-			const child = store.getAgent(childId);
-			expect(child?.workspace).not.toBe(repository);
-			expect(child?.workspace).toContain(join("state", "workspaces", run.id, childId));
-			expect(child).toMatchObject({ workspaceMode: "worktree", permissions: "workspace" });
-			expect(await git(child?.workspace ?? "", ["rev-parse", "--show-toplevel"])).toBe(child?.workspace);
-			await functionByName(supervisor.definitions(main.id), "stop").handler(
-				{ agent_id: childId },
-				new AbortController().signal,
+			const handle = objectValue(
+				await supervisor.spawn(main.id, { task: "work independently", name: "worker", profile: "isolated" }),
 			);
+			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
+			const childId = handle.id;
+			await waitFor(() => store.getAgent(childId)?.status === "running");
+			const child = store.getAgent(childId);
+			if (!child) throw new Error("Missing stored Agent");
+			expect(child.workspace).not.toBe(repository);
+			await writeFile(join(child.workspace, "tracked.txt"), "changed in child\n");
+			sessions.get(child.id)?.finish();
+			await waitFor(() => store.getAgent(child.id)?.status === "idle");
+			await supervisor.flushAgentEvents();
+
+			const settled = store.getAgent(child.id);
+			if (!settled?.patchHandle) throw new Error("Missing patch artifact");
+			const patch = objectValue(await artifacts.get(settled.patchHandle));
+			expect(patch.content).toContain("changed in child");
+			expect(JSON.stringify(deliveries.at(-1))).not.toContain(settled.patchHandle);
+
+			await supervisor.releaseSubagentFromUi(child.id);
+			await expect(access(child.workspace)).rejects.toThrow();
 		} finally {
 			await supervisor.close();
 			store.close();
 		}
 	}, 30_000);
-
-	test("rejects duplicate stable agent names before starting a second child", async () => {
-		const root = await mkdtemp(join(tmpdir(), "riemann-agent-name-"));
-		roots.push(root);
-		const store = new RiemannStore(join(root, ".agent"));
-		const run = store.openRun("name-test", root);
-		const main = store.ensureRootAgent(run.id, root);
-		const model = getModel("openai", "gpt-4o-mini");
-		if (!model) throw new Error("Built-in test model is unavailable");
-		const supervisor = new AgentSupervisor({
-			store,
-			artifacts: new ArtifactStore(store, run.id),
-			runId: run.id,
-			rootAgent: main,
-			rootContext: {
-				cwd: root,
-				model,
-				modelRegistry: { find: () => undefined } as unknown as ModelRegistry,
-				thinkingLevel: "off",
-			},
-			agentDir: join(root, ".agent"),
-			config,
-			createChildRuntime: async () => fakeRuntime(),
-			createChildSession: async () => new FakeChildSession(),
-		});
-		try {
-			await supervisor.spawn(main.id, {
-				task: "first",
-				name: "stable",
-				workspace: "shared",
-				capabilities: ["agents.*"],
-			});
-			await expect(
-				supervisor.spawn(main.id, {
-					task: "second",
-					name: "stable",
-					workspace: "shared",
-					capabilities: ["agents.*"],
-				}),
-			).rejects.toMatchObject({ code: "conflict" });
-		} finally {
-			await supervisor.close();
-			store.close();
-		}
-	});
 });

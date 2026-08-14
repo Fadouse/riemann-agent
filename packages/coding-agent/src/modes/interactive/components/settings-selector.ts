@@ -95,6 +95,7 @@ export interface SettingsConfig {
 	fullscreenScrollbar: ScrollViewScrollbar;
 	warnings: WarningSettings;
 	riemann: RiemannConfig;
+	availableAgentModels?: readonly string[];
 }
 
 export interface SettingsCallbacks {
@@ -525,152 +526,62 @@ const GENERAL_SETTING_CATEGORIES: Record<Exclude<SettingsCategory, "Agents" | "M
 	Context: ["autocompact", "cache-miss-notices"],
 };
 
-const RIEMANN_NUMBER_CHOICES = {
-	"limits.maxAgentsPerRun": [1, 2, 4, 8, 16, 32, 64],
-	"limits.maxConcurrentPerRun": [1, 2, 4, 8, 16, 32],
-	"limits.maxConcurrentPerModel": [1, 2, 4, 8, 16],
-	"limits.maxDepth": [0, 1, 2, 3, 4, 6, 8],
-	"limits.maxCellOutputChars": [10_000, 25_000, 50_000, 100_000, 250_000, 500_000],
-	"limits.maxArtifactPreviewChars": [1_000, 4_000, 8_000, 12_000, 20_000, 50_000],
-	"retention.maxAgeDays": [0, 7, 14, 30, 60, 90, 180, 365],
-	"retention.maxArtifactBytes": [0, 268_435_456, 536_870_912, 1_073_741_824, 2_147_483_648, 5_368_709_120],
-	"retention.maxSnapshotBytes": [0, 134_217_728, 268_435_456, 536_870_912, 1_073_741_824, 2_147_483_648],
-	"retention.maxWorktreeBytes": [0, 1_073_741_824, 2_147_483_648, 5_368_709_120, 10_737_418_240],
-} as const;
-
-function bytesLabel(bytes: number): string {
-	if (bytes === 0) return "unlimited";
-	if (bytes >= 1_073_741_824) return `${bytes / 1_073_741_824} GiB`;
-	return `${bytes / 1_048_576} MiB`;
-}
+const AGENT_SLOT_CHOICES = [0, 1, 2, 4, 8, 16] as const;
 
 function parseRiemannValue(path: string, display: string): unknown {
 	if (path.endsWith(".enabled") || path.endsWith(".exposeToModel")) return display === "true";
-	if (path.endsWith("TimeoutMs")) return Number.parseInt(display, 10);
-	if (path === "compaction.strategy" || path.startsWith("agents.")) return display;
-	if (display === "unlimited") return 0;
-	if (display.endsWith(" days")) return Number.parseInt(display, 10);
-	if (display.endsWith(" GiB")) return Number.parseFloat(display) * 1_073_741_824;
-	if (display.endsWith(" MiB")) return Number.parseFloat(display) * 1_048_576;
-	if (display.endsWith("K chars")) return Number.parseFloat(display) * 1_000;
+	if (path === "agents.defaults.model") return display === "inherit" ? undefined : display;
+	if (path.endsWith("TimeoutMs") || path === "agents.maxAgents") return Number.parseInt(display, 10);
+	if (
+		path === "compaction.strategy" ||
+		path === "agents.main.permissions" ||
+		path === "agents.defaults.workspace" ||
+		path === "agents.defaults.permissions"
+	)
+		return display;
 	return Number.parseFloat(display);
 }
 
-function rNumberItem(
-	config: RiemannConfig,
-	path: keyof typeof RIEMANN_NUMBER_CHOICES,
-	label: string,
-	value: number,
-	format: (value: number) => string = String,
-): SettingItem {
-	const project = config.projectOverrides.has(path);
-	return {
-		id: path,
-		label,
-		description: project
-			? "Read-only because the trusted project config overrides this value."
-			: "Applies to new runs.",
-		currentValue: project ? `${format(value)} · project` : format(value),
-		values: project ? undefined : RIEMANN_NUMBER_CHOICES[path].map(format),
-	};
-}
-
-function agentSettingItems(config: RiemannConfig): SettingItem[] {
-	const projectCompaction = config.projectOverrides.has("compaction.strategy");
-	const projectMainPermissions = config.projectOverrides.has("agents.main.permissions");
-	const projectDefaultWorkspace = config.projectOverrides.has("agents.defaults.workspace");
-	const projectDefaultPermissions = config.projectOverrides.has("agents.defaults.permissions");
+function agentSettingItems(config: RiemannConfig, availableModels: readonly string[] = []): SettingItem[] {
+	const slotsFromProject = config.projectOverrides.has("agents.maxAgents");
+	const modelFromProject = config.projectOverrides.has("agents.defaults.model");
+	const currentModel = config.agentDefaults.model ?? "inherit";
+	const modelValues = ["inherit", ...availableModels.filter((model) => model !== currentModel)];
+	if (currentModel !== "inherit") modelValues.splice(1, 0, currentModel);
 	return [
 		{
-			id: "agents.main.permissions",
-			label: "Main Agent permissions",
-			description: projectMainPermissions
-				? "Read-only because the trusted project config overrides this value."
-				: "Host allows host filesystem access; workspace confines IPython and shell to the project workspace.",
-			currentValue: projectMainPermissions
-				? `${config.mainAgent.permissions} · project`
-				: config.mainAgent.permissions,
-			values: projectMainPermissions ? undefined : ["host", "workspace"],
+			id: "agents.maxAgents",
+			label: "Agent slots",
+			description: slotsFromProject
+				? "Read-only because the trusted project config lowers the global limit."
+				: "Maximum reusable child Agent identities in one run. Main Agent excluded; 0 disables delegation.",
+			currentValue: slotsFromProject ? `${config.maxAgents} · project` : String(config.maxAgents),
+			values: slotsFromProject ? undefined : AGENT_SLOT_CHOICES.map(String),
 		},
 		{
-			id: "agents.defaults.workspace",
-			label: "Subagent workspace",
-			description: projectDefaultWorkspace
-				? "Read-only because the trusted project config overrides this value."
-				: "Shared uses the parent workspace; worktree creates an independent detached Git worktree.",
-			currentValue: projectDefaultWorkspace
-				? `${config.agentDefaults.workspace} · project`
-				: config.agentDefaults.workspace,
-			values: projectDefaultWorkspace ? undefined : ["shared", "worktree"],
+			id: "agents.defaults.model",
+			label: "Default Agent model",
+			description: modelFromProject
+				? "Read-only because the trusted project config selects this model."
+				: "Model used by new child Agents. Profiles may override it; inherit uses the Main Agent model.",
+			currentValue: modelFromProject ? `${currentModel} · project` : currentModel,
+			values: modelFromProject ? undefined : modelValues,
 		},
-		{
-			id: "agents.defaults.permissions",
-			label: "Subagent permissions",
-			description: projectDefaultPermissions
-				? "Read-only because the trusted project config overrides this value."
-				: "Default filesystem scope for Subagents; a child cannot exceed its parent permissions.",
-			currentValue: projectDefaultPermissions
-				? `${config.agentDefaults.permissions} · project`
-				: config.agentDefaults.permissions,
-			values: projectDefaultPermissions ? undefined : ["host", "workspace"],
-		},
+	];
+}
+
+function contextSettingItems(config: RiemannConfig): SettingItem[] {
+	const project = config.projectOverrides.has("compaction.strategy");
+	return [
 		{
 			id: "compaction.strategy",
 			label: "Compaction strategy",
-			description: projectCompaction
+			description: project
 				? "Read-only because the trusted project config overrides this value."
 				: "Context compaction implementation; applies to new runs.",
-			currentValue: projectCompaction ? `${config.compaction.strategy} · project` : config.compaction.strategy,
-			values: projectCompaction ? undefined : ["default", "snapshot", "openai"],
+			currentValue: project ? `${config.compaction.strategy} · project` : config.compaction.strategy,
+			values: project ? undefined : ["default", "snapshot", "openai"],
 		},
-		rNumberItem(config, "limits.maxAgentsPerRun", "Agents per run", config.limits.maxAgentsPerRun),
-		rNumberItem(config, "limits.maxConcurrentPerRun", "Concurrent agents", config.limits.maxConcurrentPerRun),
-		rNumberItem(config, "limits.maxConcurrentPerModel", "Concurrent per model", config.limits.maxConcurrentPerModel),
-		rNumberItem(config, "limits.maxDepth", "Subagent depth", config.limits.maxDepth),
-		rNumberItem(
-			config,
-			"limits.maxCellOutputChars",
-			"Cell output limit",
-			config.limits.maxCellOutputChars,
-			(value) => `${value / 1_000}K chars`,
-		),
-		rNumberItem(
-			config,
-			"limits.maxArtifactPreviewChars",
-			"Artifact preview",
-			config.limits.maxArtifactPreviewChars,
-			(value) => `${value / 1_000}K chars`,
-		),
-		rNumberItem(config, "retention.maxAgeDays", "Run retention", config.retention.maxAgeDays, (value) =>
-			value === 0 ? "unlimited" : `${value} days`,
-		),
-		rNumberItem(
-			config,
-			"retention.maxArtifactBytes",
-			"Artifact budget",
-			config.retention.maxArtifactBytes,
-			bytesLabel,
-		),
-		rNumberItem(
-			config,
-			"retention.maxSnapshotBytes",
-			"Snapshot budget",
-			config.retention.maxSnapshotBytes,
-			bytesLabel,
-		),
-		rNumberItem(
-			config,
-			"retention.maxWorktreeBytes",
-			"Worktree budget",
-			config.retention.maxWorktreeBytes,
-			bytesLabel,
-		),
-		...Object.entries(config.profiles).map(([name, profile]) => ({
-			id: `profile.${name}`,
-			label: `Profile: ${name}`,
-			description: `${profile.description ?? "Configured agent profile."} Definition is read-only.`,
-			currentValue: `${profile.workspace ?? config.agentDefaults.workspace} · ${profile.permissions ?? config.agentDefaults.permissions}`,
-		})),
 	];
 }
 
@@ -1194,11 +1105,18 @@ export class SettingsSelectorComponent extends Container {
 	private applyCategory(): void {
 		const category = this.currentCategory();
 		if (category === "Agents") {
-			this.settingsList.setItems(agentSettingItems(this.config.riemann));
+			this.settingsList.setItems(agentSettingItems(this.config.riemann, this.config.availableAgentModels));
 			return;
 		}
 		if (category === "MCP Servers") {
 			this.settingsList.setItems(mcpSettingItems(this.config.riemann));
+			return;
+		}
+		if (category === "Context") {
+			this.settingsList.setItems([
+				...this.items.filter((item) => GENERAL_SETTING_CATEGORIES.Context.includes(item.id)),
+				...contextSettingItems(this.config.riemann),
+			]);
 			return;
 		}
 		this.settingsList.setItems(this.items.filter((item) => GENERAL_SETTING_CATEGORIES[category].includes(item.id)));

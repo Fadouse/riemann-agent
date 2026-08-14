@@ -1,16 +1,16 @@
 import {
+	getKeybindings,
 	isKeyRelease,
 	isKeyRepeat,
-	Key,
-	matchesKey,
 	type TUI,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { ExtensionCommandContext, ExtensionContext } from "../../core/extensions/types.ts";
+import { keyText } from "../../modes/interactive/components/keybinding-hints.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
-import type { SubagentUiSnapshot } from "../../riemann/agents/supervisor.ts";
+import type { AgentEventDelivery, SubagentUiSnapshot } from "../../riemann/agents/supervisor.ts";
 import type { RiemannRuntime } from "../../riemann/runtime.ts";
 import {
 	compactLine,
@@ -33,6 +33,7 @@ const FINISHED_LINGER_MS = 4_000;
 
 export interface SubagentUiController {
 	showHub(context: ExtensionCommandContext): Promise<void>;
+	notifyAgentEvents(events: AgentEventDelivery["events"]): void;
 	dispose(): void;
 }
 
@@ -61,6 +62,14 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		this.refresh();
 	}
 
+	notifyAgentEvents(events: AgentEventDelivery["events"]): void {
+		if (this.disposed || this.context.mode !== "tui") return;
+		for (const event of events) {
+			const summary = `Agent ${event.name} (${event.agentId}) completed turn ${event.turnId}: ${event.outcome}`;
+			const level = event.outcome === "error" ? "error" : event.outcome === "cancelled" ? "warning" : "info";
+			this.context.ui.notify(`${summary} · /agents to inspect`, level);
+		}
+	}
 	async showHub(context: ExtensionCommandContext): Promise<void> {
 		if (context.mode !== "tui") {
 			context.ui.notify("The Agents Hub is available in interactive mode", "warning");
@@ -102,7 +111,7 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		if (this.disposed || this.context.mode !== "tui") return;
 		const now = Date.now();
 		this.agents = this.runtime.listSubagentsForUi().filter((agent) => this.isFleetVisible(agent, now));
-		const running = this.agents.filter((agent) => agent.status === "running" || agent.status === "idle").length;
+		const running = this.agents.filter((agent) => agent.status === "running").length;
 		const queued = this.agents.filter((agent) => agent.status === "queued").length;
 		const status = activeStatusSummary(running, queued);
 		if (status !== this.lastStatus) {
@@ -165,15 +174,16 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		if (this.disposed || this.viewerOpen || this.hubOpen || isKeyRelease(data) || this.agents.length === 0) {
 			return undefined;
 		}
+		const keybindings = getKeybindings();
 		if (!this.active) {
 			if (this.context.ui.getEditorText().length > 0) return undefined;
-			if (matchesKey(data, Key.down) || matchesKey(data, Key.left)) {
+			if (keybindings.matches(data, "tui.select.down") || keybindings.matches(data, "tui.editor.cursorLeft")) {
 				this.active = true;
 				this.selectedIndex = 0;
 				this.tui?.requestRender();
 				return { consume: true };
 			}
-			if (matchesKey(data, Key.up)) {
+			if (keybindings.matches(data, "tui.select.up")) {
 				this.active = true;
 				this.selectedIndex = this.agents.length;
 				this.tui?.requestRender();
@@ -181,12 +191,12 @@ export class RiemannSubagentUiController implements SubagentUiController {
 			}
 			return undefined;
 		}
-		if (matchesKey(data, Key.down)) {
+		if (keybindings.matches(data, "tui.select.down")) {
 			this.selectedIndex = Math.min(this.agents.length, this.selectedIndex + 1);
 			this.tui?.requestRender();
 			return { consume: true };
 		}
-		if (matchesKey(data, Key.up)) {
+		if (keybindings.matches(data, "tui.select.up")) {
 			if (this.selectedIndex === 0) this.deactivate();
 			else {
 				this.selectedIndex -= 1;
@@ -194,11 +204,11 @@ export class RiemannSubagentUiController implements SubagentUiController {
 			}
 			return { consume: true };
 		}
-		if (matchesKey(data, Key.escape)) {
+		if (keybindings.matches(data, "tui.select.cancel")) {
 			this.deactivate();
 			return { consume: true };
 		}
-		if (matchesKey(data, Key.enter)) {
+		if (keybindings.matches(data, "tui.select.confirm")) {
 			this.openSelected();
 			return { consume: true };
 		}
@@ -305,6 +315,8 @@ export async function showSubagentsHub(
 			let selectedIndex = Math.max(0, agents.length - 1);
 			let stopArmedId: string | undefined;
 			let stoppingId: string | undefined;
+			let releaseArmedId: string | undefined;
+			let releasingId: string | undefined;
 			let closed = false;
 			let renderTimer: NodeJS.Timeout | undefined;
 			const refresh = () => {
@@ -334,31 +346,28 @@ export async function showSubagentsHub(
 					closed = true;
 					unsubscribe();
 					clearInterval(timer);
-					if (renderTimer) clearTimeout(renderTimer);
+					clearTimeout(renderTimer);
 				},
 				invalidate: refresh,
 				handleInput: (data: string) => {
 					if (isKeyRelease(data)) return;
-					if (keybindings.matches(data, "tui.select.cancel")) {
+					if (keybindings.matches(data, "tui.select.cancel") || keybindings.matches(data, "app.agents.close")) {
 						if (isKeyRepeat(data)) return;
 						closed = true;
 						done(undefined);
 						return;
 					}
-					if (matchesKey(data, "q")) {
-						closed = true;
-						done(undefined);
-						return;
-					}
-					if (keybindings.matches(data, "tui.select.up") || matchesKey(data, "k")) {
+					if (keybindings.matches(data, "tui.select.up") || keybindings.matches(data, "app.agents.previous")) {
 						selectedIndex = Math.max(0, selectedIndex - 1);
 						stopArmedId = undefined;
+						releaseArmedId = undefined;
 						tui.requestRender();
 						return;
 					}
-					if (keybindings.matches(data, "tui.select.down") || matchesKey(data, "j")) {
+					if (keybindings.matches(data, "tui.select.down") || keybindings.matches(data, "app.agents.next")) {
 						selectedIndex = Math.min(Math.max(0, agents.length - 1), selectedIndex + 1);
 						stopArmedId = undefined;
+						releaseArmedId = undefined;
 						tui.requestRender();
 						return;
 					}
@@ -368,7 +377,14 @@ export async function showSubagentsHub(
 						done(agent.id);
 						return;
 					}
-					if (matchesKey(data, "x") && agent && isActiveSubagent(agent) && stoppingId === undefined) {
+					if (
+						keybindings.matches(data, "app.agents.stop") &&
+						agent &&
+						isActiveSubagent(agent) &&
+						stoppingId === undefined
+					) {
+						if (isKeyRepeat(data)) return;
+						releaseArmedId = undefined;
 						if (stopArmedId !== agent.id) {
 							stopArmedId = agent.id;
 							tui.requestRender();
@@ -385,9 +401,46 @@ export async function showSubagentsHub(
 								stoppingId = undefined;
 								refresh();
 							});
+						return;
+					}
+					if (
+						keybindings.matches(data, "app.agents.release") &&
+						agent &&
+						!isActiveSubagent(agent) &&
+						releasingId === undefined
+					) {
+						if (isKeyRepeat(data)) return;
+						stopArmedId = undefined;
+						if (releaseArmedId !== agent.id) {
+							releaseArmedId = agent.id;
+							tui.requestRender();
+							return;
+						}
+						releaseArmedId = undefined;
+						releasingId = agent.id;
+						void runtime
+							.releaseSubagentFromUi(agent.id)
+							.catch((error: unknown) =>
+								context.ui.notify(error instanceof Error ? error.message : String(error), "error"),
+							)
+							.finally(() => {
+								releasingId = undefined;
+								refresh();
+							});
 					}
 				},
-				render: (width: number) => renderHub(agents, selectedIndex, stopArmedId, stoppingId, width, tui, theme),
+				render: (width: number) =>
+					renderHub(
+						agents,
+						selectedIndex,
+						stopArmedId,
+						stoppingId,
+						releaseArmedId,
+						releasingId,
+						width,
+						tui,
+						theme,
+					),
 			};
 		},
 		{
@@ -402,6 +455,8 @@ function renderHub(
 	selectedIndex: number,
 	stopArmedId: string | undefined,
 	stoppingId: string | undefined,
+	releaseArmedId: string | undefined,
+	releasingId: string | undefined,
 	width: number,
 	tui: TUI,
 	theme: Theme,
@@ -424,7 +479,7 @@ function renderHub(
 	];
 	if (agents.length === 0) {
 		lines.push(row(""), row(theme.fg("muted", "No Subagents in this run.")), row(""), middle);
-		lines.push(row(theme.fg("dim", "Esc close")), bottom);
+		lines.push(row(theme.fg("dim", `${keyText("tui.select.cancel")} close`)), bottom);
 		return lines;
 	}
 	const maxRows = Math.max(1, Math.min(8, Math.floor(tui.terminal.rows * 0.7 - 12)));
@@ -445,7 +500,7 @@ function renderHub(
 	if (selected) {
 		lines.push(middle);
 		const stats = [
-			selected.modelRole,
+			selected.model,
 			selected.turnCount > 0 ? `↻${selected.turnCount}` : "",
 			selected.toolUses > 0 ? `${selected.toolUses} tool${selected.toolUses === 1 ? "" : "s"}` : "",
 		]
@@ -458,14 +513,25 @@ function renderHub(
 	}
 	lines.push(middle);
 	const canStopSelected = selected !== undefined && isActiveSubagent(selected);
+	const canReleaseSelected = selected !== undefined && !isActiveSubagent(selected);
+	const stopKey = keyText("app.agents.stop");
+	const releaseKey = keyText("app.agents.release");
+	const closeKey = keyText("tui.select.cancel");
+	const controls = `${keyText("tui.select.up")}/${keyText("tui.select.down")}/${keyText("app.agents.previous")}/${keyText("app.agents.next")} select · ${keyText("tui.select.confirm")} view`;
 	const footer =
 		stopArmedId === selected?.id
-			? theme.fg("error", "x again to STOP · Esc close")
-			: stoppingId === selected?.id
-				? theme.fg("warning", "stopping…")
-				: canStopSelected
-					? theme.fg("dim", "↑↓/jk select · Enter view · x stop · Esc close")
-					: theme.fg("dim", "↑↓/jk select · Enter view · Esc close");
+			? theme.fg("error", `${stopKey} again to STOP · ${closeKey} close`)
+			: releaseArmedId === selected?.id
+				? theme.fg("error", `${releaseKey} again to RELEASE SLOT · ${closeKey} close`)
+				: stoppingId === selected?.id
+					? theme.fg("warning", "stopping…")
+					: releasingId === selected?.id
+						? theme.fg("warning", "releasing…")
+						: canStopSelected
+							? theme.fg("dim", `${controls} · ${stopKey} stop · ${closeKey} close`)
+							: canReleaseSelected
+								? theme.fg("dim", `${controls} · ${releaseKey} release · ${closeKey} close`)
+								: theme.fg("dim", `${controls} · ${closeKey} close`);
 	lines.push(row(footer), bottom);
 	return lines;
 }

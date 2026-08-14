@@ -164,7 +164,7 @@ export class RiemannActivityTracker {
 			return { activity };
 		}
 
-		if (type.startsWith("agents.") && type !== "agents.self") {
+		if (type.startsWith("agents.")) {
 			const operation = type.slice("agents.".length);
 			const activity: IPythonAgentActivity = {
 				id,
@@ -176,8 +176,6 @@ export class RiemannActivityTracker {
 				...(stringValue(args.task) ? { task: stringValue(args.task) } : {}),
 				...(stringValue(args.message) ? { message: stringValue(args.message) } : {}),
 				...(stringValue(args.profile) ? { profile: stringValue(args.profile) } : {}),
-				...(stringValue(args.model_role) ? { modelRole: stringValue(args.model_role) } : {}),
-				...(stringValue(args.workspace) ? { workspace: stringValue(args.workspace) } : {}),
 			};
 			return { activity };
 		}
@@ -261,12 +259,13 @@ export class RiemannActivityTracker {
 		} else if (!error && activity.kind === "agent") {
 			const info = agentInfo(result);
 			const agentStatus = stringValue(info?.status);
+			const agentOutcome = stringValue(info?.last_outcome);
 			activity = {
 				...activity,
 				...(stringValue(info?.id) ? { agentId: stringValue(info?.id) } : {}),
 				...(stringValue(info?.name) ? { name: stringValue(info?.name) } : {}),
 				...(agentStatus ? { agentStatus } : activity.operation === "spawn" ? { agentStatus: "running" } : {}),
-				...(agentStatus === "failed" ? { status: "error", error: "Agent failed" } : {}),
+				...(agentOutcome === "error" ? { status: "error", error: "Agent failed" } : {}),
 			};
 		} else if (!error && activity.kind === "patch") {
 			const value = objectValue(result);

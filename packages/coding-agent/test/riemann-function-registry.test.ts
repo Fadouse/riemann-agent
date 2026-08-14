@@ -45,8 +45,8 @@ describe("Riemann function registry prompt inventory", () => {
 		const readOnly = new Set(["workspace.read"]);
 
 		const inventory = registry.promptInventory(readOnly);
-		expect(inventory).toContain("`workspace.read(path) -> TextSnapshot`: Read a file.");
-		expect(inventory).toContain("`catalog.search(query, limit=None) -> list[dict]`");
+		expect(inventory).toContain("`await workspace.read(path) -> TextSnapshot`: Read a file.");
+		expect(inventory).toContain("`await catalog.search(query, limit=None) -> list[dict]`");
 		expect(inventory).not.toContain("workspace.edit");
 		expect(registry.pythonSpecifications(undefined, readOnly).map((item) => item.qualified_name)).toEqual([
 			"catalog.search",
