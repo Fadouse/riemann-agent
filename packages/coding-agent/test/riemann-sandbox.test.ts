@@ -1,8 +1,12 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import { macOSSandboxProfile, sandboxedKernelCommand } from "../src/riemann/kernel/sandbox.ts";
+import {
+	macOSSandboxProfile,
+	resolveSandboxExecutable,
+	sandboxedKernelCommand,
+} from "../src/riemann/kernel/sandbox.ts";
 
 const roots: string[] = [];
 
@@ -26,7 +30,7 @@ async function policy(workspaceWritable: boolean) {
 }
 
 describe("Riemann kernel system sandbox", () => {
-	test("builds a network-isolated Linux bubblewrap command with capability-derived writes", async () => {
+	test("builds a file-only Linux sandbox with host devices and capability-derived writes", async () => {
 		process.env.RIEMANN_TEST_SECRET = "must-not-leak";
 		try {
 			const readOnly = await policy(false);
@@ -35,9 +39,12 @@ describe("Riemann kernel system sandbox", () => {
 				"ipykernel_launcher",
 			]);
 			expect(command.command).toBe("/usr/bin/bwrap");
-			expect(command.args).toContain("--unshare-all");
+			expect(command.args).not.toContain("--unshare-all");
 			expect(command.args).toContain("--new-session");
 			expect(command.transport).toBe("ipc");
+			expect(command.args).toEqual(expect.arrayContaining(["--dev-bind", "/dev", "/dev"]));
+			expect(command.args).toEqual(expect.arrayContaining(["--ro-bind", "/sys", "/sys"]));
+			expect(command.args).not.toContain("--share-net");
 			expect(command.env.RIEMANN_TEST_SECRET).toBeUndefined();
 			expect(command.env.PYTHONNOUSERSITE).toBe("1");
 			const workspaceBind = command.args.findIndex(
@@ -58,6 +65,22 @@ describe("Riemann kernel system sandbox", () => {
 		} finally {
 			delete process.env.RIEMANN_TEST_SECRET;
 		}
+	});
+
+	test("uses the effective PATH and canonical executable target", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-sandbox-path-"));
+		roots.push(root);
+		const targetDirectory = join(root, "target", "bin");
+		const pathDirectory = join(root, "profile", "bin");
+		const target = join(targetDirectory, "probe");
+		await Promise.all([mkdir(targetDirectory, { recursive: true }), mkdir(pathDirectory, { recursive: true })]);
+		await writeFile(target, "#!/bin/sh\n", { mode: 0o755 });
+		await chmod(target, 0o755);
+		await symlink(target, join(pathDirectory, "probe"));
+
+		expect(resolveSandboxExecutable("probe", root, pathDirectory)).toBe(await realpath(target));
+		expect(resolveSandboxExecutable("probe", root, relative(root, pathDirectory))).toBe(await realpath(target));
+		expect(resolveSandboxExecutable("missing-probe", root, pathDirectory)).toBeUndefined();
 	});
 	test("masks nested Riemann state while remounting only the managed runtime", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-sandbox-nested-state-"));

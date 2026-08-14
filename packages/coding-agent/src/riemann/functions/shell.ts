@@ -105,6 +105,19 @@ export class ShellFunctions {
 		},
 	): Promise<JsonValue> {
 		const started = Date.now();
+		const executable = resolveSandboxExecutable(command, options.cwd, options.env.PATH ?? process.env.PATH);
+		if (!executable) {
+			return {
+				$riemann: "process_result",
+				command: [command, ...commandArgs].join(" "),
+				exit_code: 127,
+				stdout: "",
+				stderr: `${command}: command not found\n`,
+				duration_ms: Date.now() - started,
+				timed_out: false,
+				artifact: null,
+			};
+		}
 		const sandboxDir = await mkdtemp(join(tmpdir(), "riemann-shell-"));
 		await Promise.all([
 			mkdir(join(sandboxDir, "home"), { recursive: true, mode: 0o700 }),
@@ -112,7 +125,6 @@ export class ShellFunctions {
 		]);
 		let launch: SandboxedCommand;
 		try {
-			const executable = resolveSandboxExecutable(command, options.cwd, process.env.PATH);
 			launch = sandboxedKernelCommand(
 				{
 					agentDir: this.sandbox.agentDir,

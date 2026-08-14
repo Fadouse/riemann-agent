@@ -44,9 +44,10 @@ const SAFE_ENVIRONMENT = [
 	"PI_REASONING_LEVEL",
 ] as const;
 
-function executableFromPath(name: string, pathValue = process.env.PATH): string | undefined {
+function executableFromPath(name: string, pathValue = process.env.PATH, cwd = process.cwd()): string | undefined {
 	for (const directory of pathValue?.split(delimiter) ?? []) {
-		const candidate = join(directory, name);
+		const root = directory.length === 0 ? cwd : resolve(cwd, directory);
+		const candidate = join(root, name);
 		try {
 			accessSync(candidate, constants.X_OK);
 			return candidate;
@@ -115,10 +116,9 @@ function sanitizedEnvironment(policy: KernelSandboxPolicy): NodeJS.ProcessEnv {
 }
 
 function linuxHostCommand(policy: KernelSandboxPolicy, pythonArgs: string[], bubblewrap: string): SandboxedCommand {
-	const args = ["--die-with-parent", "--new-session", "--unshare-all"];
-	if (policy.networkAllowed) args.push("--share-net");
+	const args = ["--die-with-parent", "--new-session"];
 	args.push(policy.workspaceWritable ? "--bind" : "--ro-bind", "/", "/");
-	args.push("--proc", "/proc", "--dev", "/dev", "--chdir", resolve(policy.cwd ?? policy.workspace), "--");
+	args.push("--proc", "/proc", "--dev-bind", "/dev", "/dev", "--chdir", resolve(policy.cwd ?? policy.workspace), "--");
 	args.push(resolve(policy.python), ...pythonArgs);
 	return {
 		command: bubblewrap,
@@ -140,17 +140,16 @@ function linuxCommand(policy: KernelSandboxPolicy, pythonArgs: string[]): Sandbo
 	const args = [
 		"--die-with-parent",
 		"--new-session",
-		"--unshare-all",
 		"--proc",
 		"/proc",
-		"--dev",
+		"--dev-bind",
+		"/dev",
 		"/dev",
 		"--tmpfs",
 		"/tmp",
 		"--tmpfs",
 		"/run",
 	];
-	if (policy.networkAllowed) args.push("--share-net");
 	for (const path of existingRoots([
 		"/nix",
 		"/usr",
@@ -159,6 +158,7 @@ function linuxCommand(policy: KernelSandboxPolicy, pythonArgs: string[]): Sandbo
 		"/lib",
 		"/lib64",
 		"/etc",
+		"/sys",
 		interpreterLinkRoot(policy.python) ?? "",
 	])) {
 		args.push("--ro-bind", path, path);
@@ -281,9 +281,21 @@ export function sandboxedKernelCommand(policy: KernelSandboxPolicy, pythonArgs: 
 	throw new Error(`Riemann kernel sandboxing is supported only on Linux and macOS, not ${platform}.`);
 }
 
-export function resolveSandboxExecutable(command: string, cwd: string, pathValue?: string): string {
-	const candidate = command.includes("/") ? resolve(cwd, command) : executableFromPath(command, pathValue);
-	if (!candidate) throw new Error(`Executable not found for sandboxed process: ${command}`);
-	accessSync(candidate, constants.X_OK);
-	return candidate;
+export function resolveSandboxExecutable(command: string, cwd: string, pathValue?: string): string | undefined {
+	const candidate = command.includes("/") ? resolve(cwd, command) : executableFromPath(command, pathValue, cwd);
+	if (!candidate) return undefined;
+	try {
+		accessSync(candidate, constants.X_OK);
+		return realpathSync(candidate);
+	} catch (error) {
+		if (
+			typeof error === "object" &&
+			error !== null &&
+			"code" in error &&
+			(error.code === "ENOENT" || error.code === "ENOTDIR")
+		) {
+			return undefined;
+		}
+		throw error;
+	}
 }

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -22,8 +22,45 @@ function record(value: JsonValue): Record<string, JsonValue> {
 	return value;
 }
 
+describe("Riemann shell command resolution", () => {
+	test("returns a structured command-not-found process result", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-missing-"));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		await mkdir(workspace);
+		const store = new RiemannStore(join(root, "agent"));
+		try {
+			const run = store.openRun("shell-missing", workspace);
+			const shell = new ShellFunctions(workspace, new ArtifactStore(store, run.id), 100_000, {
+				agentDir: join(root, "agent"),
+				filesystemScope: "workspace",
+				workspaceWritable: false,
+				networkAllowed: false,
+			});
+			const definition = shell.definitions().find((item) => item.name === "run");
+			if (!definition) throw new Error("shell.run is unavailable");
+			const result = record(
+				await definition.handler(
+					{ command: "riemann-command-that-does-not-exist", timeout: 10 },
+					new AbortController().signal,
+				),
+			);
+			expect(result).toMatchObject({
+				command: "riemann-command-that-does-not-exist",
+				exit_code: 127,
+				stdout: "",
+				stderr: "riemann-command-that-does-not-exist: command not found\n",
+				timed_out: false,
+				artifact: null,
+			});
+		} finally {
+			store.close();
+		}
+	});
+});
+
 describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
-	test("enforces read-only workspace, host filesystem, network, and environment boundaries", async () => {
+	test("enforces read-only workspace, host filesystem, and environment boundaries", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-sandbox-"));
 		roots.push(root);
 		const workspace = join(root, "workspace");
@@ -43,7 +80,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 			const definition = shell.definitions().find((item) => item.name === "run");
 			if (!definition) throw new Error("shell.run is unavailable");
 			process.env.RIEMANN_HOST_SECRET_TEST = "hidden";
-			const script = `(async()=>{const fs=require("node:fs"); const net=require("node:net"); const out={inside:fs.readFileSync("inside.txt","utf8"),hostSecret:process.env.RIEMANN_HOST_SECRET_TEST??null,explicit:process.env.EXPLICIT_VALUE??null}; try{fs.writeFileSync("write.txt","bad");out.write="allowed"}catch(e){out.write=e.code} try{fs.readFileSync(${JSON.stringify(outside)},"utf8");out.outside="allowed"}catch(e){out.outside=e.code} await new Promise(r=>{const s=net.createConnection({host:"1.1.1.1",port:53}); s.on("connect",()=>{out.network="allowed";s.destroy();r()});s.on("error",e=>{out.network=e.code;r()})}); console.log(JSON.stringify(out))})()`;
+			const script = `const fs=require("node:fs");const out={inside:fs.readFileSync("inside.txt","utf8"),hostSecret:process.env.RIEMANN_HOST_SECRET_TEST??null,explicit:process.env.EXPLICIT_VALUE??null};try{fs.writeFileSync("write.txt","bad");out.write="allowed"}catch(e){out.write=e.code}try{fs.readFileSync(${JSON.stringify(outside)},"utf8");out.outside="allowed"}catch(e){out.outside=e.code}console.log(JSON.stringify(out))`;
 			const result = record(
 				await definition.handler(
 					{ command: process.execPath, args: ["-e", script], env: { EXPLICIT_VALUE: "visible" }, timeout: 10 },
@@ -54,7 +91,6 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 			expect(output).toMatchObject({ inside: "inside", hostSecret: null, explicit: "visible" });
 			expect(output.write).not.toBe("allowed");
 			expect(output.outside).not.toBe("allowed");
-			expect(output.network).not.toBe("allowed");
 			await expect(readFile(join(workspace, "write.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
 			delete process.env.RIEMANN_HOST_SECRET_TEST;
@@ -62,6 +98,37 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		}
 	}, 30_000);
 
+	test("resolves commands from an explicit call-level PATH", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-path-"));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		const bin = join(workspace, "tools");
+		await mkdir(bin, { recursive: true });
+		const executable = join(bin, "path-probe");
+		await writeFile(executable, "#!/bin/sh\nprintf 'path-ok\\n'\n");
+		await chmod(executable, 0o755);
+		const store = new RiemannStore(join(root, "agent"));
+		try {
+			const run = store.openRun("shell-path", workspace);
+			const shell = new ShellFunctions(workspace, new ArtifactStore(store, run.id), 100_000, {
+				agentDir: join(root, "agent"),
+				filesystemScope: "workspace",
+				workspaceWritable: false,
+				networkAllowed: false,
+			});
+			const definition = shell.definitions().find((item) => item.name === "run");
+			if (!definition) throw new Error("shell.run is unavailable");
+			const result = record(
+				await definition.handler(
+					{ command: "path-probe", env: { PATH: bin }, timeout: 10 },
+					new AbortController().signal,
+				),
+			);
+			expect(result).toMatchObject({ exit_code: 0, stdout: "path-ok\n" });
+		} finally {
+			store.close();
+		}
+	});
 	test("masks nested Riemann state without blocking normal workspace commands", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-nested-state-"));
 		roots.push(root);

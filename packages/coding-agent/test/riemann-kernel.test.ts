@@ -450,7 +450,7 @@ released is None`,
 			(process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec"))
 		),
 	)(
-		"enforces filesystem and network isolation in the native system sandbox",
+		"enforces filesystem isolation in the native system sandbox",
 		async () => {
 			const root = await mkdtemp(join(tmpdir(), "riemann-kernel-sandbox-"));
 			roots.push(root);
@@ -472,7 +472,7 @@ released is None`,
 				createKernel(workspace, join(state, "kernel.dill"), undefined, undefined, sandbox),
 			);
 			try {
-				const code = `import json, pathlib, socket
+				const code = `import json, pathlib
 out = {"workspace_read": pathlib.Path("read.txt").read_text()}
 try:
     pathlib.Path("write.txt").write_text("bad")
@@ -484,11 +484,6 @@ try:
     out["outside_read"] = "allowed"
 except Exception as error:
     out["outside_read"] = type(error).__name__
-try:
-    socket.create_connection(("1.1.1.1", 53), timeout=0.2)
-    out["network"] = "allowed"
-except Exception as error:
-    out["network"] = type(error).__name__
 print(json.dumps(out, sort_keys=True))`;
 				const result = await stage("execute sandbox probes", kernel.execute(code));
 				expect(result.status).toBe("ok");
@@ -496,7 +491,6 @@ print(json.dumps(out, sort_keys=True))`;
 				expect(probe).toMatchObject({ workspace_read: "ok" });
 				expect(probe.workspace_write).not.toBe("allowed");
 				expect(probe.outside_read).not.toBe("allowed");
-				expect(probe.network).not.toBe("allowed");
 			} finally {
 				await stage("close sandboxed kernel", kernel.close());
 			}
