@@ -45,13 +45,8 @@ export function rightAlign(left: string, right: string, width: number, minGap = 
 
 function fleetWindow(selectedIndex: number, agentCount: number): { start: number; visible: number } {
 	const visible = Math.min(MAX_FLEET_AGENT_ROWS, agentCount);
-	const selectedAgent = Math.max(0, selectedIndex - 1);
-	const start = selectedAgent < visible ? 0 : selectedAgent - visible + 1;
+	const start = selectedIndex < visible ? 0 : selectedIndex - visible + 1;
 	return { start, visible };
-}
-
-function fleetBullet(index: number, selectedIndex: number, theme: Theme): string {
-	return index === selectedIndex ? theme.fg("accent", "●") : theme.fg("dim", "○");
 }
 
 export function renderSubagentFleet(
@@ -64,25 +59,26 @@ export function renderSubagentFleet(
 ): string[] {
 	if (agents.length === 0) return [];
 	const safeWidth = Math.max(1, width);
-	const selected = selectionActive ? Math.max(0, Math.min(agents.length, selectedIndex)) : -1;
-	const { start, visible } = fleetWindow(Math.max(0, selectedIndex), agents.length);
+	const windowIndex = Math.max(0, Math.min(agents.length - 1, selectedIndex));
+	const selected = selectionActive ? windowIndex : -1;
+	const { start, visible } = fleetWindow(windowIndex, agents.length);
 	const hint = selectionActive
 		? `${keyText("tui.select.up")}/${keyText("tui.select.down")} select · ${keyText("tui.select.confirm")} view · ${keyText("tui.select.cancel")} back`
 		: `${keyText("app.interrupt")} to interrupt · ${keyText("tui.editor.cursorLeft")} for agents · ${keyText("tui.select.down")} to manage`;
 	const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, safeWidth, ""), ""];
-	lines.push(truncateToWidth(`  ${fleetBullet(0, selected, theme)} main`, safeWidth, ""));
 	if (start > 0) lines.push(rightAlign("", theme.fg("dim", `↑ ${start} more`), safeWidth));
 	for (let index = start; index < start + visible; index += 1) {
 		const agent = agents[index];
 		if (!agent) continue;
-		const left = `  ${fleetBullet(index + 1, selected, theme)} ${subagentStatusIcon(agent, theme)} ${theme.bold(agent.name)}`;
+		const name = index === selected ? theme.fg("accent", theme.bold(agent.name)) : theme.bold(agent.name);
+		const left = `  ${subagentStatusIcon(agent, theme)} ${name}`;
 		if (!isActiveSubagent(agent)) {
 			lines.push(truncateToWidth(left, safeWidth, ""));
 			continue;
 		}
-		const status = theme.fg("muted", subagentStatusText(agent));
+		const preview = theme.fg("muted", compactLine(latestAssistantText(agent) ?? agent.task));
 		const right = theme.fg("dim", `${formatFleetElapsed(agent, now)} · ${formatFleetTokens(agent.tokens)}`);
-		lines.push(rightAlign(`${left}  ${status}`, right, safeWidth));
+		lines.push(rightAlign(`${left}  ${preview}`, right, safeWidth));
 	}
 	const hiddenBelow = agents.length - (start + visible);
 	if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), safeWidth));

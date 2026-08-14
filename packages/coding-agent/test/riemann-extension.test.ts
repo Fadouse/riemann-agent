@@ -66,7 +66,13 @@ describe("Riemann session extension", () => {
 			{
 				type: "custom",
 				customType: "riemann-agent-events",
-				data: { eventIds: ["event-1", "event-2"] },
+				data: {
+					eventIds: ["event-1", "event-2"],
+					completions: [
+						{ name: "reviewer", outcome: "ok" },
+						{ name: "tester", outcome: "ok" },
+					],
+				},
 			},
 		]);
 		expect(sent).toEqual([
@@ -121,6 +127,7 @@ describe("Riemann session extension", () => {
 		let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<unknown>) | undefined;
 		let shutdown: ((event: unknown, ctx: ExtensionContext) => Promise<unknown>) | undefined;
 		const api = {
+			registerEntryRenderer() {},
 			registerTool(tool: ToolDefinition) {
 				registered.push(tool);
 			},

@@ -19,7 +19,7 @@
 - Kept the strict Riemann configuration schema at `version: 1`; settings writes and examples no longer force an unrelated version-two migration.
 - Fixed async Agent calls being presented as synchronous expressions, and replaced delayed result-bearing completion injection with immediate minimal steering reminders.
 - Fixed sandboxed command lookup to honor call-level `PATH`, resolve Nix profile symlinks canonically, and return a structured exit-127 result for missing executables.
-- Fixed opaque `AgentInfo` field guidance and coalesced Subagent completion notices; the prompt now exposes flat Turn fields, the Fleet reuses standard status markers, settled rows remain independently visible, and no Subagent count is added to the footer.
+- Fixed opaque `AgentInfo` field guidance and Agent completion presentation; the prompt exposes flat Turn fields, asynchronous completions emit immediate compact transcript lines, and the Subagent-only Fleet uses one status icon with the latest Agent output.
 - Fixed wrapped Riemann Shell activity previews exceeding their collapsed visual-row budget and increased fullscreen mouse-wheel scrolling from one to three rows per event.
 
 ## [0.84.2] - 2026-08-14

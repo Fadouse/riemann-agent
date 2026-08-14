@@ -98,7 +98,7 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		if (this.disposed || this.context.mode !== "tui") return;
 		const now = Date.now();
 		this.agents = this.runtime.listSubagentsForUi().filter((agent) => this.isFleetVisible(agent, now));
-		this.selectedIndex = Math.max(0, Math.min(this.agents.length, this.selectedIndex));
+		this.selectedIndex = Math.max(0, Math.min(this.agents.length - 1, this.selectedIndex));
 		if (this.agents.length === 0) {
 			this.active = false;
 			this.selectedIndex = 0;
@@ -165,14 +165,14 @@ export class RiemannSubagentUiController implements SubagentUiController {
 			}
 			if (keybindings.matches(data, "tui.select.up")) {
 				this.active = true;
-				this.selectedIndex = this.agents.length;
+				this.selectedIndex = this.agents.length - 1;
 				this.tui?.requestRender();
 				return { consume: true };
 			}
 			return undefined;
 		}
 		if (keybindings.matches(data, "tui.select.down")) {
-			this.selectedIndex = Math.min(this.agents.length, this.selectedIndex + 1);
+			this.selectedIndex = Math.min(this.agents.length - 1, this.selectedIndex + 1);
 			this.tui?.requestRender();
 			return { consume: true };
 		}
@@ -203,11 +203,7 @@ export class RiemannSubagentUiController implements SubagentUiController {
 	}
 
 	private openSelected(): void {
-		if (this.selectedIndex === 0) {
-			this.deactivate();
-			return;
-		}
-		const agent = this.agents[this.selectedIndex - 1];
+		const agent = this.agents[this.selectedIndex];
 		if (!agent) return;
 		this.viewerOpen = true;
 		this.viewingAgentId = agent.id;
@@ -224,7 +220,7 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		this.viewingAgentId = undefined;
 		this.viewerOpen = false;
 		const index = this.agents.findIndex((agent) => agent.id === agentId);
-		this.selectedIndex = index < 0 ? 0 : index + 1;
+		this.selectedIndex = index < 0 ? 0 : index;
 		this.refresh();
 	}
 

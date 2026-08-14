@@ -46,12 +46,11 @@ describe("Riemann Subagent UI", () => {
 		const agents = Array.from({ length: 7 }, (_, index) =>
 			snapshot({ id: `agent-${index}`, name: `worker-${index}`, task: `Task ${index}` }),
 		);
-		const lines = renderSubagentFleet(agents, theme, Date.parse("2026-08-13T12:00:12.000Z"), 80, 7, true);
+		const lines = renderSubagentFleet(agents, theme, Date.parse("2026-08-13T12:00:12.000Z"), 80, 6, true);
 		const rendered = stripAnsi(lines.join("\n"));
 		expect(rendered).toContain("select");
-		expect(rendered).toContain("○ main");
 		expect(rendered).toContain("● worker-6");
-		expect(rendered).toContain("Working…");
+		expect(rendered).toContain("Task 6");
 		expect(rendered).toContain("↑ 2 more");
 		expect(rendered).toContain("12s · ↓ 13.1k tokens");
 		expect(rendered).not.toContain("worker-0");
@@ -180,7 +179,7 @@ describe("Riemann Subagent UI", () => {
 			expect(installed).toMatchObject({ key: "riemann-subagents:fleet", options: { placement: "belowEditor" } });
 			if (!installed || typeof installed.content !== "function") throw new Error("Fleet widget was not installed");
 			const component = installed.content({ requestRender: () => undefined } as unknown as TUI, theme);
-			expect(stripAnsi(component.render(80).join("\n"))).toContain("● reviewer  Working…");
+			expect(stripAnsi(component.render(80).join("\n"))).toContain("● reviewer  Review parser changes");
 
 			agents = [
 				snapshot({

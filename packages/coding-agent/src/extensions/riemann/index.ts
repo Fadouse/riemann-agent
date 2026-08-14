@@ -1,3 +1,4 @@
+import { Text } from "@earendil-works/pi-tui";
 import type { BuildSystemPromptOptions, ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
 import type { AgentEventDelivery } from "../../riemann/agents/supervisor.ts";
 import {
@@ -11,6 +12,13 @@ import { installSubagentUi, type SubagentUiController } from "./subagent-ui.ts";
 
 const AGENT_EVENT_RECEIPT_TYPE = "riemann-agent-events";
 const AGENT_COMPLETION_MESSAGE_TYPE = "riemann-agent-completion";
+
+type AgentCompletionDisplay = Pick<AgentEventDelivery["events"][number], "name" | "outcome">;
+
+interface AgentEventReceipt {
+	eventIds: string[];
+	completions?: AgentCompletionDisplay[];
+}
 
 function persistedAgentEventIds(ctx: ExtensionContext): Set<string> {
 	const ids = new Set<string>();
@@ -35,6 +43,34 @@ function persistedAgentEventIds(ctx: ExtensionContext): Set<string> {
 		}
 	}
 	return ids;
+}
+
+function completionDisplays(value: unknown): AgentCompletionDisplay[] {
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		Array.isArray(value) ||
+		!("completions" in value) ||
+		!Array.isArray(value.completions)
+	) {
+		return [];
+	}
+	const displays: AgentCompletionDisplay[] = [];
+	for (const completion of value.completions) {
+		if (
+			typeof completion !== "object" ||
+			completion === null ||
+			Array.isArray(completion) ||
+			!("name" in completion) ||
+			typeof completion.name !== "string" ||
+			!("outcome" in completion) ||
+			(completion.outcome !== "ok" && completion.outcome !== "error" && completion.outcome !== "cancelled")
+		) {
+			continue;
+		}
+		displays.push({ name: completion.name, outcome: completion.outcome });
+	}
+	return displays;
 }
 
 function completionReminder(events: AgentEventDelivery["events"]): string {
@@ -66,7 +102,10 @@ export function deliverAgentEvents(
 		},
 		{ triggerTurn: true, deliverAs: "steer" },
 	);
-	pi.appendEntry(AGENT_EVENT_RECEIPT_TYPE, { eventIds });
+	pi.appendEntry<AgentEventReceipt>(AGENT_EVENT_RECEIPT_TYPE, {
+		eventIds,
+		completions: missing.map(({ name, outcome }) => ({ name, outcome })),
+	});
 	const stored = persistedAgentEventIds(ctx);
 	if (eventIds.some((id) => !stored.has(id))) {
 		throw new Error("Could not persist Riemann Agent completion receipts");
@@ -105,6 +144,17 @@ function appendProjectContext(prompt: string, options: BuildSystemPromptOptions)
 }
 
 const riemannExtension: ExtensionFactory = (pi) => {
+	pi.registerEntryRenderer<AgentEventReceipt>(AGENT_EVENT_RECEIPT_TYPE, (entry, _options, theme) => {
+		const completions = completionDisplays(entry.data);
+		if (completions.length === 0) return undefined;
+		const lines = completions.map(({ name, outcome }) => {
+			if (outcome === "error") return `${theme.fg("error", "✗")} ${theme.fg("muted", `${name} failed`)}`;
+			if (outcome === "cancelled") return `${theme.fg("dim", "■")} ${theme.fg("muted", `${name} cancelled`)}`;
+			return `${theme.fg("success", "✓")} ${theme.fg("muted", `${name} completed`)}`;
+		});
+		return new Text(lines.join("\n"), 1, 0);
+	});
+
 	let runtime: RiemannRuntime | undefined;
 	let closing: Promise<void> | undefined;
 	let subagentUi: SubagentUiController | undefined;
