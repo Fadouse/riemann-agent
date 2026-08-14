@@ -74,6 +74,21 @@ export class SettingsList implements Component {
 		}
 	}
 
+	hasOpenSubmenu(): boolean {
+		return this.submenuComponent !== null;
+	}
+
+	setItems(items: SettingItem[]): void {
+		this.items = items;
+		this.filteredItems = items;
+		this.selectedIndex = 0;
+		if (this.searchInput) this.searchInput.setValue("");
+	}
+
+	getFilterQuery(): string {
+		return this.searchInput?.getValue() ?? "";
+	}
+
 	invalidate(): void {
 		this.submenuComponent?.invalidate?.();
 	}
@@ -91,7 +106,8 @@ export class SettingsList implements Component {
 		const lines: string[] = [];
 
 		if (this.searchEnabled && this.searchInput) {
-			lines.push(...this.searchInput.render(width));
+			if (this.searchInput.getValue().length > 0) lines.push(...this.searchInput.render(width));
+			else lines.push("");
 			lines.push("");
 		}
 

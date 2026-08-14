@@ -36,6 +36,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 			const run = store.openRun("shell-sandbox", workspace);
 			const shell = new ShellFunctions(workspace, new ArtifactStore(store, run.id), 100_000, {
 				agentDir: join(root, "agent"),
+				filesystemScope: "workspace",
 				workspaceWritable: false,
 				networkAllowed: false,
 			});
@@ -57,6 +58,80 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 			await expect(readFile(join(workspace, "write.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
 			delete process.env.RIEMANN_HOST_SECRET_TEST;
+			store.close();
+		}
+	}, 30_000);
+
+	test("masks nested Riemann state without blocking normal workspace commands", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-nested-state-"));
+		roots.push(root);
+		const agentDir = join(root, ".riemann", "agent");
+		await mkdir(agentDir, { recursive: true });
+		await Promise.all([
+			writeFile(join(root, "visible.txt"), "visible"),
+			writeFile(join(agentDir, "auth.json"), "RIEMANN_PRIVATE_CREDENTIAL"),
+		]);
+		const store = new RiemannStore(agentDir);
+		try {
+			const run = store.openRun("shell-nested-state", root);
+			const shell = new ShellFunctions(root, new ArtifactStore(store, run.id), 100_000, {
+				agentDir,
+				filesystemScope: "workspace",
+				workspaceWritable: false,
+				networkAllowed: false,
+			});
+			const definition = shell.definitions().find((item) => item.name === "run");
+			if (!definition) throw new Error("shell.run is unavailable");
+			const script = `const fs=require("node:fs");const out={visible:fs.readFileSync("visible.txt","utf8")};try{fs.readFileSync(${JSON.stringify(join(agentDir, "auth.json"))},"utf8");out.state="allowed"}catch(error){out.state=error.code}console.log(JSON.stringify(out))`;
+			const result = record(
+				await definition.handler(
+					{ command: process.execPath, args: ["-e", script], timeout: 10 },
+					new AbortController().signal,
+				),
+			);
+			const output = JSON.parse(String(result.stdout).trim()) as Record<string, string>;
+			expect(output.visible).toBe("visible");
+			expect(output.state).not.toBe("allowed");
+			await expect(
+				definition.handler(
+					{ command: process.execPath, args: ["-e", ""], cwd: ".riemann/agent", timeout: 10 },
+					new AbortController().signal,
+				),
+			).rejects.toMatchObject({ code: "permission_denied" });
+		} finally {
+			store.close();
+		}
+	}, 30_000);
+
+	test("allows a main Agent with host scope to access paths outside its workspace", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-host-"));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		const outsideDirectory = join(root, "outside");
+		const outside = join(outsideDirectory, "secret.txt");
+		await Promise.all([mkdir(workspace), mkdir(outsideDirectory)]);
+		await writeFile(outside, "secret");
+		const store = new RiemannStore(join(root, "agent"));
+		try {
+			const run = store.openRun("shell-host", workspace);
+			const shell = new ShellFunctions(workspace, new ArtifactStore(store, run.id), 100_000, {
+				agentDir: join(root, "agent"),
+				filesystemScope: "host",
+				workspaceWritable: true,
+				networkAllowed: false,
+			});
+			const definition = shell.definitions().find((item) => item.name === "run");
+			if (!definition) throw new Error("shell.run is unavailable");
+			const script = `const fs=require("node:fs");fs.writeFileSync("created.txt","created");console.log(fs.readFileSync("secret.txt","utf8"))`;
+			const result = record(
+				await definition.handler(
+					{ command: process.execPath, args: ["-e", script], cwd: outsideDirectory, timeout: 10 },
+					new AbortController().signal,
+				),
+			);
+			expect(String(result.stdout).trim()).toBe("secret");
+			expect(await readFile(join(outsideDirectory, "created.txt"), "utf8")).toBe("created");
+		} finally {
 			store.close();
 		}
 	}, 30_000);

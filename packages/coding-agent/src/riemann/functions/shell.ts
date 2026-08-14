@@ -55,6 +55,7 @@ function appendCaptured(chunks: Buffer[], currentBytes: number, chunk: Buffer, m
 
 export interface ShellSandboxPolicy {
 	agentDir: string;
+	filesystemScope: "host" | "workspace";
 	workspaceWritable: boolean;
 	networkAllowed: boolean;
 }
@@ -77,8 +78,18 @@ export class ShellFunctions {
 		if (typeof value !== "string" || value.length === 0)
 			throw new RiemannHostError("invalid_arguments", "cwd must be a non-empty string");
 		const cwd = resolve(this.root, value);
-		if (!isInside(this.root, cwd))
+		if (this.sandbox.filesystemScope === "workspace" && !isInside(this.root, cwd)) {
 			throw new RiemannHostError("permission_denied", `Command cwd is outside the workspace: ${value}`);
+		}
+		const stateRoot = resolve(this.sandbox.agentDir);
+		if (
+			this.sandbox.filesystemScope === "workspace" &&
+			stateRoot !== this.root &&
+			isInside(this.root, stateRoot) &&
+			isInside(stateRoot, cwd)
+		) {
+			throw new RiemannHostError("permission_denied", `Command cwd is reserved for Riemann state: ${value}`);
+		}
 		return cwd;
 	}
 
@@ -106,6 +117,8 @@ export class ShellFunctions {
 				{
 					agentDir: this.sandbox.agentDir,
 					workspace: this.root,
+					cwd: options.cwd,
+					filesystemScope: this.sandbox.filesystemScope,
 					workspaceWritable: this.sandbox.workspaceWritable,
 					networkAllowed: this.sandbox.networkAllowed,
 					python: executable,
@@ -225,7 +238,10 @@ export class ShellFunctions {
 					{ name: "args", description: "Argument list", type: "list[str] | None", required: false },
 					{
 						name: "cwd",
-						description: "Workspace-relative working directory",
+						description:
+							this.sandbox.filesystemScope === "host"
+								? "Working directory; relative paths resolve from the project workspace and absolute host paths are allowed"
+								: "Workspace-relative working directory",
 						type: "str | None",
 						required: false,
 					},
@@ -269,7 +285,10 @@ export class ShellFunctions {
 					{ name: "script", description: "Shell source", type: "str", required: true },
 					{
 						name: "cwd",
-						description: "Workspace-relative working directory",
+						description:
+							this.sandbox.filesystemScope === "host"
+								? "Working directory; relative paths resolve from the project workspace and absolute host paths are allowed"
+								: "Workspace-relative working directory",
 						type: "str | None",
 						required: false,
 					},

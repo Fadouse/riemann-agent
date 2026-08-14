@@ -4,6 +4,8 @@ import {
 	type Component,
 	Container,
 	getCapabilities,
+	getKeybindings,
+	Input,
 	type ScrollViewScrollbar,
 	type SelectItem,
 	SelectList,
@@ -21,6 +23,7 @@ import type {
 	TuiMode,
 	WarningSettings,
 } from "../../../core/settings-manager.ts";
+import type { RiemannConfig, RiemannSettingPath } from "../../../riemann/config.ts";
 import {
 	getSelectListTheme,
 	getSettingsListTheme,
@@ -91,6 +94,7 @@ export interface SettingsConfig {
 	fullscreenExitOutput: FullscreenExitOutput;
 	fullscreenScrollbar: ScrollViewScrollbar;
 	warnings: WarningSettings;
+	riemann: RiemannConfig;
 }
 
 export interface SettingsCallbacks {
@@ -126,6 +130,8 @@ export interface SettingsCallbacks {
 	onFullscreenExitOutputChange: (output: FullscreenExitOutput) => void;
 	onFullscreenScrollbarChange: (mode: ScrollViewScrollbar) => void;
 	onWarningsChange: (warnings: WarningSettings) => void;
+	onRiemannChange: (path: RiemannSettingPath, value: unknown) => Promise<void>;
+	onError: (message: string) => void;
 	onCancel: () => void;
 }
 
@@ -274,8 +280,8 @@ function defaultAutomaticThemes(
 }
 
 class ThemeSubmenu extends Container {
-	private inputComponent: Component | undefined;
 	private readonly callbacks: SettingsCallbacks;
+	private inputComponent: Component | undefined;
 	private readonly availableThemes: string[];
 	private readonly terminalTheme: TerminalTheme;
 	private readonly onDone: (selectedValue?: string) => void;
@@ -481,14 +487,291 @@ class ThemeSubmenu extends Container {
 	}
 }
 
+const SETTINGS_CATEGORIES = ["Interface", "Interaction", "Model", "Context", "Agents", "MCP Servers"] as const;
+type SettingsCategory = (typeof SETTINGS_CATEGORIES)[number];
+
+const GENERAL_SETTING_CATEGORIES: Record<Exclude<SettingsCategory, "Agents" | "MCP Servers">, readonly string[]> = {
+	Interface: [
+		"theme",
+		"tui-mode",
+		"fullscreen-exit-output",
+		"fullscreen-scrollbar",
+		"show-images",
+		"image-width-cells",
+		"auto-resize-images",
+		"block-images",
+		"mermaid-rendering",
+		"hide-thinking",
+		"show-hardware-cursor",
+		"editor-padding",
+		"output-padding",
+		"autocomplete-max-visible",
+		"clear-on-shrink",
+		"terminal-progress",
+	],
+	Interaction: [
+		"steering-mode",
+		"follow-up-mode",
+		"skill-commands",
+		"default-project-trust",
+		"double-escape-action",
+		"tree-filter-mode",
+		"warnings",
+		"collapse-changelog",
+		"quiet-startup",
+		"install-telemetry",
+	],
+	Model: ["transport", "http-idle-timeout", "thinking"],
+	Context: ["autocompact", "cache-miss-notices"],
+};
+
+const RIEMANN_NUMBER_CHOICES = {
+	"limits.maxAgentsPerRun": [1, 2, 4, 8, 16, 32, 64],
+	"limits.maxConcurrentPerRun": [1, 2, 4, 8, 16, 32],
+	"limits.maxConcurrentPerModel": [1, 2, 4, 8, 16],
+	"limits.maxDepth": [0, 1, 2, 3, 4, 6, 8],
+	"limits.maxCellOutputChars": [10_000, 25_000, 50_000, 100_000, 250_000, 500_000],
+	"limits.maxArtifactPreviewChars": [1_000, 4_000, 8_000, 12_000, 20_000, 50_000],
+	"retention.maxAgeDays": [0, 7, 14, 30, 60, 90, 180, 365],
+	"retention.maxArtifactBytes": [0, 268_435_456, 536_870_912, 1_073_741_824, 2_147_483_648, 5_368_709_120],
+	"retention.maxSnapshotBytes": [0, 134_217_728, 268_435_456, 536_870_912, 1_073_741_824, 2_147_483_648],
+	"retention.maxWorktreeBytes": [0, 1_073_741_824, 2_147_483_648, 5_368_709_120, 10_737_418_240],
+} as const;
+
+function bytesLabel(bytes: number): string {
+	if (bytes === 0) return "unlimited";
+	if (bytes >= 1_073_741_824) return `${bytes / 1_073_741_824} GiB`;
+	return `${bytes / 1_048_576} MiB`;
+}
+
+function parseRiemannValue(path: string, display: string): unknown {
+	if (path.endsWith(".enabled") || path.endsWith(".exposeToModel")) return display === "true";
+	if (path.endsWith("TimeoutMs")) return Number.parseInt(display, 10);
+	if (path === "compaction.strategy" || path.startsWith("agents.")) return display;
+	if (display === "unlimited") return 0;
+	if (display.endsWith(" days")) return Number.parseInt(display, 10);
+	if (display.endsWith(" GiB")) return Number.parseFloat(display) * 1_073_741_824;
+	if (display.endsWith(" MiB")) return Number.parseFloat(display) * 1_048_576;
+	if (display.endsWith("K chars")) return Number.parseFloat(display) * 1_000;
+	return Number.parseFloat(display);
+}
+
+function rNumberItem(
+	config: RiemannConfig,
+	path: keyof typeof RIEMANN_NUMBER_CHOICES,
+	label: string,
+	value: number,
+	format: (value: number) => string = String,
+): SettingItem {
+	const project = config.projectOverrides.has(path);
+	return {
+		id: path,
+		label,
+		description: project
+			? "Read-only because the trusted project config overrides this value."
+			: "Applies to new runs.",
+		currentValue: project ? `${format(value)} · project` : format(value),
+		values: project ? undefined : RIEMANN_NUMBER_CHOICES[path].map(format),
+	};
+}
+
+function agentSettingItems(config: RiemannConfig): SettingItem[] {
+	const projectCompaction = config.projectOverrides.has("compaction.strategy");
+	const projectMainPermissions = config.projectOverrides.has("agents.main.permissions");
+	const projectDefaultWorkspace = config.projectOverrides.has("agents.defaults.workspace");
+	const projectDefaultPermissions = config.projectOverrides.has("agents.defaults.permissions");
+	return [
+		{
+			id: "agents.main.permissions",
+			label: "Main Agent permissions",
+			description: projectMainPermissions
+				? "Read-only because the trusted project config overrides this value."
+				: "Host allows host filesystem access; workspace confines IPython and shell to the project workspace.",
+			currentValue: projectMainPermissions
+				? `${config.mainAgent.permissions} · project`
+				: config.mainAgent.permissions,
+			values: projectMainPermissions ? undefined : ["host", "workspace"],
+		},
+		{
+			id: "agents.defaults.workspace",
+			label: "Subagent workspace",
+			description: projectDefaultWorkspace
+				? "Read-only because the trusted project config overrides this value."
+				: "Shared uses the parent workspace; worktree creates an independent detached Git worktree.",
+			currentValue: projectDefaultWorkspace
+				? `${config.agentDefaults.workspace} · project`
+				: config.agentDefaults.workspace,
+			values: projectDefaultWorkspace ? undefined : ["shared", "worktree"],
+		},
+		{
+			id: "agents.defaults.permissions",
+			label: "Subagent permissions",
+			description: projectDefaultPermissions
+				? "Read-only because the trusted project config overrides this value."
+				: "Default filesystem scope for Subagents; a child cannot exceed its parent permissions.",
+			currentValue: projectDefaultPermissions
+				? `${config.agentDefaults.permissions} · project`
+				: config.agentDefaults.permissions,
+			values: projectDefaultPermissions ? undefined : ["host", "workspace"],
+		},
+		{
+			id: "compaction.strategy",
+			label: "Compaction strategy",
+			description: projectCompaction
+				? "Read-only because the trusted project config overrides this value."
+				: "Context compaction implementation; applies to new runs.",
+			currentValue: projectCompaction ? `${config.compaction.strategy} · project` : config.compaction.strategy,
+			values: projectCompaction ? undefined : ["default", "snapshot", "openai"],
+		},
+		rNumberItem(config, "limits.maxAgentsPerRun", "Agents per run", config.limits.maxAgentsPerRun),
+		rNumberItem(config, "limits.maxConcurrentPerRun", "Concurrent agents", config.limits.maxConcurrentPerRun),
+		rNumberItem(config, "limits.maxConcurrentPerModel", "Concurrent per model", config.limits.maxConcurrentPerModel),
+		rNumberItem(config, "limits.maxDepth", "Subagent depth", config.limits.maxDepth),
+		rNumberItem(
+			config,
+			"limits.maxCellOutputChars",
+			"Cell output limit",
+			config.limits.maxCellOutputChars,
+			(value) => `${value / 1_000}K chars`,
+		),
+		rNumberItem(
+			config,
+			"limits.maxArtifactPreviewChars",
+			"Artifact preview",
+			config.limits.maxArtifactPreviewChars,
+			(value) => `${value / 1_000}K chars`,
+		),
+		rNumberItem(config, "retention.maxAgeDays", "Run retention", config.retention.maxAgeDays, (value) =>
+			value === 0 ? "unlimited" : `${value} days`,
+		),
+		rNumberItem(
+			config,
+			"retention.maxArtifactBytes",
+			"Artifact budget",
+			config.retention.maxArtifactBytes,
+			bytesLabel,
+		),
+		rNumberItem(
+			config,
+			"retention.maxSnapshotBytes",
+			"Snapshot budget",
+			config.retention.maxSnapshotBytes,
+			bytesLabel,
+		),
+		rNumberItem(
+			config,
+			"retention.maxWorktreeBytes",
+			"Worktree budget",
+			config.retention.maxWorktreeBytes,
+			bytesLabel,
+		),
+		...Object.entries(config.profiles).map(([name, profile]) => ({
+			id: `profile.${name}`,
+			label: `Profile: ${name}`,
+			description: `${profile.description ?? "Configured agent profile."} Definition is read-only.`,
+			currentValue: `${profile.workspace ?? config.agentDefaults.workspace} · ${profile.permissions ?? config.agentDefaults.permissions}`,
+		})),
+	];
+}
+
+class ToolFilterEditor extends Container {
+	private readonly input = new Input();
+	constructor(title: string, value: string, done: (value?: string) => void) {
+		super();
+		this.input.setValue(value);
+		this.input.onSubmit = (next) => done(next);
+		this.input.onEscape = () => done();
+		this.addChild(new Text(theme.fg("accent", title), 1, 0));
+		this.addChild(new Text(theme.fg("muted", "Comma-separated tool names; use 'all' to clear."), 1, 0));
+		this.addChild(this.input);
+		this.addChild(new Text(theme.fg("dim", "Enter save · Esc cancel"), 1, 0));
+	}
+	handleInput(data: string): void {
+		this.input.handleInput(data);
+	}
+}
+
+function mcpSettingItems(config: RiemannConfig): SettingItem[] {
+	return Object.entries(config.mcpServers).flatMap(([name, server]) => {
+		const prefix = `mcp.servers.${name}`;
+		const editable = (field: string) => !config.projectOverrides.has(`${prefix}.${field}` as RiemannSettingPath);
+		const display = (field: string, value: string) => (editable(field) ? value : `${value} · project`);
+		const tools = (value: string[] | undefined) => (value?.length ? value.join(",") : "all");
+		const transport =
+			server.url ?? (server.command ? `${server.command} ${(server.args ?? []).join(" ")}`.trim() : "invalid");
+		return [
+			{
+				id: `server.${name}`,
+				label: `Server: ${name}`,
+				description: `Connection is read-only. ${server.description ?? ""}`,
+				currentValue: transport,
+			},
+			{
+				id: `${prefix}.enabled`,
+				label: `${name}: enabled`,
+				description: "Applies to new runs.",
+				currentValue: display("enabled", server.enabled === false ? "false" : "true"),
+				values: editable("enabled") ? ["true", "false"] : undefined,
+			},
+			{
+				id: `${prefix}.exposeToModel`,
+				label: `${name}: model-visible`,
+				description: "Applies to new runs.",
+				currentValue: display("exposeToModel", server.exposeToModel === false ? "false" : "true"),
+				values: editable("exposeToModel") ? ["true", "false"] : undefined,
+			},
+			{
+				id: `${prefix}.startupTimeoutMs`,
+				label: `${name}: startup timeout`,
+				description: "Applies to new runs.",
+				currentValue: display("startupTimeoutMs", `${server.startupTimeoutMs ?? 10_000} ms`),
+				values: editable("startupTimeoutMs")
+					? ["1000 ms", "5000 ms", "10000 ms", "30000 ms", "60000 ms"]
+					: undefined,
+			},
+			{
+				id: `${prefix}.toolTimeoutMs`,
+				label: `${name}: tool timeout`,
+				description: "Applies to new runs.",
+				currentValue: display("toolTimeoutMs", `${server.toolTimeoutMs ?? 120_000} ms`),
+				values: editable("toolTimeoutMs")
+					? ["10000 ms", "30000 ms", "60000 ms", "120000 ms", "300000 ms"]
+					: undefined,
+			},
+			{
+				id: `${prefix}.enabledTools`,
+				label: `${name}: enabled tools`,
+				description: "Comma-separated allowlist; 'all' clears it.",
+				currentValue: display("enabledTools", tools(server.enabledTools)),
+				submenu: editable("enabledTools")
+					? (value, done) => new ToolFilterEditor(`${name}: enabled tools`, value, done)
+					: undefined,
+			},
+			{
+				id: `${prefix}.disabledTools`,
+				label: `${name}: disabled tools`,
+				description: "Comma-separated denylist; 'all' clears it.",
+				currentValue: display("disabledTools", tools(server.disabledTools)),
+				submenu: editable("disabledTools")
+					? (value, done) => new ToolFilterEditor(`${name}: disabled tools`, value, done)
+					: undefined,
+			},
+		];
+	});
+}
+
 /**
  * Main settings selector component.
  */
 export class SettingsSelectorComponent extends Container {
 	private settingsList: SettingsList;
+	private readonly items: SettingItem[];
+	private readonly config: SettingsConfig;
+	private categoryIndex = 0;
 
 	constructor(config: SettingsConfig, callbacks: SettingsCallbacks) {
 		super();
+		this.config = config;
 
 		const supportsImages = getCapabilities().images;
 		const followUpKey = keyDisplayText("app.message.followUp");
@@ -771,8 +1054,7 @@ export class SettingsSelectorComponent extends Container {
 			values: ["true", "false"],
 		});
 
-		// Add borders
-		this.addChild(new DynamicBorder());
+		this.items = items;
 
 		this.settingsList = new SettingsList(
 			items,
@@ -877,14 +1159,84 @@ export class SettingsSelectorComponent extends Container {
 					case "theme":
 						callbacks.onThemeChange(newValue);
 						break;
+					default:
+						if (id.startsWith("profile.") || id.startsWith("server.")) break;
+						if (id.endsWith("enabledTools") || id.endsWith("disabledTools")) {
+							const value =
+								newValue === "all"
+									? []
+									: newValue
+											.split(",")
+											.map((entry) => entry.trim())
+											.filter(Boolean);
+							void callbacks
+								.onRiemannChange(id as RiemannSettingPath, value)
+								.catch((error) => callbacks.onError(error instanceof Error ? error.message : String(error)));
+							break;
+						}
+						void callbacks
+							.onRiemannChange(id as RiemannSettingPath, parseRiemannValue(id, newValue))
+							.catch((error) => callbacks.onError(error instanceof Error ? error.message : String(error)));
 				}
 			},
 			callbacks.onCancel,
 			{ enableSearch: true },
 		);
 
-		this.addChild(this.settingsList);
+		this.applyCategory();
+		this.rebuild();
+	}
+
+	private currentCategory(): SettingsCategory {
+		return SETTINGS_CATEGORIES[this.categoryIndex];
+	}
+
+	private applyCategory(): void {
+		const category = this.currentCategory();
+		if (category === "Agents") {
+			this.settingsList.setItems(agentSettingItems(this.config.riemann));
+			return;
+		}
+		if (category === "MCP Servers") {
+			this.settingsList.setItems(mcpSettingItems(this.config.riemann));
+			return;
+		}
+		this.settingsList.setItems(this.items.filter((item) => GENERAL_SETTING_CATEGORIES[category].includes(item.id)));
+	}
+
+	private rebuild(): void {
+		this.clear();
 		this.addChild(new DynamicBorder());
+		this.addChild(new Text(`${theme.bold("Settings")}  ${this.renderCategories()}`, 1, 0));
+		this.addChild(this.settingsList);
+		this.addChild(new Text(theme.fg("dim", "  ←/→ category"), 1, 0));
+		this.addChild(new DynamicBorder());
+	}
+
+	private renderCategories(): string {
+		return SETTINGS_CATEGORIES.map((category, index) =>
+			index === this.categoryIndex ? theme.fg("accent", `[ ${category} ]`) : theme.fg("muted", `  ${category}  `),
+		).join(" ");
+	}
+
+	handleInput(data: string): void {
+		if (!this.settingsList.hasOpenSubmenu()) {
+			const keybindings = getKeybindings();
+			const queryActive = this.settingsList.getFilterQuery().length > 0;
+			if (!queryActive && keybindings.matches(data, "tui.editor.cursorLeft")) {
+				this.categoryIndex = (this.categoryIndex - 1 + SETTINGS_CATEGORIES.length) % SETTINGS_CATEGORIES.length;
+				this.applyCategory();
+				this.rebuild();
+				return;
+			}
+			if (!queryActive && keybindings.matches(data, "tui.editor.cursorRight")) {
+				this.categoryIndex = (this.categoryIndex + 1) % SETTINGS_CATEGORIES.length;
+				this.applyCategory();
+				this.rebuild();
+				return;
+			}
+		}
+		this.settingsList.handleInput(data);
 	}
 
 	getSettingsList(): SettingsList {

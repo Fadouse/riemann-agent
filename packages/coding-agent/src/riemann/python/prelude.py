@@ -107,6 +107,8 @@ class AgentInfo:
     depth: int
     model_role: str
     workspace: str
+    workspace_mode: str
+    permissions: str
 
 
 @_dataclasses.dataclass(frozen=True)
@@ -255,26 +257,39 @@ async def _riemann_call(name: str, arguments: dict):
     comm = _create_comm(target_name="riemann.host", primary=False)
 
     def on_message(message):
-        content = message.get("content", {}) if isinstance(message, dict) else {}
-        reply = content.get("data", {}) if isinstance(content, dict) else {}
-        if not isinstance(reply, dict):
-            return
-
         def settle():
-            if future.done():
-                return
-            if reply.get("status") == "ok":
-                future.set_result(_from_wire(reply.get("value")))
-            else:
-                error = reply.get("error")
-                if isinstance(error, dict):
-                    code = str(error.get("code") or "runtime_error")
-                    message_text = str(error.get("message") or f"{name} failed")
-                    error_type = _ERROR_TYPES.get(code, RiemannError)
-                    future.set_exception(error_type(message_text, code=code, details=error.get("details")))
+            try:
+                if future.done():
+                    return
+                if not isinstance(message, dict):
+                    raise RiemannError("Host returned an invalid reply", code="bridge_protocol_error")
+                content = message.get("content")
+                if not isinstance(content, dict):
+                    raise RiemannError("Host returned an invalid reply", code="bridge_protocol_error")
+                reply = content.get("data")
+                if not isinstance(reply, dict):
+                    raise RiemannError("Host returned an invalid reply", code="bridge_protocol_error")
+                status = reply.get("status")
+                if status == "ok":
+                    future.set_result(_from_wire(reply.get("value")))
+                elif status == "error":
+                    reply_error = reply.get("error")
+                    if isinstance(reply_error, dict):
+                        code = str(reply_error.get("code") or "runtime_error")
+                        message_text = str(reply_error.get("message") or f"{name} failed")
+                        error_type = _ERROR_TYPES.get(code, RiemannError)
+                        future.set_exception(
+                            error_type(message_text, code=code, details=reply_error.get("details"))
+                        )
+                    else:
+                        future.set_exception(RiemannError(str(reply_error or f"{name} failed")))
                 else:
-                    future.set_exception(RiemannError(str(error or f"{name} failed")))
-            comm.close()
+                    raise RiemannError("Host returned an invalid reply status", code="bridge_protocol_error")
+            except Exception as error:
+                if not future.done():
+                    future.set_exception(error)
+            finally:
+                comm.close()
 
         loop.call_soon_threadsafe(settle)
 

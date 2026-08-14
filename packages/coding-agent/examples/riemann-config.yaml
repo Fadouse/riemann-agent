@@ -26,12 +26,18 @@ models:
     deep: anthropic/claude-sonnet-4-5
 
 agents:
+  main:
+    permissions: host
+  defaults:
+    workspace: shared
+    permissions: workspace
   profiles:
     reviewer:
       description: Review a bounded change without writing files.
       modelRole: deep
       thinkingLevel: high
-      workspace: read-only
+      workspace: worktree
+      permissions: workspace
       capabilities:
         - workspace.read
         - agents.list

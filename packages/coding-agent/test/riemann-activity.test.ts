@@ -104,7 +104,7 @@ describe("Riemann IPython activity tracking", () => {
 			task: "Review the parser",
 			name: "Reviewer",
 			model_role: "deep",
-			workspace_policy: "isolated",
+			workspace: "worktree",
 		});
 		await observe(tracker, { phase: "start", requestId: "agent-1", request: spawnRequest, startedAt: 1 });
 		const activities = await observe(tracker, {
@@ -121,7 +121,7 @@ describe("Riemann IPython activity tracking", () => {
 			agentId: "child-1",
 			name: "Reviewer",
 			task: "Review the parser",
-			workspace: "isolated",
+			workspace: "worktree",
 			agentStatus: "running",
 		});
 	});

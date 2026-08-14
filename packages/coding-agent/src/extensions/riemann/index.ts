@@ -6,6 +6,7 @@ import {
 	type IPythonToolDetails,
 } from "../../riemann/ipython.ts";
 import { RiemannRuntime } from "../../riemann/runtime.ts";
+import { installSubagentUi, type SubagentUiController } from "./subagent-ui.ts";
 
 function appendProjectContext(prompt: string, options: BuildSystemPromptOptions): string {
 	const sections = [prompt];
@@ -41,6 +42,7 @@ function appendProjectContext(prompt: string, options: BuildSystemPromptOptions)
 const riemannExtension: ExtensionFactory = (pi) => {
 	let runtime: RiemannRuntime | undefined;
 	let closing: Promise<void> | undefined;
+	let subagentUi: SubagentUiController | undefined;
 
 	const getRuntime = async (ctx: ExtensionContext): Promise<RiemannRuntime> => {
 		if (runtime) return runtime;
@@ -49,6 +51,8 @@ const riemannExtension: ExtensionFactory = (pi) => {
 	};
 
 	const closeRuntime = async (): Promise<void> => {
+		subagentUi?.dispose();
+		subagentUi = undefined;
 		if (!runtime) return;
 		closing ??= runtime.close();
 		await closing;
@@ -69,8 +73,19 @@ const riemannExtension: ExtensionFactory = (pi) => {
 		},
 	});
 
+	pi.registerCommand("agents", {
+		description: "Inspect and manage active Riemann Subagents",
+		handler: async (_args, ctx) => {
+			const current = await getRuntime(ctx);
+			subagentUi ??= installSubagentUi(current, ctx);
+			await subagentUi.showHub(ctx);
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
-		await getRuntime(ctx);
+		const current = await getRuntime(ctx);
+		subagentUi?.dispose();
+		subagentUi = installSubagentUi(current, ctx);
 		pi.setActiveTools(["ipython"]);
 	});
 

@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, realpathSync } from "node:fs";
 import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { glob } from "glob";
@@ -54,6 +54,9 @@ function isInside(root: string, path: string): boolean {
 		(!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot))
 	);
 }
+function globPath(path: string): string {
+	return path.split(sep).join("/");
+}
 
 async function syncDirectory(path: string): Promise<void> {
 	try {
@@ -72,20 +75,46 @@ export class WorkspaceFunctions {
 	private readonly root: string;
 	private readonly runId: string;
 	private readonly store: RiemannStore;
+	private readonly protectedRoots: readonly string[];
+	private readonly canonicalProtectedRoots: readonly string[];
+	private readonly globIgnores: readonly string[];
 
-	constructor(root: string, runId: string, store: RiemannStore) {
+	constructor(root: string, runId: string, store: RiemannStore, protectedRoots: readonly string[] = []) {
 		this.root = resolve(root);
 		this.runId = runId;
 		this.store = store;
+		this.protectedRoots = protectedRoots.map((path) => resolve(path)).filter((path) => isInside(this.root, path));
+		this.canonicalProtectedRoots = this.protectedRoots.map((path) => {
+			try {
+				return realpathSync(path);
+			} catch {
+				return path;
+			}
+		});
+		this.globIgnores = this.protectedRoots.flatMap((path) => {
+			const relativePath = globPath(relative(this.root, path));
+			return relativePath ? [relativePath, `${relativePath}/**`] : ["**"];
+		});
+	}
+
+	private assertAllowed(path: string, input: string): void {
+		if (
+			this.protectedRoots.some((root) => isInside(root, path)) ||
+			this.canonicalProtectedRoots.some((root) => isInside(root, path))
+		) {
+			throw new RiemannHostError("permission_denied", `Path is reserved for Riemann state: ${input}`);
+		}
 	}
 
 	private async resolvePath(input: string): Promise<string> {
 		const candidate = resolve(this.root, input);
+		this.assertAllowed(candidate, input);
 		if (!isInside(this.root, candidate))
 			throw new RiemannHostError("permission_denied", `Path is outside the workspace: ${input}`);
 		const canonical = await realpath(candidate);
 		if (!isInside(this.root, canonical))
 			throw new RiemannHostError("permission_denied", `Path resolves outside the workspace: ${input}`);
+		this.assertAllowed(canonical, input);
 		return canonical;
 	}
 
@@ -93,12 +122,14 @@ export class WorkspaceFunctions {
 		const candidate = resolve(this.root, input);
 		if (!isInside(this.root, candidate))
 			throw new RiemannHostError("permission_denied", `Path is outside the workspace: ${input}`);
+		this.assertAllowed(candidate, input);
 		let ancestor = dirname(candidate);
 		while (true) {
 			try {
 				const canonical = await realpath(ancestor);
 				if (!isInside(this.root, canonical))
 					throw new RiemannHostError("permission_denied", `Parent resolves outside the workspace: ${input}`);
+				this.assertAllowed(canonical, input);
 				break;
 			} catch (error) {
 				if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
@@ -111,6 +142,7 @@ export class WorkspaceFunctions {
 		const parent = await realpath(dirname(candidate));
 		if (!isInside(this.root, parent))
 			throw new RiemannHostError("permission_denied", `Parent resolves outside the workspace: ${input}`);
+		this.assertAllowed(parent, input);
 		return candidate;
 	}
 
@@ -134,6 +166,7 @@ export class WorkspaceFunctions {
 		const capability = this.store.getFileCapability(this.runId, reference.capability);
 		if (!capability)
 			throw new RiemannHostError("not_found", "Snapshot capability is unknown or belongs to another run");
+		this.assertAllowed(capability.path, capability.path);
 		return { ...capability, capability: reference.capability };
 	}
 
@@ -238,9 +271,20 @@ export class WorkspaceFunctions {
 						cwd: this.root,
 						dot: optionalBoolean(args, "include_hidden", false),
 						nodir: true,
-						ignore: [".git/**", "node_modules/**"],
+						ignore: [".git/**", "node_modules/**", ...this.globIgnores],
 					});
-					return matches.sort().slice(0, Math.max(1, Math.min(optionalInteger(args, "limit", 200), 5_000)));
+					const limit = Math.max(1, Math.min(optionalInteger(args, "limit", 200), 5_000));
+					const visible: string[] = [];
+					for (const match of matches.sort()) {
+						if (visible.length >= limit) break;
+						try {
+							const path = await this.resolvePath(match);
+							visible.push(globPath(relative(this.root, path)));
+						} catch {
+							// Glob patterns may match protected, outside, or escaping symlink paths.
+						}
+					}
+					return visible;
 				},
 			},
 			{
@@ -283,7 +327,7 @@ export class WorkspaceFunctions {
 						cwd: this.root,
 						dot: false,
 						nodir: true,
-						ignore: [".git/**", "node_modules/**"],
+						ignore: [".git/**", "node_modules/**", ...this.globIgnores],
 					});
 					const limit = Math.max(1, Math.min(optionalInteger(args, "limit", 100), 2_000));
 					const hits: JsonValue[] = [];

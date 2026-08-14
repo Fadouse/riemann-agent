@@ -12,7 +12,8 @@ The model sees one tool: `ipython`. Workspace I/O, shell processes, web access, 
 - SQLite-backed runs, agents, messages, artifacts, and revision capabilities.
 - Content-addressed large-result artifacts.
 - Lazy MCP activation; discovered tools use a Python/catalog namespace derived from the configured server name, with collision-safe fallback.
-- Asynchronous child agents with durable handles, inboxes, steering, concurrency limits, model roles, capability narrowing, shared/read-only/isolated workspaces, park, revive, and stop.
+- Asynchronous child agents with durable handles, inboxes, steering, concurrency limits, model roles, capability narrowing, shared/worktree topology and host/workspace permissions, park, revive, and stop.
+- A `pi-subagents`-style Fleet below the editor plus an `/agents` hub for live child transcripts, steering, scrolling, and stop controls.
 - Strictly configured context compaction: subscription-backed OpenAI Codex, OMP snapshot archives, or Riemann semantic checkpoints.
 - Pi's TUI, session management, model providers, authentication, settings, RPC mode, and extension ecosystem.
 
@@ -34,11 +35,17 @@ For source development:
 
 Riemann provisions a hash-pinned Python environment on first IPython use. User state defaults to `~/.riemann/agent`; override it with `RIEMANN_CODING_AGENT_DIR`.
 
+## Subagent UI
+
+Active Subagents appear in the Fleet below the editor; settled rows linger for four seconds and then disappear, matching `pi-subagents`, while the footer reports running and queued counts. With an empty editor, press `Left` or `Down` to focus the Fleet, use `Up`/`Down` to select an Agent, and press `Enter` to open its conversation viewer.
+
+Run `/agents` to open the centered Agents Hub. The hub lists active and settled Subagents; `Enter` opens the selected transcript or durable result, and `x` twice stops an active child. In the viewer, use `Up`/`Down` or `PageUp`/`PageDown` to scroll, `Enter` or `m` to send steering, and `x` twice to stop. `Esc` closes only the current Agent overlay; it does not interrupt the main Agent's active IPython cell.
+
 ## System sandbox
 
 Every IPython kernel and `shell.*` process runs inside a mandatory OS sandbox. Linux uses Bubblewrap with separate user, PID, IPC, UTS, cgroup, and network namespaces. macOS uses a deny-by-default Seatbelt profile through `/usr/bin/sandbox-exec`. Riemann fails closed when the native sandbox is unavailable; Windows is not supported.
 
-The kernel communicates with the host only through a bind-mounted ZeroMQ IPC directory. Direct Python network access is denied. The workspace is mounted read-only unless the agent holds `workspace.write`; isolated agents receive only their Git worktree. Managed Python and system executables are read-only, host credentials are removed from the child environment, and Riemann state must reside outside the workspace. `shell.network` is a separate capability: the main agent holds it through `*`, while default children do not.
+The kernel communicates with the host through ZeroMQ IPC. Direct Python network access is denied. The main Agent defaults to `host` permissions; a trusted project can set `agents.main.permissions: workspace` to confine IPython and shell to the project. Subagents independently use `shared` or `worktree` topology and `host` or `workspace` permissions, defaulting to `shared` plus `workspace`. Managed Python and system executables are read-only, and host credentials are removed from the child environment. If the Riemann state directory is inside a workspace, workspace-scoped Python, Shell, artifact, and `workspace.*` access excludes that state subtree; only the managed Python runtime is remounted read-only, and kernel snapshots are staged outside the sandbox before host-side persistence. `shell.network` is a separate capability: the main Agent holds it through `*`, while default children do not.
 
 Large-result artifacts, kernel snapshots, and isolated worktrees belonging to closed runs are garbage-collected by age and size budgets. Active runs are never selected. Configure the budgets under `retention`:
 
@@ -55,6 +62,17 @@ retention:
 Global configuration: `~/.riemann/agent/config.yaml`.
 
 Trusted project configuration: `<workspace>/.riemann/config.yaml`. Project values merge over global values. Copy `examples/riemann-config.yaml` as a starting point.
+
+Agent topology and filesystem permissions can be set globally or per trusted project:
+
+```yaml
+agents:
+  main:
+    permissions: host # host | workspace
+  defaults:
+    workspace: shared # shared | worktree
+    permissions: workspace # host | workspace
+```
 
 ```bash
 mkdir -p ~/.riemann/agent
@@ -100,7 +118,7 @@ review = await handle.wait(timeout=600)
 
 ```
 
-Without a profile, `agents.spawn(task=..., name=...)` shares the current workspace and grants the standard child capabilities bounded by the parent's own allowlist. Use `workspace_policy=\"read-only\"` or `workspace_policy=\"isolated\"` only when the task needs that override; isolated mode requires a Git worktree. Capability overrides accept exact operations such as `web.search` and namespace shorthand such as `web`, which is normalized to `web.*`. Configured profile names and descriptions are listed directly in the system prompt.
+Without a profile, `agents.spawn(task=..., name=...)` uses `agents.defaults`. Pass `workspace="shared"` or `workspace="worktree"` to override only its directory topology; a worktree requires Git. Filesystem scope comes from `permissions: host | workspace`, and a child cannot exceed its parent's scope. Capability overrides accept exact operations such as `web.search` and namespace shorthand such as `web`, which is normalized to `web.*`. Configured profile names and descriptions are listed directly in the system prompt.
 
 Large values should remain in variables or artifacts; display only the slice needed for the next decision. A cancelled cell can have completed an external side effect, so inspect durable state before retrying.
 

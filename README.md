@@ -10,7 +10,7 @@ Core behavior:
 - Snapshot/CAS workspace edits with atomic writes and conflict detection.
 - SQLite-backed run, agent, message, artifact, and capability state.
 - Lazy MCP activation and dynamically installed Python namespaces.
-- Durable asynchronous child agents with direct messages, steering, limits, model roles, capability narrowing, and shared/read-only/isolated workspaces.
+- Durable asynchronous child agents with direct messages, steering, limits, model roles, capability narrowing, and shared/worktree topology and host/workspace permissions.
 - Compact model context: large results stay in Python variables or content-addressed artifacts; summaries carry deterministic durable state.
 - Pi's provider support, authentication, TUI, sessions, settings, RPC mode, and extension framework.
 
@@ -44,7 +44,7 @@ Riemann runs every IPython kernel and host shell process in a mandatory native s
 - macOS: the built-in Seatbelt sandbox through `/usr/bin/sandbox-exec`.
 - Other platforms: startup of an execution kernel fails explicitly; there is no unsandboxed fallback.
 
-Direct Python network access is denied, workspace writes follow the agent capability set, and read-only/isolated child workspaces are enforced by the operating system. The main agent can explicitly use `shell.network`; default children cannot. Containers may still be used as an additional deployment boundary.
+Direct Python network access is denied. The main Agent uses `host` filesystem permissions by default and a trusted project can select `agents.main.permissions: workspace`. Subagents independently select `shared` or `worktree` topology and `host` or `workspace` permissions; defaults are `shared` plus `workspace`. When Riemann state is nested inside a workspace, workspace-scoped Agents see a masked state subtree with only the managed runtime remounted read-only; durable snapshots are staged through the isolated kernel directory. The main Agent can explicitly use `shell.network`; default children cannot. Containers may still be used as an additional deployment boundary.
 
 ## Contributing
 

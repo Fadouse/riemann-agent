@@ -10,11 +10,13 @@
 - Added the `defaultTools` setting for configuring the initial built-in tool selection globally or per project.
 - Added `--use-theme <name[/name]>` to choose an initial per-run interactive theme without changing saved settings ([#7722](https://github.com/earendil-works/pi/pull/7722) by [@rwachtler](https://github.com/rwachtler)).
 - Added live OMP-style nested Shell, subagent, file mutation, and patch activity rendering inside Riemann IPython cells.
+- Added a `pi-subagents`-style Riemann Fleet below the editor and an `/agents` hub with live child transcripts, steering, scrolling, and stop controls.
 - Added configurable Riemann context compaction with semantic checkpoints as the default and OMP snapshot archives available as `compaction.strategy: snapshot`.
 - Added strict `compaction.strategy: openai` for subscription-authenticated OpenAI Codex Responses V2 cloud compaction with durable opaque artifact replay; configured strategies never fall through or create cross-strategy backups.
 - Added mandatory Linux Bubblewrap and macOS Seatbelt isolation for IPython kernels and shell processes, including network namespaces, capability-derived workspace mounts, sanitized environments, and ZeroMQ IPC.
-- Added age- and size-based garbage collection for closed-run artifacts, kernel snapshots, and isolated Git worktrees.
+- Added age- and size-based garbage collection for closed-run artifacts, kernel snapshots, and detached Subagent Git worktrees.
 - Added Linux/macOS sandbox integration, managed Python provisioning, retention, and Bun release-asset tests.
+- Added an Oh My Pi-inspired Riemann settings panel for global agent limits, compaction, retention, read-only agent-profile inventory, and controlled MCP server settings.
 
 ### Changed
 
@@ -23,7 +25,8 @@
 - Changed Riemann IPython cells to a compact, backgroundless transcript and removed inline thinking and tool-expansion hints while preserving their keyboard shortcuts.
 - Simplified Riemann's model-facing execution prompt, identified the current working environment, listed capability-filtered Python operations directly, and exposed available MCP server names and descriptions by default while preserving lazy activation.
 - Removed the redundant model-facing `mcp.list()` operation and aligned activated MCP Python/catalog namespaces with configured server names so discovery results are directly callable.
-- Made `agents.spawn(task=..., name=...)` usable without discovery by applying parent-bounded standard capabilities and the approved shared-workspace default, renamed the policy override to `workspace_policy`, normalized bare capability namespaces, and listed configured agent profiles in the system prompt.
+- Made `agents.spawn(task=..., name=...)` usable without discovery by applying parent-bounded standard capabilities, normalized bare capability namespaces, and listed configured agent profiles in the system prompt.
+- Separated Agent filesystem permissions (`host` or `workspace`) from Subagent directory topology (`shared` or `worktree`), with `host` for the main Agent and `shared` plus `workspace` for Subagents by default.
 - Documented standard `asyncio.gather(...)` concurrency in Riemann's IPython code schema for independent operations.
 
 - Renamed the published CLI, SDK imports, examples, release archives, environment markers, and local release tooling consistently to `riemann-agent`/`riemann`, while rejecting inherited tool-selection flags that cannot alter the single-tool runtime.
@@ -35,6 +38,11 @@
 - Fixed inherited required LaTeX arguments starting on a new line being parsed as empty ([#7760](https://github.com/earendil-works/pi/issues/7760)).
 - Fixed Riemann's host bridge using the deprecated `ipykernel.comm.Comm` API, which leaked a `DeprecationWarning` through cell stderr into model context and the TUI.
 - Fixed Riemann IPython activity rebuilding and re-highlighting unchanged cells on every TUI repaint, which could make the main UI stutter during Python execution.
+- Fixed Riemann IPython cancellation hanging behind non-cooperative host requests by keeping the Jupyter message pump responsive and restarting kernels that do not acknowledge an interrupt.
+- Fixed Riemann Subagent completion waits and UI updates being delayed by child-runtime teardown, kept current-run Agents inspectable in the Agents Hub after settlement, and made `Esc` in Agent overlays close only the overlay without aborting the main Agent.
+- Fixed Riemann `AgentInfo` host-bridge schema drift that left `agents.self`, `agents.list`, `agents.wait`, `agents.result`, `agents.park`, and `agents.stop` calls pending after the host operation completed; bridge decoding failures now surface immediately and close their Comm.
+- Fixed settled Riemann Subagents remaining indefinitely in the bottom Fleet; settled rows now linger for four seconds and disappear while remaining available in `/agents`.
+- Fixed shared and recursively spawned Subagents failing IPython calls when the Riemann state directory was nested inside their workspace; workspace-scoped sandboxes and host file operations now mask the state subtree, selectively expose the read-only managed runtime, stage durable snapshots outside the sandbox, and shut down nested runtimes without hanging or downgrading completed Agents.
 - Fixed `artifacts.materialize` bypassing `workspace.write` capability checks and `workspace.search` following file symlinks outside the workspace.
 
 ## [0.84.1] - 2026-08-07

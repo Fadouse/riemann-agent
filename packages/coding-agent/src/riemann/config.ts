@@ -1,12 +1,13 @@
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
-const WorkspacePolicySchema = Type.Union([Type.Literal("shared"), Type.Literal("isolated"), Type.Literal("read-only")]);
+const AgentPermissionsSchema = Type.Union([Type.Literal("host"), Type.Literal("workspace")]);
+const SubagentWorkspaceSchema = Type.Union([Type.Literal("shared"), Type.Literal("worktree")]);
 const ThinkingLevelSchema = Type.Union([
 	Type.Literal("off"),
 	Type.Literal("minimal"),
@@ -29,7 +30,8 @@ const AgentProfileSchema = Type.Object(
 		modelRole: Type.Optional(Type.String()),
 		thinkingLevel: Type.Optional(ThinkingLevelSchema),
 		capabilities: Type.Optional(Type.Array(Type.String())),
-		workspace: Type.Optional(WorkspacePolicySchema),
+		workspace: Type.Optional(SubagentWorkspaceSchema),
+		permissions: Type.Optional(AgentPermissionsSchema),
 		maxDepth: Type.Optional(Type.Integer({ minimum: 0 })),
 		parkOnComplete: Type.Optional(Type.Boolean()),
 	},
@@ -91,7 +93,21 @@ const ConfigSchema = Type.Object(
 		),
 		agents: Type.Optional(
 			Type.Object(
-				{ profiles: Type.Optional(Type.Record(Type.String(), AgentProfileSchema)) },
+				{
+					main: Type.Optional(
+						Type.Object({ permissions: Type.Optional(AgentPermissionsSchema) }, { additionalProperties: false }),
+					),
+					defaults: Type.Optional(
+						Type.Object(
+							{
+								workspace: Type.Optional(SubagentWorkspaceSchema),
+								permissions: Type.Optional(AgentPermissionsSchema),
+							},
+							{ additionalProperties: false },
+						),
+					),
+					profiles: Type.Optional(Type.Record(Type.String(), AgentProfileSchema)),
+				},
 				{ additionalProperties: false },
 			),
 		),
@@ -117,7 +133,30 @@ const ConfigSchema = Type.Object(
 export type RiemannConfigFile = Static<typeof ConfigSchema>;
 export type AgentProfileConfig = Static<typeof AgentProfileSchema>;
 export type McpServerConfig = Static<typeof McpServerSchema>;
-export type WorkspacePolicy = Static<typeof WorkspacePolicySchema>;
+export type AgentPermissions = Static<typeof AgentPermissionsSchema>;
+export type SubagentWorkspace = Static<typeof SubagentWorkspaceSchema>;
+
+export type RiemannSettingPath =
+	| "limits.maxAgentsPerRun"
+	| "limits.maxConcurrentPerRun"
+	| "limits.maxConcurrentPerModel"
+	| "limits.maxDepth"
+	| "limits.maxCellOutputChars"
+	| "limits.maxArtifactPreviewChars"
+	| "retention.maxAgeDays"
+	| "retention.maxArtifactBytes"
+	| "retention.maxSnapshotBytes"
+	| "retention.maxWorktreeBytes"
+	| "compaction.strategy"
+	| "agents.main.permissions"
+	| "agents.defaults.workspace"
+	| "agents.defaults.permissions"
+	| `mcp.servers.${string}.enabled`
+	| `mcp.servers.${string}.exposeToModel`
+	| `mcp.servers.${string}.startupTimeoutMs`
+	| `mcp.servers.${string}.toolTimeoutMs`
+	| `mcp.servers.${string}.enabledTools`
+	| `mcp.servers.${string}.disabledTools`;
 
 export interface RiemannConfig {
 	limits: {
@@ -137,6 +176,13 @@ export interface RiemannConfig {
 	compaction: {
 		strategy: "snapshot" | "default" | "openai";
 	};
+	mainAgent: {
+		permissions: AgentPermissions;
+	};
+	agentDefaults: {
+		workspace: SubagentWorkspace;
+		permissions: AgentPermissions;
+	};
 	modelRoles: Record<string, string>;
 	profiles: Record<string, AgentProfileConfig>;
 	mcpServers: Record<string, McpServerConfig>;
@@ -145,6 +191,7 @@ export interface RiemannConfig {
 		searchBackend: "exa" | "disabled";
 	};
 	files: string[];
+	projectOverrides: ReadonlySet<RiemannSettingPath>;
 }
 
 const DEFAULTS: Omit<RiemannConfig, "files"> = {
@@ -163,10 +210,13 @@ const DEFAULTS: Omit<RiemannConfig, "files"> = {
 		maxWorktreeBytes: 5_368_709_120,
 	},
 	compaction: { strategy: "default" },
+	mainAgent: { permissions: "host" },
+	agentDefaults: { workspace: "shared", permissions: "workspace" },
 	modelRoles: {},
 	profiles: {},
 	mcpServers: {},
 	web: { searchBackend: "exa" },
+	projectOverrides: new Set<RiemannSettingPath>(),
 };
 
 function mergeConfig(base: RiemannConfig, next: RiemannConfigFile, path: string): RiemannConfig {
@@ -174,12 +224,38 @@ function mergeConfig(base: RiemannConfig, next: RiemannConfigFile, path: string)
 		limits: { ...base.limits, ...next.limits },
 		retention: { ...base.retention, ...next.retention },
 		compaction: { ...base.compaction, ...next.compaction },
+		mainAgent: { ...base.mainAgent, ...next.agents?.main },
+		agentDefaults: { ...base.agentDefaults, ...next.agents?.defaults },
 		modelRoles: { ...base.modelRoles, ...next.models?.roles },
 		profiles: { ...base.profiles, ...next.agents?.profiles },
 		mcpServers: { ...base.mcpServers, ...next.mcp?.servers },
 		web: { ...base.web, ...next.web },
 		files: [...base.files, path],
+		projectOverrides: base.projectOverrides,
 	};
+}
+
+function configuredSettingPaths(config: RiemannConfigFile): Set<RiemannSettingPath> {
+	const paths = new Set<RiemannSettingPath>();
+	for (const key of Object.keys(config.limits ?? {})) paths.add(`limits.${key}` as RiemannSettingPath);
+	for (const key of Object.keys(config.retention ?? {})) paths.add(`retention.${key}` as RiemannSettingPath);
+	if (config.compaction?.strategy !== undefined) paths.add("compaction.strategy");
+	if (config.agents?.main?.permissions !== undefined) paths.add("agents.main.permissions");
+	if (config.agents?.defaults?.workspace !== undefined) paths.add("agents.defaults.workspace");
+	if (config.agents?.defaults?.permissions !== undefined) paths.add("agents.defaults.permissions");
+	for (const [name, server] of Object.entries(config.mcp?.servers ?? {})) {
+		for (const key of [
+			"enabled",
+			"exposeToModel",
+			"startupTimeoutMs",
+			"toolTimeoutMs",
+			"enabledTools",
+			"disabledTools",
+		] as const) {
+			if (server[key] !== undefined) paths.add(`mcp.servers.${name}.${key}`);
+		}
+	}
+	return paths;
 }
 
 async function parseConfigFile(path: string): Promise<RiemannConfigFile | undefined> {
@@ -197,12 +273,7 @@ async function parseConfigFile(path: string): Promise<RiemannConfigFile | undefi
 			.join("; ");
 		throw new Error(`Invalid Riemann config ${path}: ${errors}`);
 	}
-	for (const [name, server] of Object.entries(value.mcp?.servers ?? {})) {
-		const exposed = server.enabled !== false && server.exposeToModel !== false;
-		if (exposed && (!server.description || server.description.trim().length === 0)) {
-			throw new Error(`Invalid Riemann config ${path}: model-visible MCP server ${name} requires a description`);
-		}
-	}
+	validateMcpDescriptions(value, path);
 	return value;
 }
 
@@ -211,16 +282,98 @@ export async function loadRiemannConfig(options: {
 	agentDir: string;
 	projectTrusted: boolean;
 }): Promise<RiemannConfig> {
-	let config: RiemannConfig = { ...DEFAULTS, limits: { ...DEFAULTS.limits }, files: [] };
+	let config: RiemannConfig = {
+		...DEFAULTS,
+		limits: { ...DEFAULTS.limits },
+		retention: { ...DEFAULTS.retention },
+		compaction: { ...DEFAULTS.compaction },
+		mainAgent: { ...DEFAULTS.mainAgent },
+		agentDefaults: { ...DEFAULTS.agentDefaults },
+		files: [],
+		projectOverrides: new Set<RiemannSettingPath>(),
+	};
 	const globalPath = join(options.agentDir, "config.yaml");
 	const globalConfig = await parseConfigFile(globalPath);
 	if (globalConfig) config = mergeConfig(config, globalConfig, globalPath);
 	if (options.projectTrusted) {
 		const projectPath = join(options.cwd, ".riemann", "config.yaml");
 		const projectConfig = await parseConfigFile(projectPath);
-		if (projectConfig) config = mergeConfig(config, projectConfig, projectPath);
+		if (projectConfig) {
+			config = mergeConfig(config, projectConfig, projectPath);
+			config.projectOverrides = configuredSettingPaths(projectConfig);
+		}
 	}
 	return config;
+}
+
+function settingPathSegments(path: RiemannSettingPath): string[] {
+	if (!path.startsWith("mcp.servers.")) return path.split(".");
+	for (const field of [
+		"enabled",
+		"exposeToModel",
+		"startupTimeoutMs",
+		"toolTimeoutMs",
+		"enabledTools",
+		"disabledTools",
+	] as const) {
+		const suffix = `.${field}`;
+		if (path.endsWith(suffix)) return ["mcp", "servers", path.slice("mcp.servers.".length, -suffix.length), field];
+	}
+	throw new Error(`Unsupported Riemann setting path: ${path}`);
+}
+
+function validateMcpDescriptions(config: RiemannConfigFile, path: string): void {
+	for (const [name, server] of Object.entries(config.mcp?.servers ?? {})) {
+		const exposed = server.enabled !== false && server.exposeToModel !== false;
+		if (exposed && (!server.description || server.description.trim().length === 0)) {
+			throw new Error(`Invalid Riemann config ${path}: model-visible MCP server ${name} requires a description`);
+		}
+	}
+}
+
+function setNestedValue(target: Record<string, unknown>, path: readonly string[], value: unknown): void {
+	let current = target;
+	for (const segment of path.slice(0, -1)) {
+		const existing = current[segment];
+		if (typeof existing !== "object" || existing === null || Array.isArray(existing)) {
+			const created: Record<string, unknown> = {};
+			current[segment] = created;
+			current = created;
+		} else {
+			current = existing as Record<string, unknown>;
+		}
+	}
+	const key = path.at(-1);
+	if (!key) throw new Error("Riemann setting path must not be empty");
+	current[key] = value;
+}
+
+export async function updateGlobalRiemannSetting(
+	agentDir: string,
+	path: RiemannSettingPath,
+	value: unknown,
+): Promise<void> {
+	const configPath = join(agentDir, "config.yaml");
+	const existing = (await parseConfigFile(configPath)) ?? { version: 1 };
+	const next = structuredClone(existing) as Record<string, unknown>;
+	setNestedValue(next, settingPathSegments(path), value);
+	if (!Value.Check(ConfigSchema, next)) {
+		const errors = [...Value.Errors(ConfigSchema, next)]
+			.slice(0, 8)
+			.map((error) => `${error.instancePath || path}: ${error.message}`)
+			.join("; ");
+		throw new Error(`Invalid Riemann setting ${path}: ${errors}`);
+	}
+	validateMcpDescriptions(next as RiemannConfigFile, configPath);
+	await mkdir(agentDir, { recursive: true });
+	const temporaryPath = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+	try {
+		await writeFile(temporaryPath, stringifyYaml(next), { encoding: "utf8", mode: 0o600 });
+		await rename(temporaryPath, configPath);
+	} catch (error) {
+		await rm(temporaryPath, { force: true });
+		throw error;
+	}
 }
 
 export function expandConfigSecret(value: string | undefined): string | undefined {

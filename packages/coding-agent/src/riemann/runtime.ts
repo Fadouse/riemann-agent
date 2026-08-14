@@ -5,7 +5,7 @@ import { getPackageDir, isBunBinary } from "../config.ts";
 import type { CompactionPreparation, CompactionResult } from "../core/compaction/index.ts";
 import type { ExtensionContext, ToolDefinition } from "../core/extensions/types.ts";
 import { RiemannActivityTracker } from "./activity.ts";
-import { AgentSupervisor, type ChildRiemannRuntime } from "./agents/supervisor.ts";
+import { AgentSupervisor, type ChildRiemannRuntime, type SubagentUiSnapshot } from "./agents/supervisor.ts";
 import { createRiemannCompaction, createRiemannSnapshotCompaction } from "./compaction.ts";
 import { expandConfigSecret, getRiemannAgentDir, loadRiemannConfig, type RiemannConfig } from "./config.ts";
 import { formatEnvironmentContext } from "./environment.ts";
@@ -123,13 +123,15 @@ export class RiemannRuntime {
 		this.agent = agent;
 		this.root = root;
 		this.capabilities = new Set(agent.capabilities);
-		const workspace = new WorkspaceFunctions(agent.workspace, shared.run.id, shared.store);
+		const protectedRoots = agent.permissions === "workspace" ? [shared.agentDir] : [];
+		const workspace = new WorkspaceFunctions(agent.workspace, shared.run.id, shared.store, protectedRoots);
 		const shell = new ShellFunctions(
 			agent.workspace,
 			shared.artifacts,
 			shared.config.limits.maxArtifactPreviewChars,
 			{
 				agentDir: shared.agentDir,
+				filesystemScope: agent.permissions,
 				workspaceWritable: hasCapability(this.capabilities, "workspace.write", "workspace"),
 				networkAllowed: hasCapability(this.capabilities, "shell.network", "shell"),
 			},
@@ -153,7 +155,7 @@ export class RiemannRuntime {
 		const store = new RiemannStore(agentDir);
 		const run = store.openRun(ctx.sessionManager.getSessionId(), ctx.cwd);
 		const retentionReport = await applyRetention(store, config.retention);
-		const rootAgent = store.ensureRootAgent(run.id, ctx.cwd);
+		const rootAgent = store.ensureRootAgent(run.id, ctx.cwd, config.mainAgent.permissions);
 		const artifacts = new ArtifactStore(store, run.id);
 		const rootContext = {
 			cwd: ctx.cwd,
@@ -183,13 +185,42 @@ export class RiemannRuntime {
 		return new RiemannRuntime(shared, agent, false, await existingExaKey(shared.config));
 	}
 
+	listSubagentsForUi(): SubagentUiSnapshot[] {
+		if (!this.root) return [];
+		return this.shared.supervisor.listSubagentsForUi();
+	}
+
+	subscribeSubagentUi(listener: () => void): () => void {
+		if (!this.root) return () => undefined;
+		return this.shared.supervisor.subscribeSubagentUi(listener);
+	}
+
+	async steerSubagentFromUi(agentId: string, message: string): Promise<void> {
+		if (!this.root) throw new RiemannHostError("permission_denied", "Only the root runtime can steer Subagents");
+		await this.shared.supervisor.steerSubagentFromUi(agentId, message);
+	}
+
+	async stopSubagentFromUi(agentId: string): Promise<void> {
+		if (!this.root) throw new RiemannHostError("permission_denied", "Only the root runtime can stop Subagents");
+		await this.shared.supervisor.stopSubagentFromUi(agentId);
+	}
+
 	private async resolveArtifactDestination(input: string): Promise<string> {
 		const root = resolve(this.agent.workspace);
 		const candidate = resolve(root, input);
+		const stateRoot = resolve(this.shared.agentDir);
+		const protectedState =
+			this.agent.permissions === "workspace" && stateRoot !== root && isInside(root, stateRoot)
+				? stateRoot
+				: undefined;
+		if (protectedState && isInside(protectedState, candidate)) {
+			throw new RiemannHostError("permission_denied", `Destination is reserved for Riemann state: ${input}`);
+		}
 		if (!isInside(root, candidate)) {
 			throw new RiemannHostError("permission_denied", `Destination is outside the workspace: ${input}`);
 		}
 		const canonicalRoot = await realpath(root);
+		const canonicalProtectedState = protectedState ? await realpath(protectedState) : undefined;
 		let ancestor = dirname(candidate);
 		while (true) {
 			try {
@@ -198,6 +229,12 @@ export class RiemannRuntime {
 					throw new RiemannHostError(
 						"permission_denied",
 						`Destination parent resolves outside the workspace: ${input}`,
+					);
+				}
+				if (canonicalProtectedState && isInside(canonicalProtectedState, canonicalAncestor)) {
+					throw new RiemannHostError(
+						"permission_denied",
+						`Destination parent is reserved for Riemann state: ${input}`,
 					);
 				}
 				break;
@@ -212,6 +249,9 @@ export class RiemannRuntime {
 		const canonicalParent = await realpath(dirname(candidate));
 		if (!isInside(canonicalRoot, canonicalParent)) {
 			throw new RiemannHostError("permission_denied", `Destination parent resolves outside the workspace: ${input}`);
+		}
+		if (canonicalProtectedState && isInside(canonicalProtectedState, canonicalParent)) {
+			throw new RiemannHostError("permission_denied", `Destination parent is reserved for Riemann state: ${input}`);
 		}
 		return candidate;
 	}
@@ -331,6 +371,9 @@ export class RiemannRuntime {
 					agent_name: this.agent.name,
 					workspace: this.agent.workspace,
 					config_files: this.shared.config.files,
+					filesystem_scope: this.agent.permissions,
+					main_agent_permissions: this.shared.config.mainAgent.permissions,
+					subagent_defaults: this.shared.config.agentDefaults,
 					retention: this.shared.retentionReport as unknown as JsonValue,
 				}),
 			},
@@ -372,6 +415,8 @@ export class RiemannRuntime {
 				id: this.agent.id,
 				name: this.agent.name,
 				workspace: this.agent.workspace,
+				workspace_mode: this.agent.workspaceMode,
+				permissions: this.agent.permissions,
 			},
 			agents: agents.map((agent) => ({
 				id: agent.id,
@@ -380,6 +425,8 @@ export class RiemannRuntime {
 				status: agent.status,
 				model_role: agent.modelRole,
 				workspace: agent.workspace,
+				workspace_mode: agent.workspaceMode,
+				permissions: agent.permissions,
 				result_available: agent.result !== null,
 				error: agent.error,
 			})),
@@ -473,6 +520,7 @@ export class RiemannRuntime {
 				snapshotPath: join(this.shared.store.snapshotsDir, this.agent.id, "kernel.dill"),
 				sandbox: {
 					agentDir: this.shared.agentDir,
+					filesystemScope: this.agent.permissions,
 					workspaceWritable: hasCapability(this.capabilities, "workspace.write", "workspace"),
 				},
 				maxOutputChars: Math.max(this.shared.config.limits.maxCellOutputChars * 4, 400_000),
@@ -564,8 +612,10 @@ export class RiemannRuntime {
 						});
 					},
 				});
-				const snapshot = await kernel.snapshot();
-				if (snapshot.error) runtime.pendingRestoreNotice = `[Checkpoint warning] ${snapshot.error}`;
+				if (result.status !== "aborted") {
+					const snapshot = await kernel.snapshot();
+					if (snapshot.error) runtime.pendingRestoreNotice = `[Checkpoint warning] ${snapshot.error}`;
+				}
 				const formatted = await runtime.formatResult(result);
 				return {
 					content: [{ type: "text", text: formatted.text }],

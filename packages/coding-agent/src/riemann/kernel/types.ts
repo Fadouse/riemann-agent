@@ -106,6 +106,7 @@ export type KernelHostRequestHandler = (
 
 export interface KernelSandboxConfiguration {
 	agentDir: string;
+	filesystemScope: "host" | "workspace";
 	workspaceWritable: boolean;
 	platform?: NodeJS.Platform;
 	bubblewrapPath?: string;

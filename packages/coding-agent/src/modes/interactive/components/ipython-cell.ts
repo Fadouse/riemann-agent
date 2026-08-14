@@ -2,6 +2,7 @@ import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from 
 import type { IPythonActivity } from "../../../riemann/ipython.ts";
 import { highlightCode, theme } from "../theme/theme.ts";
 import { IPythonActivityComponent } from "./ipython-activity.ts";
+import { keyText } from "./keybinding-hints.ts";
 
 export interface IPythonCellContentBlock {
 	type: string;
@@ -169,6 +170,10 @@ export class IPythonCellComponent implements Component {
 
 	private summaryLine(details: IPythonDetails): string {
 		const parts = [`${this.marker(details)} ${theme.fg("muted", "python")}`];
+		if (this.state.executionStarted && this.statusKind(details) === "running") {
+			const interruptKey = keyText("app.interrupt");
+			if (interruptKey) parts.push(theme.fg("muted", `${interruptKey} to interrupt`));
+		}
 		const preview = firstCodeLine(this.state.code);
 		if (preview) {
 			parts.push(highlightCode(preview, "python")[0] ?? theme.fg("mdCodeBlock", preview));

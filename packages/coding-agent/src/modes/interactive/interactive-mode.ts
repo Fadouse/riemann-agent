@@ -99,6 +99,7 @@ import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
+import { getRiemannAgentDir, loadRiemannConfig, updateGlobalRiemannSetting } from "../../riemann/config.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
@@ -4380,218 +4381,237 @@ export class InteractiveMode {
 	}
 
 	private showSettingsSelector(): void {
-		this.showSelector((done) => {
-			let selector: SettingsSelectorComponent | undefined;
-			selector = new SettingsSelectorComponent(
-				{
-					autoCompact: this.session.autoCompactionEnabled,
-					showImages: this.settingsManager.getShowImages(),
-					imageWidthCells: this.settingsManager.getImageWidthCells(),
-					autoResizeImages: this.settingsManager.getImageAutoResize(),
-					blockImages: this.settingsManager.getBlockImages(),
-					enableSkillCommands: this.settingsManager.getEnableSkillCommands(),
-					steeringMode: this.session.steeringMode,
-					followUpMode: this.session.followUpMode,
-					transport: this.settingsManager.getTransport(),
-					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
-					thinkingLevel: this.session.thinkingLevel,
-					availableThinkingLevels: this.session.getAvailableThinkingLevels(),
-					currentTheme: this.themeController.getThemeSelection() || "dark",
-					terminalTheme: this.themeController.getTerminalTheme(),
-					availableThemes: getAvailableThemes(),
-					hideThinkingBlock: this.hideThinkingBlock,
-					mermaidRenderingMode: this.settingsManager.getMermaidRenderingMode(),
-					collapseChangelog: this.settingsManager.getCollapseChangelog(),
-					enableInstallTelemetry: this.settingsManager.getEnableInstallTelemetry(),
-					doubleEscapeAction: this.settingsManager.getDoubleEscapeAction(),
-					treeFilterMode: this.settingsManager.getTreeFilterMode(),
-					showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
-					showCacheMissNotices: this.settingsManager.getShowCacheMissNotices(),
-					defaultProjectTrust: this.settingsManager.getDefaultProjectTrust(),
-					editorPaddingX: this.settingsManager.getEditorPaddingX(),
-					outputPad: this.settingsManager.getOutputPad(),
-					autocompleteMaxVisible: this.settingsManager.getAutocompleteMaxVisible(),
-					quietStartup: this.settingsManager.getQuietStartup(),
-					clearOnShrink: this.settingsManager.getClearOnShrink(),
-					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
-					tuiMode: this.ui.mode,
-					fullscreenExitOutput: this.settingsManager.getFullscreenExitOutput(),
-					fullscreenScrollbar: this.settingsManager.getFullscreenScrollbar(),
-					warnings: this.settingsManager.getWarnings(),
-				},
-				{
-					onAutoCompactChange: (enabled) => {
-						this.session.setAutoCompactionEnabled(enabled);
-						this.footer.setAutoCompactEnabled(enabled);
-					},
-					onShowImagesChange: (enabled) => {
-						this.settingsManager.setShowImages(enabled);
-						for (const child of this.chatContainer.children) {
-							if (child instanceof ToolExecutionComponent) {
-								child.setShowImages(enabled);
-							}
-						}
-					},
-					onImageWidthCellsChange: (width) => {
-						this.settingsManager.setImageWidthCells(width);
-						for (const child of this.chatContainer.children) {
-							if (child instanceof ToolExecutionComponent) {
-								child.setImageWidthCells(width);
-							}
-						}
-					},
-					onAutoResizeImagesChange: (enabled) => {
-						this.settingsManager.setImageAutoResize(enabled);
-					},
-					onBlockImagesChange: (blocked) => {
-						this.settingsManager.setBlockImages(blocked);
-					},
-					onEnableSkillCommandsChange: (enabled) => {
-						this.settingsManager.setEnableSkillCommands(enabled);
-						this.setupAutocompleteProvider();
-					},
-					onSteeringModeChange: (mode) => {
-						this.session.setSteeringMode(mode);
-					},
-					onFollowUpModeChange: (mode) => {
-						this.session.setFollowUpMode(mode);
-					},
-					onTransportChange: (transport) => {
-						this.settingsManager.setTransport(transport);
-						this.session.agent.transport = transport;
-					},
-					onHttpIdleTimeoutMsChange: (timeoutMs) => {
-						this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
-						configureHttpDispatcher(timeoutMs);
-						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`);
-					},
-					onThinkingLevelChange: (level) => {
-						this.session.setThinkingLevel(level);
-						this.footer.invalidate();
-						this.updateEditorBorderColor();
-					},
-					onThemeChange: (themeSetting) => {
-						this.settingsManager.setTheme(themeSetting);
-						void this.themeController.setThemeSetting(themeSetting);
-					},
-					onThemePreview: (themeName) => this.themeController.preview(themeName),
-					onHideThinkingBlockChange: (hidden) => {
-						this.hideThinkingBlock = hidden;
-						this.settingsManager.setHideThinkingBlock(hidden);
-						for (const child of this.chatContainer.children) {
-							if (child instanceof AssistantMessageComponent) {
-								child.setHideThinkingBlock(hidden);
-							}
-						}
-						this.chatContainer.clear();
-						this.rebuildChatFromMessages();
-					},
-					onMermaidRenderingModeChange: (mode) => {
-						this.settingsManager.setMermaidRenderingMode(mode);
-						this.chatContainer.invalidate();
-						this.ui.requestRender();
-					},
-					onShowCacheMissNoticesChange: (shown) => {
-						this.settingsManager.setShowCacheMissNotices(shown);
-						this.rebuildChatFromMessages();
-					},
-					onCollapseChangelogChange: (collapsed) => {
-						this.settingsManager.setCollapseChangelog(collapsed);
-					},
-					onEnableInstallTelemetryChange: (enabled) => {
-						this.settingsManager.setEnableInstallTelemetry(enabled);
-					},
-					onQuietStartupChange: (enabled) => {
-						this.settingsManager.setQuietStartup(enabled);
-					},
-					onDefaultProjectTrustChange: (defaultProjectTrust) => {
-						this.settingsManager.setDefaultProjectTrust(defaultProjectTrust);
-					},
-					onDoubleEscapeActionChange: (action) => {
-						this.settingsManager.setDoubleEscapeAction(action);
-					},
-					onTreeFilterModeChange: (mode) => {
-						this.settingsManager.setTreeFilterMode(mode);
-					},
-					onShowHardwareCursorChange: (enabled) => {
-						this.settingsManager.setShowHardwareCursor(enabled);
-						this.ui.setShowHardwareCursor(enabled);
-					},
-					onEditorPaddingXChange: (padding) => {
-						this.settingsManager.setEditorPaddingX(padding);
-						this.defaultEditor.setPaddingX(padding);
-						if (this.editor !== this.defaultEditor && this.editor.setPaddingX !== undefined) {
-							this.editor.setPaddingX(padding);
-						}
-					},
-					onOutputPadChange: (padding) => {
-						this.settingsManager.setOutputPad(padding);
-						this.outputPad = padding;
-						if (this.streamingComponent || this.session.isStreaming) {
-							for (const child of this.chatContainer.children) {
-								if (
-									child instanceof AssistantMessageComponent ||
-									child instanceof CustomMessageComponent ||
-									child instanceof UserMessageComponent
-								) {
-									child.setOutputPad(padding);
-								}
-							}
-							if (this.streamingComponent) {
-								this.streamingComponent.setOutputPad(padding);
-							}
-							this.ui.requestRender();
-							return;
-						}
-						this.rebuildChatFromMessages();
-					},
-					onAutocompleteMaxVisibleChange: (maxVisible) => {
-						this.settingsManager.setAutocompleteMaxVisible(maxVisible);
-						this.defaultEditor.setAutocompleteMaxVisible(maxVisible);
-						if (this.editor !== this.defaultEditor && this.editor.setAutocompleteMaxVisible !== undefined) {
-							this.editor.setAutocompleteMaxVisible(maxVisible);
-						}
-					},
-					onClearOnShrinkChange: (enabled) => {
-						this.settingsManager.setClearOnShrink(enabled);
-						this.ui.setClearOnShrink(enabled);
-						if (!enabled && !this.activeStatusIndicator) {
-							this.statusContainer.clear();
-						}
-					},
-					onShowTerminalProgressChange: (enabled) => {
-						this.settingsManager.setShowTerminalProgress(enabled);
-					},
-					onTuiModeChange: (mode) => {
-						if (!this.switchTuiMode(mode)) {
-							selector?.getSettingsList().updateValue("tui-mode", this.ui.mode);
-							this.showStatus("Close active overlays before changing TUI mode");
-							return;
-						}
-						this.settingsManager.setTuiMode(mode);
-						if (!this.activeStatusIndicator) this.statusContainer.clear();
-						this.showStatus(`TUI mode: ${mode}`);
-					},
-					onFullscreenExitOutputChange: (output) => {
-						this.settingsManager.setFullscreenExitOutput(output);
-					},
-					onFullscreenScrollbarChange: (mode) => {
-						this.settingsManager.setFullscreenScrollbar(mode);
-						this.applyFullscreenScrollbarSetting();
-					},
-					onWarningsChange: (warnings) => {
-						this.settingsManager.setWarnings(warnings);
-					},
-					onCancel: () => {
-						done();
-						this.ui.requestRender();
-					},
-				},
-			);
-			return { component: selector, focus: selector.getSettingsList() };
-		});
+		void this.showUnifiedSettingsSelector();
 	}
 
+	private async showUnifiedSettingsSelector(): Promise<void> {
+		try {
+			const agentDir = getRiemannAgentDir();
+			const riemann = await loadRiemannConfig({
+				cwd: this.sessionManager.getCwd(),
+				agentDir,
+				projectTrusted: this.settingsManager.isProjectTrusted(),
+			});
+			this.showSelector((done) => {
+				let selector: SettingsSelectorComponent | undefined;
+				selector = new SettingsSelectorComponent(
+					{
+						autoCompact: this.session.autoCompactionEnabled,
+						showImages: this.settingsManager.getShowImages(),
+						imageWidthCells: this.settingsManager.getImageWidthCells(),
+						autoResizeImages: this.settingsManager.getImageAutoResize(),
+						blockImages: this.settingsManager.getBlockImages(),
+						enableSkillCommands: this.settingsManager.getEnableSkillCommands(),
+						steeringMode: this.session.steeringMode,
+						followUpMode: this.session.followUpMode,
+						transport: this.settingsManager.getTransport(),
+						httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
+						thinkingLevel: this.session.thinkingLevel,
+						availableThinkingLevels: this.session.getAvailableThinkingLevels(),
+						currentTheme: this.themeController.getThemeSelection() || "dark",
+						terminalTheme: this.themeController.getTerminalTheme(),
+						availableThemes: getAvailableThemes(),
+						hideThinkingBlock: this.hideThinkingBlock,
+						mermaidRenderingMode: this.settingsManager.getMermaidRenderingMode(),
+						collapseChangelog: this.settingsManager.getCollapseChangelog(),
+						enableInstallTelemetry: this.settingsManager.getEnableInstallTelemetry(),
+						doubleEscapeAction: this.settingsManager.getDoubleEscapeAction(),
+						treeFilterMode: this.settingsManager.getTreeFilterMode(),
+						showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
+						showCacheMissNotices: this.settingsManager.getShowCacheMissNotices(),
+						defaultProjectTrust: this.settingsManager.getDefaultProjectTrust(),
+						editorPaddingX: this.settingsManager.getEditorPaddingX(),
+						outputPad: this.settingsManager.getOutputPad(),
+						autocompleteMaxVisible: this.settingsManager.getAutocompleteMaxVisible(),
+						quietStartup: this.settingsManager.getQuietStartup(),
+						clearOnShrink: this.settingsManager.getClearOnShrink(),
+						showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
+						tuiMode: this.ui.mode,
+						fullscreenExitOutput: this.settingsManager.getFullscreenExitOutput(),
+						fullscreenScrollbar: this.settingsManager.getFullscreenScrollbar(),
+						warnings: this.settingsManager.getWarnings(),
+						riemann,
+					},
+					{
+						onAutoCompactChange: (enabled) => {
+							this.session.setAutoCompactionEnabled(enabled);
+							this.footer.setAutoCompactEnabled(enabled);
+						},
+						onShowImagesChange: (enabled) => {
+							this.settingsManager.setShowImages(enabled);
+							for (const child of this.chatContainer.children) {
+								if (child instanceof ToolExecutionComponent) {
+									child.setShowImages(enabled);
+								}
+							}
+						},
+						onImageWidthCellsChange: (width) => {
+							this.settingsManager.setImageWidthCells(width);
+							for (const child of this.chatContainer.children) {
+								if (child instanceof ToolExecutionComponent) {
+									child.setImageWidthCells(width);
+								}
+							}
+						},
+						onAutoResizeImagesChange: (enabled) => {
+							this.settingsManager.setImageAutoResize(enabled);
+						},
+						onBlockImagesChange: (blocked) => {
+							this.settingsManager.setBlockImages(blocked);
+						},
+						onEnableSkillCommandsChange: (enabled) => {
+							this.settingsManager.setEnableSkillCommands(enabled);
+							this.setupAutocompleteProvider();
+						},
+						onSteeringModeChange: (mode) => {
+							this.session.setSteeringMode(mode);
+						},
+						onFollowUpModeChange: (mode) => {
+							this.session.setFollowUpMode(mode);
+						},
+						onTransportChange: (transport) => {
+							this.settingsManager.setTransport(transport);
+							this.session.agent.transport = transport;
+						},
+						onHttpIdleTimeoutMsChange: (timeoutMs) => {
+							this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
+							configureHttpDispatcher(timeoutMs);
+							this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`);
+						},
+						onThinkingLevelChange: (level) => {
+							this.session.setThinkingLevel(level);
+							this.footer.invalidate();
+							this.updateEditorBorderColor();
+						},
+						onThemeChange: (themeSetting) => {
+							this.settingsManager.setTheme(themeSetting);
+							void this.themeController.setThemeSetting(themeSetting);
+						},
+						onThemePreview: (themeName) => this.themeController.preview(themeName),
+						onHideThinkingBlockChange: (hidden) => {
+							this.hideThinkingBlock = hidden;
+							this.settingsManager.setHideThinkingBlock(hidden);
+							for (const child of this.chatContainer.children) {
+								if (child instanceof AssistantMessageComponent) {
+									child.setHideThinkingBlock(hidden);
+								}
+							}
+							this.chatContainer.clear();
+							this.rebuildChatFromMessages();
+						},
+						onMermaidRenderingModeChange: (mode) => {
+							this.settingsManager.setMermaidRenderingMode(mode);
+							this.chatContainer.invalidate();
+							this.ui.requestRender();
+						},
+						onShowCacheMissNoticesChange: (shown) => {
+							this.settingsManager.setShowCacheMissNotices(shown);
+							this.rebuildChatFromMessages();
+						},
+						onCollapseChangelogChange: (collapsed) => {
+							this.settingsManager.setCollapseChangelog(collapsed);
+						},
+						onEnableInstallTelemetryChange: (enabled) => {
+							this.settingsManager.setEnableInstallTelemetry(enabled);
+						},
+						onQuietStartupChange: (enabled) => {
+							this.settingsManager.setQuietStartup(enabled);
+						},
+						onDefaultProjectTrustChange: (defaultProjectTrust) => {
+							this.settingsManager.setDefaultProjectTrust(defaultProjectTrust);
+						},
+						onDoubleEscapeActionChange: (action) => {
+							this.settingsManager.setDoubleEscapeAction(action);
+						},
+						onTreeFilterModeChange: (mode) => {
+							this.settingsManager.setTreeFilterMode(mode);
+						},
+						onShowHardwareCursorChange: (enabled) => {
+							this.settingsManager.setShowHardwareCursor(enabled);
+							this.ui.setShowHardwareCursor(enabled);
+						},
+						onEditorPaddingXChange: (padding) => {
+							this.settingsManager.setEditorPaddingX(padding);
+							this.defaultEditor.setPaddingX(padding);
+							if (this.editor !== this.defaultEditor && this.editor.setPaddingX !== undefined) {
+								this.editor.setPaddingX(padding);
+							}
+						},
+						onOutputPadChange: (padding) => {
+							this.settingsManager.setOutputPad(padding);
+							this.outputPad = padding;
+							if (this.streamingComponent || this.session.isStreaming) {
+								for (const child of this.chatContainer.children) {
+									if (
+										child instanceof AssistantMessageComponent ||
+										child instanceof CustomMessageComponent ||
+										child instanceof UserMessageComponent
+									) {
+										child.setOutputPad(padding);
+									}
+								}
+								if (this.streamingComponent) {
+									this.streamingComponent.setOutputPad(padding);
+								}
+								this.ui.requestRender();
+								return;
+							}
+							this.rebuildChatFromMessages();
+						},
+						onAutocompleteMaxVisibleChange: (maxVisible) => {
+							this.settingsManager.setAutocompleteMaxVisible(maxVisible);
+							this.defaultEditor.setAutocompleteMaxVisible(maxVisible);
+							if (this.editor !== this.defaultEditor && this.editor.setAutocompleteMaxVisible !== undefined) {
+								this.editor.setAutocompleteMaxVisible(maxVisible);
+							}
+						},
+						onClearOnShrinkChange: (enabled) => {
+							this.settingsManager.setClearOnShrink(enabled);
+							this.ui.setClearOnShrink(enabled);
+							if (!enabled && !this.activeStatusIndicator) {
+								this.statusContainer.clear();
+							}
+						},
+						onShowTerminalProgressChange: (enabled) => {
+							this.settingsManager.setShowTerminalProgress(enabled);
+						},
+						onTuiModeChange: (mode) => {
+							if (!this.switchTuiMode(mode)) {
+								selector?.getSettingsList().updateValue("tui-mode", this.ui.mode);
+								this.showStatus("Close active overlays before changing TUI mode");
+								return;
+							}
+							this.settingsManager.setTuiMode(mode);
+							if (!this.activeStatusIndicator) this.statusContainer.clear();
+							this.showStatus(`TUI mode: ${mode}`);
+						},
+						onFullscreenExitOutputChange: (output) => {
+							this.settingsManager.setFullscreenExitOutput(output);
+						},
+						onFullscreenScrollbarChange: (mode) => {
+							this.settingsManager.setFullscreenScrollbar(mode);
+							this.applyFullscreenScrollbarSetting();
+						},
+						onWarningsChange: (warnings) => {
+							this.settingsManager.setWarnings(warnings);
+						},
+						onRiemannChange: async (path, value) => {
+							await updateGlobalRiemannSetting(agentDir, path, value);
+							this.showStatus(`Saved ${path}; applies to new runs`);
+						},
+						onError: (message) => this.showError(message),
+						onCancel: () => {
+							done();
+							this.ui.requestRender();
+						},
+					},
+				);
+				return { component: selector, focus: selector };
+			});
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
 	private async handleModelCommand(searchTerm?: string): Promise<void> {
 		if (!searchTerm) {
 			this.showModelSelector();

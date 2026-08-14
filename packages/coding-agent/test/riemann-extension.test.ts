@@ -28,7 +28,8 @@ describe("Riemann session extension", () => {
 				"  profiles:",
 				"    researcher:",
 				"      description: Research public sources without modifying files.",
-				"      workspace: read-only",
+				"      workspace: shared",
+				"      permissions: workspace",
 				"      capabilities:",
 				"        - web",
 				"mcp:",
@@ -48,12 +49,16 @@ describe("Riemann session extension", () => {
 			].join("\n"),
 		);
 		const registered: ToolDefinition[] = [];
+		const registeredCommands: string[] = [];
 		let beforeStart: ((event: unknown, ctx: ExtensionContext) => Promise<unknown>) | undefined;
 		let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<unknown>) | undefined;
 		let shutdown: ((event: unknown, ctx: ExtensionContext) => Promise<unknown>) | undefined;
 		const api = {
 			registerTool(tool: ToolDefinition) {
 				registered.push(tool);
+			},
+			registerCommand(name: string) {
+				registeredCommands.push(name);
 			},
 			on(name: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown>) {
 				if (name === "session_start") sessionStart = handler;
@@ -86,13 +91,15 @@ describe("Riemann session extension", () => {
 		try {
 			riemannExtension(api as never);
 			expect(registered.map((tool) => tool.name)).toEqual(["ipython"]);
+			expect(registeredCommands).toEqual(["agents"]);
 			expect(registered[0]?.description).toBe(
 				"Execute Python in a persistent IPython environment. The operation namespaces listed in the system prompt are preinstalled globals; calls can be assigned and composed with top-level await. Variables persist across executions.",
 			);
 			expect(JSON.stringify(registered[0]?.parameters)).not.toContain("IPython");
 			expect(JSON.stringify(registered[0]?.parameters)).toContain("asyncio.gather");
-			expect(beforeStart).toBeDefined();
+			expect(sessionStart).toBeDefined();
 			await sessionStart?.({}, ctx);
+			expect(beforeStart).toBeDefined();
 			const prepared = await beforeStart?.({ systemPromptOptions: {} }, ctx);
 			expect(prepared && typeof prepared === "object" && "systemPrompt" in prepared).toBe(true);
 			if (!prepared || typeof prepared !== "object" || !("systemPrompt" in prepared)) {
@@ -110,8 +117,8 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).toContain("## Available operations");
 			expect(systemPrompt).toContain("`workspace.read(path) -> TextSnapshot`");
 			expect(systemPrompt).toContain("`shell.run(");
-			expect(systemPrompt).toContain("`agents.spawn(task, name=None, profile=None, workspace_policy=None");
-			expect(systemPrompt).not.toContain("agents.spawn(task, name=None, profile=None, workspace=None");
+			expect(systemPrompt).toContain("`agents.spawn(task, name=None, profile=None, workspace=None");
+			expect(systemPrompt).not.toContain("workspace_policy");
 			expect(systemPrompt).toContain("## Configured agent profiles");
 			expect(systemPrompt).toContain('- "researcher": Research public sources without modifying files.');
 			expect(systemPrompt).toContain('- "public_docs": Search approved internal documentation.');
@@ -127,6 +134,11 @@ describe("Riemann session extension", () => {
 				{
 					code: [
 						"assert not hasattr(mcp, 'list')",
+						"identity = await agents.self()",
+						"mesh = await agents.list()",
+						"assert len(mesh) == 1 and mesh[0].id == identity.id, mesh",
+						"assert identity.workspace_mode == 'shared', identity",
+						"assert identity.permissions == 'host', identity",
 						"snap = await workspace.create(path='value.txt', text='before\\n')",
 						"snap = await workspace.edit(snapshot=snap, operations=[{'kind':'replace','start':0,'end':6,'text':'after'}])",
 						"process = await shell.run(command='node', args=['-e', \"console.log('streamed')\"])",
@@ -179,7 +191,7 @@ describe("Riemann session extension", () => {
 			expect(database.byteLength).toBeGreaterThan(0);
 			const snapshotNames = await readdir(join(agentDir, "state", "snapshots"));
 			expect(snapshotNames).toHaveLength(1);
-			const snapshot = await readFile(join(agentDir, "state", "snapshots", snapshotNames[0]));
+			const snapshot = await readFile(join(agentDir, "state", "snapshots", snapshotNames[0], "kernel.dill"));
 			expect(snapshot.byteLength).toBeGreaterThan(0);
 		} finally {
 			await shutdown?.({}, ctx);

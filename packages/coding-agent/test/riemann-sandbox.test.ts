@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -15,9 +15,14 @@ async function policy(workspaceWritable: boolean) {
 	roots.push(root);
 	const workspace = join(root, "workspace");
 	const connectionDir = join(root, "connection");
-	const snapshotPath = join(root, "state", "kernel.dill");
-	await Promise.all([mkdir(workspace), mkdir(connectionDir), mkdir(join(root, "state"))]);
-	return { workspace, workspaceWritable, connectionDir, snapshotPath, python: process.execPath };
+	await Promise.all([mkdir(workspace), mkdir(connectionDir)]);
+	return {
+		workspace,
+		filesystemScope: "workspace" as const,
+		workspaceWritable,
+		connectionDir,
+		python: process.execPath,
+	};
 }
 
 describe("Riemann kernel system sandbox", () => {
@@ -54,6 +59,66 @@ describe("Riemann kernel system sandbox", () => {
 			delete process.env.RIEMANN_TEST_SECRET;
 		}
 	});
+	test("masks nested Riemann state while remounting only the managed runtime", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-sandbox-nested-state-"));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		const agentDir = join(workspace, ".riemann", "agent");
+		const runtime = join(agentDir, "runtime", "python-v1");
+		const python = join(runtime, "bin", "python");
+		const connectionDir = join(root, "connection");
+		await mkdir(join(runtime, "bin"), { recursive: true });
+		await Promise.all([
+			mkdir(connectionDir),
+			writeFile(python, ""),
+			writeFile(join(agentDir, "auth.json"), "secret"),
+		]);
+		const command = sandboxedKernelCommand(
+			{
+				agentDir,
+				workspace,
+				filesystemScope: "workspace",
+				workspaceWritable: true,
+				connectionDir,
+				python,
+				platform: "linux",
+				bubblewrapPath: "/usr/bin/bwrap",
+			},
+			[],
+		);
+		const workspaceBind = command.args.findIndex(
+			(value, index) =>
+				value === "--bind" && command.args[index + 1] === workspace && command.args[index + 2] === workspace,
+		);
+		const stateMask = command.args.findIndex(
+			(value, index) => value === "--tmpfs" && command.args[index + 1] === agentDir,
+		);
+		const runtimeBind = command.args.findIndex(
+			(value, index) =>
+				value === "--ro-bind" && command.args[index + 1] === runtime && command.args[index + 2] === runtime,
+		);
+		const stateReadOnly = command.args.findIndex(
+			(value, index) => value === "--remount-ro" && command.args[index + 1] === agentDir,
+		);
+		expect(workspaceBind).toBeGreaterThan(-1);
+		expect(stateMask).toBeGreaterThan(workspaceBind);
+		expect(runtimeBind).toBeGreaterThan(stateMask);
+		expect(stateReadOnly).toBeGreaterThan(runtimeBind);
+
+		const profile = macOSSandboxProfile({
+			agentDir,
+			workspace,
+			filesystemScope: "workspace",
+			workspaceWritable: true,
+			connectionDir,
+			python,
+		});
+		const excluded = JSON.stringify(agentDir);
+		expect(profile).toContain(`(require-not (literal ${excluded}))`);
+		expect(profile).toContain(`(require-not (subpath ${excluded}))`);
+		expect(profile).toContain(`(allow file-read* (subpath ${JSON.stringify(runtime)}))`);
+		expect(profile).not.toContain(`(allow file-write* (subpath ${excluded}))`);
+	});
 
 	test("builds a deny-by-default macOS Seatbelt profile with only the kernel IPC socket", async () => {
 		const readOnly = await policy(false);
@@ -62,6 +127,19 @@ describe("Riemann kernel system sandbox", () => {
 		expect(profile).not.toContain("(allow network*)\n");
 		expect(profile).toContain(`(allow network* (subpath ${JSON.stringify(readOnly.connectionDir)}))`);
 		expect(profile).not.toContain(`(allow file-write* (subpath ${JSON.stringify(readOnly.workspace)}))`);
+	});
+
+	test("grants host filesystem access only for the explicit host scope", async () => {
+		const writable = await policy(true);
+		const linux = sandboxedKernelCommand(
+			{ ...writable, filesystemScope: "host", platform: "linux", bubblewrapPath: "/usr/bin/bwrap" },
+			[],
+		);
+		expect(linux.args).toEqual(expect.arrayContaining(["--bind", "/", "/"]));
+
+		const macOS = macOSSandboxProfile({ ...writable, filesystemScope: "host", platform: "darwin" });
+		expect(macOS).toContain("(allow file-read*)");
+		expect(macOS).toContain("(allow file-write*)");
 	});
 
 	test("fails closed on unsupported platforms", async () => {

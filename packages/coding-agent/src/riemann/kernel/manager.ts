@@ -1,6 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -25,6 +25,7 @@ import { decodeJupyterMessage, encodeJupyterMessage } from "./wire.ts";
 
 const CONNECTION_WAIT_MS = 50;
 const SHUTDOWN_GRACE_MS = 1_500;
+const INTERRUPT_GRACE_MS = 500;
 const HOST_COMM_TARGET = "riemann.host";
 
 interface ActiveExecution {
@@ -85,6 +86,13 @@ function parseError(message: JupyterMessage): KernelError | undefined {
 function stripAnsi(value: string): string {
 	return value.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
 }
+function errorCode(error: unknown): string | undefined {
+	return error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
 
 export class IPythonKernelManager {
 	private readonly options: KernelManagerOptions;
@@ -105,6 +113,40 @@ export class IPythonKernelManager {
 
 	constructor(options: KernelManagerOptions) {
 		this.options = options;
+	}
+	private kernelSnapshotPath(): string | undefined {
+		if (!this.options.snapshotPath) return undefined;
+		if (!this.options.sandbox) return this.options.snapshotPath;
+		if (!this.tempDir) throw new Error("IPython kernel snapshot staging directory is unavailable");
+		return join(this.tempDir, "snapshot.dill");
+	}
+
+	private async stageSnapshotForRestore(kernelPath: string): Promise<void> {
+		const durablePath = this.options.snapshotPath;
+		if (!durablePath || kernelPath === durablePath) return;
+		try {
+			await copyFile(durablePath, kernelPath);
+		} catch (error) {
+			if (errorCode(error) !== "ENOENT") throw error;
+		}
+	}
+
+	private async persistStagedSnapshot(kernelPath: string): Promise<void> {
+		const durablePath = this.options.snapshotPath;
+		if (!durablePath || kernelPath === durablePath) return;
+		const temporary = join(dirname(durablePath), `.snapshot-${randomUUID()}.tmp`);
+		try {
+			await copyFile(kernelPath, temporary);
+			const file = await open(temporary, "r");
+			try {
+				await file.sync();
+			} finally {
+				await file.close();
+			}
+			await rename(temporary, durablePath);
+		} finally {
+			await rm(temporary, { force: true });
+		}
 	}
 
 	async start(): Promise<void> {
@@ -143,7 +185,11 @@ export class IPythonKernelManager {
 		this.shellLoop = undefined;
 		this.controlLoop = undefined;
 		this.iopubLoop = undefined;
-		if (process?.exitCode === null) process.kill("SIGKILL");
+		if (process?.exitCode === null) {
+			process.kill("SIGKILL");
+			process.stdout?.destroy();
+			process.stderr?.destroy();
+		}
 		if (process) await Promise.race([waitForChildProcess(process), delay(SHUTDOWN_GRACE_MS)]);
 		await Promise.allSettled(loops);
 		this.options.onProcess?.(undefined);
@@ -178,10 +224,10 @@ export class IPythonKernelManager {
 					{
 						workspace: this.options.cwd,
 						agentDir: sandbox.agentDir,
+						filesystemScope: sandbox.filesystemScope,
 						workspaceWritable: sandbox.workspaceWritable,
 						python: this.options.python,
 						connectionDir: this.tempDir,
-						snapshotPath: this.options.snapshotPath,
 						platform: sandbox.platform,
 						bubblewrapPath: sandbox.bubblewrapPath,
 						sandboxExecPath: sandbox.sandboxExecPath,
@@ -278,20 +324,25 @@ export class IPythonKernelManager {
 			for await (const frames of socket) {
 				if (!this.connection) continue;
 				const message = decodeJupyterMessage(frames as Buffer[], this.connection.key);
-				if (message) await this.handleMessage(channel, message);
+				if (message) this.handleMessage(channel, message);
 			}
 		} catch (error) {
 			if (!this.closed) this.failActive(error instanceof Error ? error : new Error(String(error)));
 		}
 	}
 
-	private async handleMessage(channel: "shell" | "control" | "iopub", message: JupyterMessage): Promise<void> {
+	private handleMessage(channel: "shell" | "control" | "iopub", message: JupyterMessage): void {
 		if (message.header.msg_type === "kernel_info_reply") {
 			this.kernelReady = true;
 			return;
 		}
 		if (message.header.msg_type === "comm_open" && stringField(message.content.target_name) === HOST_COMM_TARGET) {
-			await this.handleHostRequest(channel, message);
+			const execution = this.execution?.id === stringField(message.parentHeader.msg_id) ? this.execution : undefined;
+			void this.handleHostRequest(channel, message).catch((error: unknown) => {
+				if (execution && this.execution === execution) {
+					this.failActive(error instanceof Error ? error : new Error(String(error)));
+				}
+			});
 			return;
 		}
 		const execution = this.execution;
@@ -314,13 +365,15 @@ export class IPythonKernelManager {
 				break;
 			}
 			case "error":
-				execution.error = parseError(message);
-				execution.status = "error";
+				if (execution.status !== "aborted") {
+					execution.error = parseError(message);
+					execution.status = "error";
+				}
 				break;
 			case "execute_reply":
 				execution.replied = true;
 				execution.executionCount ??= numberField(message.content.execution_count);
-				if (message.content.status === "error") {
+				if (message.content.status === "error" && execution.status !== "aborted") {
 					execution.status = "error";
 					execution.error ??= parseError(message);
 				} else if (message.content.status === "aborted") {
@@ -491,37 +544,51 @@ export class IPythonKernelManager {
 			onHostRequest: options.onHostRequest,
 			hostNotificationQueue: Promise.resolve(),
 		};
-		if (options.signal) {
-			const onAbort = () => void this.interrupt().catch(() => undefined);
-			options.signal.addEventListener("abort", onAbort, { once: true });
-			execution.abort = () => options.signal?.removeEventListener("abort", onAbort);
-		}
 		this.execution = execution;
 		try {
 			await this.shell.send(request.frames);
 		} catch (error) {
 			this.failActive(error instanceof Error ? error : new Error(String(error)));
 		}
+		if (options.signal && !execution.settled) {
+			const onAbort = () => void this.interrupt().catch(() => undefined);
+			options.signal.addEventListener("abort", onAbort, { once: true });
+			execution.abort = () => options.signal?.removeEventListener("abort", onAbort);
+			if (options.signal.aborted) onAbort();
+		}
 		return promise;
 	}
 
 	async interrupt(): Promise<void> {
-		if (this.execution) this.abortHostRequests(this.execution, new Error("IPython cell interrupted"));
-		if (!this.control || !this.connection) return;
-		const request = encodeJupyterMessage({
-			type: "interrupt_request",
-			session: this.session,
-			username: this.options.sessionId,
-			key: this.connection.key,
-		});
-		await this.control.send(request.frames);
+		const execution = this.execution;
+		if (!execution) return;
+		execution.status = "aborted";
+		this.abortHostRequests(execution, new Error("IPython cell interrupted"));
+		if (this.control && this.connection) {
+			const request = encodeJupyterMessage({
+				type: "interrupt_request",
+				session: this.session,
+				username: this.options.sessionId,
+				key: this.connection.key,
+			});
+			await this.control.send(request.frames).catch(() => undefined);
+		}
+		await delay(INTERRUPT_GRACE_MS);
+		if (this.execution !== execution || execution.settled) return;
+		this.kernelReady = false;
+		if (this.process?.exitCode === null) this.process.kill("SIGKILL");
+		execution.replied = true;
+		execution.idle = true;
+		this.settleIfComplete(execution);
 	}
 
 	private failActive(error: Error): void {
 		const execution = this.execution;
 		if (!execution || execution.settled) return;
-		execution.error = { ename: error.name, evalue: error.message, traceback: [] };
-		execution.status = "error";
+		if (execution.status !== "aborted") {
+			execution.error = { ename: error.name, evalue: error.message, traceback: [] };
+			execution.status = "error";
+		}
 		execution.replied = true;
 		execution.idle = true;
 		this.settleIfComplete(execution);
@@ -584,8 +651,19 @@ export class IPythonKernelManager {
 	}
 
 	private async restoreSnapshot(): Promise<void> {
-		if (!this.options.snapshotPath) return;
-		const escapedPath = JSON.stringify(this.options.snapshotPath);
+		const kernelPath = this.kernelSnapshotPath();
+		if (!kernelPath) return;
+		try {
+			await this.stageSnapshotForRestore(kernelPath);
+		} catch (error) {
+			this.options.onRestore?.({
+				restored: [],
+				skipped: [],
+				error: `Could not stage snapshot for restore: ${errorMessage(error)}`,
+			});
+			return;
+		}
+		const escapedPath = JSON.stringify(kernelPath);
 		const result = await this.execute(
 			`import dill as _riemann_dill, json as _riemann_json, pathlib as _riemann_pathlib\n_riemann_restore = {"restored": [], "skipped": []}\n_riemann_snapshot_path = _riemann_pathlib.Path(${escapedPath})\nif _riemann_snapshot_path.exists():\n    try:\n        with _riemann_snapshot_path.open("rb") as _riemann_file:\n            _riemann_values = _riemann_dill.load(_riemann_file)\n        for _riemann_name, _riemann_value in _riemann_values.items():\n            globals()[_riemann_name] = _riemann_value\n            _riemann_restore["restored"].append(_riemann_name)\n    except Exception as _riemann_error:\n        _riemann_restore["error"] = f"{type(_riemann_error).__name__}: {_riemann_error}"\nprint("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps(_riemann_restore, sort_keys=True))`,
 			{ internal: true },
@@ -594,14 +672,23 @@ export class IPythonKernelManager {
 	}
 
 	async snapshot(): Promise<KernelRestoreResult> {
-		if (!this.options.snapshotPath) return { restored: [], skipped: [], error: "Snapshots are disabled" };
+		const kernelPath = this.kernelSnapshotPath();
+		if (!kernelPath) return { restored: [], skipped: [], error: "Snapshots are disabled" };
+		if (!this.kernelReady || this.process?.exitCode !== null)
+			return { restored: [], skipped: [], error: "Cannot snapshot while an IPython kernel restart is pending" };
 		if (this.execution)
 			return { restored: [], skipped: [], error: "Cannot snapshot while an IPython cell is running" };
-		const escapedPath = JSON.stringify(this.options.snapshotPath);
+		const escapedPath = JSON.stringify(kernelPath);
 		const code = `import builtins as _riemann_builtins, dill as _riemann_dill, json as _riemann_json, os as _riemann_os, pathlib as _riemann_pathlib, tempfile as _riemann_tempfile\n_riemann_snapshot_path = _riemann_pathlib.Path(${escapedPath})\n_riemann_snapshot_path.parent.mkdir(parents=True, exist_ok=True)\n_riemann_values, _riemann_skipped = {}, []\n_riemann_reserved = {name for name in globals() if name.startswith("_")} | {"In", "Out", "get_ipython", "exit", "quit"} | set(globals().get("_RIEMANN_PROTECTED", set()))\nfor _riemann_name, _riemann_value in list(globals().items()):\n    if _riemann_name in _riemann_reserved or isinstance(_riemann_value, type(_riemann_builtins)):\n        continue\n    try:\n        _riemann_dill.dumps(_riemann_value)\n        _riemann_values[_riemann_name] = _riemann_value\n    except Exception as _riemann_error:\n        _riemann_skipped.append({"name": _riemann_name, "reason": f"{type(_riemann_error).__name__}: {_riemann_error}"})\n_riemann_fd, _riemann_tmp = _riemann_tempfile.mkstemp(dir=str(_riemann_snapshot_path.parent), prefix=".snapshot-", suffix=".tmp")\ntry:\n    with _riemann_os.fdopen(_riemann_fd, "wb") as _riemann_file:\n        _riemann_dill.dump(_riemann_values, _riemann_file)\n        _riemann_file.flush()\n        _riemann_os.fsync(_riemann_file.fileno())\n    _riemann_os.replace(_riemann_tmp, _riemann_snapshot_path)\nfinally:\n    if _riemann_os.path.exists(_riemann_tmp): _riemann_os.unlink(_riemann_tmp)\nprint("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps({"restored": sorted(_riemann_values), "skipped": _riemann_skipped}, sort_keys=True))`;
 		const result = await this.execute(code, { internal: true });
 		if (result.status !== "ok") return { restored: [], skipped: [], error: result.error?.evalue ?? result.stderr };
-		return this.parseSnapshotResult(result);
+		const parsed = this.parseSnapshotResult(result);
+		try {
+			await this.persistStagedSnapshot(kernelPath);
+			return parsed;
+		} catch (error) {
+			return { ...parsed, error: `Could not persist snapshot: ${errorMessage(error)}` };
+		}
 	}
 
 	async close(): Promise<void> {

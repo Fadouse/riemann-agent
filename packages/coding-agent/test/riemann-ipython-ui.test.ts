@@ -1,7 +1,8 @@
-import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { setKeybindings, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, test } from "vitest";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
+import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { IPythonCellComponent } from "../src/modes/interactive/components/ipython-cell.ts";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -24,6 +25,7 @@ function createIPythonDefinition(): ToolDefinition {
 describe("Riemann IPython transcript", () => {
 	beforeAll(() => {
 		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
 	});
 
 	test("uses a compact backgroundless summary and expands code plus output", () => {
@@ -101,6 +103,27 @@ describe("Riemann IPython transcript", () => {
 			expanded: true,
 		});
 		expect(stripAnsi(component.render(80).join("\n"))).toContain("search result body");
+	});
+	test("shows the configured interrupt key while a cell is running", () => {
+		const component = new IPythonCellComponent({
+			code: "await agents.wait(agent_id='worker')",
+			details: { status: "running" },
+			isPartial: true,
+			executionStarted: true,
+			argsComplete: true,
+			expanded: false,
+		});
+		expect(stripAnsi(component.render(100).join("\n"))).toContain("escape to interrupt");
+
+		component.update({
+			code: "await agents.wait(agent_id='worker')",
+			details: { status: "aborted" },
+			isPartial: false,
+			executionStarted: true,
+			argsComplete: true,
+			expanded: false,
+		});
+		expect(stripAnsi(component.render(100).join("\n"))).not.toContain("to interrupt");
 	});
 
 	test("renders shell, subagent, file, and patch activities inside the IPython cell", () => {

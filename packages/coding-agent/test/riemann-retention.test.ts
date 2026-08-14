@@ -52,11 +52,13 @@ describe("Riemann state retention", () => {
 			const child = store.createAgent({
 				runId: closed.id,
 				parentId: store.ensureRootAgent(closed.id, repository).id,
-				name: "isolated",
+				name: "worktree",
 				status: "completed",
 				prompt: "",
 				modelRole: "inherit",
 				workspace: repository,
+				workspaceMode: "worktree",
+				permissions: "workspace",
 				depth: 1,
 				capabilities: ["workspace.read"],
 			});

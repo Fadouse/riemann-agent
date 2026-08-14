@@ -4,11 +4,12 @@ import { delimiter, dirname, join, resolve } from "node:path";
 export interface KernelSandboxPolicy {
 	agentDir?: string;
 	workspace: string;
+	cwd?: string;
+	filesystemScope: "host" | "workspace";
 	workspaceWritable: boolean;
 	networkAllowed?: boolean;
 	python: string;
 	connectionDir: string;
-	snapshotPath?: string;
 	platform?: NodeJS.Platform;
 	bubblewrapPath?: string;
 	sandboxExecPath?: string;
@@ -75,10 +76,18 @@ function isInside(parent: string, child: string): boolean {
 	const candidate = resolve(child);
 	return candidate === root || candidate.startsWith(`${root}${process.platform === "win32" ? "\\" : "/"}`);
 }
+function protectedStateRoot(policy: KernelSandboxPolicy): string | undefined {
+	if (policy.filesystemScope !== "workspace" || !policy.agentDir) return undefined;
+	const workspace = resolve(policy.workspace);
+	const agentDir = resolve(policy.agentDir);
+	if (agentDir === workspace) {
+		throw new Error(`Riemann state directory cannot be the sandbox workspace: ${agentDir}`);
+	}
+	return isInside(workspace, agentDir) ? agentDir : undefined;
+}
 
 function writablePaths(policy: KernelSandboxPolicy): string[] {
 	const paths = [resolve(policy.connectionDir)];
-	if (policy.snapshotPath) paths.push(dirname(resolve(policy.snapshotPath)));
 	if (policy.workspaceWritable) paths.push(resolve(policy.workspace));
 	return [...new Set(paths)];
 }
@@ -105,6 +114,21 @@ function sanitizedEnvironment(policy: KernelSandboxPolicy): NodeJS.ProcessEnv {
 	};
 }
 
+function linuxHostCommand(policy: KernelSandboxPolicy, pythonArgs: string[], bubblewrap: string): SandboxedCommand {
+	const args = ["--die-with-parent", "--new-session", "--unshare-all"];
+	if (policy.networkAllowed) args.push("--share-net");
+	args.push(policy.workspaceWritable ? "--bind" : "--ro-bind", "/", "/");
+	args.push("--proc", "/proc", "--dev", "/dev", "--chdir", resolve(policy.cwd ?? policy.workspace), "--");
+	args.push(resolve(policy.python), ...pythonArgs);
+	return {
+		command: bubblewrap,
+		args,
+		env: sanitizedEnvironment(policy),
+		transport: "ipc",
+		endpointPrefix: join(policy.connectionDir, "kernel"),
+	};
+}
+
 function linuxCommand(policy: KernelSandboxPolicy, pythonArgs: string[]): SandboxedCommand {
 	const bubblewrap = policy.bubblewrapPath ?? process.env.RIEMANN_BWRAP_PATH ?? executableFromPath("bwrap");
 	if (!bubblewrap) {
@@ -112,6 +136,7 @@ function linuxCommand(policy: KernelSandboxPolicy, pythonArgs: string[]): Sandbo
 			"Riemann requires bubblewrap for Linux kernel isolation. Install bwrap or set RIEMANN_BWRAP_PATH.",
 		);
 	}
+	if (policy.filesystemScope === "host") return linuxHostCommand(policy, pythonArgs, bubblewrap);
 	const args = [
 		"--die-with-parent",
 		"--new-session",
@@ -143,17 +168,20 @@ function linuxCommand(policy: KernelSandboxPolicy, pythonArgs: string[]): Sandbo
 	}
 	const runtime = dirname(dirname(resolve(policy.python)));
 	const workspace = resolve(policy.workspace);
+	const protectedState = protectedStateRoot(policy);
 	args.push("--ro-bind", workspace, workspace);
 	if (policy.workspaceWritable) args.push("--bind", workspace, workspace);
-	if (runtime !== "/" && !runtime.startsWith("/nix/") && !isInside(workspace, runtime)) {
+	if (protectedState) args.push("--tmpfs", protectedState);
+	const runtimeHiddenByState = protectedState !== undefined && isInside(protectedState, runtime);
+	if (runtimeHiddenByState && runtime === protectedState) {
+		throw new Error(`Sandbox executable runtime cannot expose the protected Riemann state root: ${runtime}`);
+	}
+	if (runtime !== "/" && !runtime.startsWith("/nix/") && (!isInside(workspace, runtime) || runtimeHiddenByState)) {
 		args.push("--ro-bind", runtime, runtime);
 	}
+	if (protectedState) args.push("--remount-ro", protectedState);
 	args.push("--bind", resolve(policy.connectionDir), resolve(policy.connectionDir));
-	if (policy.snapshotPath) {
-		const snapshotDirectory = dirname(resolve(policy.snapshotPath));
-		args.push("--bind", snapshotDirectory, snapshotDirectory);
-	}
-	args.push("--chdir", workspace, "--", resolve(policy.python), ...pythonArgs);
+	args.push("--chdir", resolve(policy.cwd ?? workspace), "--", resolve(policy.python), ...pythonArgs);
 	return {
 		command: bubblewrap,
 		args,
@@ -167,24 +195,37 @@ function seatbeltPath(path: string): string {
 	const resolved = resolve(path);
 	return JSON.stringify(existsSync(resolved) ? realpathSync(resolved) : resolved);
 }
+function seatbeltAccessFilter(path: string, excludedPath?: string): string {
+	const root = seatbeltPath(path);
+	if (!excludedPath) return `(subpath ${root})`;
+	const excluded = seatbeltPath(excludedPath);
+	return `(require-all (subpath ${root}) (require-not (literal ${excluded})) (require-not (subpath ${excluded})))`;
+}
 
 export function macOSSandboxProfile(policy: KernelSandboxPolicy): string {
 	const runtime = dirname(dirname(resolve(policy.python)));
-	const readable = [
-		"/System",
-		"/usr",
-		"/bin",
-		"/sbin",
-		"/Library",
-		"/private/etc",
-		"/dev",
-		"/nix",
-		"/run/current-system",
-		...(runtime === "/" ? [] : [runtime]),
-		resolve(policy.workspace),
-		resolve(policy.connectionDir),
-		...(policy.snapshotPath ? [dirname(resolve(policy.snapshotPath))] : []),
-	].filter((path) => existsSync(path));
+	const workspace = resolve(policy.workspace);
+	const protectedState = protectedStateRoot(policy);
+	if (protectedState === runtime) {
+		throw new Error(`Sandbox executable runtime cannot expose the protected Riemann state root: ${runtime}`);
+	}
+	const readable =
+		policy.filesystemScope === "host"
+			? ["/"]
+			: [
+					"/System",
+					"/usr",
+					"/bin",
+					"/sbin",
+					"/Library",
+					"/private/etc",
+					"/dev",
+					"/nix",
+					"/run/current-system",
+					...(runtime === "/" ? [] : [runtime]),
+					workspace,
+					resolve(policy.connectionDir),
+				].filter((path) => existsSync(path));
 	const lines = [
 		"(version 1)",
 		"(deny default)",
@@ -200,8 +241,18 @@ export function macOSSandboxProfile(policy: KernelSandboxPolicy): string {
 		"(allow system-socket)",
 		"(allow file-read-metadata)",
 		'(allow file-read* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom"))',
-		...readable.map((path) => `(allow file-read* (subpath ${seatbeltPath(path)}))`),
-		...writablePaths(policy).map((path) => `(allow file-write* (subpath ${seatbeltPath(path)}))`),
+		...(policy.filesystemScope === "host"
+			? ["(allow file-read*)"]
+			: readable.map(
+					(path) =>
+						`(allow file-read* ${seatbeltAccessFilter(path, path === workspace ? protectedState : undefined)})`,
+				)),
+		...(policy.filesystemScope === "host" && policy.workspaceWritable
+			? ["(allow file-write*)"]
+			: writablePaths(policy).map(
+					(path) =>
+						`(allow file-write* ${seatbeltAccessFilter(path, path === workspace ? protectedState : undefined)})`,
+				)),
 		...(policy.networkAllowed
 			? ["(allow network*)"]
 			: [`(allow network* (subpath ${seatbeltPath(policy.connectionDir)}))`]),
@@ -224,11 +275,6 @@ function macOSCommand(policy: KernelSandboxPolicy, pythonArgs: string[]): Sandbo
 }
 
 export function sandboxedKernelCommand(policy: KernelSandboxPolicy, pythonArgs: string[]): SandboxedCommand {
-	if (policy.agentDir && isInside(policy.workspace, policy.agentDir)) {
-		throw new Error(
-			`Riemann state directory ${resolve(policy.agentDir)} must be outside sandbox workspace ${resolve(policy.workspace)}`,
-		);
-	}
 	const platform = policy.platform ?? process.platform;
 	if (platform === "linux") return linuxCommand(policy, pythonArgs);
 	if (platform === "darwin") return macOSCommand(policy, pythonArgs);

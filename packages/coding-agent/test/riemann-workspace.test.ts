@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -123,6 +123,46 @@ describe("Riemann workspace capabilities", () => {
 		try {
 			const result = await search.handler({ query: "find-me" }, new AbortController().signal);
 			expect(result).toEqual([{ path: "inside.txt", line: 1, text: "find-me inside" }]);
+		} finally {
+			store.close();
+		}
+	});
+	test("excludes nested Riemann state from workspace host operations", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-workspace-protected-state-"));
+		roots.push(root);
+		const agentDir = join(root, ".riemann", "agent");
+		await mkdir(agentDir, { recursive: true });
+		const store = new RiemannStore(agentDir);
+		const run = store.openRun("protected-state-test", root);
+		await Promise.all([
+			writeFile(join(root, "visible.txt"), "visible\n"),
+			writeFile(join(agentDir, "auth.json"), "RIEMANN_PRIVATE_CREDENTIAL\n"),
+		]);
+		const definitions = new Map(
+			new WorkspaceFunctions(root, run.id, store, [agentDir])
+				.definitions()
+				.map((definition) => [definition.name, definition]),
+		);
+		const read = definitions.get("read");
+		const glob = definitions.get("glob");
+		const search = definitions.get("search");
+		const create = definitions.get("create");
+		if (!read || !glob || !search || !create) throw new Error("Workspace definitions are incomplete");
+		const signal = new AbortController().signal;
+		try {
+			await expect(read.handler({ path: ".riemann/agent/auth.json" }, signal)).rejects.toMatchObject({
+				code: "permission_denied",
+			});
+			await expect(
+				create.handler({ path: ".riemann/agent/injected.txt", text: "blocked" }, signal),
+			).rejects.toMatchObject({ code: "permission_denied" });
+			const matches = await glob.handler({ pattern: "**/*", include_hidden: true }, signal);
+			expect(matches).toEqual(expect.arrayContaining(["visible.txt"]));
+			expect((matches as JsonValue[]).some((path) => String(path).includes(".riemann/agent"))).toBe(false);
+			expect(await glob.handler({ pattern: `${agentDir}/**/*`, include_hidden: true }, signal)).toEqual([]);
+			expect(await search.handler({ query: "RIEMANN_PRIVATE_CREDENTIAL" }, signal)).toEqual([]);
+			const visible = objectValue(await read.handler({ path: "visible.txt" }, signal));
+			expect(visible.text).toBe("visible\n");
 		} finally {
 			store.close();
 		}

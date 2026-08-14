@@ -1,9 +1,10 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test } from "vitest";
+import { execCommand } from "../src/core/exec.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
 import { AgentSupervisor, type ChildAgentSession, type ChildRiemannRuntime } from "../src/riemann/agents/supervisor.ts";
 import type { RiemannConfig } from "../src/riemann/config.ts";
@@ -28,6 +29,12 @@ function functionByName(definitions: FunctionDefinition[], name: string): Functi
 	const definition = definitions.find((candidate) => candidate.name === name);
 	if (!definition) throw new Error(`Missing function: ${name}`);
 	return definition;
+}
+
+async function git(cwd: string, args: string[]): Promise<string> {
+	const result = await execCommand("git", ["-C", cwd, ...args], cwd, { timeout: 30_000 });
+	if (result.code !== 0) throw new Error(result.stderr);
+	return result.stdout.trim();
 }
 
 class FakeChildSession implements ChildAgentSession {
@@ -58,12 +65,26 @@ class FakeChildSession implements ChildAgentSession {
 
 	dispose(): void {}
 
+	getSessionStats() {
+		return {
+			sessionFile: undefined,
+			sessionId: "fake-child",
+			userMessages: 1,
+			assistantMessages: 2,
+			toolCalls: 3,
+			toolResults: 3,
+			totalMessages: 6,
+			tokens: { input: 800, output: 434, cacheRead: 0, cacheWrite: 0, total: 1_234 },
+			cost: 0,
+		};
+	}
+
 	finish(): void {
 		this.resolveCompletion();
 	}
 }
 
-function fakeRuntime(): ChildRiemannRuntime {
+function fakeRuntime(close: () => Promise<void> = async () => undefined): ChildRiemannRuntime {
 	return {
 		tool: {
 			name: "ipython",
@@ -83,7 +104,7 @@ function fakeRuntime(): ChildRiemannRuntime {
 			};
 		},
 		async snapshot() {},
-		async close() {},
+		close,
 	};
 }
 
@@ -98,11 +119,14 @@ const config: RiemannConfig = {
 	},
 	retention: { maxAgeDays: 30, maxArtifactBytes: 1_000_000, maxSnapshotBytes: 1_000_000, maxWorktreeBytes: 1_000_000 },
 	compaction: { strategy: "snapshot" },
+	mainAgent: { permissions: "host" },
+	agentDefaults: { workspace: "shared", permissions: "workspace" },
 	modelRoles: {},
-	profiles: {},
+	profiles: { privileged: { permissions: "host" } },
 	mcpServers: {},
 	web: { searchBackend: "disabled" },
 	files: [],
+	projectOverrides: new Set(),
 };
 
 describe("Riemann agent mesh", () => {
@@ -116,6 +140,14 @@ describe("Riemann agent mesh", () => {
 		const model = getModel("openai", "gpt-4o-mini");
 		if (!model) throw new Error("Built-in test model is unavailable");
 		const sessions = new Map<string, FakeChildSession>();
+		let releaseWorkerClose!: () => void;
+		const workerClose = new Promise<void>((resolve) => {
+			releaseWorkerClose = resolve;
+		});
+		let resolveWorkerCloseStarted!: () => void;
+		const workerCloseStarted = new Promise<void>((resolve) => {
+			resolveWorkerCloseStarted = resolve;
+		});
 		const supervisor = new AgentSupervisor({
 			store,
 			artifacts: new ArtifactStore(store, run.id),
@@ -128,8 +160,16 @@ describe("Riemann agent mesh", () => {
 				thinkingLevel: "off",
 			},
 			agentDir,
-			config,
-			createChildRuntime: async () => fakeRuntime(),
+			config: { ...config, limits: { ...config.limits, maxConcurrentPerRun: 1 } },
+			createChildRuntime: async (agent) =>
+				fakeRuntime(
+					agent.name === "worker"
+						? async () => {
+								resolveWorkerCloseStarted();
+								await workerClose;
+							}
+						: undefined,
+				),
 			createChildSession: async (agent) => {
 				const session = new FakeChildSession();
 				sessions.set(agent.id, session);
@@ -143,7 +183,7 @@ describe("Riemann agent mesh", () => {
 				"task",
 				"name",
 				"profile",
-				"workspace_policy",
+				"workspace",
 				"capabilities",
 				"model_role",
 			]);
@@ -161,6 +201,7 @@ describe("Riemann agent mesh", () => {
 			expect(storedChild).toMatchObject({
 				status: "running",
 				workspace: root,
+				permissions: "workspace",
 				capabilities: [
 					"workspace.read",
 					"workspace.write",
@@ -171,6 +212,27 @@ describe("Riemann agent mesh", () => {
 					"mcp.*",
 				],
 			});
+
+			expect(supervisor.listSubagentsForUi()).toContainEqual(
+				expect.objectContaining({
+					id: childId,
+					name: "worker",
+					status: "running",
+					task: "Produce a bounded result",
+					turnCount: 2,
+					toolUses: 3,
+					tokens: 1_234,
+					live: true,
+				}),
+			);
+			let uiNotifications = 0;
+			const unsubscribeUi = supervisor.subscribeSubagentUi(() => {
+				uiNotifications += 1;
+			});
+			await supervisor.steerSubagentFromUi(childId, "steer from the Agent Viewer");
+			unsubscribeUi();
+			expect(sessions.get(childId)?.steering[0]).toContain("steer from the Agent Viewer");
+			expect(uiNotifications).toBeGreaterThan(0);
 
 			const childFunctions = supervisor.definitions(childId);
 			await functionByName(childFunctions, "send").handler(
@@ -184,24 +246,60 @@ describe("Riemann agent mesh", () => {
 				{ agent_id: childId, message: "parent steering message" },
 				signal,
 			);
-			expect(sessions.get(childId)?.steering[0]).toContain("parent steering message");
+			expect(sessions.get(childId)?.steering).toEqual(
+				expect.arrayContaining([expect.stringContaining("parent steering message")]),
+			);
+			const waitController = new AbortController();
+			const cancelledWait = functionByName(supervisor.definitions(main.id), "wait").handler(
+				{ agent_id: childId },
+				waitController.signal,
+			);
+			waitController.abort(new Error("cancelled by user"));
+			await expect(cancelledWait).rejects.toThrow("cancelled by user");
+			const cancelledHandle = objectValue(
+				await supervisor.spawn(main.id, {
+					task: "Remain queued until cancelled",
+					name: "cancelled-worker",
+				}),
+			);
+			const cancelledId = cancelledHandle.id;
+			if (typeof cancelledId !== "string") throw new Error("Queued spawn did not return an agent id");
+			expect(store.getAgent(cancelledId)?.status).toBe("queued");
+			await supervisor.stopSubagentFromUi(cancelledId);
+			expect(store.getAgent(cancelledId)?.status).toBe("stopped");
+
+			const successorHandle = objectValue(
+				await supervisor.spawn(main.id, {
+					task: "Start after the active worker finishes",
+					name: "successor",
+				}),
+			);
+			const successorId = successorHandle.id;
+			if (typeof successorId !== "string") throw new Error("Successor spawn did not return an agent id");
+			expect(store.getAgent(successorId)?.status).toBe("queued");
 
 			sessions.get(childId)?.finish();
-			const waited = objectValue(
-				await functionByName(supervisor.definitions(main.id), "wait").handler(
-					{ agent_id: childId, timeout: 5 },
-					signal,
-				),
+			const waitedPromise = functionByName(supervisor.definitions(main.id), "wait").handler(
+				{ agent_id: childId, timeout: 5 },
+				signal,
 			);
+			await workerCloseStarted;
+			const settledBeforeClose = await Promise.race([waitedPromise.then(() => true), delay(100).then(() => false)]);
+			releaseWorkerClose();
+			const waited = objectValue(await waitedPromise);
+			expect(settledBeforeClose).toBe(true);
 			const agent = objectValue(waited.agent ?? null);
 			expect(agent.status).toBe("completed");
 			expect(waited.result).toBe("child completed with evidence");
+			await delay(0);
+			expect(store.getAgent(successorId)?.status).toBe("running");
+			await functionByName(supervisor.definitions(main.id), "stop").handler({ agent_id: successorId }, signal);
 
 			const webHandle = objectValue(
 				await supervisor.spawn(main.id, {
 					task: "Research a public source",
 					name: "web-worker",
-					workspace_policy: "read-only",
+					workspace: "shared",
 					capabilities: ["web"],
 				}),
 			);
@@ -221,6 +319,8 @@ describe("Riemann agent mesh", () => {
 				prompt: "",
 				modelRole: "inherit",
 				workspace: root,
+				workspaceMode: "shared",
+				permissions: "workspace",
 				depth: 1,
 				capabilities: ["agents.spawn", "web.search"],
 			});
@@ -237,11 +337,128 @@ describe("Riemann agent mesh", () => {
 				capabilities: ["web.search"],
 			});
 			await functionByName(supervisor.definitions(main.id), "stop").handler({ agent_id: nestedChildId }, signal);
+			await expect(
+				supervisor.spawn(restrictedParent.id, {
+					task: "Attempt to exceed parent scope",
+					name: "overprivileged-worker",
+					profile: "privileged",
+				}),
+			).rejects.toMatchObject({ code: "permission_denied" });
 		} finally {
 			await supervisor.close();
 			store.close();
 		}
 	}, 15_000);
+
+	test("preserves a completed status when shutdown overlaps child teardown", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-agent-close-status-"));
+		roots.push(root);
+		const agentDir = join(root, ".agent");
+		const store = new RiemannStore(agentDir);
+		const run = store.openRun("close-status-test", root);
+		const main = store.ensureRootAgent(run.id, root);
+		const model = getModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Built-in test model is unavailable");
+		const sessions = new Map<string, FakeChildSession>();
+		let releaseRuntimeClose!: () => void;
+		const runtimeClose = new Promise<void>((resolve) => {
+			releaseRuntimeClose = resolve;
+		});
+		const supervisor = new AgentSupervisor({
+			store,
+			artifacts: new ArtifactStore(store, run.id),
+			runId: run.id,
+			rootAgent: main,
+			rootContext: {
+				cwd: root,
+				model,
+				modelRegistry: { find: () => undefined } as unknown as ModelRegistry,
+				thinkingLevel: "off",
+			},
+			agentDir,
+			config,
+			createChildRuntime: async () => fakeRuntime(async () => runtimeClose),
+			createChildSession: async (agent) => {
+				const session = new FakeChildSession();
+				sessions.set(agent.id, session);
+				return session;
+			},
+		});
+		try {
+			const handle = objectValue(
+				await supervisor.spawn(main.id, { task: "Complete during close", name: "status-race" }),
+			);
+			const childId = handle.id;
+			if (typeof childId !== "string") throw new Error("Spawn did not return an agent id");
+			await delay(0);
+			sessions.get(childId)?.finish();
+			await functionByName(supervisor.definitions(main.id), "wait").handler(
+				{ agent_id: childId, timeout: 5 },
+				new AbortController().signal,
+			);
+			const closing = supervisor.close();
+			releaseRuntimeClose();
+			await closing;
+			expect(store.getAgent(childId)?.status).toBe("completed");
+		} finally {
+			releaseRuntimeClose();
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("creates a distinct Git worktree for worktree Subagents", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-agent-worktree-"));
+		roots.push(root);
+		const repository = join(root, "repository");
+		const agentDir = join(root, "agent");
+		await mkdir(repository);
+		await git(repository, ["init"]);
+		await git(repository, ["config", "user.email", "riemann@example.invalid"]);
+		await git(repository, ["config", "user.name", "Riemann Test"]);
+		await writeFile(join(repository, "tracked.txt"), "tracked");
+		await git(repository, ["add", "tracked.txt"]);
+		await git(repository, ["commit", "-m", "initial"]);
+
+		const store = new RiemannStore(agentDir);
+		const run = store.openRun("worktree-test", repository);
+		const main = store.ensureRootAgent(run.id, repository, "host");
+		const model = getModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Built-in test model is unavailable");
+		const supervisor = new AgentSupervisor({
+			store,
+			artifacts: new ArtifactStore(store, run.id),
+			runId: run.id,
+			rootAgent: main,
+			rootContext: {
+				cwd: repository,
+				model,
+				modelRegistry: { find: () => undefined } as unknown as ModelRegistry,
+				thinkingLevel: "off",
+			},
+			agentDir,
+			config: { ...config, agentDefaults: { workspace: "worktree", permissions: "workspace" } },
+			createChildRuntime: async () => fakeRuntime(),
+			createChildSession: async () => new FakeChildSession(),
+		});
+		try {
+			const handle = objectValue(await supervisor.spawn(main.id, { task: "work independently", name: "worker" }));
+			const childId = handle.id;
+			if (typeof childId !== "string") throw new Error("Spawn did not return an agent id");
+			const child = store.getAgent(childId);
+			expect(child?.workspace).not.toBe(repository);
+			expect(child?.workspace).toContain(join("state", "workspaces", run.id, childId));
+			expect(child).toMatchObject({ workspaceMode: "worktree", permissions: "workspace" });
+			expect(await git(child?.workspace ?? "", ["rev-parse", "--show-toplevel"])).toBe(child?.workspace);
+			await functionByName(supervisor.definitions(main.id), "stop").handler(
+				{ agent_id: childId },
+				new AbortController().signal,
+			);
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	}, 30_000);
 
 	test("rejects duplicate stable agent names before starting a second child", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-agent-name-"));
@@ -271,14 +488,14 @@ describe("Riemann agent mesh", () => {
 			await supervisor.spawn(main.id, {
 				task: "first",
 				name: "stable",
-				workspace_policy: "shared",
+				workspace: "shared",
 				capabilities: ["agents.*"],
 			});
 			await expect(
 				supervisor.spawn(main.id, {
 					task: "second",
 					name: "stable",
-					workspace_policy: "shared",
+					workspace: "shared",
 					capabilities: ["agents.*"],
 				}),
 			).rejects.toMatchObject({ code: "conflict" });

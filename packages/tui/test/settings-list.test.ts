@@ -55,4 +55,20 @@ describe("SettingsList", () => {
 
 		assert.deepStrictEqual(changes, [{ id: "tui-mode", value: "fullscreen" }]);
 	});
+
+	it("hides the search input until a query is entered", () => {
+		const list = new SettingsList(
+			items.map((item) => ({ ...item })),
+			10,
+			testTheme,
+			() => {},
+			() => {},
+			{ enableSearch: true },
+		);
+
+		assert.equal(list.render(80)[0], "");
+		assert.match(list.render(80)[2] ?? "", /^> TUI mode/);
+		list.handleInput("x");
+		assert.match(list.render(80)[0] ?? "", /^> x/);
+	});
 });

@@ -23,6 +23,8 @@ export interface StoredAgent {
 	prompt: string;
 	modelRole: string;
 	workspace: string;
+	workspaceMode: "shared" | "worktree";
+	permissions: "host" | "workspace";
 	depth: number;
 	capabilities: string[];
 	result: string | null;
@@ -71,6 +73,8 @@ interface AgentRow {
 	prompt: string;
 	model_role: string;
 	workspace: string;
+	workspace_mode: "shared" | "worktree";
+	permissions: "host" | "workspace";
 	depth: number;
 	capabilities_json: string;
 	result: string | null;
@@ -131,6 +135,8 @@ function agentFromRow(row: AgentRow): StoredAgent {
 		prompt: row.prompt,
 		modelRole: row.model_role,
 		workspace: row.workspace,
+		workspaceMode: row.workspace_mode,
+		permissions: row.permissions,
 		depth: row.depth,
 		capabilities: parseStringArray(row.capabilities_json),
 		result: row.result,
@@ -206,6 +212,8 @@ export class RiemannStore {
 				prompt TEXT NOT NULL,
 				model_role TEXT NOT NULL,
 				workspace TEXT NOT NULL,
+				workspace_mode TEXT NOT NULL DEFAULT 'shared',
+				permissions TEXT NOT NULL DEFAULT 'workspace',
 				depth INTEGER NOT NULL,
 				capabilities_json TEXT NOT NULL,
 				result TEXT,
@@ -248,6 +256,13 @@ export class RiemannStore {
 				created_at TEXT NOT NULL
 			);
 		`);
+		const agentColumns = this.db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+		if (!agentColumns.some((column) => column.name === "workspace_mode")) {
+			this.db.exec("ALTER TABLE agents ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'shared'");
+		}
+		if (!agentColumns.some((column) => column.name === "permissions")) {
+			this.db.exec("ALTER TABLE agents ADD COLUMN permissions TEXT NOT NULL DEFAULT 'workspace'");
+		}
 	}
 
 	openRun(sessionId: string, cwd: string): StoredRun {
@@ -280,11 +295,14 @@ export class RiemannStore {
 		this.db.prepare("UPDATE runs SET status = 'closed', updated_at = ? WHERE id = ?").run(now(), runId);
 	}
 
-	ensureRootAgent(runId: string, cwd: string): StoredAgent {
+	ensureRootAgent(runId: string, cwd: string, permissions: "host" | "workspace" = "host"): StoredAgent {
 		const existing = this.db.prepare("SELECT * FROM agents WHERE run_id = ? AND parent_id IS NULL").get(runId) as
 			| AgentRow
 			| undefined;
-		if (existing) return agentFromRow(existing);
+		if (existing) {
+			const agent = agentFromRow(existing);
+			return agent.permissions === permissions ? agent : this.updateAgent(agent.id, { permissions });
+		}
 		return this.createAgent({
 			runId,
 			parentId: null,
@@ -293,6 +311,8 @@ export class RiemannStore {
 			prompt: "",
 			modelRole: "main",
 			workspace: cwd,
+			workspaceMode: "shared",
+			permissions,
 			depth: 0,
 			capabilities: ["*"],
 		});
@@ -306,6 +326,8 @@ export class RiemannStore {
 		prompt: string;
 		modelRole: string;
 		workspace: string;
+		workspaceMode: "shared" | "worktree";
+		permissions: "host" | "workspace";
 		depth: number;
 		capabilities: string[];
 	}): StoredAgent {
@@ -320,7 +342,7 @@ export class RiemannStore {
 		};
 		this.db
 			.prepare(
-				"INSERT INTO agents(id, run_id, parent_id, name, status, prompt, model_role, workspace, depth, capabilities_json, result, error, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+				"INSERT INTO agents(id, run_id, parent_id, name, status, prompt, model_role, workspace, workspace_mode, permissions, depth, capabilities_json, result, error, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
 			)
 			.run(
 				agent.id,
@@ -331,6 +353,8 @@ export class RiemannStore {
 				agent.prompt,
 				agent.modelRole,
 				agent.workspace,
+				agent.workspaceMode,
+				agent.permissions,
 				agent.depth,
 				JSON.stringify(agent.capabilities),
 				agent.createdAt,
@@ -351,7 +375,13 @@ export class RiemannStore {
 
 	updateAgent(
 		id: string,
-		patch: { status?: AgentStatus; result?: string | null; error?: string | null; workspace?: string },
+		patch: {
+			status?: AgentStatus;
+			result?: string | null;
+			error?: string | null;
+			workspace?: string;
+			permissions?: "host" | "workspace";
+		},
 	): StoredAgent {
 		const current = this.getAgent(id);
 		if (!current) throw new Error(`Agent not found: ${id}`);
@@ -359,11 +389,14 @@ export class RiemannStore {
 		const result = patch.result === undefined ? current.result : patch.result;
 		const error = patch.error === undefined ? current.error : patch.error;
 		const workspace = patch.workspace ?? current.workspace;
+		const permissions = patch.permissions ?? current.permissions;
 		const updatedAt = now();
 		this.db
-			.prepare("UPDATE agents SET status = ?, result = ?, error = ?, workspace = ?, updated_at = ? WHERE id = ?")
-			.run(status, result, error, workspace, updatedAt, id);
-		return { ...current, status, result, error, workspace, updatedAt };
+			.prepare(
+				"UPDATE agents SET status = ?, result = ?, error = ?, workspace = ?, permissions = ?, updated_at = ? WHERE id = ?",
+			)
+			.run(status, result, error, workspace, permissions, updatedAt, id);
+		return { ...current, status, result, error, workspace, permissions, updatedAt };
 	}
 
 	markInterruptedAgents(runId: string): void {

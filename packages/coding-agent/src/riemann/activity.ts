@@ -177,7 +177,7 @@ export class RiemannActivityTracker {
 				...(stringValue(args.message) ? { message: stringValue(args.message) } : {}),
 				...(stringValue(args.profile) ? { profile: stringValue(args.profile) } : {}),
 				...(stringValue(args.model_role) ? { modelRole: stringValue(args.model_role) } : {}),
-				...(stringValue(args.workspace_policy) ? { workspace: stringValue(args.workspace_policy) } : {}),
+				...(stringValue(args.workspace) ? { workspace: stringValue(args.workspace) } : {}),
 			};
 			return { activity };
 		}
