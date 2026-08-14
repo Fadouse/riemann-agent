@@ -1324,7 +1324,8 @@ export class AgentSupervisor {
 				name: "list",
 				namespace: "agents",
 				description: "List this Agent's reusable child identities, current activity, and latest outcomes.",
-				promptSnippet: "List reusable child Agents and their latest Turn state.",
+				promptSnippet:
+					"List reusable child Agents. AgentInfo exposes flat `id`, `name`, `turn_id`, `status`, `parent_id`, `task`, `profile`, `model`, `workspace`, `active_turn_id`, `last_turn_id`, `last_outcome`, `created_at`, and `updated_at` fields.",
 				parameters: [],
 				returns: "list[AgentInfo]",
 				capability: "agents.list",

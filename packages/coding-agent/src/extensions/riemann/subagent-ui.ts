@@ -10,7 +10,7 @@ import {
 import type { ExtensionCommandContext, ExtensionContext } from "../../core/extensions/types.ts";
 import { keyText } from "../../modes/interactive/components/keybinding-hints.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
-import type { AgentEventDelivery, SubagentUiSnapshot } from "../../riemann/agents/supervisor.ts";
+import type { SubagentUiSnapshot } from "../../riemann/agents/supervisor.ts";
 import type { RiemannRuntime } from "../../riemann/runtime.ts";
 import {
 	compactLine,
@@ -26,14 +26,12 @@ import {
 import { runSubagentView } from "./subagent-view.ts";
 
 const FLEET_WIDGET_KEY = "riemann-subagents:fleet";
-const FLEET_STATUS_KEY = "riemann-subagents";
 const UPDATE_COALESCE_MS = 32;
 const MIN_TIMER_DELAY_MS = 1;
 const FINISHED_LINGER_MS = 4_000;
 
 export interface SubagentUiController {
 	showHub(context: ExtensionCommandContext): Promise<void>;
-	notifyAgentEvents(events: AgentEventDelivery["events"]): void;
 	dispose(): void;
 }
 
@@ -53,7 +51,6 @@ export class RiemannSubagentUiController implements SubagentUiController {
 	private inputUnsubscribe: (() => void) | undefined;
 	private tickTimer: NodeJS.Timeout | undefined;
 	private refreshTimer: NodeJS.Timeout | undefined;
-	private lastStatus: string | undefined;
 
 	constructor(runtime: RiemannRuntime, context: ExtensionContext) {
 		this.runtime = runtime;
@@ -62,14 +59,6 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		this.refresh();
 	}
 
-	notifyAgentEvents(events: AgentEventDelivery["events"]): void {
-		if (this.disposed || this.context.mode !== "tui") return;
-		for (const event of events) {
-			const summary = `Agent ${event.name} (${event.agentId}) completed turn ${event.turnId}: ${event.outcome}`;
-			const level = event.outcome === "error" ? "error" : event.outcome === "cancelled" ? "warning" : "info";
-			this.context.ui.notify(`${summary} · /agents to inspect`, level);
-		}
-	}
 	async showHub(context: ExtensionCommandContext): Promise<void> {
 		if (context.mode !== "tui") {
 			context.ui.notify("The Agents Hub is available in interactive mode", "warning");
@@ -102,8 +91,6 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		this.inputUnsubscribe?.();
 		this.inputUnsubscribe = undefined;
 		if (this.widgetRegistered) this.context.ui.setWidget(FLEET_WIDGET_KEY, undefined);
-		if (this.lastStatus !== undefined) this.context.ui.setStatus(FLEET_STATUS_KEY, undefined);
-		this.lastStatus = undefined;
 		this.tui = undefined;
 	}
 
@@ -111,13 +98,6 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		if (this.disposed || this.context.mode !== "tui") return;
 		const now = Date.now();
 		this.agents = this.runtime.listSubagentsForUi().filter((agent) => this.isFleetVisible(agent, now));
-		const running = this.agents.filter((agent) => agent.status === "running").length;
-		const queued = this.agents.filter((agent) => agent.status === "queued").length;
-		const status = activeStatusSummary(running, queued);
-		if (status !== this.lastStatus) {
-			this.context.ui.setStatus(FLEET_STATUS_KEY, status);
-			this.lastStatus = status;
-		}
 		this.selectedIndex = Math.max(0, Math.min(this.agents.length, this.selectedIndex));
 		if (this.agents.length === 0) {
 			this.active = false;
@@ -291,14 +271,6 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		}, nextDelay);
 		this.tickTimer.unref?.();
 	}
-}
-
-function activeStatusSummary(running: number, queued: number): string | undefined {
-	const parts: string[] = [];
-	if (running > 0) parts.push(`${running} running`);
-	if (queued > 0) parts.push(`${queued} queued`);
-	const total = running + queued;
-	return total === 0 ? undefined : `${parts.join(", ")} agent${total === 1 ? "" : "s"}`;
 }
 
 export function installSubagentUi(runtime: RiemannRuntime, context: ExtensionContext): SubagentUiController {

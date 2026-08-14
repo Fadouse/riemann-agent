@@ -5,7 +5,7 @@
 ### Added
 
 - Added configurable reusable Agent slots and default child-model selection to the settings panel.
-- Added durable Agent completion notices, standard transcript rendering, configurable Hub/viewer controls, and confirmed settled-slot release.
+- Added durable Agent completion delivery, standard transcript rendering, configurable Hub/viewer controls, and confirmed settled-slot release.
 - Added synchronous `agents.run()`, exact-Turn `AgentHandle.wait()`, cancellable settlement, and race-free suppression of duplicate background completion wakes.
 
 ### Changed
@@ -19,6 +19,7 @@
 - Kept the strict Riemann configuration schema at `version: 1`; settings writes and examples no longer force an unrelated version-two migration.
 - Fixed async Agent calls being presented as synchronous expressions, and replaced delayed result-bearing completion injection with immediate minimal steering reminders.
 - Fixed sandboxed command lookup to honor call-level `PATH`, resolve Nix profile symlinks canonically, and return a structured exit-127 result for missing executables.
+- Fixed opaque `AgentInfo` field guidance and coalesced Subagent completion notices; the prompt now exposes flat Turn fields, the Fleet reuses standard status markers, settled rows remain independently visible, and no Subagent count is added to the footer.
 
 ## [0.84.2] - 2026-08-14
 

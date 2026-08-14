@@ -24,7 +24,6 @@ describe("Riemann session extension", () => {
 			details: unknown;
 			options: unknown;
 		}> = [];
-		const notices: AgentEventDelivery["events"][] = [];
 		const api = {
 			appendEntry(customType: string, data: unknown) {
 				entries.push({ type: "custom", customType, data });
@@ -50,29 +49,35 @@ describe("Riemann session extension", () => {
 					turnId: "turn-1",
 					outcome: "ok",
 				},
+				{
+					id: "event-2",
+					agentId: "agent-2",
+					name: "tester",
+					turnId: "turn-2",
+					outcome: "ok",
+				},
 			],
 		};
 
-		deliverAgentEvents(api as never, ctx, delivery, (events) => notices.push(events));
-		deliverAgentEvents(api as never, ctx, delivery, (events) => notices.push(events));
+		deliverAgentEvents(api as never, ctx, delivery);
+		deliverAgentEvents(api as never, ctx, delivery);
 
 		expect(entries).toEqual([
 			{
 				type: "custom",
 				customType: "riemann-agent-events",
-				data: { eventIds: ["event-1"] },
+				data: { eventIds: ["event-1", "event-2"] },
 			},
 		]);
 		expect(sent).toEqual([
 			{
 				customType: "riemann-agent-completion",
 				content:
-					"[Riemann Agent completion]\n\nAgent reviewer (agent-1) completed turn turn-1: ok. Inspect with `await agents.list()` and `await handle.wait()`.",
-				details: { eventIds: ["event-1"] },
+					"[Riemann Agent completion]\n\nAgent reviewer (agent-1) completed turn turn-1: ok. Inspect with `await agents.list()` and `await handle.wait()`.\nAgent tester (agent-2) completed turn turn-2: ok. Inspect with `await agents.list()` and `await handle.wait()`.",
+				details: { eventIds: ["event-1", "event-2"] },
 				options: { triggerTurn: true, deliverAs: "steer" },
 			},
 		]);
-		expect(notices).toEqual([delivery.events]);
 	});
 
 	test("exposes only IPython and checkpoints a session through the live runtime", async () => {
@@ -189,6 +194,9 @@ describe("Riemann session extension", () => {
 			);
 			expect(systemPrompt).toContain("`await handle.wait(timeout=None) -> AgentResult`");
 			expect(systemPrompt).toContain("`await agents.list() -> list[AgentInfo]`");
+			expect(systemPrompt).toContain(
+				"AgentInfo exposes flat `id`, `name`, `turn_id`, `status`, `parent_id`, `task`, `profile`, `model`, `workspace`, `active_turn_id`, `last_turn_id`, `last_outcome`, `created_at`, and `updated_at` fields.",
+			);
 			expect(systemPrompt).toContain(
 				"`import asyncio; handles = await asyncio.gather(agents.spawn(...), agents.spawn(...))`",
 			);

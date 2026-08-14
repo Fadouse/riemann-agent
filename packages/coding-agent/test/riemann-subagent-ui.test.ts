@@ -51,6 +51,7 @@ describe("Riemann Subagent UI", () => {
 		expect(rendered).toContain("select");
 		expect(rendered).toContain("○ main");
 		expect(rendered).toContain("● worker-6");
+		expect(rendered).toContain("Working…");
 		expect(rendered).toContain("↑ 2 more");
 		expect(rendered).toContain("12s · ↓ 13.1k tokens");
 		expect(rendered).not.toContain("worker-0");
@@ -115,7 +116,34 @@ describe("Riemann Subagent UI", () => {
 		viewer.dispose();
 	});
 
-	test("lingers settled Agents briefly, then removes the bottom Fleet while preserving active footer state", async () => {
+	test("renders concurrent settled Agents as independent minimal success rows", () => {
+		const agents = [
+			snapshot({
+				id: "agent-1",
+				name: "reviewer",
+				status: "idle",
+				lastOutcome: "ok",
+				live: false,
+			}),
+			snapshot({
+				id: "agent-2",
+				name: "tester",
+				status: "idle",
+				lastOutcome: "ok",
+				live: false,
+			}),
+		];
+		const rendered = stripAnsi(
+			renderSubagentFleet(agents, theme, Date.parse("2026-08-13T12:00:12.000Z"), 80).join("\n"),
+		);
+		expect(rendered).toContain("✓ reviewer");
+		expect(rendered).toContain("✓ tester");
+		expect(rendered).not.toContain("Done");
+		expect(rendered).not.toContain("Review parser changes");
+		expect(rendered).not.toContain("tokens");
+	});
+
+	test("lingers settled Agents briefly, then removes the bottom Fleet", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-08-13T12:00:00.000Z"));
 		let listener: (() => void) | undefined;
@@ -134,7 +162,6 @@ describe("Riemann Subagent UI", () => {
 			content: string[] | ((tui: TUI, theme: Theme) => Component) | undefined;
 			options?: ExtensionWidgetOptions;
 		}> = [];
-		const statusUpdates: Array<{ key: string; text: string | undefined }> = [];
 		const context = {
 			mode: "tui",
 			ui: {
@@ -143,7 +170,6 @@ describe("Riemann Subagent UI", () => {
 					content: string[] | ((tui: TUI, theme: Theme) => Component) | undefined,
 					options?: ExtensionWidgetOptions,
 				) => widgetUpdates.push({ key, content, options }),
-				setStatus: (key: string, text: string | undefined) => statusUpdates.push({ key, text }),
 				onTerminalInput: () => () => undefined,
 				getEditorText: () => "",
 			},
@@ -154,8 +180,7 @@ describe("Riemann Subagent UI", () => {
 			expect(installed).toMatchObject({ key: "riemann-subagents:fleet", options: { placement: "belowEditor" } });
 			if (!installed || typeof installed.content !== "function") throw new Error("Fleet widget was not installed");
 			const component = installed.content({ requestRender: () => undefined } as unknown as TUI, theme);
-			expect(stripAnsi(component.render(80).join("\n"))).toContain("reviewer  Review parser changes");
-			expect(statusUpdates.at(-1)).toEqual({ key: "riemann-subagents", text: "1 running agent" });
+			expect(stripAnsi(component.render(80).join("\n"))).toContain("● reviewer  Working…");
 
 			agents = [
 				snapshot({
@@ -167,11 +192,10 @@ describe("Riemann Subagent UI", () => {
 			];
 			listener?.();
 			await vi.advanceTimersByTimeAsync(32);
-			expect(stripAnsi(component.render(80).join("\n"))).toContain("reviewer  Review parser changes");
-			expect(statusUpdates.at(-1)).toEqual({ key: "riemann-subagents", text: undefined });
+			expect(stripAnsi(component.render(80).join("\n"))).toContain("✓ reviewer");
 
 			await vi.advanceTimersByTimeAsync(3_967);
-			expect(stripAnsi(component.render(80).join("\n"))).toContain("reviewer  Review parser changes");
+			expect(stripAnsi(component.render(80).join("\n"))).toContain("✓ reviewer");
 			await vi.advanceTimersByTimeAsync(1);
 			expect(stripAnsi(component.render(80).join("\n"))).not.toContain("reviewer");
 			expect(widgetUpdates.at(-1)).toMatchObject({ key: "riemann-subagents:fleet", content: undefined });
@@ -180,38 +204,6 @@ describe("Riemann Subagent UI", () => {
 			vi.useRealTimers();
 		}
 		expect(listener).toBeUndefined();
-	});
-
-	test("shows terminal completion notices that link to the durable Hub", () => {
-		const notices: Array<{ message: string; level: string | undefined }> = [];
-		const runtime = {
-			listSubagentsForUi: () => [],
-			subscribeSubagentUi: () => () => undefined,
-		} as unknown as RiemannRuntime;
-		const context = {
-			mode: "tui",
-			ui: {
-				setWidget: () => undefined,
-				setStatus: () => undefined,
-				onTerminalInput: () => () => undefined,
-				getEditorText: () => "",
-				notify: (message: string, level?: string) => notices.push({ message, level }),
-			},
-		} as unknown as ExtensionContext;
-		const controller = installSubagentUi(runtime, context);
-		controller.notifyAgentEvents([
-			{
-				id: "event-1",
-				agentId: "agent-1",
-				name: "reviewer",
-				turnId: "turn-1",
-				outcome: "ok",
-			},
-		]);
-		expect(notices).toEqual([
-			{ message: "Agent reviewer (agent-1) completed turn turn-1: ok · /agents to inspect", level: "info" },
-		]);
-		controller.dispose();
 	});
 
 	test("requires confirmation to release a settled Hub slot and closes without interrupting the active cell", async () => {

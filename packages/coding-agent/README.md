@@ -37,7 +37,7 @@ Riemann provisions a hash-pinned Python environment on first IPython use. User s
 
 ## Subagent UI
 
-Active Subagents appear in the Fleet below the editor; settled rows linger for four seconds and then disappear, while the footer reports running and queued counts. With an empty editor, press `Left` or `Down` to focus the Fleet, use `Up`/`Down` to select an Agent, and press `Enter` to open its conversation viewer.
+Running Subagents appear in the Fleet below the editor using the same status icons as the Hub. Running rows show the Agent name, current state, elapsed time, and tokens; settled rows collapse to the Agent name and outcome icon, linger for four seconds, then disappear. With an empty editor, press `Left` or `Down` to focus the Fleet, use `Up`/`Down` to select an Agent, and press `Enter` to open its conversation viewer.
 
 Run `/agents` to inspect every current-run Agent. The Hub keeps settled Agents visible and uses the standard assistant, thinking, and tool renderers in its viewer. Default controls: `Enter` opens or messages, `x` twice stops an active turn, `r` twice releases a settled slot, `Ctrl+T` expands thinking, `Ctrl+O` expands tools, and `Esc` closes only the overlay. These actions are configurable keybindings. `Esc` during the Main Agent's active IPython cell interrupts the cell instead.
 

@@ -75,9 +75,14 @@ export function renderSubagentFleet(
 	for (let index = start; index < start + visible; index += 1) {
 		const agent = agents[index];
 		if (!agent) continue;
-		const left = `  ${fleetBullet(index + 1, selected, theme)} ${theme.fg("muted", agent.name)}  ${agent.task}`;
+		const left = `  ${fleetBullet(index + 1, selected, theme)} ${subagentStatusIcon(agent, theme)} ${theme.bold(agent.name)}`;
+		if (!isActiveSubagent(agent)) {
+			lines.push(truncateToWidth(left, safeWidth, ""));
+			continue;
+		}
+		const status = theme.fg("muted", subagentStatusText(agent));
 		const right = theme.fg("dim", `${formatFleetElapsed(agent, now)} · ${formatFleetTokens(agent.tokens)}`);
-		lines.push(rightAlign(left, right, safeWidth));
+		lines.push(rightAlign(`${left}  ${status}`, right, safeWidth));
 	}
 	const hiddenBelow = agents.length - (start + visible);
 	if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), safeWidth));

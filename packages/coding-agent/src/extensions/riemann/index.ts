@@ -52,7 +52,6 @@ export function deliverAgentEvents(
 	pi: Parameters<ExtensionFactory>[0],
 	ctx: ExtensionContext,
 	delivery: AgentEventDelivery,
-	notify: (events: AgentEventDelivery["events"]) => void,
 ): void {
 	const persisted = persistedAgentEventIds(ctx);
 	const missing = delivery.events.filter((event) => !persisted.has(event.id));
@@ -72,7 +71,6 @@ export function deliverAgentEvents(
 	if (eventIds.some((id) => !stored.has(id))) {
 		throw new Error("Could not persist Riemann Agent completion receipts");
 	}
-	notify(missing);
 }
 
 function appendProjectContext(prompt: string, options: BuildSystemPromptOptions): string {
@@ -117,8 +115,7 @@ const riemannExtension: ExtensionFactory = (pi) => {
 			return runtime;
 		}
 		runtime = await RiemannRuntime.createRoot(ctx, {
-			deliverAgentEvents: async (delivery) =>
-				deliverAgentEvents(pi, ctx, delivery, (events) => subagentUi?.notifyAgentEvents(events)),
+			deliverAgentEvents: async (delivery) => deliverAgentEvents(pi, ctx, delivery),
 		});
 		return runtime;
 	};
