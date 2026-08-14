@@ -8,6 +8,7 @@ import type {
 } from "../../../riemann/ipython.ts";
 import { highlightCode, theme } from "../theme/theme.ts";
 import { renderDiff } from "./diff.ts";
+import { truncateToVisualLines } from "./visual-truncate.ts";
 
 const OUTPUT_PREVIEW_LINES = 12;
 const TASK_PREVIEW_LINES = 3;
@@ -110,16 +111,23 @@ export class IPythonActivityComponent implements Component {
 		const output = [activity.stdout, activity.stderr].filter(Boolean).join("\n");
 		const outputLines = nonEmptyLines(output);
 		if (outputLines.length > 0) {
-			const shown = this.expanded ? outputLines : outputLines.slice(-OUTPUT_PREVIEW_LINES);
-			if (!this.expanded && outputLines.length > shown.length) {
-				this.pushWrapped(
-					lines,
-					width,
-					"    ",
-					theme.fg("dim", `… ${outputLines.length - shown.length} earlier lines`),
+			if (this.expanded) {
+				for (const line of outputLines) {
+					this.pushWrapped(lines, width, "    ", theme.fg("toolOutput", replaceTabs(line)));
+				}
+			} else {
+				const outputWidth = Math.max(1, width - 1 - visibleWidth("    "));
+				const styledOutput = outputLines.map((line) => theme.fg("toolOutput", replaceTabs(line))).join("\n");
+				const { visualLines, skippedCount } = truncateToVisualLines(
+					styledOutput,
+					OUTPUT_PREVIEW_LINES - 1,
+					outputWidth,
 				);
+				if (skippedCount > 0) {
+					lines.push(truncateToWidth(`     ${theme.fg("dim", `… ${skippedCount} earlier lines`)}`, width, ""));
+				}
+				for (const line of visualLines) lines.push(truncateToWidth(`     ${line}`, width, ""));
 			}
-			for (const line of shown) this.pushWrapped(lines, width, "    ", theme.fg("toolOutput", replaceTabs(line)));
 		}
 		const stats: string[] = [];
 		if (activity.status === "running") stats.push("running");

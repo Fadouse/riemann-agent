@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { beforeAll, describe, expect, test } from "vitest";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
+import { IPythonActivityComponent } from "../src/modes/interactive/components/ipython-activity.ts";
 import { IPythonCellComponent } from "../src/modes/interactive/components/ipython-cell.ts";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -209,6 +210,33 @@ describe("Riemann IPython transcript", () => {
 		const expanded = stripAnsi(component.render(90).join("\\n"));
 		expect(expanded).toContain("-1 const value = 1;");
 		expect(expanded).toContain("+1 const value = 2;");
+	});
+
+	test("caps wrapped shell output by visual rows while collapsed", () => {
+		const longLine = "wrapped-output ".repeat(20);
+		const activity = {
+			id: "shell-wrapped",
+			kind: "shell",
+			status: "ok",
+			operation: "exec",
+			command: "cat logs/vllm.log",
+			stdout: [longLine, longLine, longLine, `${longLine}tail-sentinel`].join("\n"),
+			exitCode: 0,
+			durationMs: 25,
+		} as const;
+		const component = new IPythonActivityComponent(activity, false);
+
+		for (const width of [32, 60]) {
+			const lines = component.render(width);
+			const rendered = stripAnsi(lines.join("\n"));
+			expect(lines).toHaveLength(14);
+			expect(rendered).toContain("earlier lines");
+			expect(rendered).toContain("tail-sentinel");
+			expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+		}
+
+		component.update(activity, true);
+		expect(component.render(32).length).toBeGreaterThan(14);
 	});
 
 	test("keeps narrow error output inside the viewport", () => {
