@@ -47,6 +47,7 @@ function testAgentWire(agent: (typeof TEST_AGENTS)[number], status = "idle"): Re
 		active_turn_id: status === "queued" || status === "running" ? turnId : null,
 		last_turn_id: turnId,
 		last_outcome: status === "stopped" ? "cancelled" : "ok",
+		output_preview: status === "idle" ? `Completed ${agent.name}` : null,
 		created_at: TEST_AGENT_TIMESTAMP,
 		updated_at: TEST_AGENT_TIMESTAMP,
 	};
@@ -64,7 +65,7 @@ function testAgentResultWire(
 		turn_id: turnId,
 		status: outcome === "cancelled" ? "stopped" : "idle",
 		outcome,
-		result: outcome === "ok" ? `Completed ${agent.name}` : "",
+		output: outcome === "ok" ? `Completed ${agent.name}` : "",
 		error: null,
 		transcript_handle: `artifact://${agent.id}-transcript`,
 		patch_handle: null,
@@ -211,17 +212,17 @@ describe("Riemann IPython kernel", () => {
 				"decode agent list",
 				kernel.execute(
 					`listed = await agents.list()
-(len(listed), listed[0].id, listed[0].turn_id, listed[-1].id, all(hasattr(item, name) for item in listed for name in ("info", "wait", "send", "stop", "release")))`,
+(len(listed), listed[0].id, listed[0].turn_id, listed[-1].id, all(hasattr(item, name) for item in listed for name in ("info", "wait", "send", "stop", "release")), repr(listed[0]) == "AgentInfo(name='quick-env', status='idle', task='Task for quick-env', last_outcome='ok', output_preview='Completed quick-env')")`,
 				),
 			);
 			expect(listed.status).toBe("ok");
-			expect(listed.result?.data["text/plain"]).toBe("(3, 'agent-1', 'agent-1-turn', 'agent-3', True)");
+			expect(listed.result?.data["text/plain"]).toBe("(3, 'agent-1', 'agent-1-turn', 'agent-3', True, True)");
 
 			const info = await stage(
 				"refresh Agent info",
 				kernel.execute(
 					`info = await listed[0].info()
-(info.id, info.turn_id, info.task, info.model, info.active_turn_id, info.last_turn_id) == ("agent-1", "agent-1-turn", "Task for quick-env", "faux/test-model", None, "agent-1-turn")`,
+(info.id, info.turn_id, info.task, info.model, info.active_turn_id, info.last_turn_id, info.output_preview) == ("agent-1", "agent-1-turn", "Task for quick-env", "faux/test-model", None, "agent-1-turn", "Completed quick-env")`,
 				),
 			);
 			expect(info.status).toBe("ok");
@@ -231,7 +232,7 @@ describe("Riemann IPython kernel", () => {
 				"wait for exact Agent Turn",
 				kernel.execute(
 					`waited = await listed[0].wait(timeout=2)
-(waited.id, waited.turn_id, waited.status, waited.outcome, waited.result, waited.transcript_handle) == ("agent-1", "agent-1-turn", "idle", "ok", "Completed quick-env", "artifact://agent-1-transcript")`,
+(waited.id, waited.turn_id, waited.status, waited.outcome, waited.output, waited.transcript_handle, repr(waited)) == ("agent-1", "agent-1-turn", "idle", "ok", "Completed quick-env", "artifact://agent-1-transcript", "AgentResult(name='quick-env', outcome='ok', output='Completed quick-env')")`,
 				),
 			);
 			expect(waited.status).toBe("ok");

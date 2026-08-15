@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Renamed the public `AgentResult.result` field to `AgentResult.output`; update consumers of `agents.run()`, `AgentHandle.wait()`, and `AgentHandle.stop()`.
+
 ### Added
 
 - Added configurable reusable Agent slots and default child-model selection to the settings panel.
@@ -12,6 +16,7 @@
 
 - Changed child delegation to durable per-Turn `AgentHandle` results with `info()`, `wait()`, `send()`, `stop()`, and `release()` lifecycle controls; standard `asyncio.gather(...)` composes independent runs and waits.
 - Changed Linux Riemann isolation to a filesystem-only Bubblewrap policy that preserves workspace/state mounts while sharing host devices and system namespaces for ordinary commands.
+- Changed `agents.list()` to render compact `AgentInfo` summaries with bounded latest-output previews, while retaining full metadata as explicit fields and exact-Turn result retrieval through each item's handle methods.
 
 ### Fixed
 

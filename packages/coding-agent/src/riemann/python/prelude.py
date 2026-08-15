@@ -125,6 +125,15 @@ class Document:
     artifact: Artifact | None = None
 
 
+def _agent_text_preview(value: str | None, limit: int) -> str | None:
+    if not value:
+        return None
+    compact = " ".join(value.split())
+    if not compact:
+        return None
+    return compact if len(compact) <= limit else f"{compact[: limit - 1]}…"
+
+
 @_dataclasses.dataclass(frozen=True)
 class AgentHandle:
     id: str
@@ -159,7 +168,7 @@ class AgentHandle:
         )
 
 
-@_dataclasses.dataclass(frozen=True)
+@_dataclasses.dataclass(frozen=True, repr=False)
 class AgentInfo(AgentHandle):
     status: str
     parent_id: str | None
@@ -170,20 +179,44 @@ class AgentInfo(AgentHandle):
     active_turn_id: str | None
     last_turn_id: str
     last_outcome: str | None
+    output_preview: str | None
     created_at: str
     updated_at: str
 
+    def __repr__(self) -> str:
+        parts = [
+            f"name={self.name!r}",
+            f"status={self.status!r}",
+            f"task={_agent_text_preview(self.task, 80)!r}",
+        ]
+        if self.last_outcome is not None:
+            parts.append(f"last_outcome={self.last_outcome!r}")
+        if self.output_preview is not None:
+            parts.append(f"output_preview={self.output_preview!r}")
+        return f"AgentInfo({', '.join(parts)})"
 
-@_dataclasses.dataclass(frozen=True)
+
+@_dataclasses.dataclass(frozen=True, repr=False)
 class AgentResult(AgentHandle):
     status: str
     outcome: str
-    result: str
+    output: str
     error: str | None
     transcript_handle: str
     patch_handle: str | None
     started_at: str
     completed_at: str
+
+    def __repr__(self) -> str:
+        parts = [
+            f"name={self.name!r}",
+            f"outcome={self.outcome!r}",
+            f"output={(_agent_text_preview(self.output, 160) or '')!r}",
+        ]
+        if self.error is not None:
+            parts.append(f"error={_agent_text_preview(self.error, 160)!r}")
+        return f"AgentResult({', '.join(parts)})"
+
 
 class _RiemannNamespace(_types.SimpleNamespace):
     def __init__(self, name: str):

@@ -375,7 +375,7 @@ describe("Riemann reusable Agent slots", () => {
 				turn_id: first.turn_id,
 				status: "idle",
 				outcome: "ok",
-				result: "child completed: first turn",
+				output: "child completed: first turn",
 			});
 			expect(store.listPendingAgentEvents(mainId)).toHaveLength(0);
 			expect(deliveries).toHaveLength(0);
@@ -461,7 +461,7 @@ describe("Riemann reusable Agent slots", () => {
 				id: syncAgent.id,
 				status: "idle",
 				outcome: "ok",
-				result: "child completed: synchronous turn",
+				output: "child completed: synchronous turn",
 			});
 
 			const abortedController = new AbortController();

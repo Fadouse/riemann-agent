@@ -79,7 +79,7 @@ describe("Riemann session extension", () => {
 			{
 				customType: "riemann-agent-completion",
 				content:
-					"[Riemann Agent completion]\n\nAgent reviewer (agent-1) completed turn turn-1: ok. Inspect with `await agents.list()` and `await handle.wait()`.\nAgent tester (agent-2) completed turn turn-2: ok. Inspect with `await agents.list()` and `await handle.wait()`.",
+					"[Riemann Agent completion]\n\nAgent reviewer (agent-1) completed turn turn-1: ok.\nAgent tester (agent-2) completed turn turn-2: ok.\n\nProgress only: wait for every retained handle and read each AgentResult.output before synthesizing a batch.",
 				details: { eventIds: ["event-1", "event-2"] },
 				options: { triggerTurn: true, deliverAs: "steer" },
 			},
@@ -202,11 +202,12 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).toContain("`await handle.wait(timeout=None) -> AgentResult`");
 			expect(systemPrompt).toContain("`await agents.list() -> list[AgentInfo]`");
 			expect(systemPrompt).toContain(
-				"AgentInfo exposes flat `id`, `name`, `turn_id`, `status`, `parent_id`, `task`, `profile`, `model`, `workspace`, `active_turn_id`, `last_turn_id`, `last_outcome`, `created_at`, and `updated_at` fields.",
+				"AgentInfo items are handles; inspect `name`, `status`, `task`, `last_outcome`, and `output_preview`, then use `await info.wait()` for the full `AgentResult.output`.",
 			);
 			expect(systemPrompt).toContain(
 				"`import asyncio; handles = await asyncio.gather(agents.spawn(...), agents.spawn(...))`",
 			);
+			expect(systemPrompt).toContain("`results = await asyncio.gather(*(handle.wait() for handle in handles))`");
 			expect(systemPrompt).not.toContain("`agents.wait(");
 			expect(systemPrompt).not.toContain("`agents.result(");
 			expect(systemPrompt).not.toContain("`agents.inbox(");

@@ -125,6 +125,7 @@ const DEFAULT_CHILD_CAPABILITIES = [
 	"web.fetch",
 	"mcp.*",
 ];
+const AGENT_OUTPUT_PREVIEW_CHARS = 160;
 
 function canonicalCapabilities(values: readonly string[]): string[] {
 	return [
@@ -167,33 +168,58 @@ function handleWire(agent: StoredAgent, turnId: string): JsonValue {
 	};
 }
 
+function assistantText(message: unknown): string | undefined {
+	if (
+		typeof message !== "object" ||
+		message === null ||
+		!("role" in message) ||
+		message.role !== "assistant" ||
+		!("content" in message) ||
+		!Array.isArray(message.content)
+	) {
+		return undefined;
+	}
+	return message.content
+		.flatMap((part) =>
+			typeof part === "object" &&
+			part !== null &&
+			"type" in part &&
+			part.type === "text" &&
+			"text" in part &&
+			typeof part.text === "string"
+				? [part.text]
+				: [],
+		)
+		.join("\n")
+		.trim();
+}
+
 function finalAssistantText(messages: readonly unknown[]): string {
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const message = messages[index];
-		if (
-			typeof message !== "object" ||
-			message === null ||
-			!("role" in message) ||
-			message.role !== "assistant" ||
-			!("content" in message) ||
-			!Array.isArray(message.content)
-		)
-			continue;
-		return message.content
-			.flatMap((part) =>
-				typeof part === "object" &&
-				part !== null &&
-				"type" in part &&
-				part.type === "text" &&
-				"text" in part &&
-				typeof part.text === "string"
-					? [part.text]
-					: [],
-			)
-			.join("\n")
-			.trim();
+		const text = assistantText(messages[index]);
+		if (text !== undefined) return text;
 	}
 	return "";
+}
+
+function currentAssistantText(messages: readonly unknown[], streamingMessage: unknown): string {
+	const streamingText = assistantText(streamingMessage);
+	if (streamingText) return streamingText;
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index];
+		if (typeof message === "object" && message !== null && "role" in message && message.role === "user") break;
+		const text = assistantText(message);
+		if (text !== undefined) return text;
+	}
+	return "";
+}
+
+function outputPreview(value: string): string | null {
+	const compact = value.replace(/\s+/g, " ").trim();
+	if (!compact) return null;
+	return compact.length <= AGENT_OUTPUT_PREVIEW_CHARS
+		? compact
+		: `${compact.slice(0, AGENT_OUTPUT_PREVIEW_CHARS - 1)}…`;
 }
 
 function artifactHandle(value: JsonValue): string {
@@ -392,6 +418,10 @@ export class AgentSupervisor {
 
 	private agentInfoWire(agent: StoredAgent): JsonValue {
 		const turn = this.latestTurn(agent);
+		const liveSession = this.live.get(agent.id)?.session;
+		const latestOutput = agent.activeTurnId
+			? currentAssistantText(liveSession?.state.messages ?? [], liveSession?.state.streamingMessage)
+			: (turn.result ?? "");
 		return {
 			$riemann: "agent_info",
 			id: agent.id,
@@ -406,6 +436,7 @@ export class AgentSupervisor {
 			active_turn_id: agent.activeTurnId,
 			last_turn_id: agent.lastTurnId,
 			last_outcome: agent.lastOutcome,
+			output_preview: outputPreview(latestOutput),
 			created_at: agent.createdAt,
 			updated_at: agent.updatedAt,
 		};
@@ -422,7 +453,7 @@ export class AgentSupervisor {
 			turn_id: turn.id,
 			status: turn.outcome === "cancelled" ? "stopped" : "idle",
 			outcome: turn.outcome,
-			result: turn.result ?? "",
+			output: turn.result ?? "",
 			error: turn.error,
 			transcript_handle: turn.transcriptHandle ?? "",
 			patch_handle: turn.patchHandle,
@@ -1325,7 +1356,7 @@ export class AgentSupervisor {
 				namespace: "agents",
 				description: "List this Agent's reusable child identities, current activity, and latest outcomes.",
 				promptSnippet:
-					"List reusable child Agents. AgentInfo exposes flat `id`, `name`, `turn_id`, `status`, `parent_id`, `task`, `profile`, `model`, `workspace`, `active_turn_id`, `last_turn_id`, `last_outcome`, `created_at`, and `updated_at` fields.",
+					"List reusable child Agents. AgentInfo items are handles; inspect `name`, `status`, `task`, `last_outcome`, and `output_preview`, then use `await info.wait()` for the full `AgentResult.output`.",
 				parameters: [],
 				returns: "list[AgentInfo]",
 				capability: "agents.list",
@@ -1357,10 +1388,11 @@ export class AgentSupervisor {
 				promptGuidelines: [
 					"Use `await agents.run(...)` when the current reasoning step requires the child result before continuing.",
 					"`await agents.spawn(...)` returns an AgentHandle after admission; resolve the call before reading `id`, `name`, or `turn_id`.",
-					"Use `await handle.wait(timeout=None) -> AgentResult` for that exact Turn; it suppresses the background completion reminder.",
+					"Use `await handle.wait(timeout=None) -> AgentResult` for that exact Turn and read its final response from `AgentResult.output`; waiting suppresses the background completion reminder.",
 					"`await handle.info() -> AgentInfo` refreshes state; `await handle.send(message) -> AgentHandle` steers the current Turn or starts the next persisted Turn.",
 					"`await handle.stop(timeout=None) -> AgentResult` cancels its exact Turn; `await handle.release() -> None` frees a settled identity.",
 					"For concurrent background admission use `import asyncio; handles = await asyncio.gather(agents.spawn(...), agents.spawn(...))`.",
+					"Completion reminders are progress signals, not batch barriers; keep returned handles and collect every expected Turn with `results = await asyncio.gather(*(handle.wait() for handle in handles))` before synthesis.",
 					"Reuse stable names or release settled handles; idle and stopped identities continue to occupy the bounded Agent slots.",
 				],
 				handler: (args, signal) => this.run(callerId, args, signal),

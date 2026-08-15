@@ -37,7 +37,7 @@ Riemann provisions a hash-pinned Python environment on first IPython use. User s
 
 ## Subagent UI
 
-Running Subagents appear in the Fleet below the editor using the same status icons as the Hub. Running rows show the Agent name, current state, elapsed time, and tokens; settled rows collapse to the Agent name and outcome icon, linger for four seconds, then disappear. With an empty editor, press `Left` or `Down` to focus the Fleet, use `Up`/`Down` to select an Agent, and press `Enter` to open its conversation viewer.
+Running Subagents appear in the Fleet below the editor using the same status icons as the Hub. Running rows show one status icon, the Agent name, its latest response preview or current task, elapsed time, and tokens; settled rows collapse to the Agent name and outcome icon, linger for four seconds, then disappear. With an empty editor, press `Left` or `Down` to focus the Fleet, use `Up`/`Down` to select an Agent, and press `Enter` to open its conversation viewer.
 
 Run `/agents` to inspect every current-run Agent. The Hub keeps settled Agents visible and uses the standard assistant, thinking, and tool renderers in its viewer. Default controls: `Enter` opens or messages, `x` twice stops an active turn, `r` twice releases a settled slot, `Ctrl+T` expands thinking, `Ctrl+O` expands tools, and `Esc` closes only the overlay. These actions are configurable keybindings. `Esc` during the Main Agent's active IPython cell interrupts the cell instead.
 
@@ -67,7 +67,7 @@ agents:
     permissions: workspace # host | workspace
 ```
 
-Named profiles remain optional for specialist prompts, model overrides, or narrower capabilities. `await agents.run()` returns a settled result in the current cell. `await agents.spawn()` returns a handle after admission while the child continues in the background. Resolve every spawn call before using handle fields; unclaimed completion sends only a minimal steering reminder, and the caller explicitly retrieves the durable result with `await handle.wait()`.
+Named profiles remain optional for specialist prompts, model overrides, or narrower capabilities. `await agents.run()` returns an `AgentResult` whose final response is `output`. `await agents.spawn()` returns a handle after admission while the child continues in the background. Completion reminders are progress signals, not batch barriers: retain every expected handle and retrieve each durable result with `await handle.wait()` before synthesis.
 
 ```bash
 mkdir -p ~/.riemann/agent
@@ -112,17 +112,21 @@ handle = await agents.spawn(
     name=\"reviewer\",
 )
 review = await handle.wait(timeout=600)
+display(review.output)
 
 parallel_handles = await asyncio.gather(
     agents.spawn(task="Review parser behavior.", name="parser-review"),
     agents.spawn(task="Review API compatibility.", name="api-review"),
 )
+parallel_results = await asyncio.gather(*(handle.wait() for handle in parallel_handles))
+display([result.output for result in parallel_results])
 
 sync_result = await agents.run(
     task="Check the focused regression and return the failure trace.",
     name="test-reviewer",
     timeout=600,
 )
+display(sync_result.output)
 
 ```
 

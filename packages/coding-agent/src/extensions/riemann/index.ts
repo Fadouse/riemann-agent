@@ -78,9 +78,10 @@ function completionReminder(events: AgentEventDelivery["events"]): string {
 		"[Riemann Agent completion]",
 		"",
 		...events.map(
-			(event) =>
-				`Agent ${event.name} (${event.agentId}) completed turn ${event.turnId}: ${event.outcome}. Inspect with \`await agents.list()\` and \`await handle.wait()\`.`,
+			(event) => `Agent ${event.name} (${event.agentId}) completed turn ${event.turnId}: ${event.outcome}.`,
 		),
+		"",
+		"Progress only: wait for every retained handle and read each AgentResult.output before synthesizing a batch.",
 	].join("\n");
 }
 
