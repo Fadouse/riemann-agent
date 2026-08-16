@@ -71,7 +71,13 @@ export function renderSubagentFleet(
 		const agent = agents[index];
 		if (!agent) continue;
 		const name = index === selected ? theme.fg("accent", theme.bold(agent.name)) : theme.bold(agent.name);
-		const left = `  ${subagentStatusIcon(agent, theme)} ${name}`;
+		const icon =
+			index === selected && isActiveSubagent(agent)
+				? theme.fg("accent", "●")
+				: agent.status === "running"
+					? theme.fg("accent", "○")
+					: subagentStatusIcon(agent, theme);
+		const left = `  ${icon} ${name}`;
 		if (!isActiveSubagent(agent)) {
 			lines.push(truncateToWidth(left, safeWidth, ""));
 			continue;

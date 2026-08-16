@@ -46,10 +46,16 @@ describe("Riemann Subagent UI", () => {
 		const agents = Array.from({ length: 7 }, (_, index) =>
 			snapshot({ id: `agent-${index}`, name: `worker-${index}`, task: `Task ${index}` }),
 		);
+		const inactiveLines = renderSubagentFleet(agents, theme, Date.parse("2026-08-13T12:00:12.000Z"), 80, 6, false);
+		const inactive = stripAnsi(inactiveLines.join("\n"));
+		expect(inactive).toContain("○ worker-6");
+		expect(inactive).not.toContain("● worker-6");
+
 		const lines = renderSubagentFleet(agents, theme, Date.parse("2026-08-13T12:00:12.000Z"), 80, 6, true);
 		const rendered = stripAnsi(lines.join("\n"));
 		expect(rendered).toContain("select");
 		expect(rendered).toContain("● worker-6");
+		expect(rendered).toContain("○ worker-2");
 		expect(rendered).toContain("Task 6");
 		expect(rendered).toContain("↑ 2 more");
 		expect(rendered).toContain("12s · ↓ 13.1k tokens");
@@ -64,7 +70,12 @@ describe("Riemann Subagent UI", () => {
 				content: [
 					{ type: "thinking", thinking: "**Reviewing parser**\nprivate analysis" },
 					{ type: "text", text: "Found two concrete defects." },
-					{ type: "toolCall", id: "tool-1", name: "ipython", arguments: { code: "print('ok')" } },
+					{
+						type: "toolCall",
+						id: "tool-1",
+						name: "ipython",
+						arguments: { code: "values = [1, 2, 3]\nprint(values)" },
+					},
 				],
 				api: "openai-responses",
 				provider: "openai",
@@ -84,8 +95,8 @@ describe("Riemann Subagent UI", () => {
 				role: "toolResult",
 				toolCallId: "tool-1",
 				toolName: "ipython",
-				content: [{ type: "text", text: "ok" }],
-				details: { status: "ok", durationMs: 5 },
+				content: [{ type: "text", text: "[1, 2, 3]\ncomplete" }],
+				details: { status: "ok", durationMs: 1250 },
 				isError: false,
 				timestamp: Date.now(),
 			},
@@ -105,17 +116,26 @@ describe("Riemann Subagent UI", () => {
 		});
 		const collapsed = stripAnsi(viewer.render(100).join("\n"));
 		expect(collapsed).toContain("Found two concrete defects.");
-		expect(collapsed).toContain("python");
-		expect(collapsed).toContain("print('ok')");
+		expect(collapsed).toContain("✓ python");
+		expect(collapsed).toContain("values = [1, 2, 3]");
+		expect(collapsed).toContain("↑ 2 ↓ 2 lines");
+		expect(collapsed).not.toContain('"code"');
+		expect(collapsed).not.toContain("print(values)");
+		expect(collapsed).not.toContain("complete");
 		expect(collapsed).not.toContain("[Assistant]");
 		expect(collapsed).not.toContain("private analysis");
+
+		viewer.handleInput("\x0f");
+		const expanded = stripAnsi(viewer.render(100).join("\n"));
+		expect(expanded).toContain("print(values)");
+		expect(expanded).toContain("complete");
 
 		viewer.handleInput("\x14");
 		expect(stripAnsi(viewer.render(100).join("\n"))).toContain("private analysis");
 		viewer.dispose();
 	});
 
-	test("renders concurrent settled Agents as independent minimal success rows", () => {
+	test("renders concurrent settled Agents as independent minimal Fleet rows", () => {
 		const agents = [
 			snapshot({
 				id: "agent-1",
@@ -137,6 +157,7 @@ describe("Riemann Subagent UI", () => {
 		);
 		expect(rendered).toContain("✓ reviewer");
 		expect(rendered).toContain("✓ tester");
+		expect(rendered).not.toContain("● reviewer");
 		expect(rendered).not.toContain("Done");
 		expect(rendered).not.toContain("Review parser changes");
 		expect(rendered).not.toContain("tokens");
@@ -179,7 +200,7 @@ describe("Riemann Subagent UI", () => {
 			expect(installed).toMatchObject({ key: "riemann-subagents:fleet", options: { placement: "belowEditor" } });
 			if (!installed || typeof installed.content !== "function") throw new Error("Fleet widget was not installed");
 			const component = installed.content({ requestRender: () => undefined } as unknown as TUI, theme);
-			expect(stripAnsi(component.render(80).join("\n"))).toContain("● reviewer  Review parser changes");
+			expect(stripAnsi(component.render(80).join("\n"))).toContain("○ reviewer  Review parser changes");
 
 			agents = [
 				snapshot({

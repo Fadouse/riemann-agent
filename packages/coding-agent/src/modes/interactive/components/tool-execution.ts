@@ -70,12 +70,12 @@ export class ToolExecutionComponent extends Container {
 
 		// Always create all shell variants. contentBox is used for default renderer-based composition.
 		// selfRenderContainer is used when the tool renders its own framing.
-		// contentText is reserved for generic fallback rendering when no tool definition exists.
+		// contentText is reserved for generic fallback rendering when no specialized renderer exists.
 		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
 		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
 		this.selfRenderContainer = new Container();
 
-		if (this.hasRendererDefinition()) {
+		if (this.hasSpecializedRenderer()) {
 			this.addChild(this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox);
 		} else {
 			this.addChild(this.contentText);
@@ -104,8 +104,12 @@ export class ToolExecutionComponent extends Container {
 		return this.toolDefinition.renderResult ?? this.builtInToolDefinition.renderResult;
 	}
 
-	private hasRendererDefinition(): boolean {
-		return this.builtInToolDefinition !== undefined || this.toolDefinition !== undefined;
+	private hasSpecializedRenderer(): boolean {
+		return (
+			this.shouldUseIPythonRenderer() ||
+			this.builtInToolDefinition !== undefined ||
+			this.toolDefinition !== undefined
+		);
 	}
 
 	private getRenderShell(): "default" | "self" {
@@ -244,7 +248,7 @@ export class ToolExecutionComponent extends Container {
 			return [];
 		}
 
-		if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
+		if (this.hasSpecializedRenderer() && this.getRenderShell() === "self") {
 			const contentLines = this.selfRenderContainer.render(width);
 			if (contentLines.length === 0 && this.imageComponents.length === 0) {
 				return [];
@@ -280,7 +284,7 @@ export class ToolExecutionComponent extends Container {
 
 		let hasContent = false;
 		this.hideComponent = false;
-		if (this.hasRendererDefinition() && this.shouldUseIPythonRenderer()) {
+		if (this.hasSpecializedRenderer() && this.shouldUseIPythonRenderer()) {
 			const state = {
 				code: getIPythonCodeFromArgs(this.args),
 				content: this.result?.content,
@@ -307,7 +311,7 @@ export class ToolExecutionComponent extends Container {
 				this.ipythonMounted = true;
 			}
 			hasContent = true;
-		} else if (this.hasRendererDefinition()) {
+		} else if (this.hasSpecializedRenderer()) {
 			const renderContainer = this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox;
 			if (renderContainer instanceof Box) {
 				renderContainer.setBgFn(bgFn);
@@ -401,7 +405,7 @@ export class ToolExecutionComponent extends Container {
 			}
 		}
 
-		if (this.hasRendererDefinition() && !hasContent && this.imageComponents.length === 0) {
+		if (this.hasSpecializedRenderer() && !hasContent && this.imageComponents.length === 0) {
 			this.hideComponent = true;
 		}
 	}

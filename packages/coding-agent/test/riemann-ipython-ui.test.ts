@@ -30,10 +30,16 @@ describe("Riemann IPython transcript", () => {
 	});
 
 	test("uses a compact backgroundless summary and expands code plus output", () => {
+		const args = { code: "values = [1, 2, 3]\nprint(values)" };
+		const result = {
+			content: [{ type: "text", text: "[1, 2, 3]\ncomplete" }],
+			details: { status: "ok", durationMs: 1250 },
+			isError: false,
+		};
 		const component = new ToolExecutionComponent(
 			"ipython",
 			"cell-1",
-			{ code: "values = [1, 2, 3]\nprint(values)" },
+			args,
 			{},
 			createIPythonDefinition(),
 			createFakeTui(),
@@ -41,16 +47,22 @@ describe("Riemann IPython transcript", () => {
 		);
 		component.markExecutionStarted();
 		component.setArgsComplete();
-		component.updateResult(
-			{
-				content: [{ type: "text", text: "[1, 2, 3]\ncomplete" }],
-				details: { status: "ok", durationMs: 1250 },
-				isError: false,
-			},
-			false,
+		component.updateResult(result, false);
+		const definitionless = new ToolExecutionComponent(
+			"ipython",
+			"cell-without-definition",
+			args,
+			{},
+			undefined,
+			createFakeTui(),
+			process.cwd(),
 		);
+		definitionless.markExecutionStarted();
+		definitionless.setArgsComplete();
+		definitionless.updateResult(result, false);
 
 		const collapsedLines = component.render(80);
+		expect(definitionless.render(80)).toEqual(collapsedLines);
 		const collapsed = stripAnsi(collapsedLines.join("\n"));
 		expect(collapsed).toContain("✓ python");
 		expect(collapsed).toContain("values = [1, 2, 3]");
