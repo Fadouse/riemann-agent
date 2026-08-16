@@ -2,6 +2,34 @@ import type { ChildProcess } from "node:child_process";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
+export const KERNEL_HOST_RESULT = Symbol("riemann.kernel-host-result");
+
+export type KernelImageReference = {
+	type: "image_ref";
+	artifactHandle: string;
+	mimeType: string;
+	byteLength: number;
+	sha256: string;
+	detail?: "auto" | "low" | "high" | "original";
+};
+
+export type KernelModelContent = { type: "text"; text: string } | KernelImageReference;
+
+export type KernelHostResult = {
+	[key: string]: JsonValue;
+	readonly [KERNEL_HOST_RESULT]: true;
+	value: JsonValue;
+	modelContent: KernelModelContent[];
+};
+
+export function kernelHostResult(value: JsonValue, modelContent: KernelModelContent[] = []): KernelHostResult {
+	return { [KERNEL_HOST_RESULT]: true, value, modelContent };
+}
+
+export function isKernelHostResult(value: JsonValue | KernelHostResult): value is KernelHostResult {
+	return typeof value === "object" && value !== null && KERNEL_HOST_RESULT in value;
+}
+
 export interface JupyterConnectionInfo {
 	ip: string;
 	transport: "tcp" | "ipc";
@@ -50,6 +78,7 @@ export interface KernelExecuteResult {
 	stderr: string;
 	result?: KernelDisplay;
 	displays: KernelDisplay[];
+	modelContent: KernelModelContent[];
 	error?: KernelError;
 	executionCount?: number;
 	durationMs: number;
@@ -102,7 +131,7 @@ export type KernelHostRequestHandler = (
 	request: KernelHostRequest,
 	signal: AbortSignal,
 	onUpdate?: KernelHostRequestUpdate,
-) => Promise<JsonValue>;
+) => Promise<JsonValue | KernelHostResult>;
 
 export interface KernelSandboxConfiguration {
 	agentDir: string;

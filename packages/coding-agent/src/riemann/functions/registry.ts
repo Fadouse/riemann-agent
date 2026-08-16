@@ -1,5 +1,5 @@
 import { RiemannHostError } from "../errors.ts";
-import type { JsonValue, KernelHostRequest } from "../kernel/types.ts";
+import type { JsonValue, KernelHostRequest, KernelHostResult } from "../kernel/types.ts";
 
 export interface FunctionParameter {
 	name: string;
@@ -27,7 +27,7 @@ export interface FunctionDefinition {
 		args: Record<string, JsonValue>,
 		signal: AbortSignal,
 		onUpdate?: FunctionUpdateCallback,
-	) => Promise<JsonValue>;
+	) => Promise<JsonValue | KernelHostResult>;
 }
 
 export interface PythonFunctionSpecification {
@@ -209,7 +209,7 @@ export class FunctionRegistry {
 		capabilities: ReadonlySet<string>,
 		signal: AbortSignal,
 		onUpdate?: FunctionUpdateCallback,
-	): Promise<JsonValue> {
+	): Promise<JsonValue | KernelHostResult> {
 		const definition = this.definitions.get(request.type);
 		if (!definition) throw new Error(`Function is not registered: ${request.type}`);
 		if (!isFunctionAvailable(definition, capabilities)) {

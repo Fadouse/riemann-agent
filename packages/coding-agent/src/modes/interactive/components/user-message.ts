@@ -6,6 +6,7 @@ import { createMarkdownTransform } from "./markdown-transform.ts";
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+const IMAGE_MARKER_REGEX = /\[Image #\d+\]/g;
 
 /**
  * Component that renders a user message
@@ -45,7 +46,16 @@ export class UserMessageComponent extends Container {
 				0,
 				this.markdownTheme,
 				{
-					color: (content: string) => theme.fg("userMessageText", content),
+					color: (content: string) => {
+						const userTextColor = theme.getFgAnsi("userMessageText");
+						return theme.fg(
+							"userMessageText",
+							content.replace(
+								IMAGE_MARKER_REGEX,
+								(marker) => `${theme.bold(theme.fg("accent", marker))}${userTextColor}`,
+							),
+						);
+					},
 				},
 				{
 					preserveOrderedListMarkers: true,

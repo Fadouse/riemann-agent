@@ -82,9 +82,15 @@ describe("RemoteSession operations", () => {
 			lifecycles.push(lifecycle.status === "busy" ? `${lifecycle.status}:${lifecycle.operation}` : lifecycle.status);
 		});
 
-		const prompting = remoteSession.submit("  first prompt  ");
+		const image = { type: "image", data: "cG5n", mimeType: "image/png", detail: "high" } as const;
+		const prompting = remoteSession.submit("  first prompt  ", [image]);
 		const request = requests.at(-1);
-		expect(request?.request).toEqual({ command: "prompt", sessionId: "session-1", text: "first prompt" });
+		expect(request?.request).toEqual({
+			command: "prompt",
+			sessionId: "session-1",
+			text: "first prompt",
+			images: [image],
+		});
 		expect(remoteSession.operation).toBe("submit");
 		if (!request) throw new Error("Missing prompt request");
 		server.send({
@@ -108,9 +114,15 @@ describe("RemoteSession operations", () => {
 		);
 		const requests = collectRequests(server);
 
-		const steering = remoteSession.submit("adjust");
+		const image = { type: "image", data: "cG5n", mimeType: "image/png" } as const;
+		const steering = remoteSession.submit("adjust", [image]);
 		const request = requests.at(-1);
-		expect(request?.request).toEqual({ command: "steer", sessionId: "session-1", text: "adjust" });
+		expect(request?.request).toEqual({
+			command: "steer",
+			sessionId: "session-1",
+			text: "adjust",
+			images: [image],
+		});
 		if (!request) throw new Error("Missing steer request");
 		server.send({
 			type: "response",

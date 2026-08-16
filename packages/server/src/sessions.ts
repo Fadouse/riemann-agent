@@ -90,13 +90,15 @@ export class LiveSessionManager {
 			case "prompt": {
 				const live = this.requireAttached(connection, command.sessionId);
 				const session = await this.runOperation(connection, live, () =>
-					live.runtime.prompt({ text: command.text }),
+					live.runtime.prompt({ text: command.text, ...(command.images ? { images: command.images } : {}) }),
 				);
 				return { command: "prompt" as const, session };
 			}
 			case "steer": {
 				const live = this.requireAttached(connection, command.sessionId);
-				const session = await this.runOperation(connection, live, () => live.runtime.steer({ text: command.text }));
+				const session = await this.runOperation(connection, live, () =>
+					live.runtime.steer({ text: command.text, ...(command.images ? { images: command.images } : {}) }),
+				);
 				return { command: "steer" as const, session };
 			}
 			case "abort": {

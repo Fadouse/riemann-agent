@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { contentText, type Message, type Usage } from "@earendil-works/pi-ai";
 import { type CompactionPreparation, type CompactionResult, estimateTokens } from "../core/compaction/index.ts";
-import { serializeConversation } from "../core/compaction/utils.ts";
+import { collectConversationImages, serializeConversation } from "../core/compaction/utils.ts";
 import type { ExtensionContext } from "../core/extensions/types.ts";
 import { convertToLlm } from "../core/messages.ts";
 import type { JsonValue } from "./kernel/types.ts";
@@ -67,6 +67,7 @@ function combineUsage(first: Usage | undefined, second: Usage): Usage {
 
 async function createSemanticSection(options: {
 	kind: SemanticCompactionKind;
+	includeImages: boolean;
 	messages: CompactionPreparation["messagesToSummarize"];
 	previousSummary?: string;
 	customInstructions?: string;
@@ -95,9 +96,13 @@ async function createSemanticSection(options: {
 			model.maxTokens || Number.MAX_SAFE_INTEGER,
 		),
 	);
+	const images =
+		options.includeImages && model.input.includes("image")
+			? collectConversationImages(convertToLlm(options.messages))
+			: [];
 	const userMessage: Message = {
 		role: "user",
-		content: [{ type: "text", text: request }],
+		content: [{ type: "text", text: request }, ...images],
 		timestamp: Date.now(),
 	};
 	const response = await options.context.modelRegistry.complete(
@@ -120,6 +125,7 @@ async function createSemanticSection(options: {
 
 export async function createRiemannCompaction(options: {
 	preparation: CompactionPreparation;
+	includeImages: boolean;
 	customInstructions?: string;
 	signal: AbortSignal;
 	context: Pick<ExtensionContext, "model" | "modelRegistry">;
@@ -135,6 +141,7 @@ export async function createRiemannCompaction(options: {
 		let historyUsage: Usage | undefined;
 		if (preparation.messagesToSummarize.length > 0) {
 			const result = await createSemanticSection({
+				includeImages: options.includeImages,
 				kind,
 				messages: preparation.messagesToSummarize,
 				previousSummary: preparation.previousSummary,
@@ -148,6 +155,7 @@ export async function createRiemannCompaction(options: {
 			historyUsage = result.usage;
 		}
 		const prefix = await createSemanticSection({
+			includeImages: options.includeImages,
 			kind: "prefix",
 			messages: preparation.turnPrefixMessages,
 			customInstructions: options.customInstructions,
@@ -161,6 +169,7 @@ export async function createRiemannCompaction(options: {
 		kind = "prefix";
 	} else {
 		const result = await createSemanticSection({
+			includeImages: options.includeImages,
 			kind,
 			messages: preparation.messagesToSummarize,
 			previousSummary: preparation.previousSummary,

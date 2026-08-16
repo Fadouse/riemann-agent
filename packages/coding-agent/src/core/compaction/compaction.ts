@@ -17,6 +17,7 @@ import {
 	sessionEntryToContextMessages,
 } from "../session-manager.ts";
 import {
+	collectConversationImages,
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
@@ -659,10 +660,12 @@ export async function generateSummaryWithUsage(
 	}
 	promptText += basePrompt;
 
+	const summaryImages = model.input.includes("image") ? collectConversationImages(llmMessages) : [];
+
 	const summarizationMessages = [
 		{
 			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
+			content: [{ type: "text" as const, text: promptText }, ...summaryImages],
 			timestamp: Date.now(),
 		},
 	];

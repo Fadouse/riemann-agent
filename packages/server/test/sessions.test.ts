@@ -305,7 +305,13 @@ describe("PiServer Unix integration", () => {
 		await client.hello();
 		await attach(client, "session-1");
 
-		const prompt = client.request({ command: "prompt", sessionId: "session-1", text: "first" });
+		const image = { type: "image", data: "cG5n", mimeType: "image/png", detail: "high" } as const;
+		const prompt = client.request({
+			command: "prompt",
+			sessionId: "session-1",
+			text: "first",
+			images: [image],
+		});
 		await client.next(
 			(message) =>
 				message.type === "event" &&
@@ -315,9 +321,15 @@ describe("PiServer Unix integration", () => {
 		const busy = await client.request({ command: "prompt", sessionId: "session-1", text: "second" });
 		expect(busy).toMatchObject({ ok: false, error: { code: "busy" } });
 
-		const steer = await client.request({ command: "steer", sessionId: "session-1", text: "adjust" });
+		expect(service.latestRuntime("session-1").prompts).toEqual([{ text: "first", images: [image] }]);
+		const steer = await client.request({
+			command: "steer",
+			sessionId: "session-1",
+			text: "adjust",
+			images: [image],
+		});
 		expect(steer).toMatchObject({ ok: true, result: { command: "steer" } });
-		expect(service.latestRuntime("session-1").steers).toEqual([{ text: "adjust" }]);
+		expect(service.latestRuntime("session-1").steers).toEqual([{ text: "adjust", images: [image] }]);
 		const abort = await client.request({ command: "abort", sessionId: "session-1" });
 		expect(abort).toMatchObject({ ok: true, result: { command: "abort" } });
 		expect(await prompt).toMatchObject({ ok: true, result: { command: "prompt", session: { phase: "idle" } } });

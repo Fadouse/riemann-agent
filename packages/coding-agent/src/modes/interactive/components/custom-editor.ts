@@ -1,11 +1,18 @@
 import { Editor, type EditorOptions, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import type { AppKeybinding, KeybindingsManager } from "../../../core/keybindings.ts";
 
+const IMAGE_MARKER_REGEX = /\[Image #\d+\]/g;
+
+export interface CustomEditorOptions extends EditorOptions {
+	highlightImageMarker?: (text: string) => string;
+}
+
 /**
  * Custom editor that handles app-level keybindings for coding-agent.
  */
 export class CustomEditor extends Editor {
 	private keybindings: KeybindingsManager;
+	private readonly highlightImageMarker?: (text: string) => string;
 	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
 
 	// Special handlers that can be dynamically replaced
@@ -15,9 +22,11 @@ export class CustomEditor extends Editor {
 	/** Handler for extension-registered shortcuts. Returns true if handled. */
 	public onExtensionShortcut?: (data: string) => boolean;
 
-	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, options?: EditorOptions) {
-		super(tui, theme, options);
+	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, options: CustomEditorOptions = {}) {
+		const { highlightImageMarker, ...editorOptions } = options;
+		super(tui, theme, editorOptions);
 		this.keybindings = keybindings;
+		this.highlightImageMarker = highlightImageMarker;
 	}
 
 	/**
@@ -25,6 +34,13 @@ export class CustomEditor extends Editor {
 	 */
 	onAction(action: AppKeybinding, handler: () => void): void {
 		this.actionHandlers.set(action, handler);
+	}
+
+	render(width: number): string[] {
+		const lines = super.render(width);
+		const highlightImageMarker = this.highlightImageMarker;
+		if (!highlightImageMarker) return lines;
+		return lines.map((line) => line.replace(IMAGE_MARKER_REGEX, (marker) => highlightImageMarker(marker)));
 	}
 
 	handleInput(data: string): void {

@@ -31,4 +31,16 @@ describe("CustomEditor prompt history keybindings", () => {
 		editor.handleInput("\x0e"); // Ctrl+N
 		expect(editor.getText()).toBe("draft");
 	});
+
+	it("highlights pasted image markers without changing submitted text", () => {
+		const keybindings = new KeybindingsManager();
+		setKeybindings(keybindings);
+		const editor = new CustomEditor(new TuiMainScreen(new VirtualTerminal()), defaultEditorTheme, keybindings, {
+			highlightImageMarker: (text) => `\x1b[35m${text}\x1b[39m`,
+		});
+		editor.setText("Inspect [Image #1]");
+
+		expect(editor.render(80).join("\n")).toContain("\x1b[35m[Image #1]\x1b[39m");
+		expect(editor.getText()).toBe("Inspect [Image #1]");
+	});
 });

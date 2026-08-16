@@ -76,4 +76,26 @@ describe("serializeConversation", () => {
 		expect(result).not.toContain("truncated");
 		expect(result).toContain(longText);
 	});
+
+	it("preserves image references in serialized summaries", () => {
+		const messages: Message[] = [
+			{
+				role: "user",
+				content: [{ type: "image", data: "cG5n", mimeType: "image/png", detail: "high" }],
+				timestamp: 1,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "read",
+				content: [{ type: "image", data: "anBlZw==", mimeType: "image/jpeg" }],
+				isError: false,
+				timestamp: 2,
+			},
+		];
+
+		expect(serializeConversation(messages)).toBe(
+			"[User]: [Image: image/png, detail=high]\n\n[Tool result]: [Image: image/jpeg]",
+		);
+	});
 });

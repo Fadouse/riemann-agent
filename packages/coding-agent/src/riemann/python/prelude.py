@@ -74,6 +74,9 @@ class Artifact:
     async def materialize(self, path: str):
         return await _riemann_call("artifacts.materialize", {"handle": self.handle, "path": path})
 
+    async def view(self):
+        return await _riemann_call("artifacts.view", {"handle": self.handle})
+
 
 @_dataclasses.dataclass(frozen=True, repr=False)
 class TextSnapshot:
@@ -94,6 +97,28 @@ class TextSnapshot:
 
     def __repr__(self) -> str:
         return f"TextSnapshot(path={self.path!r}, chars={len(self.text)}, lines={self.line_count})"
+
+
+@_dataclasses.dataclass(frozen=True, repr=False)
+class ImageSnapshot:
+    path: str | None
+    artifact: Artifact
+    mime_type: str
+    source_size: int
+    _capability: str | None
+    width: int | None = None
+    height: int | None = None
+
+    def __repr__(self) -> str:
+        dimensions = (
+            f", dimensions={self.width}x{self.height}"
+            if self.width is not None and self.height is not None
+            else ""
+        )
+        return (
+            f"ImageSnapshot(path={self.path!r}, mime_type={self.mime_type!r}, "
+            f"source_size={self.source_size}{dimensions})"
+        )
 
 
 @_dataclasses.dataclass(frozen=True)
@@ -242,6 +267,7 @@ _ERROR_TYPES = {
 _DOMAIN_TYPES = {
     "artifact": Artifact,
     "text_snapshot": TextSnapshot,
+    "image_snapshot": ImageSnapshot,
     "process_result": ProcessResult,
     "search_hit": SearchHit,
     "document": Document,
@@ -263,6 +289,7 @@ _RIEMANN_PROTECTED = {
     "AgentUnavailableError",
     "Artifact",
     "TextSnapshot",
+    "ImageSnapshot",
     "ProcessResult",
     "SearchHit",
     "Document",
@@ -276,6 +303,10 @@ _RIEMANN_PROTECTED = {
 def _to_wire(value):
     if isinstance(value, TextSnapshot):
         return {"$riemann": "text_snapshot_ref", "capability": value._capability}
+    if isinstance(value, ImageSnapshot):
+        if value._capability is None:
+            raise TypeError("ImageSnapshot is not backed by a workspace file capability")
+        return {"$riemann": "image_snapshot_ref", "capability": value._capability}
     if isinstance(value, Artifact):
         return {"$riemann": "artifact_ref", "handle": value.handle}
     if isinstance(value, AgentHandle):

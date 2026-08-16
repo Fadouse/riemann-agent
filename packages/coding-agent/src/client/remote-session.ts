@@ -6,6 +6,7 @@ import type {
 	Unsubscribe,
 } from "@earendil-works/pi-client";
 import type {
+	ImageContent,
 	ModelMetadata,
 	ModelRef,
 	ServerEvent,
@@ -172,16 +173,18 @@ export class RemoteSession {
 		await this.#replace("create", () => this.#client.createSession(options));
 	}
 
-	async submit(text: string): Promise<void> {
+	async submit(text: string, images?: readonly ImageContent[]): Promise<void> {
 		const normalized = text.trim();
-		if (!normalized) return;
+		if (!normalized && (!images || images.length === 0)) return;
 		this.#assertAvailable();
 		const handle = this.#requireHandle();
 		if (this.phase !== "idle" && this.phase !== "turn") {
 			throw new Error(`Session cannot accept input during ${this.phase ?? "unknown"} phase`);
 		}
 		await this.#runOperation("submit", () =>
-			(this.phase === "idle" ? handle.prompt(normalized) : handle.steer(normalized)).then(() => undefined),
+			(this.phase === "idle" ? handle.prompt(normalized, images) : handle.steer(normalized, images)).then(
+				() => undefined,
+			),
 		);
 	}
 

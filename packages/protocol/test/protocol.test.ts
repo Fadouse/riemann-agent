@@ -52,10 +52,11 @@ function itemMessage(item: unknown, type: "item_updated" | "item_finished" = "it
 }
 
 describe("protocol validation", () => {
-	test("uses protocol version 1", () => {
-		expect(PROTOCOL_VERSION).toBe(1);
-		expect(isSupportedProtocolVersion(1)).toBe(true);
-		expect(isSupportedProtocolVersion(2)).toBe(false);
+	test("uses protocol version 2", () => {
+		expect(PROTOCOL_VERSION).toBe(2);
+		expect(isSupportedProtocolVersion(1)).toBe(false);
+		expect(isSupportedProtocolVersion(2)).toBe(true);
+		expect(isSupportedProtocolVersion(3)).toBe(false);
 		expect(isSupportedProtocolVersion(2.5)).toBe(false);
 	});
 
@@ -81,17 +82,22 @@ describe("protocol validation", () => {
 		expect(() => parseServerMessage(JSON.stringify(serverHello))).toThrow(ProtocolValidationError);
 	});
 
-	test("rejects image input while the MVP remains text-only", () => {
+	test("accepts image prompt input and validates image details", () => {
+		const message = {
+			type: "request",
+			id: "request-1",
+			request: {
+				command: "prompt",
+				sessionId: "session-1",
+				text: "inspect",
+				images: [{ type: "image", data: "abc", mimeType: "image/png", detail: "high" }],
+			},
+		} as const;
+		expect(parseClientMessage(message)).toEqual(message);
 		expect(() =>
 			parseClientMessage({
-				type: "request",
-				id: "request-1",
-				request: {
-					command: "prompt",
-					sessionId: "session-1",
-					text: "inspect",
-					images: [{ type: "image", data: "abc", mimeType: "image/png" }],
-				},
+				...message,
+				request: { ...message.request, images: [{ ...message.request.images[0], detail: "invalid" }] },
 			}),
 		).toThrow(ProtocolValidationError);
 	});

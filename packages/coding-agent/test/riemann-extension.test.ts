@@ -193,8 +193,9 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).toContain("already available as globals");
 			expect(systemPrompt).toContain("compose operations with normal Python");
 			expect(systemPrompt).toContain("## Available operations");
-			expect(systemPrompt).toContain("`await workspace.read(path) -> TextSnapshot`");
+			expect(systemPrompt).toContain("`await workspace.read(path) -> TextSnapshot | ImageSnapshot`");
 			expect(systemPrompt).toContain("`await shell.run(");
+			expect(systemPrompt).toContain("`await artifacts.view(handle) -> ImageSnapshot`");
 			expect(systemPrompt).toContain("`await agents.spawn(task, name=None, profile=None) -> AgentHandle`");
 			expect(systemPrompt).toContain(
 				"`await agents.run(task, name=None, profile=None, timeout=None) -> AgentResult`",
@@ -220,6 +221,9 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).not.toContain("private-docs-command");
 			expect(systemPrompt).not.toContain("PRIVATE_TOKEN");
 
+			const pixelBase64 =
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+			await writeFile(join(root, "pixel.png"), Buffer.from(pixelBase64, "base64"));
 			const updates: unknown[] = [];
 			const ipython = registered[0];
 			const executed = await ipython.execute(
@@ -237,6 +241,11 @@ describe("Riemann session extension", () => {
 						"assert mesh == [], mesh",
 						"snap = await workspace.create(path='value.txt', text='before\\n')",
 						"snap = await workspace.edit(snapshot=snap, operations=[{'kind':'replace','start':0,'end':6,'text':'after'}])",
+						"image = await workspace.read(path='pixel.png')",
+						"assert isinstance(image, ImageSnapshot), image",
+						"viewed = await image.artifact.view()",
+						"assert isinstance(viewed, ImageSnapshot), viewed",
+						`display({"image/png": "${pixelBase64}"}, raw=True)`,
 						"process = await shell.run(command='node', args=['-e', \"console.log('streamed')\"])",
 						"public_docs = await mcp.activate(name='public_docs')",
 						"matches = await catalog.search(query='sum values')",
@@ -245,6 +254,8 @@ describe("Riemann session extension", () => {
 						"assert contract['name'] == 'public_docs.sum_values', contract",
 						"mcp_result = await public_docs.sum_values(left=19, right=23)",
 						"assert mcp_result['structuredContent']['total'] == 42, mcp_result",
+						"mcp_image = await public_docs.show_pixel()",
+						"assert mcp_image['content'][0]['artifact'].mime_type == 'image/png', mcp_image",
 						"durable_value = 42",
 						"durable_value",
 					].join("\n"),
@@ -268,6 +279,14 @@ describe("Riemann session extension", () => {
 			expect(modelVisibleText).toContain("42");
 			expect(modelVisibleText).not.toContain("[stderr]");
 			expect(modelVisibleText).not.toContain("DeprecationWarning");
+			const modelVisibleImages = executed.content.filter((item) => item.type === "image");
+			expect(modelVisibleImages).toHaveLength(4);
+			expect(modelVisibleImages.every((item) => item.mimeType === "image/png")).toBe(true);
+			expect(executed.details).toMatchObject({
+				media: expect.arrayContaining([
+					expect.objectContaining({ type: "image", mimeType: "image/png", artifactHandle: expect.any(String) }),
+				]),
+			});
 			expect(updates).not.toHaveLength(0);
 			const serializedUpdates = JSON.stringify(updates);
 			expect(serializedUpdates).toContain('"kind":"file"');

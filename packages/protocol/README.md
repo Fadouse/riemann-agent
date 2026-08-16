@@ -2,7 +2,7 @@
 
 Runtime-neutral schemas, types, CBOR encoding, and byte-stream framing for the experimental pi protocol.
 
-Protocol version `1` uses binary messages with this wire layout:
+Protocol version `2` uses binary messages with this wire layout:
 
 1. A four-byte unsigned big-endian payload length.
 2. One definite-length CBOR item containing the message.

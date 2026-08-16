@@ -133,7 +133,10 @@ describe("pi-ai protocol bridge", () => {
 	test("maps user and tool messages without leaking non-JSON details", () => {
 		const user = {
 			role: "user",
-			content: "hello",
+			content: [
+				{ type: "text", text: "hello" },
+				{ type: "image", data: "cG5n", mimeType: "image/png", detail: "high" },
+			],
 			timestamp: 1,
 		} satisfies UserMessage;
 		const circular: Record<string, unknown> = {};
@@ -142,7 +145,10 @@ describe("pi-ai protocol bridge", () => {
 			role: "toolResult",
 			toolCallId: "call-1",
 			toolName: "read",
-			content: [{ type: "text", text: "result" }],
+			content: [
+				{ type: "text", text: "result" },
+				{ type: "image", data: "cG5n", mimeType: "image/png", detail: "original" },
+			],
 			details: circular,
 			isError: false,
 			timestamp: 2,
@@ -157,7 +163,10 @@ describe("pi-ai protocol bridge", () => {
 		const userResult = toProtocolUserMessage(user, { id: "user-1" });
 		expect(userResult).toMatchObject({
 			id: "user-1",
-			content: [{ type: "text", text: "hello" }],
+			content: [
+				{ type: "text", text: "hello" },
+				{ type: "image", data: "cG5n", mimeType: "image/png", detail: "high" },
+			],
 		});
 		assertValidServerPayload(userResult);
 
@@ -170,6 +179,10 @@ describe("pi-ai protocol bridge", () => {
 			toolName: "read",
 			input: { path: "README.md" },
 			details: { self: "[Circular]" },
+			content: [
+				{ type: "text", text: "result" },
+				{ type: "image", data: "cG5n", mimeType: "image/png", detail: "original" },
+			],
 			status: "complete",
 		});
 		assertValidServerPayload(toolResult);

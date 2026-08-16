@@ -36,10 +36,17 @@ describe("PiClient", () => {
 		expect(progressTypes).toEqual(["session_progress"]);
 		expect(handle.snapshot).toEqual(initial);
 
-		const prompting = handle.prompt("hello");
+		const image = { type: "image", data: "cG5n", mimeType: "image/png", detail: "high" } as const;
+		const prompting = handle.prompt("hello", [image]);
 		expect(handle.snapshot).toEqual(initial);
 		const promptRequest = requests.find((request) => request.request.command === "prompt");
 		if (!promptRequest) throw new Error("Missing prompt request");
+		expect(promptRequest.request).toEqual({
+			command: "prompt",
+			sessionId: "session-1",
+			text: "hello",
+			images: [image],
+		});
 		const updated = sessionSnapshot("session-1", { revision: 2, phase: "turn" });
 		server.send({
 			type: "response",

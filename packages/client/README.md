@@ -23,6 +23,8 @@ await session.prompt("Inspect this project");
 unsubscribe();
 ```
 
+`prompt()` and `steer()` accept an optional array of `ImageContent` attachments. Image data is base64-encoded and retains the optional `detail` hint.
+
 Call `handlers.onData(chunk)` for inbound bytes, `handlers.onClose()` for an orderly terminal close, and `handlers.onError(error)` for transport failures. A factory must create a fresh transport for every connection attempt and complete any transport-specific authentication before resolving. For example, a WebSocket factory can provide credentials in its upgrade request.
 
 `PiClient` does not reconnect automatically. Call `reconnect()` after disconnection. One connection can attach several sessions. Requests are correlated by ID. Server snapshots and successful response snapshots are authoritative, while progress events do not mutate snapshot state optimistically. Read cached session metadata from `client.snapshot?.sessions`; call `listSessions()` to request refreshed durable metadata from the server. Runtime state is available after acquiring a session.

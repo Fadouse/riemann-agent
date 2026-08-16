@@ -93,6 +93,11 @@ export class ArtifactStore {
 		return artifact;
 	}
 
+	async readBuffer(handle: string): Promise<Buffer> {
+		const artifact = this.getMetadata(handle);
+		return readFile(artifact.path);
+	}
+
 	async get(handle: string, options: { offset?: number; limit?: number } = {}): Promise<JsonValue> {
 		const artifact = this.getMetadata(handle);
 		const data = await readFile(artifact.path);

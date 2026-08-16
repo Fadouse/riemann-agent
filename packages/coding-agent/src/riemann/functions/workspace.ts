@@ -1,16 +1,18 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants, realpathSync } from "node:fs";
 import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { glob } from "glob";
 import lockfile from "proper-lockfile";
 import { RiemannHostError } from "../errors.ts";
-import type { JsonValue } from "../kernel/types.ts";
+import { imageReadNote, type StoredModelImage, storeModelImage } from "../images.ts";
+import { type JsonValue, type KernelHostResult, kernelHostResult } from "../kernel/types.ts";
+import type { ArtifactStore } from "../state/artifacts.ts";
 import type { RiemannStore } from "../state/store.ts";
 import type { FunctionDefinition } from "./registry.ts";
 
-interface TextSnapshotReference {
-	$riemann: "text_snapshot_ref";
+interface SnapshotReference {
+	$riemann: "text_snapshot_ref" | "image_snapshot_ref";
 	capability: string;
 }
 
@@ -23,6 +25,10 @@ interface TextEdit {
 
 function hashText(text: string): string {
 	return createHash("sha256").update(text).digest("hex");
+}
+
+function hashBytes(bytes: Uint8Array): string {
+	return createHash("sha256").update(bytes).digest("hex");
 }
 
 function requiredString(args: Record<string, JsonValue>, name: string): string {
@@ -75,14 +81,22 @@ export class WorkspaceFunctions {
 	private readonly root: string;
 	private readonly runId: string;
 	private readonly store: RiemannStore;
+	private readonly artifacts: ArtifactStore;
 	private readonly protectedRoots: readonly string[];
 	private readonly canonicalProtectedRoots: readonly string[];
 	private readonly globIgnores: readonly string[];
 
-	constructor(root: string, runId: string, store: RiemannStore, protectedRoots: readonly string[] = []) {
+	constructor(
+		root: string,
+		runId: string,
+		store: RiemannStore,
+		artifacts: ArtifactStore,
+		protectedRoots: readonly string[] = [],
+	) {
 		this.root = resolve(root);
 		this.runId = runId;
 		this.store = store;
+		this.artifacts = artifacts;
 		this.protectedRoots = protectedRoots.map((path) => resolve(path)).filter((path) => isInside(this.root, path));
 		this.canonicalProtectedRoots = this.protectedRoots.map((path) => {
 			try {
@@ -152,22 +166,58 @@ export class WorkspaceFunctions {
 		return { $riemann: "text_snapshot", path, text, encoding: "utf-8", _capability: capability };
 	}
 
-	private resolveSnapshot(value: JsonValue | undefined): { path: string; contentHash: string; capability: string } {
+	private createImageSnapshot(path: string, sourceBytes: Uint8Array, image: StoredModelImage): KernelHostResult {
+		const capability = randomBytes(32).toString("base64url");
+		this.store.putFileCapability({
+			runId: this.runId,
+			token: capability,
+			path,
+			contentHash: hashBytes(sourceBytes),
+		});
+		const note = imageReadNote(image.reference.mimeType, image.hints);
+		return kernelHostResult(
+			{
+				$riemann: "image_snapshot",
+				path,
+				artifact: image.artifact,
+				mime_type: image.reference.mimeType,
+				source_size: sourceBytes.byteLength,
+				_capability: capability,
+				width: null,
+				height: null,
+			},
+			[{ type: "text", text: note }, image.reference],
+		);
+	}
+
+	private resolveSnapshot(value: JsonValue | undefined): {
+		path: string;
+		contentHash: string;
+		capability: string;
+		kind: "text" | "image";
+	} {
 		if (typeof value !== "object" || value === null || Array.isArray(value)) {
 			throw new RiemannHostError(
 				"invalid_arguments",
-				"snapshot must be a TextSnapshot returned by workspace.read or workspace.edit",
+				"snapshot must be a snapshot returned by workspace.read or workspace.edit",
 			);
 		}
-		const reference = value as Partial<TextSnapshotReference>;
-		if (reference.$riemann !== "text_snapshot_ref" || typeof reference.capability !== "string") {
+		const reference = value as Partial<SnapshotReference>;
+		if (
+			(reference.$riemann !== "text_snapshot_ref" && reference.$riemann !== "image_snapshot_ref") ||
+			typeof reference.capability !== "string"
+		) {
 			throw new RiemannHostError("invalid_arguments", "snapshot capability is invalid");
 		}
 		const capability = this.store.getFileCapability(this.runId, reference.capability);
 		if (!capability)
 			throw new RiemannHostError("not_found", "Snapshot capability is unknown or belongs to another run");
 		this.assertAllowed(capability.path, capability.path);
-		return { ...capability, capability: reference.capability };
+		return {
+			...capability,
+			capability: reference.capability,
+			kind: reference.$riemann === "text_snapshot_ref" ? "text" : "image",
+		};
 	}
 
 	private parseEdits(value: JsonValue | undefined, textLength: number): TextEdit[] {
@@ -236,15 +286,44 @@ export class WorkspaceFunctions {
 			{
 				name: "read",
 				namespace: "workspace",
-				description: "Read a UTF-8 file and return an immutable TextSnapshot carrying a CAS edit capability.",
-				promptSnippet: "Read a UTF-8 file for inspection and safe snapshot-based edits.",
+				description:
+					"Read a UTF-8 text file or supported image. Text returns TextSnapshot; images return ImageSnapshot.",
+				promptSnippet: "Read a UTF-8 file or image for inspection and safe snapshot-based operations.",
 				parameters: [{ name: "path", description: "Workspace-relative path", type: "str", required: true }],
-				returns: "TextSnapshot",
-				examples: ["snap = await workspace.read(path='src/main.ts')", "display(snap.lines(40, 90))"],
+				returns: "TextSnapshot | ImageSnapshot",
+				examples: [
+					"snap = await workspace.read(path='src/main.ts')",
+					"image = await workspace.read(path='screenshot.png')",
+				],
 				capability: "workspace.read",
 				handler: async (args) => {
 					const path = await this.resolvePath(requiredString(args, "path"));
-					const text = await readFile(path, "utf8");
+					const bytes = await readFile(path);
+					const detectedImage =
+						bytes.byteLength === 0
+							? undefined
+							: await storeModelImage({
+									artifacts: this.artifacts,
+									bytes,
+									name: basename(path),
+								}).catch((error: unknown) => {
+									if (error instanceof RiemannHostError && error.code === "unsupported_media_type")
+										return undefined;
+									throw error;
+								});
+					if (detectedImage) return this.createImageSnapshot(path, bytes, detectedImage);
+					if (bytes.includes(0)) {
+						throw new RiemannHostError("unsupported_media_type", `Cannot read binary file as UTF-8: ${path}`);
+					}
+					let text: string;
+					try {
+						text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+					} catch {
+						throw new RiemannHostError(
+							"unsupported_media_type",
+							`File is neither UTF-8 text nor a supported image: ${path}`,
+						);
+					}
 					return this.createSnapshot(path, text);
 				},
 			},
@@ -386,6 +465,9 @@ export class WorkspaceFunctions {
 				],
 				handler: async (args) => {
 					const snapshot = this.resolveSnapshot(args.snapshot);
+					if (snapshot.kind !== "text") {
+						throw new RiemannHostError("invalid_arguments", "workspace.edit only accepts TextSnapshot");
+					}
 					const release = await lockfile.lock(snapshot.path, { realpath: false, stale: 30_000, retries: 8 });
 					try {
 						const current = await readFile(snapshot.path, "utf8");
@@ -443,10 +525,16 @@ export class WorkspaceFunctions {
 			{
 				name: "remove",
 				namespace: "workspace",
-				description: "Delete the file represented by a TextSnapshot. Fails if it changed after the snapshot.",
+				description:
+					"Delete the file represented by a TextSnapshot or ImageSnapshot. Fails if it changed after the snapshot.",
 				promptSnippet: "Delete an unchanged snapshotted file.",
 				parameters: [
-					{ name: "snapshot", description: "TextSnapshot to delete", type: "TextSnapshot", required: true },
+					{
+						name: "snapshot",
+						description: "TextSnapshot or ImageSnapshot to delete",
+						type: "TextSnapshot | ImageSnapshot",
+						required: true,
+					},
 				],
 				returns: "dict",
 				capability: "workspace.write",
@@ -457,8 +545,8 @@ export class WorkspaceFunctions {
 					const snapshot = this.resolveSnapshot(args.snapshot);
 					const release = await lockfile.lock(snapshot.path, { realpath: false, stale: 30_000, retries: 8 });
 					try {
-						const current = await readFile(snapshot.path, "utf8");
-						if (hashText(current) !== snapshot.contentHash)
+						const current = await readFile(snapshot.path);
+						if (hashBytes(current) !== snapshot.contentHash)
 							throw new RiemannHostError("conflict", `File changed since snapshot: ${snapshot.path}`);
 						await unlink(snapshot.path);
 						await syncDirectory(dirname(snapshot.path));

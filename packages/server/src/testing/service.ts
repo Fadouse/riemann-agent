@@ -52,6 +52,7 @@ interface StoredSession {
 export class TestSessionRuntime implements PiSessionRuntime {
 	readonly disposed = new Deferred<void>();
 	disposeCount = 0;
+	readonly prompts: PromptInput[] = [];
 	readonly steers: PromptInput[] = [];
 	private readonly stored: StoredSession;
 	private readonly onDispose: () => void;
@@ -73,6 +74,7 @@ export class TestSessionRuntime implements PiSessionRuntime {
 
 	async prompt(input: PromptInput): Promise<void> {
 		if (this.getPhase() !== "idle") throw new PiServerError("busy", "A prompt is already running");
+		this.prompts.push(input);
 		const done = new Deferred<"complete" | "aborted">();
 		this.pendingPrompt = { input, done };
 		this.update({
@@ -82,7 +84,7 @@ export class TestSessionRuntime implements PiSessionRuntime {
 				{
 					id: `user-${this.stored.snapshot.revision + 1}`,
 					role: "user",
-					content: [{ type: "text", text: input.text }],
+					content: [{ type: "text", text: input.text }, ...(input.images ?? [])],
 					timestamp: this.stored.snapshot.revision + 1,
 				},
 			],
@@ -125,7 +127,7 @@ export class TestSessionRuntime implements PiSessionRuntime {
 				{
 					id: `steer-${this.stored.snapshot.revision + 1}`,
 					role: "user",
-					content: [{ type: "text", text: input.text }],
+					content: [{ type: "text", text: input.text }, ...(input.images ?? [])],
 					timestamp: this.stored.snapshot.revision + 1,
 				},
 			],

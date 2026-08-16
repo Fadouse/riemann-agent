@@ -11,6 +11,7 @@
 - Added configurable reusable Agent slots and default child-model selection to the settings panel.
 - Added durable Agent completion delivery, standard transcript rendering, configurable Hub/viewer controls, and confirmed settled-slot release.
 - Added synchronous `agents.run()`, exact-Turn `AgentHandle.wait()`, cancellable settlement, and race-free suppression of duplicate background completion wakes.
+- Added direct-session image attachments across clipboard input with highlighted attachment markers, remote sessions, compaction, and Riemann workspace, artifact, IPython, and MCP results.
 
 ### Changed
 

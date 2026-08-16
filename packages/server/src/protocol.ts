@@ -31,8 +31,7 @@ type _AiModelInputsFitProtocol = Assert<AiModelInput extends ProtocolModelInput 
 type _ProtocolModelInputsFitAi = Assert<ProtocolModelInput extends AiModelInput ? true : false>;
 /**
  * Enumerate mapped and intentionally omitted pi-ai fields so additions fail compilation here.
- * Provider replay metadata, diagnostics, cache-write retention splits, image-resolution hints,
- * model transport settings, model sampling defaults, pricing tiers, and deferred-tool
+ * Provider replay metadata, diagnostics, cache-write retention splits, model transport settings, model sampling defaults, pricing tiers, and deferred-tool
  * availability remain intentionally server-side.
  */
 type _AiTextContentFieldsAccountedFor = Assert<ExactKeys<AiTextContent, "type" | "text" | "textSignature">>;
@@ -237,7 +236,12 @@ function toProtocolUserContent(content: UserMessage["content"]): UserTranscriptI
 			case "text":
 				return { type: "text", text: part.text };
 			case "image":
-				return { type: "image", data: part.data, mimeType: part.mimeType };
+				return {
+					type: "image",
+					data: part.data,
+					mimeType: part.mimeType,
+					...(part.detail === undefined ? {} : { detail: part.detail }),
+				};
 			default: {
 				const exhaustive: never = part;
 				return exhaustive;
@@ -313,7 +317,7 @@ export function toProtocolAssistantMessage(
 				stopReason: message.stopReason,
 			} satisfies AssistantTranscriptItem;
 		case "deferred":
-			throw new TypeError("Deferred assistant messages are not supported by protocol v1");
+			throw new TypeError("Deferred assistant messages are not supported by the protocol");
 		case "error":
 			if (message.errorMessage?.length === 0) {
 				throw new TypeError("Assistant error messages must not be empty");
@@ -344,7 +348,12 @@ function toProtocolToolContent(content: Array<AiTextContent | AiImageContent>): 
 			case "text":
 				return { type: "text", text: part.text };
 			case "image":
-				return { type: "image", data: part.data, mimeType: part.mimeType };
+				return {
+					type: "image",
+					data: part.data,
+					mimeType: part.mimeType,
+					...(part.detail === undefined ? {} : { detail: part.detail }),
+				};
 			default: {
 				const exhaustive: never = part;
 				return exhaustive;

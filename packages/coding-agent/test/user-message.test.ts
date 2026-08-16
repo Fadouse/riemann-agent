@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -54,5 +54,17 @@ describe("UserMessageComponent", () => {
 		component.invalidate();
 
 		expect(stripAnsi(component.render(80).join("\n"))).toContain("Message after");
+	});
+
+	test("highlights numbered image markers after submission and restores user text color", () => {
+		initTheme("dark");
+		const component = new UserMessageComponent("[Image #1] followed by [Image #2]");
+		const rendered = component.render(80).join("\n");
+		const firstMarker = theme.bold(theme.fg("accent", "[Image #1]"));
+		const secondMarker = theme.bold(theme.fg("accent", "[Image #2]"));
+
+		expect(rendered).toContain(`${firstMarker}${theme.getFgAnsi("userMessageText")} followed by `);
+		expect(rendered).toContain(secondMarker);
+		expect(stripAnsi(rendered)).toContain("[Image #1] followed by [Image #2]");
 	});
 });

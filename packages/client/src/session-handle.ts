@@ -1,5 +1,6 @@
 import type {
 	Command,
+	ImageContent,
 	ModelRef,
 	ResultForCommand,
 	ServerEvent,
@@ -25,8 +26,8 @@ export interface SessionLease extends AsyncDisposable {
 	onEvent(listener: (event: ServerEvent) => void): Unsubscribe;
 	detach(): Promise<void>;
 	dispose(): Promise<void>;
-	prompt(text: string): Promise<SessionSnapshot>;
-	steer(text: string): Promise<SessionSnapshot>;
+	prompt(text: string, images?: readonly ImageContent[]): Promise<SessionSnapshot>;
+	steer(text: string, images?: readonly ImageContent[]): Promise<SessionSnapshot>;
 	abort(): Promise<SessionSnapshot>;
 	setModel(model: ModelRef): Promise<SessionSnapshot>;
 	setThinking(thinkingLevel: ThinkingLevel): Promise<SessionSnapshot>;
@@ -85,12 +86,26 @@ export class SessionHandle implements SessionLease {
 		return this.dispose();
 	}
 
-	async prompt(text: string): Promise<SessionSnapshot> {
-		return (await this.#request({ command: "prompt", sessionId: this.id, text })).session;
+	async prompt(text: string, images?: readonly ImageContent[]): Promise<SessionSnapshot> {
+		return (
+			await this.#request({
+				command: "prompt",
+				sessionId: this.id,
+				text,
+				...(images === undefined ? {} : { images: [...images] }),
+			})
+		).session;
 	}
 
-	async steer(text: string): Promise<SessionSnapshot> {
-		return (await this.#request({ command: "steer", sessionId: this.id, text })).session;
+	async steer(text: string, images?: readonly ImageContent[]): Promise<SessionSnapshot> {
+		return (
+			await this.#request({
+				command: "steer",
+				sessionId: this.id,
+				text,
+				...(images === undefined ? {} : { images: [...images] }),
+			})
+		).session;
 	}
 
 	async abort(): Promise<SessionSnapshot> {

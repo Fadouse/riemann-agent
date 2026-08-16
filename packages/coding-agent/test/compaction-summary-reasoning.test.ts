@@ -164,4 +164,23 @@ describe("generateSummary reasoning options", () => {
 		});
 		expect(completeSimpleMock.mock.calls.map((call) => call[2]?.maxTokens)).toEqual([128000, 128000]);
 	});
+
+	it("includes conversation images when the summary model supports vision", async () => {
+		const image = { type: "image", data: "cG5n", mimeType: "image/png", detail: "high" } as const;
+		const visionMessages: AgentMessage[] = [
+			{ role: "user", content: [{ type: "text", text: "Inspect this" }, image], timestamp: 1 },
+		];
+		const visionModel: Model<"anthropic-messages"> = {
+			...createModel(false),
+			input: ["text", "image"],
+		};
+
+		await generateSummary(visionMessages, visionModel, 2000, "test-key");
+
+		const context = completeSimpleMock.mock.calls[0]?.[1];
+		expect(context?.messages[0]?.content).toEqual([
+			expect.objectContaining({ type: "text", text: expect.stringContaining("[Image: image/png, detail=high]") }),
+			image,
+		]);
+	});
 });

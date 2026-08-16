@@ -3,7 +3,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { contentText, type Message } from "@earendil-works/pi-ai";
+import { contentText, type ImageContent, type Message } from "@earendil-works/pi-ai";
 
 // ============================================================================
 // File Operation Tracking
@@ -98,6 +98,27 @@ function truncateForSummary(text: string, maxChars: number): string {
 	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
 }
 
+/** Collect unique user and tool-result images in conversation order. */
+export function collectConversationImages(messages: Message[]): ImageContent[] {
+	const images: ImageContent[] = [];
+	const seen = new Set<string>();
+	for (const message of messages) {
+		if (message.role !== "user" && message.role !== "toolResult") continue;
+		if (typeof message.content === "string") continue;
+		for (const part of message.content) {
+			if (part.type !== "image" || seen.has(part.data)) continue;
+			seen.add(part.data);
+			images.push({
+				type: "image",
+				data: part.data,
+				mimeType: part.mimeType,
+				...(part.detail ? { detail: part.detail } : {}),
+			});
+		}
+	}
+	return images;
+}
+
 /**
  * Serialize LLM messages to text for summarization.
  * This prevents the model from treating it as a conversation to continue.
@@ -112,7 +133,14 @@ export function serializeConversation(messages: Message[]): string {
 	for (const msg of messages) {
 		if (msg.role === "user") {
 			const content = contentText(msg.content, "");
-			if (content) parts.push(`[User]: ${content}`);
+			const images =
+				typeof msg.content === "string"
+					? []
+					: msg.content
+							.filter((part) => part.type === "image")
+							.map((part) => `[Image: ${part.mimeType}${part.detail ? `, detail=${part.detail}` : ""}]`);
+			const serialized = [content, ...images].filter(Boolean).join("\n");
+			if (serialized) parts.push(`[User]: ${serialized}`);
 		} else if (msg.role === "assistant") {
 			const thinkingParts: string[] = [];
 			const toolCalls: string[] = [];
@@ -140,8 +168,12 @@ export function serializeConversation(messages: Message[]): string {
 			}
 		} else if (msg.role === "toolResult") {
 			const content = contentText(msg.content, "");
-			if (content) {
-				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
+			const images = msg.content
+				.filter((part) => part.type === "image")
+				.map((part) => `[Image: ${part.mimeType}${part.detail ? `, detail=${part.detail}` : ""}]`);
+			const serialized = [content, ...images].filter(Boolean).join("\n");
+			if (serialized) {
+				parts.push(`[Tool result]: ${truncateForSummary(serialized, TOOL_RESULT_MAX_CHARS)}`);
 			}
 		}
 	}

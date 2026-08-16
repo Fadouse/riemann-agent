@@ -41,6 +41,7 @@ describe("Riemann context compaction", () => {
 			settings: DEFAULT_COMPACTION_SETTINGS,
 		};
 		const result = await createRiemannCompaction({
+			includeImages: true,
 			preparation,
 			signal: new AbortController().signal,
 			context: {
@@ -60,6 +61,45 @@ describe("Riemann context compaction", () => {
 		expect(call.options?.cacheRetention).toBe("none");
 	});
 
+	test("attaches source images only when direct-session compaction enables them", async () => {
+		const model = getModel("openai", "gpt-4o-mini");
+		if (!model) throw new Error("Built-in test model is unavailable");
+		const contexts: Context[] = [];
+		const complete = vi.fn(async (_model: Model<Api>, context: Context) => {
+			contexts.push(context);
+			return fauxAssistantMessage("image summary");
+		});
+		const image = { type: "image", data: "cG5n", mimeType: "image/png", detail: "high" } as const;
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "kept-entry",
+			messagesToSummarize: [{ role: "user", content: [{ type: "text", text: "Inspect" }, image], timestamp: 1 }],
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			tokensBefore: 42_000,
+			fileOps: createFileOps(),
+			settings: DEFAULT_COMPACTION_SETTINGS,
+		};
+		const common = {
+			preparation,
+			signal: new AbortController().signal,
+			context: {
+				model,
+				modelRegistry: { complete } as unknown as ExtensionContext["modelRegistry"],
+			},
+			durableState: { version: 1 },
+		};
+
+		await createRiemannCompaction({ ...common, includeImages: true });
+		await createRiemannCompaction({ ...common, includeImages: false });
+
+		expect(contexts[0]?.messages[0]?.content).toEqual([
+			expect.objectContaining({ type: "text", text: expect.stringContaining("[Image: image/png, detail=high]") }),
+			image,
+		]);
+		expect(contexts[1]?.messages[0]?.content).toEqual([
+			expect.objectContaining({ type: "text", text: expect.stringContaining("[Image: image/png, detail=high]") }),
+		]);
+	});
 	test("summarizes a split turn prefix separately and appends durable state once", async () => {
 		const model = getModel("openai", "gpt-4o-mini");
 		if (!model) throw new Error("Built-in test model is unavailable");
@@ -80,6 +120,7 @@ describe("Riemann context compaction", () => {
 			settings: DEFAULT_COMPACTION_SETTINGS,
 		};
 		const result = await createRiemannCompaction({
+			includeImages: true,
 			preparation,
 			signal: new AbortController().signal,
 			context: {

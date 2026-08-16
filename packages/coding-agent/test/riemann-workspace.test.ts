@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { WorkspaceFunctions } from "../src/riemann/functions/workspace.ts";
-import type { JsonValue } from "../src/riemann/kernel/types.ts";
+import { isKernelHostResult, type JsonValue, type KernelHostResult } from "../src/riemann/kernel/types.ts";
+import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
 
 const roots: string[] = [];
@@ -12,9 +13,11 @@ afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-function objectValue(value: JsonValue): Record<string, JsonValue> {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Expected object result");
-	return value;
+function objectValue(value: JsonValue | KernelHostResult): Record<string, JsonValue> {
+	const wireValue = isKernelHostResult(value) ? value.value : value;
+	if (typeof wireValue !== "object" || wireValue === null || Array.isArray(wireValue))
+		throw new Error("Expected object result");
+	return wireValue;
 }
 
 describe("Riemann workspace capabilities", () => {
@@ -23,7 +26,7 @@ describe("Riemann workspace capabilities", () => {
 		roots.push(root);
 		const store = new RiemannStore(join(root, ".agent"));
 		const run = store.openRun("workspace-test", root);
-		const workspace = new WorkspaceFunctions(root, run.id, store);
+		const workspace = new WorkspaceFunctions(root, run.id, store, new ArtifactStore(store, run.id));
 		const definitions = new Map(workspace.definitions().map((definition) => [definition.name, definition]));
 		const create = definitions.get("create");
 		const read = definitions.get("read");
@@ -71,7 +74,7 @@ describe("Riemann workspace capabilities", () => {
 		roots.push(root);
 		const store = new RiemannStore(join(root, ".agent"));
 		const run = store.openRun("boundary-test", root);
-		const create = new WorkspaceFunctions(root, run.id, store)
+		const create = new WorkspaceFunctions(root, run.id, store, new ArtifactStore(store, run.id))
 			.definitions()
 			.find((definition) => definition.name === "create");
 		if (!create) throw new Error("workspace.create is unavailable");
@@ -92,7 +95,7 @@ describe("Riemann workspace capabilities", () => {
 		await symlink(outside, join(root, "escape"), "dir");
 		const store = new RiemannStore(join(root, ".agent"));
 		const run = store.openRun("symlink-test", root);
-		const create = new WorkspaceFunctions(root, run.id, store)
+		const create = new WorkspaceFunctions(root, run.id, store, new ArtifactStore(store, run.id))
 			.definitions()
 			.find((definition) => definition.name === "create");
 		if (!create) throw new Error("workspace.create is unavailable");
@@ -116,7 +119,7 @@ describe("Riemann workspace capabilities", () => {
 		await symlink(join(outside, "secret.txt"), join(root, "linked-secret.txt"));
 		const store = new RiemannStore(join(root, ".agent"));
 		const run = store.openRun("search-symlink-test", root);
-		const search = new WorkspaceFunctions(root, run.id, store)
+		const search = new WorkspaceFunctions(root, run.id, store, new ArtifactStore(store, run.id))
 			.definitions()
 			.find((definition) => definition.name === "search");
 		if (!search) throw new Error("workspace.search is unavailable");
@@ -139,7 +142,7 @@ describe("Riemann workspace capabilities", () => {
 			writeFile(join(agentDir, "auth.json"), "RIEMANN_PRIVATE_CREDENTIAL\n"),
 		]);
 		const definitions = new Map(
-			new WorkspaceFunctions(root, run.id, store, [agentDir])
+			new WorkspaceFunctions(root, run.id, store, new ArtifactStore(store, run.id), [agentDir])
 				.definitions()
 				.map((definition) => [definition.name, definition]),
 		);
@@ -163,6 +166,74 @@ describe("Riemann workspace capabilities", () => {
 			expect(await search.handler({ query: "RIEMANN_PRIVATE_CREDENTIAL" }, signal)).toEqual([]);
 			const visible = objectValue(await read.handler({ path: "visible.txt" }, signal));
 			expect(visible.text).toBe("visible\n");
+		} finally {
+			store.close();
+		}
+	});
+
+	test("reads supported images into model content and removes them by snapshot capability", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-workspace-image-"));
+		roots.push(root);
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("image-test", root);
+		const artifacts = new ArtifactStore(store, run.id);
+		const definitions = new Map(
+			new WorkspaceFunctions(root, run.id, store, artifacts)
+				.definitions()
+				.map((definition) => [definition.name, definition]),
+		);
+		const read = definitions.get("read");
+		const remove = definitions.get("remove");
+		if (!read || !remove) throw new Error("Workspace definitions are incomplete");
+		const imageBytes = Buffer.from(
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+			"base64",
+		);
+		await writeFile(join(root, "pixel.png"), imageBytes);
+		try {
+			const result = await read.handler({ path: "pixel.png" }, new AbortController().signal);
+			expect(isKernelHostResult(result)).toBe(true);
+			if (!isKernelHostResult(result)) throw new Error("Expected image model content");
+			const snapshot = objectValue(result);
+			expect(snapshot).toMatchObject({
+				$riemann: "image_snapshot",
+				path: join(root, "pixel.png"),
+				mime_type: "image/png",
+				source_size: imageBytes.byteLength,
+			});
+			expect(result.modelContent[0]).toMatchObject({ type: "text", text: expect.stringContaining("Read image") });
+			expect(result.modelContent[1]).toMatchObject({ type: "image_ref", mimeType: "image/png" });
+			const reference = result.modelContent[1];
+			if (reference?.type !== "image_ref") throw new Error("Expected image reference");
+			expect((await artifacts.readBuffer(reference.artifactHandle)).byteLength).toBeGreaterThan(0);
+
+			await remove.handler(
+				{ snapshot: { $riemann: "image_snapshot_ref", capability: snapshot._capability as string } },
+				new AbortController().signal,
+			);
+			await expect(readFile(join(root, "pixel.png"))).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			store.close();
+		}
+	});
+
+	test("rejects unsupported binary files instead of decoding them as text", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-workspace-binary-"));
+		roots.push(root);
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("binary-test", root);
+		const read = new WorkspaceFunctions(root, run.id, store, new ArtifactStore(store, run.id))
+			.definitions()
+			.find((definition) => definition.name === "read");
+		if (!read) throw new Error("workspace.read is unavailable");
+		await writeFile(join(root, "empty.txt"), "");
+		const empty = objectValue(await read.handler({ path: "empty.txt" }, new AbortController().signal));
+		expect(empty.text).toBe("");
+		await writeFile(join(root, "data.bin"), Buffer.from([0, 255, 1, 2]));
+		try {
+			await expect(read.handler({ path: "data.bin" }, new AbortController().signal)).rejects.toMatchObject({
+				code: "unsupported_media_type",
+			});
 		} finally {
 			store.close();
 		}

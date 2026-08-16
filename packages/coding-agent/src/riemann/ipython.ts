@@ -80,5 +80,11 @@ export interface IPythonToolDetails {
 	errorName?: string;
 	executionCount?: number;
 	artifactHandle?: string;
+	media?: Array<{
+		type: "image";
+		artifactHandle: string;
+		mimeType: string;
+		byteLength: number;
+	}>;
 	activities?: IPythonActivity[];
 }

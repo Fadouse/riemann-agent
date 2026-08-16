@@ -19,8 +19,10 @@ import type {
 	KernelHostRequestError,
 	KernelHostRequestEvent,
 	KernelManagerOptions,
+	KernelModelContent,
 	KernelRestoreResult,
 } from "./types.ts";
+import { isKernelHostResult } from "./types.ts";
 import { decodeJupyterMessage, encodeJupyterMessage } from "./wire.ts";
 
 const CONNECTION_WAIT_MS = 50;
@@ -45,6 +47,8 @@ interface ActiveExecution {
 	abort?: () => void;
 	hostControllers: Set<AbortController>;
 	onHostRequest?: KernelExecuteOptions["onHostRequest"];
+	nextHostSequence: number;
+	hostModelContent: Array<{ sequence: number; content: KernelModelContent[] }>;
 	hostNotificationQueue: Promise<void>;
 }
 
@@ -421,6 +425,9 @@ export class IPythonKernelManager {
 			stderr: execution.stderr,
 			result: execution.result,
 			displays: execution.displays,
+			modelContent: execution.hostModelContent
+				.sort((left, right) => left.sequence - right.sequence)
+				.flatMap((entry) => entry.content),
 			error: execution.error,
 			executionCount: execution.executionCount,
 			durationMs: Date.now() - execution.startedAt,
@@ -435,6 +442,8 @@ export class IPythonKernelManager {
 		const args = data.args;
 		if (!type || typeof args !== "object" || args === null || Array.isArray(args)) return;
 		const execution = this.execution;
+		const sequence = execution?.nextHostSequence ?? 0;
+		if (execution) execution.nextHostSequence += 1;
 		const controller = new AbortController();
 		if (!execution || message.parentHeader.msg_id !== execution.id) {
 			controller.abort(new Error("The originating IPython cell is no longer active"));
@@ -452,9 +461,13 @@ export class IPythonKernelManager {
 		} else {
 			await this.notifyHostRequest(execution, { phase: "start", requestId: commId, request, startedAt });
 			try {
-				const value = await this.options.hostRequest(request, controller.signal, (update) => {
+				const result = await this.options.hostRequest(request, controller.signal, (update) => {
 					void this.notifyHostRequest(execution, { phase: "update", requestId: commId, request, update });
 				});
+				const value = isKernelHostResult(result) ? result.value : result;
+				if (isKernelHostResult(result) && result.modelContent.length > 0) {
+					execution.hostModelContent.push({ sequence, content: result.modelContent });
+				}
 				reply = { status: "ok", value };
 				await this.notifyHostRequest(execution, {
 					phase: "end",
@@ -542,6 +555,8 @@ export class IPythonKernelManager {
 			resolve: resolveExecution,
 			hostControllers: new Set(),
 			onHostRequest: options.onHostRequest,
+			nextHostSequence: 0,
+			hostModelContent: [],
 			hostNotificationQueue: Promise.resolve(),
 		};
 		this.execution = execution;

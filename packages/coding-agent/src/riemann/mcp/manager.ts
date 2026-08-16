@@ -4,7 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { raceWithAbortSignal } from "../../utils/abort.ts";
 import type { McpServerConfig } from "../config.ts";
 import { expandConfigSecret } from "../config.ts";
@@ -15,7 +15,12 @@ import {
 	hasCapability,
 	type PythonFunctionSpecification,
 } from "../functions/registry.ts";
+import { storeModelImage } from "../images.ts";
 import type { JsonValue } from "../kernel/types.ts";
+import { type KernelHostResult, type KernelModelContent, kernelHostResult } from "../kernel/types.ts";
+import type { ArtifactStore } from "../state/artifacts.ts";
+
+type McpCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
 
 interface McpServerState {
 	name: string;
@@ -58,12 +63,19 @@ export class RiemannMcpManager {
 	private closed = false;
 	private readonly configs: Record<string, McpServerConfig>;
 	private readonly cwd: string;
+	private readonly artifacts: ArtifactStore;
 	private readonly registry: FunctionRegistry;
 
-	constructor(configs: Record<string, McpServerConfig>, cwd: string, registry: FunctionRegistry) {
+	constructor(
+		configs: Record<string, McpServerConfig>,
+		cwd: string,
+		registry: FunctionRegistry,
+		artifacts: ArtifactStore,
+	) {
 		this.configs = configs;
 		this.cwd = cwd;
 		this.registry = registry;
+		this.artifacts = artifacts;
 		const usedNamespaces = new Set<string>(RESERVED_NAMESPACES);
 		for (const [name, config] of Object.entries(configs)) {
 			if (config.enabled === false) continue;
@@ -136,6 +148,73 @@ export class RiemannMcpManager {
 		const enabled = config.enabledTools ? new Set(config.enabledTools) : undefined;
 		const disabled = new Set(config.disabledTools ?? []);
 		return tools.filter((tool) => (!enabled || enabled.has(tool.name)) && !disabled.has(tool.name));
+	}
+
+	private async normalizeToolResult(result: McpCallToolResult): Promise<JsonValue | KernelHostResult> {
+		const wire = asJson(result);
+		if (!("content" in result) || !Array.isArray(result.content)) return wire;
+		if (typeof wire !== "object" || wire === null || Array.isArray(wire) || !Array.isArray(wire.content)) return wire;
+		const content = result.content as CallToolResult["content"];
+		const modelContent: KernelModelContent[] = [];
+		const normalizedContent: JsonValue[] = [];
+		for (let index = 0; index < content.length; index += 1) {
+			const item = content[index];
+			const wireItem = wire.content[index];
+			if (!item || typeof wireItem !== "object" || wireItem === null || Array.isArray(wireItem)) {
+				if (wireItem !== undefined) normalizedContent.push(wireItem);
+				continue;
+			}
+			const audience = "annotations" in item ? item.annotations?.audience : undefined;
+			const visibleToModel = audience === undefined || audience.includes("assistant");
+			if (item.type === "image") {
+				const image = await storeModelImage({
+					artifacts: this.artifacts,
+					bytes: Buffer.from(item.data, "base64"),
+					claimedMimeType: item.mimeType,
+					name: `mcp-image-${index + 1}`,
+				});
+				const normalizedItem = { ...wireItem };
+				delete normalizedItem.data;
+				normalizedItem.mimeType = image.reference.mimeType;
+				normalizedItem.artifact = image.artifact;
+				normalizedContent.push(normalizedItem);
+				if (visibleToModel) {
+					modelContent.push(
+						{ type: "text", text: `MCP image result [${image.reference.mimeType}]` },
+						image.reference,
+					);
+				}
+				continue;
+			}
+			if (item.type === "resource" && "blob" in item.resource && item.resource.mimeType?.startsWith("image/")) {
+				const image = await storeModelImage({
+					artifacts: this.artifacts,
+					bytes: Buffer.from(item.resource.blob, "base64"),
+					claimedMimeType: item.resource.mimeType,
+					name: `mcp-resource-image-${index + 1}`,
+				});
+				const wireResource = wireItem.resource;
+				if (typeof wireResource !== "object" || wireResource === null || Array.isArray(wireResource)) {
+					normalizedContent.push(wireItem);
+					continue;
+				}
+				const normalizedResource = { ...wireResource };
+				delete normalizedResource.blob;
+				normalizedResource.mimeType = image.reference.mimeType;
+				normalizedResource.artifact = image.artifact;
+				normalizedContent.push({ ...wireItem, resource: normalizedResource });
+				if (visibleToModel) {
+					modelContent.push(
+						{ type: "text", text: `MCP image resource [${image.reference.mimeType}]` },
+						image.reference,
+					);
+				}
+				continue;
+			}
+			normalizedContent.push(wireItem);
+		}
+		wire.content = normalizedContent;
+		return modelContent.length > 0 ? kernelHostResult(wire, modelContent) : wire;
 	}
 
 	private definitionForTool(
@@ -211,7 +290,7 @@ export class RiemannMcpManager {
 					resetTimeoutOnProgress: true,
 					signal,
 				});
-				return asJson(result);
+				return this.normalizeToolResult(result);
 			},
 		};
 	}

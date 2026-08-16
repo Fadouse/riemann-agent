@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { getPackageDir, isBunBinary } from "../config.ts";
 import type { CompactionPreparation, CompactionResult } from "../core/compaction/index.ts";
 import type { ExtensionContext, ToolDefinition } from "../core/extensions/types.ts";
@@ -19,6 +20,7 @@ import { type FunctionDefinition, FunctionRegistry, hasCapability } from "./func
 import { ShellFunctions } from "./functions/shell.ts";
 import { WebFunctions } from "./functions/web.ts";
 import { WorkspaceFunctions } from "./functions/workspace.ts";
+import { storeModelImage } from "./images.ts";
 import {
 	IPYTHON_TOOL_DESCRIPTION,
 	IPYTHON_TOOL_PROMPT_SNIPPET,
@@ -26,7 +28,13 @@ import {
 	type IPythonToolDetails,
 } from "./ipython.ts";
 import { IPythonKernelManager } from "./kernel/manager.ts";
-import type { JsonValue, KernelExecuteResult, KernelRestoreResult } from "./kernel/types.ts";
+import {
+	type JsonValue,
+	type KernelExecuteResult,
+	type KernelImageReference,
+	type KernelRestoreResult,
+	kernelHostResult,
+} from "./kernel/types.ts";
 import { RiemannMcpManager } from "./mcp/manager.ts";
 import { createRiemannOpenAICompaction } from "./openai-compaction.ts";
 import { renderRiemannPrompt } from "./prompts.ts";
@@ -88,6 +96,15 @@ function textFromDisplay(data: Record<string, JsonValue>): string | undefined {
 	return undefined;
 }
 
+function imageFromDisplay(data: Record<string, JsonValue>): { mimeType: string; bytes: Buffer } | undefined {
+	for (const mimeType of ["image/png", "image/jpeg", "image/gif", "image/webp"]) {
+		const encoded = data[mimeType];
+		if (typeof encoded !== "string") continue;
+		return { mimeType, bytes: Buffer.from(encoded.replace(/\s/g, ""), "base64") };
+	}
+	return undefined;
+}
+
 function restoreNotice(result: KernelRestoreResult): string | undefined {
 	if (result.restored.length === 0 && result.skipped.length === 0 && !result.error) return undefined;
 	const parts = [
@@ -133,7 +150,13 @@ export class RiemannRuntime {
 		this.root = root;
 		this.capabilities = new Set(agent.capabilities);
 		const protectedRoots = agent.permissions === "workspace" ? [shared.agentDir] : [];
-		const workspace = new WorkspaceFunctions(agent.workspace, shared.run.id, shared.store, protectedRoots);
+		const workspace = new WorkspaceFunctions(
+			agent.workspace,
+			shared.run.id,
+			shared.store,
+			shared.artifacts,
+			protectedRoots,
+		);
 		const shell = new ShellFunctions(
 			agent.workspace,
 			shared.artifacts,
@@ -152,7 +175,7 @@ export class RiemannRuntime {
 		);
 		for (const definition of [...workspace.definitions(), ...shell.definitions(), ...web.definitions()])
 			this.registry.register(definition);
-		this.mcp = new RiemannMcpManager(shared.config.mcpServers, agent.workspace, this.registry);
+		this.mcp = new RiemannMcpManager(shared.config.mcpServers, agent.workspace, this.registry, shared.artifacts);
 		for (const definition of this.mcp.definitions()) this.registry.register(definition);
 		for (const definition of shared.supervisor.definitions(agent.id)) this.registry.register(definition);
 		for (const definition of this.utilityDefinitions()) this.registry.register(definition);
@@ -357,6 +380,38 @@ export class RiemannRuntime {
 				},
 			},
 			{
+				name: "view",
+				namespace: "artifacts",
+				description: "Load an image artifact into the current model context.",
+				promptSnippet: "Load an image artifact into the current model context.",
+				parameters: [{ name: "handle", description: "Image artifact handle", type: "str", required: true }],
+				returns: "ImageSnapshot",
+				handler: async (args) => {
+					if (typeof args.handle !== "string")
+						throw new RiemannHostError("invalid_arguments", "handle must be a string");
+					const source = this.shared.artifacts.getMetadata(args.handle);
+					const image = await storeModelImage({
+						artifacts: this.shared.artifacts,
+						bytes: await this.shared.artifacts.readBuffer(args.handle),
+						claimedMimeType: source.mimeType,
+						...(source.name ? { name: source.name } : {}),
+					});
+					return kernelHostResult(
+						{
+							$riemann: "image_snapshot",
+							path: null,
+							artifact: image.artifact,
+							mime_type: image.reference.mimeType,
+							source_size: source.size,
+							_capability: null,
+							width: null,
+							height: null,
+						},
+						[{ type: "text", text: `Viewed image artifact [${image.reference.mimeType}]` }, image.reference],
+					);
+				},
+			},
+			{
 				name: "materialize",
 				namespace: "artifacts",
 				description: "Copy a durable artifact into the current workspace atomically.",
@@ -494,6 +549,7 @@ export class RiemannRuntime {
 		}
 		return createRiemannCompaction({
 			preparation,
+			includeImages: this.root,
 			customInstructions,
 			signal,
 			context,
@@ -562,21 +618,63 @@ export class RiemannRuntime {
 		return this.kernelStartup;
 	}
 
-	private async formatResult(result: KernelExecuteResult): Promise<{ text: string; artifactHandle?: string }> {
+	private async formatResult(result: KernelExecuteResult): Promise<{
+		content: Array<TextContent | ImageContent>;
+		artifactHandle?: string;
+		media?: IPythonToolDetails["media"];
+	}> {
 		const sections: string[] = [];
+		const imageReferences: KernelImageReference[] = [];
 		if (this.pendingRestoreNotice) {
 			sections.push(this.pendingRestoreNotice);
 			this.pendingRestoreNotice = undefined;
 		}
 		if (result.stdout) sections.push(result.stdout.trimEnd());
 		if (result.stderr) sections.push(`[stderr]\n${result.stderr.trimEnd()}`);
+		let displayIndex = 0;
 		for (const display of result.displays) {
 			const text = textFromDisplay(display.data);
 			if (text) sections.push(text);
+			const rawImage = imageFromDisplay(display.data);
+			if (rawImage) {
+				if (!this.root) {
+					sections.push(`Displayed image [${rawImage.mimeType}; omitted from child Agent context]`);
+					continue;
+				}
+				displayIndex += 1;
+				const image = await storeModelImage({
+					artifacts: this.shared.artifacts,
+					bytes: rawImage.bytes,
+					claimedMimeType: rawImage.mimeType,
+					name: `ipython-display-${result.executionCount ?? "internal"}-${displayIndex}`,
+				});
+				imageReferences.push(image.reference);
+				sections.push(`Displayed image [${image.reference.mimeType}]`);
+			}
 		}
 		if (result.result) {
 			const text = textFromDisplay(result.result.data);
 			if (text) sections.push(text);
+			const rawImage = imageFromDisplay(result.result.data);
+			if (rawImage) {
+				if (!this.root) {
+					sections.push(`Returned image [${rawImage.mimeType}; omitted from child Agent context]`);
+				} else {
+					const image = await storeModelImage({
+						artifacts: this.shared.artifacts,
+						bytes: rawImage.bytes,
+						claimedMimeType: rawImage.mimeType,
+						name: `ipython-result-${result.executionCount ?? "internal"}`,
+					});
+					imageReferences.push(image.reference);
+					sections.push(`Returned image [${image.reference.mimeType}]`);
+				}
+			}
+		}
+		for (const content of result.modelContent) {
+			if (content.type === "text") sections.push(content.text);
+			else if (this.root) imageReferences.push(content);
+			else sections.push(`Image content [${content.mimeType}; omitted from child Agent context]`);
 		}
 		if (result.error) {
 			const traceback =
@@ -591,14 +689,38 @@ export class RiemannRuntime {
 			);
 		const full = sections.join("\n\n");
 		const limit = this.shared.config.limits.maxCellOutputChars;
-		if (full.length <= limit) return { text: full };
-		const artifact = await this.shared.artifacts.putText(full, {
-			name: `ipython-cell-${result.executionCount ?? "internal"}.txt`,
-		});
-		const handle = artifactHandle(artifact);
+		let text = full;
+		let artifactHandleValue: string | undefined;
+		if (full.length > limit) {
+			const artifact = await this.shared.artifacts.putText(full, {
+				name: `ipython-cell-${result.executionCount ?? "internal"}.txt`,
+			});
+			artifactHandleValue = artifactHandle(artifact);
+			text = `${full.slice(0, limit)}\n\n[Cell output truncated. Full output: ${artifactHandleValue ?? "artifact unavailable"}]`;
+		}
+		const content: Array<TextContent | ImageContent> = [{ type: "text", text }];
+		for (const image of imageReferences) {
+			const bytes = await this.shared.artifacts.readBuffer(image.artifactHandle);
+			content.push({
+				type: "image",
+				data: bytes.toString("base64"),
+				mimeType: image.mimeType,
+				...(image.detail ? { detail: image.detail } : {}),
+			});
+		}
 		return {
-			text: `${full.slice(0, limit)}\n\n[Cell output truncated. Full output: ${handle ?? "artifact unavailable"}]`,
-			...(handle ? { artifactHandle: handle } : {}),
+			content,
+			...(artifactHandleValue ? { artifactHandle: artifactHandleValue } : {}),
+			...(imageReferences.length > 0
+				? {
+						media: imageReferences.map((image) => ({
+							type: "image" as const,
+							artifactHandle: image.artifactHandle,
+							mimeType: image.mimeType,
+							byteLength: image.byteLength,
+						})),
+					}
+				: {}),
 		};
 	}
 
@@ -642,13 +764,14 @@ export class RiemannRuntime {
 				}
 				const formatted = await runtime.formatResult(result);
 				return {
-					content: [{ type: "text", text: formatted.text }],
+					content: formatted.content,
 					details: {
 						status: result.status,
 						durationMs: result.durationMs,
 						...(result.error ? { errorName: result.error.ename } : {}),
 						...(result.executionCount === undefined ? {} : { executionCount: result.executionCount }),
 						...(formatted.artifactHandle ? { artifactHandle: formatted.artifactHandle } : {}),
+						...(formatted.media ? { media: formatted.media } : {}),
 						...(activities.length > 0 ? { activities } : {}),
 					},
 				};

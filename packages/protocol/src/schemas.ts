@@ -1,6 +1,6 @@
 import Type, { type Static } from "typebox";
 
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
 
 const IdSchema = Type.String({ minLength: 1 });
 const TimestampSchema = Type.Integer({ minimum: 0 });
@@ -85,6 +85,9 @@ export const ImageContentSchema = StrictObject({
 	type: Type.Literal("image"),
 	data: Type.String(),
 	mimeType: Type.String({ minLength: 1 }),
+	detail: Type.Optional(
+		Type.Union([Type.Literal("auto"), Type.Literal("low"), Type.Literal("high"), Type.Literal("original")]),
+	),
 });
 export const ToolCallContentSchema = StrictObject({
 	type: Type.Literal("toolCall"),
@@ -286,6 +289,7 @@ export type ProtocolError = Static<typeof ProtocolErrorSchema>;
 const PromptPayloadProperties = {
 	sessionId: IdSchema,
 	text: Type.String(),
+	images: Type.Optional(Type.Array(ImageContentSchema)),
 } as const;
 
 export const ListCommandSchema = StrictObject({ command: Type.Literal("list") });
