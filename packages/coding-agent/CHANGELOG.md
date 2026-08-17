@@ -28,6 +28,9 @@
 - Fixed opaque `AgentInfo` field guidance and Agent completion presentation; the prompt exposes flat Turn fields, asynchronous completions emit immediate compact transcript lines, and the Subagent-only Fleet shows the latest Agent output.
 - Fixed wrapped Riemann Shell activity previews exceeding their collapsed visual-row budget and increased fullscreen mouse-wheel scrolling from one to three rows per event.
 - Fixed the Subagent Fleet to use one icon—active rows remain hollow until selected while settled rows retain their lifecycle outcome—and routed Viewer IPython calls through the same compact renderer as the Main Agent transcript.
+- Fixed pasted image routing so deleting an `[Image #N]` marker omits that image from submission, while undo, history recall, retries, and restored queued messages preserve stable marker identity.
+- Fixed the model-facing Agent profile contract: empty configurations omit `profile`, configured profiles expose exact policy keys, and unknown keys report valid alternatives without allocating a child slot.
+- Removed redundant Shell metadata and empty Agent-profile inventory from the Riemann system prompt.
 
 ## [0.84.2] - 2026-08-14
 

@@ -6,7 +6,6 @@ export interface HostEnvironment {
 	distro?: string;
 	kernel: string;
 	architecture: string;
-	shell?: string;
 }
 
 function unquoteOsReleaseValue(value: string): string {
@@ -48,7 +47,6 @@ export function detectHostEnvironment(): HostEnvironment {
 		distro,
 		kernel: release(),
 		architecture: arch(),
-		shell: process.env.SHELL,
 	};
 }
 
@@ -71,6 +69,5 @@ export function formatEnvironmentContext(
 	];
 	if (host.distro) lines.push(`- Distro: ${host.distro}`);
 	lines.push(`- Kernel: ${host.kernel}`, `- Architecture: ${host.architecture}`);
-	if (host.shell) lines.push(`- Shell: ${JSON.stringify(host.shell)}`);
 	return lines.join("\n");
 }

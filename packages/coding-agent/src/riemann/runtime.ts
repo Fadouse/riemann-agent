@@ -479,7 +479,9 @@ export class RiemannRuntime {
 	private agentProfiles(): string {
 		if (!hasCapability(this.capabilities, "agents.spawn", "agents")) return "";
 		const inventory = this.shared.supervisor.profileInventory(this.agent.id);
-		return inventory ? `## Configured agent profiles\n\n${inventory}` : "";
+		return inventory
+			? `## Configured agent profiles\n\n\`profile\` selects an optional configured policy bundle. Use an exact key below; express the child role and objective in \`task\`.\n\n${inventory}`
+			: "";
 	}
 
 	private exposedMcpServers(): string {

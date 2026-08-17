@@ -462,11 +462,30 @@ export class AgentSupervisor {
 		};
 	}
 
-	private resolveProfile(name: string | undefined): AgentProfileConfig | undefined {
+	private availableProfileEntries(caller: StoredAgent): Array<[string, AgentProfileConfig]> {
+		return Object.entries(this.options.config.profiles)
+			.filter(([, profile]) => {
+				if (profile.permissions === "host" && caller.permissions !== "host") return false;
+				const capabilities = profile.capabilities
+					? canonicalCapabilities(profile.capabilities)
+					: this.defaultCapabilities(caller);
+				return capabilities.every((capability) => this.canGrantCapability(caller, capability));
+			})
+			.sort(([left], [right]) => left.localeCompare(right));
+	}
+
+	private resolveProfile(caller: StoredAgent, name: string | undefined): AgentProfileConfig | undefined {
 		if (!name) return undefined;
 		const profile = this.options.config.profiles[name];
-		if (!profile) throw new RiemannHostError("not_found", `Agent profile not found: ${name}`);
-		return profile;
+		if (profile) return profile;
+		const availableNames = this.availableProfileEntries(caller).map(([profileName]) => JSON.stringify(profileName));
+		const guidance =
+			availableNames.length > 0
+				? `Available profiles: ${availableNames.join(", ")}. Omit profile to use child defaults.`
+				: Object.keys(this.options.config.profiles).length === 0
+					? "No Agent profiles are configured; omit profile to use child defaults."
+					: "No Agent profiles are available to this Agent; omit profile to use child defaults.";
+		throw new RiemannHostError("not_found", `Agent profile not found: ${JSON.stringify(name)}. ${guidance}`);
 	}
 
 	private async initialAgentPrompt(profile: AgentProfileConfig | undefined, task: string): Promise<string> {
@@ -1056,7 +1075,7 @@ export class AgentSupervisor {
 		}
 		const task = requiredString(args, "task");
 		const profileName = optionalString(args, "profile");
-		const requestedProfile = this.resolveProfile(profileName);
+		const requestedProfile = this.resolveProfile(caller, profileName);
 		const name = optionalString(args, "name") ?? `agent-${randomUUID().slice(0, 8)}`;
 		if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) {
 			throw new RiemannHostError(
@@ -1331,15 +1350,7 @@ export class AgentSupervisor {
 	profileInventory(callerId: string): string {
 		const caller = this.findAgent(callerId);
 		if (caller.depth >= 1) return "";
-		return Object.entries(this.options.config.profiles)
-			.filter(([, profile]) => {
-				if (profile.permissions === "host" && caller.permissions !== "host") return false;
-				const capabilities = profile.capabilities
-					? canonicalCapabilities(profile.capabilities)
-					: this.defaultCapabilities(caller);
-				return capabilities.every((capability) => this.canGrantCapability(caller, capability));
-			})
-			.sort(([left], [right]) => left.localeCompare(right))
+		return this.availableProfileEntries(caller)
 			.map(([name, profile]) => {
 				const description = profile.description?.replace(/\s+/g, " ").trim();
 				return description ? `- ${JSON.stringify(name)}: ${description}` : `- ${JSON.stringify(name)}`;
@@ -1350,6 +1361,20 @@ export class AgentSupervisor {
 	definitions(callerId: string): FunctionDefinition[] {
 		const caller = this.findAgent(callerId);
 		if (caller.depth >= 1) return [];
+		const profileNames = this.availableProfileEntries(caller).map(([name]) => name);
+		const profileParameters: FunctionDefinition["parameters"] =
+			profileNames.length === 0
+				? []
+				: [
+						{
+							name: "profile",
+							description: `Exact configured policy key: ${profileNames
+								.map((name) => JSON.stringify(name))
+								.join(", ")}`,
+							type: "str | None",
+							required: false,
+						},
+					];
 		return [
 			{
 				name: "list",
@@ -1371,11 +1396,14 @@ export class AgentSupervisor {
 				namespace: "agents",
 				description:
 					"Run a child Agent with structured cancellation and return its settled result in the current IPython cell.",
-				promptSnippet: "Run or reuse a child Agent synchronously and return its final result.",
+				promptSnippet:
+					profileNames.length > 0
+						? "Run or reuse a child Agent synchronously with an optional exact configured profile and return its final result."
+						: "Run or reuse a child Agent synchronously and return its final result.",
 				parameters: [
 					{ name: "task", description: "Complete, self-contained task", type: "str", required: true },
 					{ name: "name", description: "Stable reusable name", type: "str | None", required: false },
-					{ name: "profile", description: "Configured specialist profile", type: "str | None", required: false },
+					...profileParameters,
 					{
 						name: "timeout",
 						description: "Total queue and execution timeout in seconds",
@@ -1402,11 +1430,14 @@ export class AgentSupervisor {
 				namespace: "agents",
 				description:
 					"Start a background child Agent in a reusable slot. Await admission to receive its handle; unclaimed completion sends only a minimal reminder.",
-				promptSnippet: "Await a background child Agent admission by task, stable name, and optional profile.",
+				promptSnippet:
+					profileNames.length > 0
+						? "Await a background child Agent admission by task, stable name, and optional exact configured profile."
+						: "Await a background child Agent admission by task and stable name.",
 				parameters: [
 					{ name: "task", description: "Complete, self-contained task", type: "str", required: true },
 					{ name: "name", description: "Stable reusable name", type: "str | None", required: false },
-					{ name: "profile", description: "Configured specialist profile", type: "str | None", required: false },
+					...profileParameters,
 				],
 				returns: "AgentHandle",
 				capability: "agents.spawn",

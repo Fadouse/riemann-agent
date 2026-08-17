@@ -17,7 +17,6 @@ describe("Riemann system environment context", () => {
 				distro: "NixOS 26.05 (Yarara)",
 				kernel: "6.18.38",
 				architecture: "x64",
-				shell: "/run/current-system/sw/bin/bash",
 			},
 			new Date(2026, 7, 13),
 		);
@@ -29,7 +28,6 @@ describe("Riemann system environment context", () => {
 				"- Distro: NixOS 26.05 (Yarara)",
 				"- Kernel: 6.18.38",
 				"- Architecture: x64",
-				'- Shell: "/run/current-system/sw/bin/bash"',
 			].join("\n"),
 		);
 	});

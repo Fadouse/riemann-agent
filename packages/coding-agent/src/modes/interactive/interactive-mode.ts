@@ -153,6 +153,7 @@ import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import { editInExternalEditor } from "./external-editor.ts";
+import { collectMarkedImages, evictImagesToBudget, formatImageMarker, imageMarkerIds } from "./image-markers.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
 import {
@@ -227,6 +228,7 @@ function isDeadTerminalError(error: unknown): boolean {
 
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 	"Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in /settings.";
+const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 
 function isAnthropicSubscriptionAuthKey(apiKey: string | undefined): boolean {
 	return typeof apiKey === "string" && apiKey.startsWith("sk-ant-oat");
@@ -432,7 +434,8 @@ export class InteractiveMode {
 	private isInitialized = false;
 	private onInputCallback?: (input: SubmittedInput) => void;
 	private pendingUserInputs: SubmittedInput[] = [];
-	private pendingImages: ImageContent[] = [];
+	private readonly pastedImages = new Map<number, ImageContent>();
+	private nextImageMarkerId = 1;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private readonly idleStatus = new IdleStatus();
 	private workingMessage: string | undefined = undefined;
@@ -2875,11 +2878,31 @@ export class InteractiveMode {
 		}
 	}
 
-	private takePendingImages(): ImageContent[] | undefined {
-		if (this.pendingImages.length === 0) return undefined;
-		const images = this.pendingImages;
-		this.pendingImages = [];
-		return images;
+	private liveImageMarkerIds(): Set<number> {
+		const ids = new Set<number>();
+		const add = (text: string): void => {
+			for (const id of imageMarkerIds(text)) ids.add(id);
+		};
+
+		add(this.editor.getText());
+		for (const entry of this.editor.getHistory?.() ?? []) add(entry);
+		for (const input of this.pendingUserInputs) add(input.text);
+		const { steering, followUp } = this.getAllQueuedMessages();
+		for (const text of steering) add(text);
+		for (const text of followUp) add(text);
+		return ids;
+	}
+
+	private rememberPastedImage(id: number, image: ImageContent): void {
+		this.pastedImages.set(id, image);
+		const keep = this.liveImageMarkerIds();
+		keep.add(id);
+		evictImagesToBudget(this.pastedImages, (entry) => entry.data.length, MAX_PASTED_IMAGE_BYTES, keep);
+	}
+
+	private collectImagesFor(text: string): ImageContent[] | undefined {
+		const images = collectMarkedImages(this.pastedImages, text);
+		return images.length > 0 ? images : undefined;
 	}
 
 	private async handleClipboardPaste(): Promise<void> {
@@ -2893,9 +2916,14 @@ export class InteractiveMode {
 					this.showWarning(processed.message);
 					return;
 				}
-				this.pendingImages.push({ type: "image", data: processed.data, mimeType: processed.mimeType });
-				const marker = `[Image #${this.pendingImages.length}]`;
-				this.editor.insertTextAtCursor?.(marker);
+				const attachment: ImageContent = {
+					type: "image",
+					data: processed.data,
+					mimeType: processed.mimeType,
+				};
+				const markerId = this.nextImageMarkerId++;
+				this.rememberPastedImage(markerId, attachment);
+				this.editor.insertTextAtCursor?.(formatImageMarker(markerId));
 				this.ui.requestRender();
 				return;
 			}
@@ -2918,7 +2946,7 @@ export class InteractiveMode {
 	private setupEditorSubmitHandler(): void {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
-			if (!text && this.pendingImages.length === 0) return;
+			if (!text) return;
 
 			// Handle commands
 			if (text === "/settings") {
@@ -3075,7 +3103,7 @@ export class InteractiveMode {
 					this.editor.setText("");
 					await this.session.prompt(text);
 				} else {
-					this.queueCompactionMessage(text, "steer", this.takePendingImages());
+					this.queueCompactionMessage(text, "steer", this.collectImagesFor(text));
 				}
 				return;
 			}
@@ -3085,7 +3113,7 @@ export class InteractiveMode {
 			if (this.session.isStreaming) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				const images = this.takePendingImages();
+				const images = this.collectImagesFor(text);
 				await this.session.prompt(text, { streamingBehavior: "steer", ...(images ? { images } : {}) });
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
@@ -3096,7 +3124,7 @@ export class InteractiveMode {
 			// First, move any pending bash components to chat
 			this.flushPendingBashComponents();
 
-			const images = this.takePendingImages();
+			const images = this.collectImagesFor(text);
 			const input: SubmittedInput = { text, ...(images ? { images } : {}) };
 			if (this.onInputCallback) {
 				this.onInputCallback(input);
@@ -4011,7 +4039,7 @@ export class InteractiveMode {
 
 	private async handleFollowUp(): Promise<void> {
 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
-		if (!text && this.pendingImages.length === 0) return;
+		if (!text) return;
 
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
@@ -4020,7 +4048,7 @@ export class InteractiveMode {
 				this.editor.setText("");
 				await this.session.prompt(text);
 			} else {
-				this.queueCompactionMessage(text, "followUp", this.takePendingImages());
+				this.queueCompactionMessage(text, "followUp", this.collectImagesFor(text));
 			}
 			return;
 		}
@@ -4030,7 +4058,7 @@ export class InteractiveMode {
 		if (this.session.isStreaming) {
 			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			const images = this.takePendingImages();
+			const images = this.collectImagesFor(text);
 			await this.session.prompt(text, { streamingBehavior: "followUp", ...(images ? { images } : {}) });
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
@@ -4155,7 +4183,6 @@ export class InteractiveMode {
 
 	clearEditor(): void {
 		this.editor.setText("");
-		this.pendingImages = [];
 		this.ui.requestRender();
 	}
 
@@ -4282,7 +4309,6 @@ export class InteractiveMode {
 		const queuedText = allQueued.map((message) => message.text).join("\n\n");
 		const currentText = options?.currentText ?? this.editor.getText();
 		const combinedText = [queuedText, currentText].filter((value) => value.trim()).join("\n\n");
-		this.pendingImages = [...allQueued.flatMap((message) => message.images ?? []), ...this.pendingImages];
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {

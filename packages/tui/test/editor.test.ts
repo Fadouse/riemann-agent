@@ -4149,4 +4149,60 @@ describe("Editor component", () => {
 			assert.strictEqual(submitted, pastedText);
 		});
 	});
+
+	describe("Image marker atomic behavior", () => {
+		const marker = "[Image #7]";
+
+		it("moves across a complete image marker as one unit", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.setText(`A${marker}B`);
+			editor.handleInput("\x01"); // Ctrl+A
+
+			editor.handleInput("\x1b[C");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 1 });
+			editor.handleInput("\x1b[C");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 1 + marker.length });
+			editor.handleInput("\x1b[D");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 1 });
+		});
+
+		it("deletes and restores a complete image marker with one Backspace", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.setText(`A${marker}B`);
+			editor.handleInput("\x01"); // Ctrl+A
+			editor.handleInput("\x1b[C");
+			editor.handleInput("\x1b[C");
+
+			editor.handleInput("\x7f");
+			assert.strictEqual(editor.getText(), "AB");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 1 });
+
+			editor.handleInput("\x1b[45;5u"); // Ctrl+-
+			assert.strictEqual(editor.getText(), `A${marker}B`);
+		});
+
+		it("deletes a complete image marker with one forward Delete", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.setText(`A${marker}B`);
+			editor.handleInput("\x01"); // Ctrl+A
+			editor.handleInput("\x1b[C");
+
+			editor.handleInput("\x1b[3~");
+			assert.strictEqual(editor.getText(), "AB");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 1 });
+		});
+
+		it("treats a complete image marker as one word for movement and deletion", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.setText(`A ${marker} B`);
+			editor.handleInput("\x01"); // Ctrl+A
+			editor.handleInput("\x1b[1;5C");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 1 });
+			editor.handleInput("\x1b[1;5C");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 2 + marker.length });
+
+			editor.handleInput("\x17"); // Ctrl+W
+			assert.strictEqual(editor.getText(), "A  B");
+		});
+	});
 });

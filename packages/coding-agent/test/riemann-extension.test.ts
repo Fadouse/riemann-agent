@@ -86,6 +86,37 @@ describe("Riemann session extension", () => {
 		]);
 	});
 
+	test("removes profile from Agent operations and omits an empty profile inventory", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-extension-empty-profiles-"));
+		roots.push(root);
+		const agentDir = join(root, "agent-dir");
+		const previousAgentDir = process.env.RIEMANN_CODING_AGENT_DIR;
+		process.env.RIEMANN_CODING_AGENT_DIR = agentDir;
+		await mkdir(agentDir, { recursive: true });
+		await writeFile(join(agentDir, "config.yaml"), "version: 1\nagents:\n  maxAgents: 4\n");
+		let runtime: RiemannRuntime | undefined;
+		try {
+			runtime = await RiemannRuntime.createRoot({
+				cwd: root,
+				model: undefined,
+				modelRegistry: { find: () => undefined },
+				thinkingLevel: "off",
+				sessionManager: { getSessionId: () => "empty-profile-contract" },
+				isProjectTrusted: () => true,
+			} as unknown as ExtensionContext);
+			const systemPrompt = runtime.systemPrompt("main");
+			expect(systemPrompt).toContain("`await agents.spawn(task, name=None) -> AgentHandle`");
+			expect(systemPrompt).toContain("`await agents.run(task, name=None, timeout=None) -> AgentResult`");
+			expect(systemPrompt).not.toContain("profile=None");
+			expect(systemPrompt).not.toContain("## Agent profiles");
+			expect(systemPrompt).not.toContain("No Agent policy profiles");
+		} finally {
+			await runtime?.close();
+			if (previousAgentDir === undefined) delete process.env.RIEMANN_CODING_AGENT_DIR;
+			else process.env.RIEMANN_CODING_AGENT_DIR = previousAgentDir;
+		}
+	});
+
 	test("exposes only IPython and checkpoints a session through the live runtime", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-extension-"));
 		roots.push(root);
@@ -189,6 +220,7 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).toMatch(/- OS: \S+/);
 			expect(systemPrompt).toMatch(/- Kernel: \S+/);
 			expect(systemPrompt).toMatch(/- Architecture: \S+/);
+			expect(systemPrompt).not.toContain("- Shell:");
 			expect(systemPrompt).toContain("`ipython` is a persistent Python environment");
 			expect(systemPrompt).toContain("already available as globals");
 			expect(systemPrompt).toContain("compose operations with normal Python");
@@ -215,6 +247,9 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).not.toContain("workspace_policy");
 			expect(systemPrompt).toContain("## Configured agent profiles");
 			expect(systemPrompt).toContain('- "researcher": Research public sources without modifying files.');
+			expect(systemPrompt).toContain(
+				"`profile` selects an optional configured policy bundle. Use an exact key below; express the child role and objective in `task`.",
+			);
 			expect(systemPrompt).toContain('- "public_docs": Search approved internal documentation.');
 			expect(systemPrompt).not.toContain("`mcp.list(");
 			expect(systemPrompt).not.toContain("hidden_docs");

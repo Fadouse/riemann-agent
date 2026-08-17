@@ -172,7 +172,7 @@ interface SupervisorHarnessOptions {
 }
 
 async function createHarness(
-	overrides: Partial<Pick<RiemannConfig, "maxAgents" | "maxConcurrentAgents" | "agentDefaults">> = {},
+	overrides: Partial<Pick<RiemannConfig, "maxAgents" | "maxConcurrentAgents" | "agentDefaults" | "profiles">> = {},
 	deliver?: (delivery: AgentEventDelivery) => Promise<void>,
 	configuredChildModel?: Model<any>,
 	options: SupervisorHarnessOptions = {},
@@ -271,6 +271,24 @@ describe("Riemann reusable Agent slots", () => {
 				"name",
 				"profile",
 			]);
+			expect(functionByName(definitions, "run").parameters.map((parameter) => parameter.name)).toEqual([
+				"task",
+				"name",
+				"profile",
+				"timeout",
+			]);
+			expect(
+				functionByName(definitions, "spawn").parameters.find((parameter) => parameter.name === "profile")
+					?.description,
+			).toBe('Exact configured policy key: "isolated", "privileged"');
+			await expect(
+				supervisor.spawn(mainId, { task: "invalid profile", name: "invalid-profile", profile: "explore" }),
+			).rejects.toMatchObject({
+				code: "not_found",
+				message:
+					'Agent profile not found: "explore". Available profiles: "isolated", "privileged". Omit profile to use child defaults.',
+			});
+			expect(store.listAgents(harness.runId).filter((agent) => agent.parentId !== null)).toHaveLength(0);
 
 			const firstHandle = objectValue(
 				await supervisor.spawn(mainId, { task: "Produce a bounded result", name: "reviewer" }),
@@ -346,6 +364,45 @@ describe("Riemann reusable Agent slots", () => {
 			await expect(
 				supervisor.spawn(childId, { task: "Attempt recursive delegation", name: "nested" }),
 			).rejects.toMatchObject({ code: "limit_exceeded" });
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("removes profile from the Agent API when no policy profiles are available", async () => {
+		const harness = await createHarness({ profiles: {} });
+		const { supervisor, store, mainId, sessions } = harness;
+		try {
+			const definitions = supervisor.definitions(mainId);
+			expect(functionByName(definitions, "run").parameters.map((parameter) => parameter.name)).toEqual([
+				"task",
+				"name",
+				"timeout",
+			]);
+			expect(functionByName(definitions, "spawn").parameters.map((parameter) => parameter.name)).toEqual([
+				"task",
+				"name",
+			]);
+			expect(supervisor.profileInventory(mainId)).toBe("");
+
+			await expect(
+				supervisor.spawn(mainId, { task: "invalid profile", name: "invalid-profile", profile: "explore" }),
+			).rejects.toMatchObject({
+				code: "not_found",
+				message:
+					'Agent profile not found: "explore". No Agent profiles are configured; omit profile to use child defaults.',
+			});
+			expect(store.listAgents(harness.runId).filter((agent) => agent.parentId !== null)).toHaveLength(0);
+
+			const handle = objectValue(
+				await supervisor.spawn(mainId, { task: "Inspect the repository", name: "project-inspector" }),
+			);
+			if (typeof handle.id !== "string") throw new Error("Spawn did not return an Agent id");
+			const childId = handle.id;
+			await waitFor(() => store.getAgent(childId)?.status === "running");
+			sessions.get(childId)?.at(-1)?.finish();
+			await waitFor(() => store.getAgent(childId)?.status === "idle");
 		} finally {
 			await supervisor.close();
 			store.close();
