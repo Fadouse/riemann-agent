@@ -305,7 +305,7 @@ def _to_wire(value):
         return {"$riemann": "text_snapshot_ref", "capability": value._capability}
     if isinstance(value, ImageSnapshot):
         if value._capability is None:
-            raise TypeError("ImageSnapshot is not backed by a workspace file capability")
+            raise TypeError("ImageSnapshot is not backed by a file capability")
         return {"$riemann": "image_snapshot_ref", "capability": value._capability}
     if isinstance(value, Artifact):
         return {"$riemann": "artifact_ref", "handle": value.handle}

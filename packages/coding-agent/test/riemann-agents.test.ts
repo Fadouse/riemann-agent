@@ -8,6 +8,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { execCommand } from "../src/core/exec.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { FULL_FILESYSTEM } from "../src/riemann/access-policy.ts";
 import {
 	type AgentEventDelivery,
 	AgentSupervisor,
@@ -140,10 +141,10 @@ const config: RiemannConfig = {
 		maxWorktreeBytes: 1_000_000,
 	},
 	compaction: { strategy: "snapshot" },
-	mainAgent: { permissions: "host" },
-	agentDefaults: { workspace: "shared", permissions: "workspace" },
+	mainAgent: {},
+	agentDefaults: { workspace: "shared" },
 	profiles: {
-		privileged: { permissions: "host" },
+		privileged: { filesystem: { read: ["/"], write: ["/"] } },
 		isolated: { workspace: "worktree" },
 	},
 	mcpServers: {},
@@ -301,8 +302,8 @@ describe("Riemann reusable Agent slots", () => {
 			await waitFor(() => supervisor.listSubagentsForUi().find((agent) => agent.id === childId)?.live === true);
 			expect(store.getAgent(childId)).toMatchObject({
 				workspace: harness.root,
-				permissions: "workspace",
-				capabilities: ["workspace.read", "workspace.write", "shell.run", "web.search", "web.fetch", "mcp.*"],
+				filesystem: FULL_FILESYSTEM,
+				capabilities: ["fs.read", "fs.write", "shell.run", "web.search", "web.fetch", "mcp.*"],
 			});
 			expect(supervisor.listSubagentsForUi()).toContainEqual(
 				expect.objectContaining({
@@ -560,7 +561,6 @@ describe("Riemann reusable Agent slots", () => {
 			{
 				agentDefaults: {
 					workspace: "shared",
-					permissions: "workspace",
 					model: `${childModel.provider}/${childModel.id}`,
 				},
 			},
@@ -853,9 +853,9 @@ describe("Riemann reusable Agent slots", () => {
 			modelRole: "inherit",
 			workspace: root,
 			workspaceMode: "shared",
-			permissions: "workspace",
+			filesystem: FULL_FILESYSTEM,
 			depth: 1,
-			capabilities: ["workspace.read"],
+			capabilities: ["fs.read"],
 		});
 		const sessionDir = join(agentDir, "state", "child-sessions", child.id);
 		await mkdir(sessionDir, { recursive: true });
@@ -902,7 +902,7 @@ describe("Riemann reusable Agent slots", () => {
 
 		const store = new RiemannStore(agentDir);
 		const run = store.openRun("worktree-test", repository);
-		const main = store.ensureRootAgent(run.id, repository, "host");
+		const main = store.ensureRootAgent(run.id, repository, FULL_FILESYSTEM);
 		const artifacts = new ArtifactStore(store, run.id);
 		const model = getModel("openai", "gpt-4o-mini");
 		if (!model) throw new Error("Built-in test model is unavailable");

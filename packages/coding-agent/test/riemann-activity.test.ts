@@ -60,7 +60,7 @@ describe("Riemann IPython activity tracking", () => {
 		expect(activities[0]).toMatchObject({ status: "ok", exitCode: 0, durationMs: 40 });
 	});
 
-	test("derives actual file and patch diffs from atomic workspace operations", async () => {
+	test("derives actual file and patch diffs from atomic file operations", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-activity-file-"));
 		roots.push(root);
 		const path = join(root, "value.ts");
@@ -68,7 +68,7 @@ describe("Riemann IPython activity tracking", () => {
 		const tracker = new RiemannActivityTracker(root, (capability) =>
 			capability === "file-capability" ? path : undefined,
 		);
-		const editRequest = request("workspace.edit", {
+		const editRequest = request("fs.edit", {
 			snapshot: { $riemann: "text_snapshot_ref", capability: "file-capability" },
 			operations: [{ kind: "replace", start: 14, end: 15, text: "2" }],
 		});

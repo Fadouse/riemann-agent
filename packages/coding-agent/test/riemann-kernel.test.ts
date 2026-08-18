@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterAll, describe, expect, test } from "vitest";
+import { FULL_FILESYSTEM, fileAccessPolicy } from "../src/riemann/access-policy.ts";
 import { IPythonKernelManager } from "../src/riemann/kernel/manager.ts";
 import type { JsonValue, KernelSandboxConfiguration } from "../src/riemann/kernel/types.ts";
 import { ensureManagedPython } from "../src/riemann/python/runtime.ts";
@@ -461,9 +462,7 @@ released is None`,
 			await Promise.all([mkdir(workspace), mkdir(state), writeFile(outside, "secret")]);
 			await writeFile(join(workspace, "read.txt"), "ok");
 			const sandbox: KernelSandboxConfiguration = {
-				agentDir: join(root, "agent"),
-				filesystemScope: "workspace",
-				workspaceWritable: false,
+				policy: fileAccessPolicy(workspace, { read: [workspace], readExclude: [], write: [], writeExclude: [] }),
 				...(process.platform === "linux"
 					? { bubblewrapPath: process.env.RIEMANN_BWRAP_PATH ?? "/usr/bin/bwrap" }
 					: {}),
@@ -517,9 +516,12 @@ print(json.dumps(out, sort_keys=True))`;
 				writeFile(join(agentDir, "auth.json"), "RIEMANN_PRIVATE_CREDENTIAL"),
 			]);
 			const sandbox: KernelSandboxConfiguration = {
-				agentDir,
-				filesystemScope: "workspace",
-				workspaceWritable: true,
+				policy: fileAccessPolicy(root, {
+					read: ["/"],
+					readExclude: [agentDir],
+					write: [root],
+					writeExclude: [agentDir],
+				}),
 				...(process.platform === "linux"
 					? { bubblewrapPath: process.env.RIEMANN_BWRAP_PATH ?? "/usr/bin/bwrap" }
 					: {}),
@@ -593,9 +595,7 @@ print(json.dumps(out, sort_keys=True))`;
 			const created = join(root, "created.txt");
 			await Promise.all([mkdir(workspace), mkdir(state), writeFile(outside, "secret")]);
 			const sandbox: KernelSandboxConfiguration = {
-				agentDir: join(root, "agent"),
-				filesystemScope: "host",
-				workspaceWritable: true,
+				policy: fileAccessPolicy(workspace, FULL_FILESYSTEM),
 				...(process.platform === "linux"
 					? { bubblewrapPath: process.env.RIEMANN_BWRAP_PATH ?? "/usr/bin/bwrap" }
 					: {}),

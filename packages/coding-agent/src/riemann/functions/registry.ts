@@ -39,7 +39,7 @@ export interface PythonFunctionSpecification {
 }
 
 const PROMPT_NAMESPACE_ORDER = new Map(
-	["workspace", "shell", "web", "artifacts", "agents", "mcp", "catalog", "state"].map((namespace, index) => [
+	["fs", "shell", "web", "artifacts", "agents", "mcp", "catalog", "state"].map((namespace, index) => [
 		namespace,
 		index,
 	]),

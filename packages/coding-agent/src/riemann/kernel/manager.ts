@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Dealer, Subscriber } from "zeromq";
 import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
+import { policyAllowsRead, policyAllowsWrite } from "../access-policy.ts";
 import { sandboxedKernelCommand } from "./sandbox.ts";
 import type {
 	JsonValue,
@@ -121,6 +122,14 @@ export class IPythonKernelManager {
 	private kernelSnapshotPath(): string | undefined {
 		if (!this.options.snapshotPath) return undefined;
 		if (!this.options.sandbox) return this.options.snapshotPath;
+		// A policy that covers the durable snapshot path lets the kernel read and
+		// write it directly; otherwise stage through the sandbox temp directory.
+		if (
+			policyAllowsRead(this.options.sandbox.policy, this.options.snapshotPath) &&
+			policyAllowsWrite(this.options.sandbox.policy, this.options.snapshotPath)
+		) {
+			return this.options.snapshotPath;
+		}
 		if (!this.tempDir) throw new Error("IPython kernel snapshot staging directory is unavailable");
 		return join(this.tempDir, "snapshot.dill");
 	}
@@ -226,10 +235,7 @@ export class IPythonKernelManager {
 		const launch = sandbox
 			? sandboxedKernelCommand(
 					{
-						workspace: this.options.cwd,
-						agentDir: sandbox.agentDir,
-						filesystemScope: sandbox.filesystemScope,
-						workspaceWritable: sandbox.workspaceWritable,
+						policy: { ...sandbox.policy, cwd: this.options.cwd },
 						python: this.options.python,
 						connectionDir: this.tempDir,
 						platform: sandbox.platform,

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { type FilesystemSnapshot, FULL_FILESYSTEM, parseFilesystemSnapshot } from "../access-policy.ts";
 import { DatabaseSync, type RiemannDatabase } from "./database.ts";
 
 export type AgentStatus = "queued" | "running" | "idle" | "stopped";
@@ -28,7 +29,7 @@ export interface StoredAgent {
 	modelRole: string;
 	workspace: string;
 	workspaceMode: "shared" | "worktree";
-	permissions: "host" | "workspace";
+	filesystem: FilesystemSnapshot;
 	depth: number;
 	capabilities: string[];
 	activeTurnId: string | null;
@@ -109,7 +110,7 @@ export interface AgentCreateInput {
 	modelRole: string;
 	workspace: string;
 	workspaceMode: "shared" | "worktree";
-	permissions: "host" | "workspace";
+	filesystem: FilesystemSnapshot;
 	depth: number;
 	capabilities: string[];
 }
@@ -162,7 +163,7 @@ interface AgentRow {
 	model_role: string;
 	workspace: string;
 	workspace_mode: "shared" | "worktree";
-	permissions: "host" | "workspace";
+	filesystem_json: string;
 	depth: number;
 	capabilities_json: string;
 	active_turn_id: string | null;
@@ -281,7 +282,7 @@ function agentFromRow(row: AgentRow): StoredAgent {
 		modelRole: row.model_role,
 		workspace: row.workspace,
 		workspaceMode: row.workspace_mode,
-		permissions: row.permissions,
+		filesystem: parseFilesystemSnapshot(row.filesystem_json),
 		depth: row.depth,
 		capabilities: parseStringArray(row.capabilities_json),
 		activeTurnId: row.active_turn_id,
@@ -396,7 +397,7 @@ export class RiemannStore {
 				model_role TEXT NOT NULL,
 				workspace TEXT NOT NULL,
 				workspace_mode TEXT NOT NULL DEFAULT 'shared',
-				permissions TEXT NOT NULL DEFAULT 'workspace',
+				filesystem_json TEXT NOT NULL DEFAULT '{}',
 				depth INTEGER NOT NULL,
 				capabilities_json TEXT NOT NULL,
 				active_turn_id TEXT,
@@ -481,9 +482,6 @@ export class RiemannStore {
 		if (!agentColumns.some((column) => column.name === "workspace_mode")) {
 			this.db.exec("ALTER TABLE agents ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'shared'");
 		}
-		if (!agentColumns.some((column) => column.name === "permissions")) {
-			this.db.exec("ALTER TABLE agents ADD COLUMN permissions TEXT NOT NULL DEFAULT 'workspace'");
-		}
 		if (!agentColumns.some((column) => column.name === "last_outcome")) {
 			this.db.exec("ALTER TABLE agents ADD COLUMN last_outcome TEXT");
 		}
@@ -501,6 +499,20 @@ export class RiemannStore {
 		}
 		if (!agentColumns.some((column) => column.name === "last_turn_id")) {
 			this.db.exec("ALTER TABLE agents ADD COLUMN last_turn_id TEXT");
+		}
+		if (agentColumns.some((column) => column.name === "permissions")) {
+			this.db.exec("ALTER TABLE agents ADD COLUMN filesystem_json TEXT NOT NULL DEFAULT '{}'");
+			const legacy = this.db.prepare("SELECT id, permissions, workspace FROM agents").all() as unknown as Array<{
+				id: string;
+				permissions: string;
+				workspace: string;
+			}>;
+			const update = this.db.prepare("UPDATE agents SET filesystem_json = ? WHERE id = ?");
+			for (const row of legacy) {
+				const roots = row.permissions === "host" ? ["/"] : [row.workspace];
+				update.run(JSON.stringify({ read: roots, readExclude: [], write: roots, writeExclude: [] }), row.id);
+			}
+			this.db.exec("ALTER TABLE agents DROP COLUMN permissions");
 		}
 		const eventColumns = this.db.prepare("PRAGMA table_info(agent_events)").all() as Array<{ name: string }>;
 		if (!eventColumns.some((column) => column.name === "turn_id")) {
@@ -522,7 +534,7 @@ export class RiemannStore {
 				END;
 		`);
 		this.backfillAgentTurns();
-		this.db.exec("UPDATE schema_version SET version = 3");
+		this.db.exec("UPDATE schema_version SET version = 4");
 	}
 
 	private backfillAgentTurns(): void {
@@ -630,13 +642,15 @@ export class RiemannStore {
 		this.db.prepare("UPDATE runs SET status = 'closed', updated_at = ? WHERE id = ?").run(now(), runId);
 	}
 
-	ensureRootAgent(runId: string, cwd: string, permissions: "host" | "workspace" = "host"): StoredAgent {
+	ensureRootAgent(runId: string, cwd: string, filesystem: FilesystemSnapshot = FULL_FILESYSTEM): StoredAgent {
 		const existing = this.db.prepare("SELECT * FROM agents WHERE run_id = ? AND parent_id IS NULL").get(runId) as
 			| AgentRow
 			| undefined;
 		if (existing) {
 			const agent = agentFromRow(existing);
-			return agent.permissions === permissions ? agent : this.updateAgent(agent.id, { permissions });
+			return JSON.stringify(agent.filesystem) === JSON.stringify(filesystem)
+				? agent
+				: this.updateAgent(agent.id, { filesystem });
 		}
 		return this.createAgent({
 			runId,
@@ -647,7 +661,7 @@ export class RiemannStore {
 			modelRole: "main",
 			workspace: cwd,
 			workspaceMode: "shared",
-			permissions,
+			filesystem,
 			depth: 0,
 			capabilities: ["*"],
 		});
@@ -671,7 +685,7 @@ export class RiemannStore {
 		};
 		this.db
 			.prepare(
-				"INSERT INTO agents(id, run_id, parent_id, name, status, prompt, model_role, workspace, workspace_mode, permissions, depth, capabilities_json, active_turn_id, last_turn_id, result, error, last_outcome, transcript_handle, patch_handle, released_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)",
+				"INSERT INTO agents(id, run_id, parent_id, name, status, prompt, model_role, workspace, workspace_mode, filesystem_json, depth, capabilities_json, active_turn_id, last_turn_id, result, error, last_outcome, transcript_handle, patch_handle, released_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)",
 			)
 			.run(
 				agent.id,
@@ -683,7 +697,7 @@ export class RiemannStore {
 				agent.modelRole,
 				agent.workspace,
 				agent.workspaceMode,
-				agent.permissions,
+				JSON.stringify(agent.filesystem),
 				agent.depth,
 				JSON.stringify(agent.capabilities),
 				agent.createdAt,
@@ -958,7 +972,7 @@ export class RiemannStore {
 			transcriptHandle?: string | null;
 			patchHandle?: string | null;
 			workspace?: string;
-			permissions?: "host" | "workspace";
+			filesystem?: FilesystemSnapshot;
 		},
 	): StoredAgent {
 		const current = this.getAgent(id);
@@ -971,11 +985,11 @@ export class RiemannStore {
 		const transcriptHandle = patch.transcriptHandle === undefined ? current.transcriptHandle : patch.transcriptHandle;
 		const patchHandle = patch.patchHandle === undefined ? current.patchHandle : patch.patchHandle;
 		const workspace = patch.workspace ?? current.workspace;
-		const permissions = patch.permissions ?? current.permissions;
+		const filesystem = patch.filesystem === undefined ? current.filesystem : patch.filesystem;
 		const updatedAt = now();
 		this.db
 			.prepare(
-				"UPDATE agents SET status = ?, prompt = ?, result = ?, error = ?, last_outcome = ?, transcript_handle = ?, patch_handle = ?, workspace = ?, permissions = ?, updated_at = ? WHERE id = ?",
+				"UPDATE agents SET status = ?, prompt = ?, result = ?, error = ?, last_outcome = ?, transcript_handle = ?, patch_handle = ?, workspace = ?, filesystem_json = ?, updated_at = ? WHERE id = ?",
 			)
 			.run(
 				status,
@@ -986,7 +1000,7 @@ export class RiemannStore {
 				transcriptHandle,
 				patchHandle,
 				workspace,
-				permissions,
+				JSON.stringify(filesystem),
 				updatedAt,
 				id,
 			);
@@ -1000,7 +1014,7 @@ export class RiemannStore {
 			transcriptHandle,
 			patchHandle,
 			workspace,
-			permissions,
+			filesystem,
 			updatedAt,
 		};
 	}

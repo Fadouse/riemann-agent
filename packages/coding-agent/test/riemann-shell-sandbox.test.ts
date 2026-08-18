@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { FULL_FILESYSTEM, fileAccessPolicy } from "../src/riemann/access-policy.ts";
 import { ShellFunctions } from "../src/riemann/functions/shell.ts";
 import type { JsonValue } from "../src/riemann/kernel/types.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
@@ -22,6 +23,10 @@ function record(value: JsonValue): Record<string, JsonValue> {
 	return value;
 }
 
+function restrictedPolicy(cwd: string, read: string[], write: string[]) {
+	return fileAccessPolicy(cwd, { read, readExclude: [], write, writeExclude: [] });
+}
+
 describe("Riemann shell command resolution", () => {
 	test("returns a structured command-not-found process result", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-missing-"));
@@ -31,12 +36,12 @@ describe("Riemann shell command resolution", () => {
 		const store = new RiemannStore(join(root, "agent"));
 		try {
 			const run = store.openRun("shell-missing", workspace);
-			const shell = new ShellFunctions(workspace, new ArtifactStore(store, run.id), 100_000, {
-				agentDir: join(root, "agent"),
-				filesystemScope: "workspace",
-				workspaceWritable: false,
-				networkAllowed: false,
-			});
+			const shell = new ShellFunctions(
+				fileAccessPolicy(workspace, FULL_FILESYSTEM),
+				new ArtifactStore(store, run.id),
+				100_000,
+				false,
+			);
 			const definition = shell.definitions().find((item) => item.name === "run");
 			if (!definition) throw new Error("shell.run is unavailable");
 			const result = record(
@@ -71,12 +76,12 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		const store = new RiemannStore(join(root, "agent"));
 		try {
 			const run = store.openRun("shell-sandbox", workspace);
-			const shell = new ShellFunctions(workspace, new ArtifactStore(store, run.id), 100_000, {
-				agentDir: join(root, "agent"),
-				filesystemScope: "workspace",
-				workspaceWritable: false,
-				networkAllowed: false,
-			});
+			const shell = new ShellFunctions(
+				restrictedPolicy(workspace, [workspace], []),
+				new ArtifactStore(store, run.id),
+				100_000,
+				false,
+			);
 			const definition = shell.definitions().find((item) => item.name === "run");
 			if (!definition) throw new Error("shell.run is unavailable");
 			process.env.RIEMANN_HOST_SECRET_TEST = "hidden";
@@ -110,12 +115,12 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		const store = new RiemannStore(join(root, "agent"));
 		try {
 			const run = store.openRun("shell-path", workspace);
-			const shell = new ShellFunctions(workspace, new ArtifactStore(store, run.id), 100_000, {
-				agentDir: join(root, "agent"),
-				filesystemScope: "workspace",
-				workspaceWritable: false,
-				networkAllowed: false,
-			});
+			const shell = new ShellFunctions(
+				fileAccessPolicy(workspace, FULL_FILESYSTEM),
+				new ArtifactStore(store, run.id),
+				100_000,
+				false,
+			);
 			const definition = shell.definitions().find((item) => item.name === "run");
 			if (!definition) throw new Error("shell.run is unavailable");
 			const result = record(
@@ -129,7 +134,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 			store.close();
 		}
 	});
-	test("masks nested Riemann state without blocking normal workspace commands", async () => {
+	test("applies user-configured read exclusions without blocking normal commands", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-nested-state-"));
 		roots.push(root);
 		const agentDir = join(root, ".riemann", "agent");
@@ -141,12 +146,12 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		const store = new RiemannStore(agentDir);
 		try {
 			const run = store.openRun("shell-nested-state", root);
-			const shell = new ShellFunctions(root, new ArtifactStore(store, run.id), 100_000, {
-				agentDir,
-				filesystemScope: "workspace",
-				workspaceWritable: false,
-				networkAllowed: false,
-			});
+			const shell = new ShellFunctions(
+				fileAccessPolicy(root, { read: ["/"], readExclude: [agentDir], write: ["/"], writeExclude: [] }),
+				new ArtifactStore(store, run.id),
+				100_000,
+				false,
+			);
 			const definition = shell.definitions().find((item) => item.name === "run");
 			if (!definition) throw new Error("shell.run is unavailable");
 			const script = `const fs=require("node:fs");const out={visible:fs.readFileSync("visible.txt","utf8")};try{fs.readFileSync(${JSON.stringify(join(agentDir, "auth.json"))},"utf8");out.state="allowed"}catch(error){out.state=error.code}console.log(JSON.stringify(out))`;
@@ -161,7 +166,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 			expect(output.state).not.toBe("allowed");
 			await expect(
 				definition.handler(
-					{ command: process.execPath, args: ["-e", ""], cwd: ".riemann/agent", timeout: 10 },
+					{ command: process.execPath, args: ["-e", ""], cwd: agentDir, timeout: 10 },
 					new AbortController().signal,
 				),
 			).rejects.toMatchObject({ code: "permission_denied" });
@@ -170,7 +175,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		}
 	}, 30_000);
 
-	test("allows a main Agent with host scope to access paths outside its workspace", async () => {
+	test("allows an unrestricted policy to access paths outside its workspace", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-host-"));
 		roots.push(root);
 		const workspace = join(root, "workspace");
@@ -181,12 +186,12 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		const store = new RiemannStore(join(root, "agent"));
 		try {
 			const run = store.openRun("shell-host", workspace);
-			const shell = new ShellFunctions(workspace, new ArtifactStore(store, run.id), 100_000, {
-				agentDir: join(root, "agent"),
-				filesystemScope: "host",
-				workspaceWritable: true,
-				networkAllowed: false,
-			});
+			const shell = new ShellFunctions(
+				fileAccessPolicy(workspace, FULL_FILESYSTEM),
+				new ArtifactStore(store, run.id),
+				100_000,
+				false,
+			);
 			const definition = shell.definitions().find((item) => item.name === "run");
 			if (!definition) throw new Error("shell.run is unavailable");
 			const script = `const fs=require("node:fs");fs.writeFileSync("created.txt","created");console.log(fs.readFileSync("secret.txt","utf8"))`;

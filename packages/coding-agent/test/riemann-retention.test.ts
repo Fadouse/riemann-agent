@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { execCommand } from "../src/core/exec.ts";
+import { FULL_FILESYSTEM } from "../src/riemann/access-policy.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
 import { applyRetention } from "../src/riemann/state/retention.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
@@ -58,9 +59,9 @@ describe("Riemann state retention", () => {
 				modelRole: "inherit",
 				workspace: repository,
 				workspaceMode: "worktree",
-				permissions: "workspace",
+				filesystem: FULL_FILESYSTEM,
 				depth: 1,
-				capabilities: ["workspace.read"],
+				capabilities: ["fs.read"],
 			});
 			const worktree = join(store.root, "workspaces", closed.id, child.id);
 			await mkdir(join(store.root, "workspaces", closed.id), { recursive: true });

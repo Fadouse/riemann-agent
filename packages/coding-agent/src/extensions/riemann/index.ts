@@ -135,7 +135,7 @@ function appendProjectContext(prompt: string, options: BuildSystemPromptOptions)
 		sections.push(
 			[
 				"<available_skills>",
-				"Load a skill with workspace.read only when its description matches the task.",
+				"Load a skill with fs.read only when its description matches the task.",
 				...options.skills.map((skill) => `- ${skill.name}: ${skill.description}\n  path: ${skill.filePath}`),
 				"</available_skills>",
 			].join("\n"),

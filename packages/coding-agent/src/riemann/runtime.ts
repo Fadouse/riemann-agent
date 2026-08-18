@@ -1,10 +1,11 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { getPackageDir, isBunBinary } from "../config.ts";
 import type { CompactionPreparation, CompactionResult } from "../core/compaction/index.ts";
 import type { ExtensionContext, ToolDefinition } from "../core/extensions/types.ts";
+import { assertWritable, fileAccessPolicy, resolveFilesystemSnapshot } from "./access-policy.ts";
 import { RiemannActivityTracker } from "./activity.ts";
 import {
 	type AgentEventDelivery,
@@ -16,10 +17,10 @@ import { createRiemannCompaction, createRiemannSnapshotCompaction } from "./comp
 import { expandConfigSecret, getRiemannAgentDir, loadRiemannConfig, type RiemannConfig } from "./config.ts";
 import { formatEnvironmentContext } from "./environment.ts";
 import { RiemannHostError } from "./errors.ts";
+import { FileFunctions } from "./functions/fs.ts";
 import { type FunctionDefinition, FunctionRegistry, hasCapability } from "./functions/registry.ts";
 import { ShellFunctions } from "./functions/shell.ts";
 import { WebFunctions } from "./functions/web.ts";
-import { WorkspaceFunctions } from "./functions/workspace.ts";
 import { storeModelImage } from "./images.ts";
 import {
 	IPYTHON_TOOL_DESCRIPTION,
@@ -65,14 +66,6 @@ function preludePath(): string {
 	if (isBunBinary) return join(packageDir, "riemann-python", "prelude.py");
 	const source = join(packageDir, "src", "riemann", "python", "prelude.py");
 	return existsSync(source) ? source : join(packageDir, "dist", "riemann", "python", "prelude.py");
-}
-
-function isInside(root: string, path: string): boolean {
-	const pathFromRoot = relative(root, path);
-	return (
-		pathFromRoot === "" ||
-		(!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot))
-	);
 }
 
 function artifactHandle(value: JsonValue): string | undefined {
@@ -135,6 +128,7 @@ async function existingExaKey(config: RiemannConfig): Promise<string | undefined
 export class RiemannRuntime {
 	private readonly registry = new FunctionRegistry();
 	private readonly capabilities: ReadonlySet<string>;
+	private readonly policy: ReturnType<typeof fileAccessPolicy>;
 	private readonly mcp: RiemannMcpManager;
 	private kernel?: IPythonKernelManager;
 	private kernelStartup?: Promise<IPythonKernelManager>;
@@ -149,31 +143,21 @@ export class RiemannRuntime {
 		this.agent = agent;
 		this.root = root;
 		this.capabilities = new Set(agent.capabilities);
-		const protectedRoots = agent.permissions === "workspace" ? [shared.agentDir] : [];
-		const workspace = new WorkspaceFunctions(
-			agent.workspace,
-			shared.run.id,
-			shared.store,
-			shared.artifacts,
-			protectedRoots,
-		);
+		this.policy = fileAccessPolicy(agent.workspace, agent.filesystem);
+		const policy = this.policy;
+		const files = new FileFunctions(policy, shared.run.id, shared.store, shared.artifacts);
 		const shell = new ShellFunctions(
-			agent.workspace,
+			policy,
 			shared.artifacts,
 			shared.config.limits.maxArtifactPreviewChars,
-			{
-				agentDir: shared.agentDir,
-				filesystemScope: agent.permissions,
-				workspaceWritable: hasCapability(this.capabilities, "workspace.write", "workspace"),
-				networkAllowed: hasCapability(this.capabilities, "shell.network", "shell"),
-			},
+			hasCapability(this.capabilities, "shell.network", "shell"),
 		);
 		const web = new WebFunctions(
 			shared.config.web.searchBackend === "exa" ? exaApiKey : undefined,
 			shared.artifacts,
 			shared.config.limits.maxArtifactPreviewChars,
 		);
-		for (const definition of [...workspace.definitions(), ...shell.definitions(), ...web.definitions()])
+		for (const definition of [...files.definitions(), ...shell.definitions(), ...web.definitions()])
 			this.registry.register(definition);
 		this.mcp = new RiemannMcpManager(shared.config.mcpServers, agent.workspace, this.registry, shared.artifacts);
 		for (const definition of this.mcp.definitions()) this.registry.register(definition);
@@ -187,7 +171,13 @@ export class RiemannRuntime {
 		const store = new RiemannStore(agentDir);
 		const run = store.openRun(ctx.sessionManager.getSessionId(), ctx.cwd);
 		const retentionReport = await applyRetention(store, config.retention);
-		const rootAgent = store.ensureRootAgent(run.id, ctx.cwd, config.mainAgent.permissions);
+		const mainFilesystem = resolveFilesystemSnapshot({
+			config: config.mainAgent.filesystem,
+			mode: "main",
+			workspace: ctx.cwd,
+			parent: undefined,
+		});
+		const rootAgent = store.ensureRootAgent(run.id, ctx.cwd, mainFilesystem);
 		const artifacts = new ArtifactStore(store, run.id);
 		const rootContext = {
 			cwd: ctx.cwd,
@@ -256,37 +246,13 @@ export class RiemannRuntime {
 	}
 
 	private async resolveArtifactDestination(input: string): Promise<string> {
-		const root = resolve(this.agent.workspace);
-		const candidate = resolve(root, input);
-		const stateRoot = resolve(this.shared.agentDir);
-		const protectedState =
-			this.agent.permissions === "workspace" && stateRoot !== root && isInside(root, stateRoot)
-				? stateRoot
-				: undefined;
-		if (protectedState && isInside(protectedState, candidate)) {
-			throw new RiemannHostError("permission_denied", `Destination is reserved for Riemann state: ${input}`);
-		}
-		if (!isInside(root, candidate)) {
-			throw new RiemannHostError("permission_denied", `Destination is outside the workspace: ${input}`);
-		}
-		const canonicalRoot = await realpath(root);
-		const canonicalProtectedState = protectedState ? await realpath(protectedState) : undefined;
+		const candidate = resolve(this.policy.cwd, input);
+		assertWritable(this.policy, candidate, input);
 		let ancestor = dirname(candidate);
 		while (true) {
 			try {
-				const canonicalAncestor = await realpath(ancestor);
-				if (!isInside(canonicalRoot, canonicalAncestor)) {
-					throw new RiemannHostError(
-						"permission_denied",
-						`Destination parent resolves outside the workspace: ${input}`,
-					);
-				}
-				if (canonicalProtectedState && isInside(canonicalProtectedState, canonicalAncestor)) {
-					throw new RiemannHostError(
-						"permission_denied",
-						`Destination parent is reserved for Riemann state: ${input}`,
-					);
-				}
+				const canonical = await realpath(ancestor);
+				assertWritable(this.policy, canonical, input);
 				break;
 			} catch (error) {
 				if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
@@ -296,13 +262,8 @@ export class RiemannRuntime {
 			}
 		}
 		await mkdir(dirname(candidate), { recursive: true });
-		const canonicalParent = await realpath(dirname(candidate));
-		if (!isInside(canonicalRoot, canonicalParent)) {
-			throw new RiemannHostError("permission_denied", `Destination parent resolves outside the workspace: ${input}`);
-		}
-		if (canonicalProtectedState && isInside(canonicalProtectedState, canonicalParent)) {
-			throw new RiemannHostError("permission_denied", `Destination parent is reserved for Riemann state: ${input}`);
-		}
+		const parent = await realpath(dirname(candidate));
+		assertWritable(this.policy, parent, input);
 		return candidate;
 	}
 
@@ -453,8 +414,13 @@ export class RiemannRuntime {
 					agent_name: this.agent.name,
 					workspace: this.agent.workspace,
 					config_files: this.shared.config.files,
-					filesystem_scope: this.agent.permissions,
-					main_agent_permissions: this.shared.config.mainAgent.permissions,
+					filesystem: {
+						cwd: this.policy.cwd,
+						read: [...this.policy.readRoots],
+						read_exclude: [...this.policy.readExcludes],
+						write: [...this.policy.writeRoots],
+						write_exclude: [...this.policy.writeExcludes],
+					},
 					subagent_defaults: this.shared.config.agentDefaults,
 					agent_slots: {
 						max: this.shared.config.maxAgents,
@@ -600,11 +566,7 @@ export class RiemannRuntime {
 				hostRequest: (request, signal, onUpdate) =>
 					this.registry.dispatch(request, this.capabilities, signal, onUpdate),
 				snapshotPath: join(this.shared.store.snapshotsDir, this.agent.id, "kernel.dill"),
-				sandbox: {
-					agentDir: this.shared.agentDir,
-					filesystemScope: this.agent.permissions,
-					workspaceWritable: hasCapability(this.capabilities, "workspace.write", "workspace"),
-				},
+				sandbox: { policy: this.policy },
 				maxOutputChars: Math.max(this.shared.config.limits.maxCellOutputChars * 4, 400_000),
 				onRestore: (result) => {
 					this.pendingRestoreNotice = restoreNotice(result);

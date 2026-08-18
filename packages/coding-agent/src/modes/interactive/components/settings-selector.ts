@@ -532,13 +532,7 @@ function parseRiemannValue(path: string, display: string): unknown {
 	if (path.endsWith(".enabled") || path.endsWith(".exposeToModel")) return display === "true";
 	if (path === "agents.defaults.model") return display === "inherit" ? undefined : display;
 	if (path.endsWith("TimeoutMs") || path === "agents.maxAgents") return Number.parseInt(display, 10);
-	if (
-		path === "compaction.strategy" ||
-		path === "agents.main.permissions" ||
-		path === "agents.defaults.workspace" ||
-		path === "agents.defaults.permissions"
-	)
-		return display;
+	if (path === "compaction.strategy" || path === "agents.defaults.workspace") return display;
 	return Number.parseFloat(display);
 }
 

@@ -133,7 +133,8 @@ describe("Riemann session extension", () => {
 				"    researcher:",
 				"      description: Research public sources without modifying files.",
 				"      workspace: shared",
-				"      permissions: workspace",
+				"      filesystem:",
+				"        write: []",
 				"      capabilities:",
 				"        - web",
 				"mcp:",
@@ -225,7 +226,7 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).toContain("already available as globals");
 			expect(systemPrompt).toContain("compose operations with normal Python");
 			expect(systemPrompt).toContain("## Available operations");
-			expect(systemPrompt).toContain("`await workspace.read(path) -> TextSnapshot | ImageSnapshot`");
+			expect(systemPrompt).toContain("`await fs.read(path) -> TextSnapshot | ImageSnapshot`");
 			expect(systemPrompt).toContain("`await shell.run(");
 			expect(systemPrompt).toContain("`await artifacts.view(handle) -> ImageSnapshot`");
 			expect(systemPrompt).toContain("`await agents.spawn(task, name=None, profile=None) -> AgentHandle`");
@@ -274,9 +275,9 @@ describe("Riemann session extension", () => {
 						"assert not hasattr(agents, 'revive')",
 						"mesh = await agents.list()",
 						"assert mesh == [], mesh",
-						"snap = await workspace.create(path='value.txt', text='before\\n')",
-						"snap = await workspace.edit(snapshot=snap, operations=[{'kind':'replace','start':0,'end':6,'text':'after'}])",
-						"image = await workspace.read(path='pixel.png')",
+						"snap = await fs.create(path='value.txt', text='before\\n')",
+						"snap = await fs.edit(snapshot=snap, operations=[{'kind':'replace','start':0,'end':6,'text':'after'}])",
+						"image = await fs.read(path='pixel.png')",
 						"assert isinstance(image, ImageSnapshot), image",
 						"viewed = await image.artifact.view()",
 						"assert isinstance(viewed, ImageSnapshot), viewed",

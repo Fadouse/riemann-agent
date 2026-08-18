@@ -44,7 +44,7 @@ Riemann runs every IPython kernel and host shell process in a mandatory native s
 - macOS: the built-in Seatbelt sandbox through `/usr/bin/sandbox-exec`.
 - Other platforms: startup of an execution kernel fails explicitly; there is no unsandboxed fallback.
 
-Direct Python network access is denied. The main Agent uses `host` filesystem permissions by default and a trusted project can select `agents.main.permissions: workspace`. Subagents independently select `shared` or `worktree` topology and `host` or `workspace` permissions; defaults are `shared` plus `workspace`. When Riemann state is nested inside a workspace, workspace-scoped Agents see a masked state subtree with only the managed runtime remounted read-only; durable snapshots are staged through the isolated kernel directory. The main Agent can explicitly use `shell.network`; default children cannot. Containers may still be used as an additional deployment boundary.
+Direct Python network access is denied. Filesystem access follows a per-agent `FileAccessPolicy` configured through `agents.*.filesystem` (`read`, `readExclude`, `write`, `writeExclude`, each a path list or `inherit`); the main Agent defaults to unrestricted read and write of `/`, shared Subagents inherit their caller's policy, and worktree Subagents inherit reads while writing only their own worktree. Exclusions exist only where configured. When Riemann state is nested inside a workspace, workspace-scoped Agents see a masked state subtree with only the managed runtime remounted read-only; durable snapshots are staged through the isolated kernel directory. The main Agent can explicitly use `shell.network`; default children cannot. Containers may still be used as an additional deployment boundary.
 
 ## Contributing
 

@@ -1,4 +1,5 @@
 import type { ChildProcess } from "node:child_process";
+import type { FileAccessPolicy } from "../access-policy.ts";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -134,9 +135,8 @@ export type KernelHostRequestHandler = (
 ) => Promise<JsonValue | KernelHostResult>;
 
 export interface KernelSandboxConfiguration {
-	agentDir: string;
-	filesystemScope: "host" | "workspace";
-	workspaceWritable: boolean;
+	policy: FileAccessPolicy;
+	networkAllowed?: boolean;
 	platform?: NodeJS.Platform;
 	bubblewrapPath?: string;
 	sandboxExecPath?: string;

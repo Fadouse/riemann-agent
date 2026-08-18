@@ -1,7 +1,8 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
+import { assertReadable, type FileAccessPolicy } from "../access-policy.ts";
 import { RiemannHostError } from "../errors.ts";
 import { resolveSandboxExecutable, type SandboxedCommand, sandboxedKernelCommand } from "../kernel/sandbox.ts";
 import type { JsonValue } from "../kernel/types.ts";
@@ -38,14 +39,6 @@ function parseEnvironment(value: JsonValue | undefined): Record<string, string> 
 	return environment;
 }
 
-function isInside(root: string, path: string): boolean {
-	const pathFromRoot = relative(root, path);
-	return (
-		pathFromRoot === "" ||
-		(!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !pathFromRoot.startsWith("/"))
-	);
-}
-
 function appendCaptured(chunks: Buffer[], currentBytes: number, chunk: Buffer, maxBytes = MAX_CAPTURE_BYTES): number {
 	if (currentBytes >= maxBytes) return currentBytes;
 	const remaining = maxBytes - currentBytes;
@@ -53,43 +46,25 @@ function appendCaptured(chunks: Buffer[], currentBytes: number, chunk: Buffer, m
 	return currentBytes + Math.min(chunk.length, remaining);
 }
 
-export interface ShellSandboxPolicy {
-	agentDir: string;
-	filesystemScope: "host" | "workspace";
-	workspaceWritable: boolean;
-	networkAllowed: boolean;
-}
-
 export class ShellFunctions {
-	private readonly root: string;
+	private readonly policy: FileAccessPolicy;
 	private readonly artifacts: ArtifactStore;
 	private readonly previewChars: number;
-	private readonly sandbox: ShellSandboxPolicy;
+	private readonly networkAllowed: boolean;
 
-	constructor(root: string, artifacts: ArtifactStore, previewChars: number, sandbox: ShellSandboxPolicy) {
-		this.root = resolve(root);
+	constructor(policy: FileAccessPolicy, artifacts: ArtifactStore, previewChars: number, networkAllowed: boolean) {
+		this.policy = policy;
 		this.artifacts = artifacts;
 		this.previewChars = previewChars;
-		this.sandbox = sandbox;
+		this.networkAllowed = networkAllowed;
 	}
 
 	private resolveCwd(value: JsonValue | undefined): string {
-		if (value === undefined || value === null) return this.root;
+		if (value === undefined || value === null) return this.policy.cwd;
 		if (typeof value !== "string" || value.length === 0)
 			throw new RiemannHostError("invalid_arguments", "cwd must be a non-empty string");
-		const cwd = resolve(this.root, value);
-		if (this.sandbox.filesystemScope === "workspace" && !isInside(this.root, cwd)) {
-			throw new RiemannHostError("permission_denied", `Command cwd is outside the workspace: ${value}`);
-		}
-		const stateRoot = resolve(this.sandbox.agentDir);
-		if (
-			this.sandbox.filesystemScope === "workspace" &&
-			stateRoot !== this.root &&
-			isInside(this.root, stateRoot) &&
-			isInside(stateRoot, cwd)
-		) {
-			throw new RiemannHostError("permission_denied", `Command cwd is reserved for Riemann state: ${value}`);
-		}
+		const cwd = resolve(this.policy.cwd, value);
+		assertReadable(this.policy, cwd, value);
 		return cwd;
 	}
 
@@ -127,12 +102,8 @@ export class ShellFunctions {
 		try {
 			launch = sandboxedKernelCommand(
 				{
-					agentDir: this.sandbox.agentDir,
-					workspace: this.root,
-					cwd: options.cwd,
-					filesystemScope: this.sandbox.filesystemScope,
-					workspaceWritable: this.sandbox.workspaceWritable,
-					networkAllowed: this.sandbox.networkAllowed,
+					policy: { ...this.policy, cwd: options.cwd },
+					networkAllowed: this.networkAllowed,
 					python: executable,
 					connectionDir: sandboxDir,
 					environment: options.env,
@@ -239,6 +210,8 @@ export class ShellFunctions {
 	}
 
 	definitions(): FunctionDefinition[] {
+		const cwdDescription =
+			"Working directory; relative paths resolve from the current working directory and absolute host paths are allowed";
 		return [
 			{
 				name: "run",
@@ -248,15 +221,7 @@ export class ShellFunctions {
 				parameters: [
 					{ name: "command", description: "Executable name or path", type: "str", required: true },
 					{ name: "args", description: "Argument list", type: "list[str] | None", required: false },
-					{
-						name: "cwd",
-						description:
-							this.sandbox.filesystemScope === "host"
-								? "Working directory; relative paths resolve from the project workspace and absolute host paths are allowed"
-								: "Workspace-relative working directory",
-						type: "str | None",
-						required: false,
-					},
+					{ name: "cwd", description: cwdDescription, type: "str | None", required: false },
 					{
 						name: "env",
 						description: "Additional environment variables",
@@ -295,15 +260,7 @@ export class ShellFunctions {
 				promptSnippet: "Use a shell only for pipes, redirection, or compound syntax.",
 				parameters: [
 					{ name: "script", description: "Shell source", type: "str", required: true },
-					{
-						name: "cwd",
-						description:
-							this.sandbox.filesystemScope === "host"
-								? "Working directory; relative paths resolve from the project workspace and absolute host paths are allowed"
-								: "Workspace-relative working directory",
-						type: "str | None",
-						required: false,
-					},
+					{ name: "cwd", description: cwdDescription, type: "str | None", required: false },
 					{
 						name: "env",
 						description: "Additional environment variables",

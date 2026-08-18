@@ -4,24 +4,24 @@ import { FunctionRegistry } from "../src/riemann/functions/registry.ts";
 function registerFixtureFunctions(registry: FunctionRegistry): void {
 	registry.register({
 		name: "read",
-		namespace: "workspace",
-		description: "Read a workspace file.",
+		namespace: "fs",
+		description: "Read a file.",
 		promptSnippet: "Read a file.",
 		parameters: [{ name: "path", description: "Path", type: "str", required: true }],
 		returns: "TextSnapshot",
-		capability: "workspace.read",
+		capability: "fs.read",
 		handler: async () => null,
 	});
 	registry.register({
 		name: "edit",
-		namespace: "workspace",
-		description: "Edit a workspace snapshot.",
+		namespace: "fs",
+		description: "Edit a file snapshot.",
 		parameters: [
 			{ name: "snapshot", description: "Snapshot", type: "TextSnapshot", required: true },
 			{ name: "operations", description: "Edits", type: "list[dict]", required: true },
 		],
 		returns: "TextSnapshot",
-		capability: "workspace.write",
+		capability: "fs.write",
 		promptGuidelines: ["Read before editing."],
 		handler: async () => null,
 	});
@@ -42,15 +42,15 @@ describe("Riemann function registry prompt inventory", () => {
 	test("lists compact signatures and filters unavailable capabilities", () => {
 		const registry = new FunctionRegistry();
 		registerFixtureFunctions(registry);
-		const readOnly = new Set(["workspace.read"]);
+		const readOnly = new Set(["fs.read"]);
 
 		const inventory = registry.promptInventory(readOnly);
-		expect(inventory).toContain("`await workspace.read(path) -> TextSnapshot`: Read a file.");
+		expect(inventory).toContain("`await fs.read(path) -> TextSnapshot`: Read a file.");
 		expect(inventory).toContain("`await catalog.search(query, limit=None) -> list[dict]`");
-		expect(inventory).not.toContain("workspace.edit");
+		expect(inventory).not.toContain("fs.edit");
 		expect(registry.pythonSpecifications(undefined, readOnly).map((item) => item.qualified_name)).toEqual([
 			"catalog.search",
-			"workspace.read",
+			"fs.read",
 		]);
 		expect(registry.promptGuidelines(readOnly)).toEqual([]);
 	});
@@ -58,10 +58,10 @@ describe("Riemann function registry prompt inventory", () => {
 	test("keeps discovery results and descriptions inside the same capability boundary", () => {
 		const registry = new FunctionRegistry();
 		registerFixtureFunctions(registry);
-		const readOnly = new Set(["workspace.read"]);
+		const readOnly = new Set(["fs.read"]);
 
-		expect(JSON.stringify(registry.search("workspace", 8, readOnly))).not.toContain("workspace.edit");
-		expect(() => registry.describe("workspace.edit", readOnly)).toThrow("Function not found");
-		expect(registry.promptGuidelines(new Set(["workspace.*"]))).toEqual(["Read before editing."]);
+		expect(JSON.stringify(registry.search("fs", 8, readOnly))).not.toContain("fs.edit");
+		expect(() => registry.describe("fs.edit", readOnly)).toThrow("Function not found");
+		expect(registry.promptGuidelines(new Set(["fs.*"]))).toEqual(["Read before editing."]);
 	});
 });

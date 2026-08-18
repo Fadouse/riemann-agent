@@ -5,8 +5,18 @@ import { isAbsolute, join, resolve } from "node:path";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import type { FilesystemConfig } from "./access-policy.ts";
 
-const AgentPermissionsSchema = Type.Union([Type.Literal("host"), Type.Literal("workspace")]);
+const FilesystemFieldSchema = Type.Union([Type.Array(Type.String({ minLength: 1 })), Type.Literal("inherit")]);
+const FilesystemSchema = Type.Object(
+	{
+		read: Type.Optional(FilesystemFieldSchema),
+		readExclude: Type.Optional(FilesystemFieldSchema),
+		write: Type.Optional(FilesystemFieldSchema),
+		writeExclude: Type.Optional(FilesystemFieldSchema),
+	},
+	{ additionalProperties: false },
+);
 const SubagentWorkspaceSchema = Type.Union([Type.Literal("shared"), Type.Literal("worktree")]);
 const ThinkingLevelSchema = Type.Union([
 	Type.Literal("off"),
@@ -30,7 +40,7 @@ const AgentProfileSchema = Type.Object(
 		thinkingLevel: Type.Optional(ThinkingLevelSchema),
 		capabilities: Type.Optional(Type.Array(Type.String())),
 		workspace: Type.Optional(SubagentWorkspaceSchema),
-		permissions: Type.Optional(AgentPermissionsSchema),
+		filesystem: Type.Optional(FilesystemSchema),
 	},
 	{ additionalProperties: false },
 );
@@ -63,14 +73,14 @@ const ConfigSchema = Type.Object(
 				{
 					maxAgents: Type.Optional(Type.Integer({ minimum: 0, maximum: 16 })),
 					main: Type.Optional(
-						Type.Object({ permissions: Type.Optional(AgentPermissionsSchema) }, { additionalProperties: false }),
+						Type.Object({ filesystem: Type.Optional(FilesystemSchema) }, { additionalProperties: false }),
 					),
 					defaults: Type.Optional(
 						Type.Object(
 							{
 								model: Type.Optional(Type.String({ minLength: 1 })),
 								workspace: Type.Optional(SubagentWorkspaceSchema),
-								permissions: Type.Optional(AgentPermissionsSchema),
+								filesystem: Type.Optional(FilesystemSchema),
 							},
 							{ additionalProperties: false },
 						),
@@ -102,16 +112,16 @@ const ConfigSchema = Type.Object(
 export type RiemannConfigFile = Static<typeof ConfigSchema>;
 export type AgentProfileConfig = Static<typeof AgentProfileSchema>;
 export type McpServerConfig = Static<typeof McpServerSchema>;
-export type AgentPermissions = Static<typeof AgentPermissionsSchema>;
+export type RiemannFilesystemConfig = Static<typeof FilesystemSchema>;
 export type SubagentWorkspace = Static<typeof SubagentWorkspaceSchema>;
 
 export type RiemannSettingPath =
 	| "agents.maxAgents"
 	| "agents.defaults.model"
 	| "compaction.strategy"
-	| "agents.main.permissions"
+	| "agents.main.filesystem"
 	| "agents.defaults.workspace"
-	| "agents.defaults.permissions"
+	| "agents.defaults.filesystem"
 	| `mcp.servers.${string}.enabled`
 	| `mcp.servers.${string}.exposeToModel`
 	| `mcp.servers.${string}.startupTimeoutMs`
@@ -136,11 +146,11 @@ export interface RiemannConfig {
 		strategy: "snapshot" | "default" | "openai";
 	};
 	mainAgent: {
-		permissions: AgentPermissions;
+		filesystem?: FilesystemConfig;
 	};
 	agentDefaults: {
 		workspace: SubagentWorkspace;
-		permissions: AgentPermissions;
+		filesystem?: FilesystemConfig;
 		model?: string;
 	};
 	profiles: Record<string, AgentProfileConfig>;
@@ -167,8 +177,8 @@ const DEFAULTS: Omit<RiemannConfig, "files"> = {
 		maxWorktreeBytes: 5_368_709_120,
 	},
 	compaction: { strategy: "default" },
-	mainAgent: { permissions: "host" },
-	agentDefaults: { workspace: "shared", permissions: "workspace" },
+	mainAgent: {},
+	agentDefaults: { workspace: "shared" },
 	profiles: {},
 	mcpServers: {},
 	web: { searchBackend: "exa" },
@@ -196,10 +206,10 @@ function configuredSettingPaths(config: RiemannConfigFile): Set<RiemannSettingPa
 	const paths = new Set<RiemannSettingPath>();
 	if (config.agents?.maxAgents !== undefined) paths.add("agents.maxAgents");
 	if (config.compaction?.strategy !== undefined) paths.add("compaction.strategy");
-	if (config.agents?.main?.permissions !== undefined) paths.add("agents.main.permissions");
+	if (config.agents?.main?.filesystem !== undefined) paths.add("agents.main.filesystem");
 	if (config.agents?.defaults?.model !== undefined) paths.add("agents.defaults.model");
 	if (config.agents?.defaults?.workspace !== undefined) paths.add("agents.defaults.workspace");
-	if (config.agents?.defaults?.permissions !== undefined) paths.add("agents.defaults.permissions");
+	if (config.agents?.defaults?.filesystem !== undefined) paths.add("agents.defaults.filesystem");
 	for (const [name, server] of Object.entries(config.mcp?.servers ?? {})) {
 		for (const key of [
 			"enabled",

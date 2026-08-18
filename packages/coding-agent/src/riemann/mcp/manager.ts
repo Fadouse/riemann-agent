@@ -35,7 +35,7 @@ interface McpServerState {
 }
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const RESERVED_NAMESPACES = new Set(["workspace", "shell", "web", "artifacts", "agents", "mcp", "catalog", "state"]);
+const RESERVED_NAMESPACES = new Set(["fs", "shell", "web", "artifacts", "agents", "mcp", "catalog", "state"]);
 
 function safeIdentifier(value: string): string {
 	const normalized = value

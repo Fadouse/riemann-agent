@@ -1,9 +1,10 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { constants, realpathSync } from "node:fs";
+import { constants } from "node:fs";
 import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { glob } from "glob";
 import lockfile from "proper-lockfile";
+import { assertReadable, assertWritable, type FileAccessPolicy, isInside } from "../access-policy.ts";
 import { RiemannHostError } from "../errors.ts";
 import { imageReadNote, type StoredModelImage, storeModelImage } from "../images.ts";
 import { type JsonValue, type KernelHostResult, kernelHostResult } from "../kernel/types.ts";
@@ -53,15 +54,12 @@ function optionalInteger(args: Record<string, JsonValue>, name: string, fallback
 	return value;
 }
 
-function isInside(root: string, path: string): boolean {
-	const pathFromRoot = relative(root, path);
-	return (
-		pathFromRoot === "" ||
-		(!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot))
-	);
-}
 function globPath(path: string): string {
 	return path.split(sep).join("/");
+}
+
+function isNoEntity(error: unknown): boolean {
+	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 async function syncDirectory(path: string): Promise<void> {
@@ -77,76 +75,46 @@ async function syncDirectory(path: string): Promise<void> {
 	}
 }
 
-export class WorkspaceFunctions {
-	private readonly root: string;
+export class FileFunctions {
+	private readonly policy: FileAccessPolicy;
 	private readonly runId: string;
 	private readonly store: RiemannStore;
 	private readonly artifacts: ArtifactStore;
-	private readonly protectedRoots: readonly string[];
-	private readonly canonicalProtectedRoots: readonly string[];
-	private readonly globIgnores: readonly string[];
 
-	constructor(
-		root: string,
-		runId: string,
-		store: RiemannStore,
-		artifacts: ArtifactStore,
-		protectedRoots: readonly string[] = [],
-	) {
-		this.root = resolve(root);
+	constructor(policy: FileAccessPolicy, runId: string, store: RiemannStore, artifacts: ArtifactStore) {
+		this.policy = policy;
 		this.runId = runId;
 		this.store = store;
 		this.artifacts = artifacts;
-		this.protectedRoots = protectedRoots.map((path) => resolve(path)).filter((path) => isInside(this.root, path));
-		this.canonicalProtectedRoots = this.protectedRoots.map((path) => {
-			try {
-				return realpathSync(path);
-			} catch {
-				return path;
-			}
-		});
-		this.globIgnores = this.protectedRoots.flatMap((path) => {
-			const relativePath = globPath(relative(this.root, path));
-			return relativePath ? [relativePath, `${relativePath}/**`] : ["**"];
-		});
 	}
 
-	private assertAllowed(path: string, input: string): void {
-		if (
-			this.protectedRoots.some((root) => isInside(root, path)) ||
-			this.canonicalProtectedRoots.some((root) => isInside(root, path))
-		) {
-			throw new RiemannHostError("permission_denied", `Path is reserved for Riemann state: ${input}`);
+	/** Resolves an existing readable path, rejecting symlink escapes into unreadable locations. */
+	private async resolveExisting(input: string): Promise<string> {
+		const candidate = resolve(this.policy.cwd, input);
+		assertReadable(this.policy, candidate, input);
+		let canonical: string;
+		try {
+			canonical = await realpath(candidate);
+		} catch (error) {
+			if (isNoEntity(error)) throw new RiemannHostError("not_found", `Path does not exist: ${input}`);
+			throw error;
 		}
-	}
-
-	private async resolvePath(input: string): Promise<string> {
-		const candidate = resolve(this.root, input);
-		this.assertAllowed(candidate, input);
-		if (!isInside(this.root, candidate))
-			throw new RiemannHostError("permission_denied", `Path is outside the workspace: ${input}`);
-		const canonical = await realpath(candidate);
-		if (!isInside(this.root, canonical))
-			throw new RiemannHostError("permission_denied", `Path resolves outside the workspace: ${input}`);
-		this.assertAllowed(canonical, input);
+		assertReadable(this.policy, canonical, input);
 		return canonical;
 	}
 
-	private async resolveNewPath(input: string): Promise<string> {
-		const candidate = resolve(this.root, input);
-		if (!isInside(this.root, candidate))
-			throw new RiemannHostError("permission_denied", `Path is outside the workspace: ${input}`);
-		this.assertAllowed(candidate, input);
+	/** Resolves the destination of a new writable path, creating missing parent directories. */
+	private async resolveNew(input: string): Promise<string> {
+		const candidate = resolve(this.policy.cwd, input);
+		assertWritable(this.policy, candidate, input);
 		let ancestor = dirname(candidate);
 		while (true) {
 			try {
 				const canonical = await realpath(ancestor);
-				if (!isInside(this.root, canonical))
-					throw new RiemannHostError("permission_denied", `Parent resolves outside the workspace: ${input}`);
-				this.assertAllowed(canonical, input);
+				assertWritable(this.policy, canonical, input);
 				break;
 			} catch (error) {
-				if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+				if (!isNoEntity(error)) throw error;
 				const parent = dirname(ancestor);
 				if (parent === ancestor) throw error;
 				ancestor = parent;
@@ -154,9 +122,7 @@ export class WorkspaceFunctions {
 		}
 		await mkdir(dirname(candidate), { recursive: true });
 		const parent = await realpath(dirname(candidate));
-		if (!isInside(this.root, parent))
-			throw new RiemannHostError("permission_denied", `Parent resolves outside the workspace: ${input}`);
-		this.assertAllowed(parent, input);
+		assertWritable(this.policy, parent, input);
 		return candidate;
 	}
 
@@ -197,10 +163,7 @@ export class WorkspaceFunctions {
 		kind: "text" | "image";
 	} {
 		if (typeof value !== "object" || value === null || Array.isArray(value)) {
-			throw new RiemannHostError(
-				"invalid_arguments",
-				"snapshot must be a snapshot returned by workspace.read or workspace.edit",
-			);
+			throw new RiemannHostError("invalid_arguments", "snapshot must be a snapshot returned by fs.read or fs.edit");
 		}
 		const reference = value as Partial<SnapshotReference>;
 		if (
@@ -212,7 +175,8 @@ export class WorkspaceFunctions {
 		const capability = this.store.getFileCapability(this.runId, reference.capability);
 		if (!capability)
 			throw new RiemannHostError("not_found", "Snapshot capability is unknown or belongs to another run");
-		this.assertAllowed(capability.path, capability.path);
+		assertReadable(this.policy, capability.path, capability.path);
+		assertWritable(this.policy, capability.path, capability.path);
 		return {
 			...capability,
 			capability: reference.capability,
@@ -281,23 +245,44 @@ export class WorkspaceFunctions {
 		}
 	}
 
+	private async globMatches(pattern: string, includeHidden: boolean): Promise<string[]> {
+		return glob(pattern, {
+			cwd: this.policy.cwd,
+			dot: includeHidden,
+			nodir: true,
+			ignore: [".git/**", "node_modules/**"],
+		});
+	}
+
+	/** Validates one glob result and returns its display path, or undefined when filtered out. */
+	private async visiblePath(match: string): Promise<string | undefined> {
+		try {
+			const path = await this.resolveExisting(match);
+			return isInside(this.policy.cwd, path) ? globPath(relative(this.policy.cwd, path)) : globPath(path);
+		} catch {
+			// Glob patterns may match unreadable paths or symlink escapes.
+			return undefined;
+		}
+	}
+
 	definitions(): FunctionDefinition[] {
+		const pathDescription = "File path; relative paths resolve from the current working directory";
 		return [
 			{
 				name: "read",
-				namespace: "workspace",
+				namespace: "fs",
 				description:
 					"Read a UTF-8 text file or supported image. Text returns TextSnapshot; images return ImageSnapshot.",
 				promptSnippet: "Read a UTF-8 file or image for inspection and safe snapshot-based operations.",
-				parameters: [{ name: "path", description: "Workspace-relative path", type: "str", required: true }],
+				parameters: [{ name: "path", description: pathDescription, type: "str", required: true }],
 				returns: "TextSnapshot | ImageSnapshot",
 				examples: [
-					"snap = await workspace.read(path='src/main.ts')",
-					"image = await workspace.read(path='screenshot.png')",
+					"snap = await fs.read(path='src/main.ts')",
+					"image = await fs.read(path='/abs/path/screenshot.png')",
 				],
-				capability: "workspace.read",
+				capability: "fs.read",
 				handler: async (args) => {
-					const path = await this.resolvePath(requiredString(args, "path"));
+					const path = await this.resolveExisting(requiredString(args, "path"));
 					const bytes = await readFile(path);
 					const detectedImage =
 						bytes.byteLength === 0
@@ -329,9 +314,9 @@ export class WorkspaceFunctions {
 			},
 			{
 				name: "glob",
-				namespace: "workspace",
-				description: "List workspace files matching one or more glob patterns without reading their contents.",
-				promptSnippet: "Find workspace files without reading them.",
+				namespace: "fs",
+				description: "List readable files matching one or more glob patterns without reading their contents.",
+				promptSnippet: "Find files without reading them.",
 				parameters: [
 					{
 						name: "pattern",
@@ -343,34 +328,28 @@ export class WorkspaceFunctions {
 					{ name: "limit", description: "Maximum paths", type: "int | None", required: false },
 				],
 				returns: "list[str]",
-				examples: ["await workspace.glob(pattern='src/**/*.ts', limit=200)"],
-				capability: "workspace.read",
+				examples: ["await fs.glob(pattern='src/**/*.ts', limit=200)"],
+				capability: "fs.read",
 				handler: async (args) => {
-					const matches = await glob(requiredString(args, "pattern"), {
-						cwd: this.root,
-						dot: optionalBoolean(args, "include_hidden", false),
-						nodir: true,
-						ignore: [".git/**", "node_modules/**", ...this.globIgnores],
-					});
+					const matches = await this.globMatches(
+						requiredString(args, "pattern"),
+						optionalBoolean(args, "include_hidden", false),
+					);
 					const limit = Math.max(1, Math.min(optionalInteger(args, "limit", 200), 5_000));
 					const visible: string[] = [];
 					for (const match of matches.sort()) {
 						if (visible.length >= limit) break;
-						try {
-							const path = await this.resolvePath(match);
-							visible.push(globPath(relative(this.root, path)));
-						} catch {
-							// Glob patterns may match protected, outside, or escaping symlink paths.
-						}
+						const path = await this.visiblePath(match);
+						if (path) visible.push(path);
 					}
 					return visible;
 				},
 			},
 			{
 				name: "search",
-				namespace: "workspace",
-				description: "Search UTF-8 workspace files and return matching paths, line numbers, and lines.",
-				promptSnippet: "Search workspace text with paths and line numbers.",
+				namespace: "fs",
+				description: "Search readable UTF-8 files and return matching paths, line numbers, and lines.",
+				promptSnippet: "Search file text with paths and line numbers.",
 				parameters: [
 					{
 						name: "query",
@@ -394,7 +373,7 @@ export class WorkspaceFunctions {
 					{ name: "limit", description: "Maximum matches", type: "int | None", required: false },
 				],
 				returns: "list[dict]",
-				capability: "workspace.read",
+				capability: "fs.read",
 				handler: async (args) => {
 					const query = requiredString(args, "query");
 					const caseSensitive = optionalBoolean(args, "case_sensitive", true);
@@ -402,22 +381,17 @@ export class WorkspaceFunctions {
 						? new RegExp(query, caseSensitive ? "g" : "gi")
 						: undefined;
 					const needle = caseSensitive ? query : query.toLowerCase();
-					const files = await glob(typeof args.pattern === "string" ? args.pattern : "**/*", {
-						cwd: this.root,
-						dot: false,
-						nodir: true,
-						ignore: [".git/**", "node_modules/**", ...this.globIgnores],
-					});
+					const files = await this.globMatches(typeof args.pattern === "string" ? args.pattern : "**/*", false);
 					const limit = Math.max(1, Math.min(optionalInteger(args, "limit", 100), 2_000));
 					const hits: JsonValue[] = [];
 					for (const file of files.sort()) {
 						if (hits.length >= limit) break;
 						let data: Buffer;
 						try {
-							const path = await this.resolvePath(file);
+							const path = await this.resolveExisting(file);
 							data = await readFile(path);
 						} catch {
-							// Glob results can be unreadable or symlink outside the workspace.
+							// Glob results can be unreadable or escape through a symlink.
 							continue;
 						}
 						if (data.includes(0)) continue;
@@ -436,14 +410,14 @@ export class WorkspaceFunctions {
 			},
 			{
 				name: "edit",
-				namespace: "workspace",
+				namespace: "fs",
 				description:
 					"Apply non-overlapping character-offset operations to a TextSnapshot. Fails if the file changed since it was read.",
 				promptSnippet: "Apply non-overlapping edits; fail if the file changed after reading.",
 				parameters: [
 					{
 						name: "snapshot",
-						description: "TextSnapshot from workspace.read or workspace.edit",
+						description: "TextSnapshot from fs.read or fs.edit",
 						type: "TextSnapshot",
 						required: true,
 					},
@@ -457,16 +431,14 @@ export class WorkspaceFunctions {
 				],
 				returns: "TextSnapshot",
 				examples: [
-					"snap = await workspace.edit(snapshot=snap, operations=[{'kind':'replace','start':10,'end':13,'text':'new'}])",
+					"snap = await fs.edit(snapshot=snap, operations=[{'kind':'replace','start':10,'end':13,'text':'new'}])",
 				],
-				capability: "workspace.write",
-				promptGuidelines: [
-					"Read before editing; pass the returned TextSnapshot to workspace.edit or workspace.remove.",
-				],
+				capability: "fs.write",
+				promptGuidelines: ["Read before editing; pass the returned TextSnapshot to fs.edit or fs.remove."],
 				handler: async (args) => {
 					const snapshot = this.resolveSnapshot(args.snapshot);
 					if (snapshot.kind !== "text") {
-						throw new RiemannHostError("invalid_arguments", "workspace.edit only accepts TextSnapshot");
+						throw new RiemannHostError("invalid_arguments", "fs.edit only accepts TextSnapshot");
 					}
 					const release = await lockfile.lock(snapshot.path, { realpath: false, stale: 30_000, retries: 8 });
 					try {
@@ -490,20 +462,20 @@ export class WorkspaceFunctions {
 			},
 			{
 				name: "create",
-				namespace: "workspace",
+				namespace: "fs",
 				description: "Create a new UTF-8 file atomically. Refuses to overwrite an existing path.",
 				promptSnippet: "Create a new UTF-8 file atomically; never overwrite.",
 				parameters: [
-					{ name: "path", description: "Workspace-relative path", type: "str", required: true },
+					{ name: "path", description: pathDescription, type: "str", required: true },
 					{ name: "text", description: "Complete file content", type: "str", required: true },
 				],
 				returns: "TextSnapshot",
-				capability: "workspace.write",
+				capability: "fs.write",
 				handler: async (args) => {
 					const inputPath = requiredString(args, "path");
 					const text = typeof args.text === "string" ? args.text : undefined;
 					if (text === undefined) throw new RiemannHostError("invalid_arguments", "text must be a string");
-					const path = await this.resolveNewPath(inputPath);
+					const path = await this.resolveNew(inputPath);
 					const file = await open(path, "wx", 0o644).catch((error: NodeJS.ErrnoException) => {
 						if (error.code === "EEXIST")
 							throw new RiemannHostError("conflict", `Path already exists: ${inputPath}`);
@@ -524,7 +496,7 @@ export class WorkspaceFunctions {
 			},
 			{
 				name: "remove",
-				namespace: "workspace",
+				namespace: "fs",
 				description:
 					"Delete the file represented by a TextSnapshot or ImageSnapshot. Fails if it changed after the snapshot.",
 				promptSnippet: "Delete an unchanged snapshotted file.",
@@ -537,10 +509,8 @@ export class WorkspaceFunctions {
 					},
 				],
 				returns: "dict",
-				capability: "workspace.write",
-				promptGuidelines: [
-					"Read before editing; pass the returned TextSnapshot to workspace.edit or workspace.remove.",
-				],
+				capability: "fs.write",
+				promptGuidelines: ["Read before editing; pass the returned TextSnapshot to fs.edit or fs.remove."],
 				handler: async (args) => {
 					const snapshot = this.resolveSnapshot(args.snapshot);
 					const release = await lockfile.lock(snapshot.path, { realpath: false, stale: 30_000, retries: 8 });

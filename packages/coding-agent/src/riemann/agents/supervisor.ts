@@ -13,6 +13,7 @@ import { DefaultResourceLoader } from "../../core/resource-loader.ts";
 import { createAgentSession } from "../../core/sdk.ts";
 import { findMostRecentSession, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
+import { isFilesystemSubset, resolveFilesystemSnapshot } from "../access-policy.ts";
 import type { AgentProfileConfig, RiemannConfig } from "../config.ts";
 import { RiemannHostError } from "../errors.ts";
 import type { FunctionDefinition } from "../functions/registry.ts";
@@ -117,14 +118,7 @@ export interface AgentEventDelivery {
 	events: AgentCompletionNotice[];
 }
 
-const DEFAULT_CHILD_CAPABILITIES = [
-	"workspace.read",
-	"workspace.write",
-	"shell.run",
-	"web.search",
-	"web.fetch",
-	"mcp.*",
-];
+const DEFAULT_CHILD_CAPABILITIES = ["fs.read", "fs.write", "shell.run", "web.search", "web.fetch", "mcp.*"];
 const AGENT_OUTPUT_PREVIEW_CHARS = 160;
 
 function canonicalCapabilities(values: readonly string[]): string[] {
@@ -462,10 +456,23 @@ export class AgentSupervisor {
 		};
 	}
 
+	/** Inventory-time filesystem check; spawn repeats it with the resolved workspace. */
+	private profileFilesystemAllowed(caller: StoredAgent, profile: AgentProfileConfig): boolean {
+		if (profile.filesystem === undefined) return true;
+		const mode = profile.workspace ?? this.options.config.agentDefaults.workspace;
+		const snapshot = resolveFilesystemSnapshot({
+			config: profile.filesystem,
+			mode,
+			workspace: caller.workspace,
+			parent: caller.filesystem,
+		});
+		return isFilesystemSubset(snapshot, caller.filesystem);
+	}
+
 	private availableProfileEntries(caller: StoredAgent): Array<[string, AgentProfileConfig]> {
 		return Object.entries(this.options.config.profiles)
 			.filter(([, profile]) => {
-				if (profile.permissions === "host" && caller.permissions !== "host") return false;
+				if (!this.profileFilesystemAllowed(caller, profile)) return false;
 				const capabilities = profile.capabilities
 					? canonicalCapabilities(profile.capabilities)
 					: this.defaultCapabilities(caller);
@@ -1104,13 +1111,30 @@ export class AgentSupervisor {
 		}
 
 		const workspaceMode = requestedProfile?.workspace ?? this.options.config.agentDefaults.workspace;
-		const permissions = requestedProfile?.permissions ?? this.options.config.agentDefaults.permissions;
-		if (permissions === "host" && caller.permissions !== "host") {
-			throw new RiemannHostError(
-				"permission_denied",
-				`Child host permissions exceed parent ${caller.name} workspace permissions`,
-			);
-		}
+		const filesystemConfig = requestedProfile?.filesystem ?? this.options.config.agentDefaults.filesystem;
+		const childFilesystem = (workspace: string, mode: "shared" | "worktree", granted: string[] = []) => {
+			const snapshot = resolveFilesystemSnapshot({
+				config: filesystemConfig,
+				mode,
+				workspace,
+				parent: caller.filesystem,
+			});
+			if (!isFilesystemSubset(snapshot, caller.filesystem, granted)) {
+				throw new RiemannHostError(
+					"permission_denied",
+					`Child filesystem exceeds parent ${caller.name} filesystem policy`,
+				);
+			}
+			return snapshot;
+		};
+		// Worktree children resolve their default write root against their own
+		// workspace, so the pre-worktree check grants the caller workspace just
+		// like the host-provisioned worktree root is granted after creation.
+		const filesystem = childFilesystem(
+			caller.workspace,
+			workspaceMode,
+			workspaceMode === "worktree" ? [caller.workspace] : [],
+		);
 		const capabilities = this.resolveCapabilities(
 			caller,
 			requestedProfile?.capabilities
@@ -1129,7 +1153,7 @@ export class AgentSupervisor {
 				modelRole: profileName ?? "inherit",
 				workspace: caller.workspace,
 				workspaceMode,
-				permissions,
+				filesystem,
 				depth: 1,
 				capabilities,
 			},
@@ -1156,7 +1180,10 @@ export class AgentSupervisor {
 		if (workspaceMode === "worktree") {
 			try {
 				const worktree = await this.worktreeWorkspace(agent.id, caller.workspace);
-				agent = this.options.store.updateAgent(agent.id, { workspace: worktree });
+				agent = this.options.store.updateAgent(agent.id, {
+					workspace: worktree,
+					filesystem: childFilesystem(worktree, "worktree", [worktree]),
+				});
 			} catch (error) {
 				await this.settleAgent(
 					agent,

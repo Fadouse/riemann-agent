@@ -180,7 +180,7 @@ export class RiemannActivityTracker {
 			return { activity };
 		}
 
-		if (type === "workspace.create") {
+		if (type === "fs.create") {
 			const text = stringValue(args.text) ?? "";
 			const activity: IPythonFileActivity = {
 				id,
@@ -193,10 +193,10 @@ export class RiemannActivityTracker {
 			return { activity };
 		}
 
-		if (type === "workspace.edit" || type === "workspace.remove") {
+		if (type === "fs.edit" || type === "fs.remove") {
 			const path = this.snapshotPath(args);
 			const before = path ? await this.readWorkspaceFile(path) : undefined;
-			if (type === "workspace.edit") {
+			if (type === "fs.edit") {
 				const activity: IPythonPatchActivity = {
 					id,
 					kind: "patch",

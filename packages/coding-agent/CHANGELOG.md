@@ -5,6 +5,10 @@
 ### Breaking Changes
 
 - Renamed the public `AgentResult.result` field to `AgentResult.output`; update consumers of `agents.run()`, `AgentHandle.wait()`, and `AgentHandle.stop()`.
+- Renamed the `workspace` Python namespace to `fs` (`fs.read`, `fs.glob`, `fs.search`, `fs.edit`, `fs.create`, `fs.remove`); capabilities are now `fs.read`/`fs.write`.
+- Removed `permissions: host|workspace` from `agents.main`, `agents.defaults`, and profiles; configure `filesystem: {read?, readExclude?, write?, writeExclude?}` instead, where each field is an absolute-path list or `inherit`.
+- Changed the main Agent default filesystem to unrestricted read and write of `/` with no built-in exclusions; tools, shell, and the kernel sandbox all consume one `FileAccessPolicy`.
+- Changed shared child Agents to inherit every filesystem field from their calling Agent and worktree children to inherit reads while defaulting writes to their own worktree; exclusions exist only where configured.
 
 ### Added
 

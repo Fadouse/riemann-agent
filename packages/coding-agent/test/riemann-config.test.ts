@@ -24,32 +24,32 @@ describe("Riemann configuration", () => {
 		);
 		await writeFile(
 			join(project, ".riemann", "config.yaml"),
-			"version: 1\nagents:\n  maxAgents: 12\n  main:\n    permissions: workspace\n  defaults:\n    model: anthropic/project-agent\n    workspace: worktree\n    permissions: workspace\ncompaction:\n  strategy: openai\n",
+			'version: 1\nagents:\n  maxAgents: 12\n  main:\n    filesystem:\n      read: ["/"]\n      write: ["/tmp/riemann-bounded"]\n  defaults:\n    model: anthropic/project-agent\n    workspace: worktree\n    filesystem:\n      read: inherit\n      write: inherit\ncompaction:\n  strategy: openai\n',
 		);
 
 		const untrusted = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: false });
 		expect(untrusted.maxAgents).toBe(8);
 		expect(untrusted.maxConcurrentAgents).toBe(4);
 		expect(untrusted.compaction.strategy).toBe("default");
-		expect(untrusted.mainAgent.permissions).toBe("host");
+		expect(untrusted.mainAgent.filesystem).toBeUndefined();
 		expect(untrusted.files).toEqual([join(agentDir, "config.yaml")]);
 		expect(untrusted.agentDefaults.model).toBe("openai/global-agent");
 
 		const bounded = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: true });
 		expect(bounded.maxAgents).toBe(8);
 		expect(bounded.compaction.strategy).toBe("openai");
-		expect(bounded.mainAgent.permissions).toBe("workspace");
+		expect(bounded.mainAgent.filesystem).toEqual({ read: ["/"], write: ["/tmp/riemann-bounded"] });
 		expect(bounded.agentDefaults).toEqual({
 			model: "anthropic/project-agent",
 			workspace: "worktree",
-			permissions: "workspace",
+			filesystem: { read: "inherit", write: "inherit" },
 		});
 		expect(bounded.web.searchBackend).toBe("disabled");
 		expect(bounded.projectOverrides.has("agents.maxAgents")).toBe(false);
 
 		await writeFile(
 			join(project, ".riemann", "config.yaml"),
-			"version: 1\nagents:\n  maxAgents: 2\n  main:\n    permissions: workspace\n  defaults:\n    model: anthropic/project-agent\n    workspace: worktree\n    permissions: workspace\ncompaction:\n  strategy: openai\n",
+			'version: 1\nagents:\n  maxAgents: 2\n  main:\n    filesystem:\n      readExclude: ["~/.ssh"]\n  defaults:\n    model: anthropic/project-agent\n    workspace: worktree\n    filesystem:\n      write: ["/tmp/riemann-lowered"]\ncompaction:\n  strategy: openai\n',
 		);
 		const lowered = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: true });
 		expect(lowered.maxAgents).toBe(2);
@@ -58,10 +58,10 @@ describe("Riemann configuration", () => {
 		expect([...lowered.projectOverrides]).toEqual([
 			"agents.maxAgents",
 			"compaction.strategy",
-			"agents.main.permissions",
+			"agents.main.filesystem",
 			"agents.defaults.model",
 			"agents.defaults.workspace",
-			"agents.defaults.permissions",
+			"agents.defaults.filesystem",
 		]);
 	});
 
@@ -149,16 +149,49 @@ describe("Riemann configuration", () => {
 
 		await updateGlobalRiemannSetting(agentDir, "compaction.strategy", "snapshot");
 		await updateGlobalRiemannSetting(agentDir, "agents.maxAgents", 1);
-		await updateGlobalRiemannSetting(agentDir, "agents.main.permissions", "workspace");
+		await updateGlobalRiemannSetting(agentDir, "agents.main.filesystem", {
+			read: ["/"],
+			write: ["/tmp/riemann-created"],
+		});
 		await updateGlobalRiemannSetting(agentDir, "agents.defaults.workspace", "worktree");
-		await updateGlobalRiemannSetting(agentDir, "agents.defaults.permissions", "host");
+		await updateGlobalRiemannSetting(agentDir, "agents.defaults.filesystem", {
+			read: "inherit",
+			write: ["."],
+		});
 
 		const config = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
 		expect(config.compaction.strategy).toBe("snapshot");
 		expect(config.maxAgents).toBe(1);
-		expect(config.mainAgent.permissions).toBe("workspace");
-		expect(config.agentDefaults).toEqual({ workspace: "worktree", permissions: "host" });
+		expect(config.mainAgent.filesystem).toEqual({ read: ["/"], write: ["/tmp/riemann-created"] });
+		expect(config.agentDefaults).toEqual({
+			workspace: "worktree",
+			filesystem: { read: "inherit", write: ["."] },
+		});
 		expect(await readFile(join(agentDir, "config.yaml"), "utf8")).toContain("version: 1");
+	});
+
+	test("rejects the removed permissions field and accepts filesystem policies", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-config-filesystem-"));
+		roots.push(root);
+		const agentDir = join(root, "agent");
+		await mkdir(agentDir, { recursive: true });
+		await writeFile(join(agentDir, "config.yaml"), "version: 1\nagents:\n  main:\n    permissions: host\n");
+		await expect(loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false })).rejects.toThrow(
+			"Invalid Riemann config",
+		);
+
+		await writeFile(
+			join(agentDir, "config.yaml"),
+			'version: 1\nagents:\n  main:\n    filesystem:\n      read: ["/"]\n      readExclude: ["~/.ssh"]\n      write: ["."]\n      writeExclude: []\n  defaults:\n    filesystem:\n      write: inherit\n',
+		);
+		const config = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
+		expect(config.mainAgent.filesystem).toEqual({
+			read: ["/"],
+			readExclude: ["~/.ssh"],
+			write: ["."],
+			writeExclude: [],
+		});
+		expect(config.agentDefaults.filesystem).toEqual({ write: "inherit" });
 	});
 
 	test("rejects removed limits and profile lifecycle settings", async () => {

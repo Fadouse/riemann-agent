@@ -45,7 +45,7 @@ Run `/agents` to inspect every current-run Agent. The Hub keeps settled Agents v
 
 Every IPython kernel and `shell.*` process runs inside a mandatory OS sandbox. Linux uses Bubblewrap as a filesystem boundary: workspace/state mounts remain capability-scoped, while commands share the host network, process/IPC namespaces, devices, `/proc`, and read-only `/sys`. macOS uses a deny-by-default Seatbelt profile through `/usr/bin/sandbox-exec`. Riemann fails closed when the native sandbox is unavailable; Windows is not supported.
 
-The kernel communicates with the host through ZeroMQ IPC. The main Agent defaults to `host` filesystem permissions; a trusted project can set `agents.main.permissions: workspace` to confine ordinary file reads and writes to the project. Subagents independently use `shared` or `worktree` topology and `host` or `workspace` permissions, defaulting to `shared` plus `workspace`. Linux hardware and system inventory commands can access host devices and system interfaces without bypassing the filesystem mount policy. Managed Python and system executables are read-only, command lookup honors an explicit `env.PATH`, and host credentials remain filtered from the process environment.
+The kernel communicates with the host through ZeroMQ IPC. Filesystem access follows a per-agent `FileAccessPolicy`: the main Agent defaults to unrestricted read and write of `/` with no built-in exclusions, configurable through `agents.main.filesystem` (`read`, `readExclude`, `write`, `writeExclude`, each a path list or `inherit`). Subagents independently use `shared` or `worktree` topology, defaulting to `shared`; shared children inherit every filesystem field from their calling Agent, and worktree children inherit reads while defaulting writes to their own worktree. Exclusions exist only where configured. Linux hardware and system inventory commands can access host devices and system interfaces without bypassing the filesystem mount policy. Managed Python and system executables are read-only, command lookup honors an explicit `env.PATH`, and host credentials remain filtered from the process environment.
 
 Large-result artifacts, kernel snapshots, and isolated worktrees belonging to closed runs are garbage-collected by fixed age and size budgets. Active runs are never selected.
 
@@ -60,11 +60,15 @@ version: 1
 agents:
   maxAgents: 4 # Main Agent excluded; 0 disables delegation
   main:
-    permissions: host # host | workspace
+    filesystem:
+      read: ["/"] # omit for the default unrestricted read root
+      write: ["/"] # omit for the default unrestricted write root
   defaults:
     model: anthropic/claude-sonnet-4-5 # omit to inherit the Main Agent model
     workspace: shared # shared | worktree
-    permissions: workspace # host | workspace
+    filesystem:
+      read: inherit # inherit the calling Agent's read policy
+      write: inherit # shared inherits; worktree defaults to its own worktree
 ```
 
 Named profiles remain optional for specialist prompts, model overrides, or narrower capabilities. `await agents.run()` returns an `AgentResult` whose final response is `output`. `await agents.spawn()` returns a handle after admission while the child continues in the background. Completion reminders are progress signals, not batch barriers: retain every expected handle and retrieve each durable result with `await handle.wait()` before synthesis.
@@ -93,12 +97,12 @@ Strategy selection is literal: `snapshot` requires an image-capable model and al
 
 ## Python operations
 
-The system prompt identifies the current date, working directory, OS, Linux distribution (for example NixOS or Debian), kernel, architecture, and shell so the model can select commands compatible with the actual host. It also lists every built-in async Python operation available to the current agent, filtered by its capability allowlist. These namespaces are preinstalled globals in the persistent IPython environment: bind results to variables and compose multiple operations with normal Python and top-level `await`. Use `help(workspace.edit)` or `await catalog.describe(name="workspace.edit")` only when the compact signature and description are insufficient. `await catalog.search(query="...")` remains available for task-based discovery.
+The system prompt identifies the current date, working directory, OS, Linux distribution (for example NixOS or Debian), kernel, architecture, and shell so the model can select commands compatible with the actual host. It also lists every built-in async Python operation available to the current agent, filtered by its capability allowlist. These namespaces are preinstalled globals in the persistent IPython environment: bind results to variables and compose multiple operations with normal Python and top-level `await`. Use `help(fs.edit)` or `await catalog.describe(name="fs.edit")` only when the compact signature and description are insufficient. `await catalog.search(query="...")` remains available for task-based discovery.
 
 ```python
 import asyncio
 
-snap = await workspace.read(path=\"src/main.ts\")
+snap = await fs.read(path=\"src/main.ts\")
 display(snap.lines(1, 80))
 
 result = await shell.run(command=\"npm\", args=[\"test\"], timeout=300)
