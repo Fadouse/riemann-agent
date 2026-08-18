@@ -17,6 +17,7 @@ import { UserMessageComponent } from "../../modes/interactive/components/user-me
 import { getMarkdownTheme, type Theme } from "../../modes/interactive/theme/theme.ts";
 import type { SubagentUiSnapshot } from "../../riemann/agents/supervisor.ts";
 import type { RiemannRuntime } from "../../riemann/runtime.ts";
+import { stripAnsi } from "../../utils/ansi.ts";
 import {
 	formatFleetElapsed,
 	formatFleetTokens,
@@ -29,6 +30,18 @@ const VIEWPORT_HEIGHT_PERCENT = 70;
 const MIN_VIEWPORT_ROWS = 3;
 const CLOCK_TICK_MS = 200;
 const UPDATE_COALESCE_MS = 32;
+
+function isVisuallyBlank(line: string): boolean {
+	return stripAnsi(line).trim().length === 0;
+}
+
+function trimVisualBlankEdges(lines: readonly string[]): string[] {
+	let start = 0;
+	let end = lines.length;
+	while (start < end && isVisuallyBlank(lines[start] ?? "")) start += 1;
+	while (end > start && isVisuallyBlank(lines[end - 1] ?? "")) end -= 1;
+	return lines.slice(start, end);
+}
 
 interface ViewerKeys {
 	cancel(data: string): boolean;
@@ -204,7 +217,7 @@ export class SubagentConversationViewer implements Component, Focusable {
 		}
 		const snapshot = this.snapshot();
 		const contentLines = this.buildContentLines(this.lastInnerWidth, snapshot);
-		const viewport = this.viewportHeight();
+		const viewport = this.viewportHeight(contentLines.length);
 		const maxScroll = Math.max(0, contentLines.length - viewport);
 		if (this.keys.scrollUp(data)) {
 			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
@@ -254,7 +267,7 @@ export class SubagentConversationViewer implements Component, Focusable {
 			lines.push(middle);
 		}
 		const contentLines = this.buildContentLines(innerWidth, snapshot);
-		const viewport = this.viewportHeight();
+		const viewport = this.viewportHeight(contentLines.length);
 		const maxScroll = Math.max(0, contentLines.length - viewport);
 		if (this.autoScroll) this.scrollOffset = maxScroll;
 		const start = Math.min(this.scrollOffset, maxScroll);
@@ -336,7 +349,9 @@ export class SubagentConversationViewer implements Component, Focusable {
 			lines.push(this.theme.fg("dim", "(waiting for first message...)"));
 		}
 		if (isActiveSubagent(agent)) {
-			lines.push("", `${this.theme.fg("accent", "▍ ")}${this.theme.fg("dim", subagentStatusText(agent))}`);
+			while (lines.length > 0 && isVisuallyBlank(lines.at(-1) ?? "")) lines.pop();
+			if (lines.length > 0) lines.push("");
+			lines.push(`${this.theme.fg("accent", "▍ ")}${this.theme.fg("dim", subagentStatusText(agent))}`);
 		}
 		this.contentCache = {
 			width,
@@ -358,9 +373,10 @@ export class SubagentConversationViewer implements Component, Focusable {
 		}
 		const lines: string[] = [];
 		const append = (rendered: readonly string[]) => {
-			if (rendered.length === 0) return;
+			const compact = trimVisualBlankEdges(rendered);
+			if (compact.length === 0) return;
 			if (lines.length > 0) lines.push("");
-			lines.push(...rendered);
+			lines.push(...compact);
 		};
 		for (const message of messages) {
 			if (typeof message !== "object" || message === null || !("role" in message)) continue;
@@ -411,9 +427,10 @@ export class SubagentConversationViewer implements Component, Focusable {
 		return lines;
 	}
 
-	private viewportHeight(): number {
+	private viewportHeight(contentLineCount: number): number {
 		const maxRows = Math.floor((this.tui.terminal.rows * VIEWPORT_HEIGHT_PERCENT) / 100);
-		return Math.max(MIN_VIEWPORT_ROWS, maxRows - (this.composer ? 8 : 7));
+		const available = Math.max(MIN_VIEWPORT_ROWS, maxRows - (this.composer ? 8 : 7));
+		return Math.max(MIN_VIEWPORT_ROWS, Math.min(available, contentLineCount));
 	}
 
 	private footer(total: number, viewport: number, start: number, width: number): string {

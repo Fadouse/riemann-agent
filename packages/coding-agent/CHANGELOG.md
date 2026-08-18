@@ -18,6 +18,7 @@
 - Changed child delegation to durable per-Turn `AgentHandle` results with `info()`, `wait()`, `send()`, `stop()`, and `release()` lifecycle controls; standard `asyncio.gather(...)` composes independent runs and waits.
 - Changed Linux Riemann isolation to a filesystem-only Bubblewrap policy that preserves workspace/state mounts while sharing host devices and system namespaces for ordinary commands.
 - Changed `agents.list()` to render compact `AgentInfo` summaries with bounded latest-output previews, while retaining full metadata as explicit fields and exact-Turn result retrieval through each item's handle methods.
+- Compacted Subagent Viewer transcript spacing and sized short overlays to their rendered content while preserving long-transcript scrolling.
 
 ### Fixed
 

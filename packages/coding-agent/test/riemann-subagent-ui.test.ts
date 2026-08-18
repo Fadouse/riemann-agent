@@ -14,6 +14,20 @@ import type { SubagentUiSnapshot } from "../src/riemann/agents/supervisor.ts";
 import type { RiemannRuntime } from "../src/riemann/runtime.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
+function longestBlankRun(lines: readonly string[]): number {
+	let longest = 0;
+	let current = 0;
+	for (const line of lines) {
+		if (line.trim().length === 0) {
+			current += 1;
+			longest = Math.max(longest, current);
+		} else {
+			current = 0;
+		}
+	}
+	return longest;
+}
+
 function snapshot(overrides: Partial<SubagentUiSnapshot> = {}): SubagentUiSnapshot {
 	return {
 		id: "agent-1",
@@ -61,6 +75,7 @@ describe("Riemann Subagent UI", () => {
 		expect(rendered).toContain("12s · ↓ 13.1k tokens");
 		expect(rendered).not.toContain("worker-0");
 		expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
+		expect(renderSubagentFleet([], theme)).toEqual([]);
 	});
 
 	test("renders child transcripts with the standard assistant and tool components", () => {
@@ -95,7 +110,7 @@ describe("Riemann Subagent UI", () => {
 				role: "toolResult",
 				toolCallId: "tool-1",
 				toolName: "ipython",
-				content: [{ type: "text", text: "[1, 2, 3]\ncomplete" }],
+				content: [{ type: "text", text: "[1, 2, 3]\n\ncomplete" }],
 				details: { status: "ok", durationMs: 1250 },
 				isError: false,
 				timestamp: Date.now(),
@@ -114,24 +129,70 @@ describe("Riemann Subagent UI", () => {
 			keybindings: new KeybindingsManager(),
 			done: () => undefined,
 		});
-		const collapsed = stripAnsi(viewer.render(100).join("\n"));
+		const collapsedLines = viewer.render(100).map((line) => stripAnsi(line));
+		const collapsed = collapsedLines.join("\n");
 		expect(collapsed).toContain("Found two concrete defects.");
 		expect(collapsed).toContain("✓ python");
 		expect(collapsed).toContain("values = [1, 2, 3]");
-		expect(collapsed).toContain("↑ 2 ↓ 2 lines");
+		expect(collapsed).toContain("↑ 2 ↓ 3 lines");
 		expect(collapsed).not.toContain('"code"');
 		expect(collapsed).not.toContain("print(values)");
 		expect(collapsed).not.toContain("complete");
 		expect(collapsed).not.toContain("[Assistant]");
 		expect(collapsed).not.toContain("private analysis");
+		expect(collapsedLines.length).toBeLessThan(20);
+		expect(longestBlankRun(collapsedLines.slice(4, -4))).toBeLessThanOrEqual(1);
 
 		viewer.handleInput("\x0f");
-		const expanded = stripAnsi(viewer.render(100).join("\n"));
+		const expandedLines = viewer.render(100).map((line) => stripAnsi(line));
+		const expanded = expandedLines.join("\n");
 		expect(expanded).toContain("print(values)");
 		expect(expanded).toContain("complete");
+		const completeIndex = expandedLines.findIndex((line) => line.includes("complete"));
+		expect(completeIndex).toBeGreaterThanOrEqual(2);
+		expect(expandedLines[completeIndex - 1]).toMatch(/^│\s*│$/);
+		expect(expandedLines[completeIndex - 2]).toContain("[1, 2, 3]");
 
 		viewer.handleInput("\x14");
 		expect(stripAnsi(viewer.render(100).join("\n"))).toContain("private analysis");
+		viewer.dispose();
+	});
+
+	test("bounds long Viewer content and preserves Home and End scrolling", () => {
+		const result = Array.from({ length: 80 }, (_, index) => `result line ${index}`).join("\n");
+		const runtime = {
+			listSubagentsForUi: () => [
+				snapshot({
+					status: "idle",
+					lastOutcome: "ok",
+					result,
+					messages: [],
+					live: false,
+				}),
+			],
+			subscribeSubagentUi: () => () => undefined,
+		} as unknown as RiemannRuntime;
+		const viewer = new SubagentConversationViewer({
+			context: { mode: "tui", ui: { notify: () => undefined } } as unknown as ExtensionContext,
+			runtime,
+			agentId: "agent-1",
+			tui: { terminal: { rows: 40 }, requestRender: () => undefined } as unknown as TUI,
+			theme,
+			keybindings: new KeybindingsManager(),
+			done: () => undefined,
+		});
+		const bottom = viewer.render(100).map((line) => stripAnsi(line));
+		expect(bottom.length).toBeLessThanOrEqual(Math.floor(40 * 0.7));
+		expect(bottom.join("\n")).toContain("100%");
+		expect(bottom.join("\n")).toContain("result line 79");
+
+		viewer.handleInput("\x1b[H");
+		const top = viewer.render(100).map((line) => stripAnsi(line));
+		expect(top.join("\n")).toContain("26%");
+		expect(top.join("\n")).toContain("result line 0");
+
+		viewer.handleInput("\x1b[F");
+		expect(stripAnsi(viewer.render(100).join("\n"))).toContain("100%");
 		viewer.dispose();
 	});
 
@@ -169,6 +230,7 @@ describe("Riemann Subagent UI", () => {
 		let listener: (() => void) | undefined;
 		let agents = [snapshot()];
 		const runtime = {
+			agent: { name: "Main" },
 			listSubagentsForUi: () => agents,
 			subscribeSubagentUi: (next: () => void) => {
 				listener = next;
@@ -184,6 +246,8 @@ describe("Riemann Subagent UI", () => {
 		}> = [];
 		const context = {
 			mode: "tui",
+			model: { provider: "openai", id: "gpt-test" },
+			isIdle: () => true,
 			ui: {
 				setWidget: (
 					key: string,
@@ -224,6 +288,67 @@ describe("Riemann Subagent UI", () => {
 			vi.useRealTimers();
 		}
 		expect(listener).toBeUndefined();
+	});
+
+	test("opens the selected child without rendering Main or interrupting the active cell", async () => {
+		const agents = [snapshot()];
+		let input: ((data: string) => { consume?: boolean } | undefined) | undefined;
+		let customCalls = 0;
+		let aborts = 0;
+		const widgetUpdates: Array<{
+			key: string;
+			content: string[] | ((tui: TUI, theme: Theme) => Component) | undefined;
+			options?: ExtensionWidgetOptions;
+		}> = [];
+		const runtime = {
+			listSubagentsForUi: () => agents,
+			subscribeSubagentUi: () => () => undefined,
+		} as unknown as RiemannRuntime;
+		const context = {
+			mode: "tui",
+			abort: () => {
+				aborts += 1;
+			},
+			ui: {
+				setWidget: (
+					key: string,
+					content: string[] | ((tui: TUI, theme: Theme) => Component) | undefined,
+					options?: ExtensionWidgetOptions,
+				) => widgetUpdates.push({ key, content, options }),
+				onTerminalInput: (handler: (data: string) => { consume?: boolean } | undefined) => {
+					input = handler;
+					return () => {
+						input = undefined;
+					};
+				},
+				getEditorText: () => "",
+				notify: () => undefined,
+				custom: async () => {
+					customCalls += 1;
+					return undefined;
+				},
+			},
+		} as unknown as ExtensionContext;
+		const controller = installSubagentUi(runtime, context);
+		try {
+			const installed = widgetUpdates[0];
+			if (!installed || typeof installed.content !== "function") throw new Error("Fleet widget was not installed");
+			const component = installed.content({ requestRender: () => undefined } as unknown as TUI, theme);
+			const inactive = stripAnsi(component.render(80).join("\n"));
+			expect(inactive).toContain("○ reviewer");
+			expect(inactive).not.toContain("main");
+
+			input?.("\x1b[B");
+			expect(stripAnsi(component.render(80).join("\n"))).toContain("● reviewer");
+			input?.("\r");
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(customCalls).toBe(1);
+			expect(aborts).toBe(0);
+		} finally {
+			controller.dispose();
+		}
+		expect(input).toBeUndefined();
 	});
 
 	test("requires confirmation to release a settled Hub slot and closes without interrupting the active cell", async () => {
@@ -290,6 +415,7 @@ describe("Riemann Subagent UI", () => {
 		await showSubagentsHub(context, runtime);
 		expect(rendered).toContain("0 active · 1 total");
 		expect(rendered).toContain("reviewer");
+		expect(rendered).not.toContain("Main");
 		expect(rendered).not.toContain("x stop");
 		expect(armed).toContain("again to RELEASE SLOT");
 		expect(releases).toBe(1);

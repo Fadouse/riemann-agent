@@ -44,6 +44,7 @@ export function rightAlign(left: string, right: string, width: number, minGap = 
 }
 
 function fleetWindow(selectedIndex: number, agentCount: number): { start: number; visible: number } {
+	if (agentCount === 0) return { start: 0, visible: 0 };
 	const visible = Math.min(MAX_FLEET_AGENT_ROWS, agentCount);
 	const start = selectedIndex < visible ? 0 : selectedIndex - visible + 1;
 	return { start, visible };
@@ -64,15 +65,16 @@ export function renderSubagentFleet(
 	const { start, visible } = fleetWindow(windowIndex, agents.length);
 	const hint = selectionActive
 		? `${keyText("tui.select.up")}/${keyText("tui.select.down")} select · ${keyText("tui.select.confirm")} view · ${keyText("tui.select.cancel")} back`
-		: `${keyText("app.interrupt")} to interrupt · ${keyText("tui.editor.cursorLeft")} for agents · ${keyText("tui.select.down")} to manage`;
-	const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, safeWidth, ""), ""];
+		: `${keyText("app.interrupt")} interrupt · ${keyText("tui.editor.cursorLeft")}/${keyText("tui.select.down")} select`;
+	const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, safeWidth, "")];
 	if (start > 0) lines.push(rightAlign("", theme.fg("dim", `↑ ${start} more`), safeWidth));
 	for (let index = start; index < start + visible; index += 1) {
 		const agent = agents[index];
 		if (!agent) continue;
-		const name = index === selected ? theme.fg("accent", theme.bold(agent.name)) : theme.bold(agent.name);
+		const isSelected = index === selected;
+		const name = isSelected ? theme.fg("accent", theme.bold(agent.name)) : theme.bold(agent.name);
 		const icon =
-			index === selected && isActiveSubagent(agent)
+			isSelected && isActiveSubagent(agent)
 				? theme.fg("accent", "●")
 				: agent.status === "running"
 					? theme.fg("accent", "○")

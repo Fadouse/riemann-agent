@@ -161,7 +161,7 @@ This routing remains configurable through the ordinary action bindings. For exam
 | `app.message.followUp` | `alt+enter` | Queue follow-up message |
 | `app.message.dequeue` | `alt+up` | Restore queued messages to editor |
 
-### Agent Hub and Viewer
+### Agent Fleet, Hub, and Viewer
 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|

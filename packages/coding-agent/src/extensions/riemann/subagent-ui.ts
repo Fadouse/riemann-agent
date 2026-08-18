@@ -96,9 +96,12 @@ export class RiemannSubagentUiController implements SubagentUiController {
 
 	private refresh(): void {
 		if (this.disposed || this.context.mode !== "tui") return;
+		const selectedAgentId = this.agents[this.selectedIndex]?.id;
 		const now = Date.now();
 		this.agents = this.runtime.listSubagentsForUi().filter((agent) => this.isFleetVisible(agent, now));
-		this.selectedIndex = Math.max(0, Math.min(this.agents.length - 1, this.selectedIndex));
+		const preservedIndex = selectedAgentId ? this.agents.findIndex((agent) => agent.id === selectedAgentId) : -1;
+		this.selectedIndex =
+			preservedIndex >= 0 ? preservedIndex : Math.max(0, Math.min(this.agents.length - 1, this.selectedIndex));
 		if (this.agents.length === 0) {
 			this.active = false;
 			this.selectedIndex = 0;
