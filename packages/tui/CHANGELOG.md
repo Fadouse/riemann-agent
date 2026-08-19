@@ -9,6 +9,8 @@
 ### Fixed
 
 - Made complete `[Image #N]` attachment markers atomic for cursor movement and deletion, matching existing paste-marker behavior.
+- Fixed duplicate fullscreen right-click paste in VS Code-based terminals on Windows ([#8186](https://github.com/earendil-works/pi/issues/8186)).
+- Fixed padded text exceeding narrow terminal widths ([#8252](https://github.com/earendil-works/pi/issues/8252)).
 
 ## [0.84.2] - 2026-08-14
 
