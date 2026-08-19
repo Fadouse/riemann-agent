@@ -9,6 +9,9 @@
 - Removed `permissions: host|workspace` from `agents.main`, `agents.defaults`, and profiles; configure `filesystem: {read?, readExclude?, write?, writeExclude?}` instead, where each field is an absolute-path list or `inherit`.
 - Changed the main Agent default filesystem to unrestricted read and write of `/` with no built-in exclusions; tools, shell, and the kernel sandbox all consume one `FileAccessPolicy`.
 - Changed shared child Agents to inherit every filesystem field from their calling Agent and worktree children to inherit reads while defaulting writes to their own worktree; exclusions exist only where configured.
+- Collapsed the Riemann `shell` operations into one script-based `shell.run(script, cwd, env, timeout)`; removed `shell.exec` and the argv `command`/`args` form.
+- Removed the `state.checkpoint()` and `catalog.namespaces()` Python operations; kernel checkpointing remains automatic after each cell and the operation inventory remains in the system prompt.
+- Hidden `artifacts.get`, `artifacts.view`, and `artifacts.materialize` from the model surface; use the `Artifact` dataclass methods `read()`, `view()`, and `materialize()` instead.
 
 ### Added
 
@@ -20,6 +23,7 @@
 
 ### Changed
 
+- Changed Riemann shell execution to resolve bash through pi's shared shell configuration (`bash -c`, legacy WSL stdin transport) instead of `$SHELL -lc`/`cmd /d /s /c`.
 - Changed child delegation to durable per-Turn `AgentHandle` results with `info()`, `wait()`, `send()`, `stop()`, and `release()` lifecycle controls; standard `asyncio.gather(...)` composes independent runs and waits.
 - Changed Linux Riemann isolation to a filesystem-only Bubblewrap policy that preserves workspace/state mounts while sharing host devices and system namespaces for ordinary commands.
 - Changed `agents.list()` to render compact `AgentInfo` summaries with bounded latest-output previews, while retaining full metadata as explicit fields and exact-Turn result retrieval through each item's handle methods.

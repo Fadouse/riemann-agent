@@ -228,7 +228,13 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).toContain("## Available operations");
 			expect(systemPrompt).toContain("`await fs.read(path) -> TextSnapshot | ImageSnapshot`");
 			expect(systemPrompt).toContain("`await shell.run(");
-			expect(systemPrompt).toContain("`await artifacts.view(handle) -> ImageSnapshot`");
+			expect(systemPrompt).not.toContain("shell.exec");
+			expect(systemPrompt).not.toContain("artifacts.get");
+			expect(systemPrompt).not.toContain("artifacts.view");
+			expect(systemPrompt).not.toContain("artifacts.materialize");
+			expect(systemPrompt).not.toContain("catalog.namespaces");
+			expect(systemPrompt).not.toContain("state.checkpoint");
+			expect(systemPrompt).toContain("`await state.status() -> dict`");
 			expect(systemPrompt).toContain("`await agents.spawn(task, name=None, profile=None) -> AgentHandle`");
 			expect(systemPrompt).toContain(
 				"`await agents.run(task, name=None, profile=None, timeout=None) -> AgentResult`",
@@ -268,6 +274,11 @@ describe("Riemann session extension", () => {
 					code: [
 						"assert not hasattr(mcp, 'list')",
 						"assert not hasattr(agents, 'wait')",
+						"assert 'artifacts' not in globals(), sorted(name for name in globals() if not name.startswith('_'))",
+						"assert not hasattr(catalog, 'namespaces')",
+						"assert not hasattr(state, 'checkpoint')",
+						"assert hasattr(catalog, 'search')",
+						"assert hasattr(state, 'status')",
 						"assert hasattr(agents, 'run')",
 						"assert not hasattr(agents, 'result')",
 						"assert not hasattr(agents, 'inbox')",
@@ -282,7 +293,8 @@ describe("Riemann session extension", () => {
 						"viewed = await image.artifact.view()",
 						"assert isinstance(viewed, ImageSnapshot), viewed",
 						`display({"image/png": "${pixelBase64}"}, raw=True)`,
-						"process = await shell.run(command='node', args=['-e', \"console.log('streamed')\"])",
+						"process = await shell.run(script=\"printf 'streamed\\n' | tail -1\")",
+						"assert process.exit_code == 0 and process.stdout.strip() == 'streamed', process",
 						"public_docs = await mcp.activate(name='public_docs')",
 						"matches = await catalog.search(query='sum values')",
 						"assert matches[0]['name'] == 'public_docs.sum_values', matches",

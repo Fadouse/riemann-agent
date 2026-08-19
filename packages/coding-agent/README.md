@@ -105,7 +105,7 @@ import asyncio
 snap = await fs.read(path=\"src/main.ts\")
 display(snap.lines(1, 80))
 
-result = await shell.run(command=\"npm\", args=[\"test\"], timeout=300)
+result = await shell.run(script=\"npm test 2>&1 | tail -40\", timeout=300)
 display((result.exit_code, result.stderr[-2000:]))
 
 docs = await mcp.activate(name=\"filesystem_docs\")

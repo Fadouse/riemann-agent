@@ -113,10 +113,6 @@ export class FunctionRegistry {
 			});
 	}
 
-	namespaces(capabilities?: ReadonlySet<string>): string[] {
-		return [...new Set(this.list(capabilities).map((definition) => definition.namespace))];
-	}
-
 	pythonSpecifications(namespace?: string, capabilities?: ReadonlySet<string>): PythonFunctionSpecification[] {
 		return this.list(capabilities)
 			.filter((definition) => definition.installInPythonNamespace !== false)

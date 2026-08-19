@@ -303,25 +303,6 @@ export class RiemannRuntime {
 				},
 			},
 			{
-				name: "namespaces",
-				namespace: "catalog",
-				description: "List currently installed Python function namespaces and their function names.",
-				promptSnippet: "List installed function namespaces.",
-				parameters: [],
-				returns: "dict[str,list[str]]",
-				handler: async () =>
-					Object.fromEntries(
-						this.registry
-							.namespaces(this.capabilities)
-							.map((namespace) => [
-								namespace,
-								this.registry
-									.pythonSpecifications(namespace, this.capabilities)
-									.map((specification) => specification.name),
-							]),
-					),
-			},
-			{
 				name: "get",
 				namespace: "artifacts",
 				description: "Read a byte or text slice from a durable artifact handle.",
@@ -332,6 +313,8 @@ export class RiemannRuntime {
 					{ name: "limit", description: "Maximum bytes", type: "int | None", required: false },
 				],
 				returns: "dict",
+				includeInSystemPrompt: false,
+				installInPythonNamespace: false,
 				handler: async (args) => {
 					if (typeof args.handle !== "string")
 						throw new RiemannHostError("invalid_arguments", "handle must be a string");
@@ -347,6 +330,8 @@ export class RiemannRuntime {
 				promptSnippet: "Load an image artifact into the current model context.",
 				parameters: [{ name: "handle", description: "Image artifact handle", type: "str", required: true }],
 				returns: "ImageSnapshot",
+				includeInSystemPrompt: false,
+				installInPythonNamespace: false,
 				handler: async (args) => {
 					if (typeof args.handle !== "string")
 						throw new RiemannHostError("invalid_arguments", "handle must be a string");
@@ -383,6 +368,8 @@ export class RiemannRuntime {
 				],
 				returns: "dict",
 				capability: "workspace.write",
+				includeInSystemPrompt: false,
+				installInPythonNamespace: false,
 				handler: async (args) => {
 					if (typeof args.handle !== "string" || typeof args.path !== "string") {
 						throw new RiemannHostError("invalid_arguments", "handle and path must be strings");
@@ -390,15 +377,6 @@ export class RiemannRuntime {
 					const destination = await this.resolveArtifactDestination(args.path);
 					return this.shared.artifacts.materialize(args.handle, destination);
 				},
-			},
-			{
-				name: "checkpoint",
-				namespace: "state",
-				description: "Confirm that the current cell will be checkpointed atomically after it finishes.",
-				promptSnippet: "Confirm the current execution will be checkpointed on completion.",
-				parameters: [],
-				returns: "dict",
-				handler: async () => ({ scheduled: true, timing: "after_current_cell" }),
 			},
 			{
 				name: "status",
