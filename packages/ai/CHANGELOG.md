@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Reduced buffered stream queue dequeue overhead while preserving event ordering and completion semantics.
+
 ## [0.84.2] - 2026-08-14
 
 ### Added

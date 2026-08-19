@@ -229,6 +229,10 @@ interface AgentEventRow {
 	delivered_at: string | null;
 }
 
+const AGENT_TURNS_SCHEMA_VERSION = 3;
+const FILESYSTEM_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 4;
+
 function now(): string {
 	return new Date().toISOString();
 }
@@ -478,7 +482,11 @@ export class RiemannStore {
 				created_at TEXT NOT NULL
 			);
 		`);
+		const schemaVersion = (this.db.prepare("SELECT version FROM schema_version LIMIT 1").get() as { version: number })
+			.version;
 		const agentColumns = this.db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+		const hasLegacyPermissions = agentColumns.some((column) => column.name === "permissions");
+		const hasFilesystem = agentColumns.some((column) => column.name === "filesystem_json");
 		if (!agentColumns.some((column) => column.name === "workspace_mode")) {
 			this.db.exec("ALTER TABLE agents ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'shared'");
 		}
@@ -500,41 +508,65 @@ export class RiemannStore {
 		if (!agentColumns.some((column) => column.name === "last_turn_id")) {
 			this.db.exec("ALTER TABLE agents ADD COLUMN last_turn_id TEXT");
 		}
-		if (agentColumns.some((column) => column.name === "permissions")) {
+		if (!hasFilesystem) {
 			this.db.exec("ALTER TABLE agents ADD COLUMN filesystem_json TEXT NOT NULL DEFAULT '{}'");
-			const legacy = this.db.prepare("SELECT id, permissions, workspace FROM agents").all() as unknown as Array<{
-				id: string;
-				permissions: string;
-				workspace: string;
-			}>;
+		}
+		if (!hasFilesystem || schemaVersion < FILESYSTEM_SCHEMA_VERSION) {
+			const legacy = this.db
+				.prepare(
+					hasLegacyPermissions
+						? "SELECT id, permissions, workspace FROM agents"
+						: hasFilesystem
+							? "SELECT id, NULL AS permissions, workspace FROM agents WHERE filesystem_json = '{}'"
+							: "SELECT id, NULL AS permissions, workspace FROM agents",
+				)
+				.all() as unknown as Array<{ id: string; permissions: string | null; workspace: string }>;
 			const update = this.db.prepare("UPDATE agents SET filesystem_json = ? WHERE id = ?");
 			for (const row of legacy) {
 				const roots = row.permissions === "host" ? ["/"] : [row.workspace];
 				update.run(JSON.stringify({ read: roots, readExclude: [], write: roots, writeExclude: [] }), row.id);
 			}
-			this.db.exec("ALTER TABLE agents DROP COLUMN permissions");
 		}
 		const eventColumns = this.db.prepare("PRAGMA table_info(agent_events)").all() as Array<{ name: string }>;
 		if (!eventColumns.some((column) => column.name === "turn_id")) {
 			this.db.exec("ALTER TABLE agent_events ADD COLUMN turn_id TEXT");
 		}
 		this.db.exec(`
-			UPDATE agents
-			SET
-				last_outcome = CASE
-					WHEN status = 'completed' THEN COALESCE(last_outcome, 'ok')
-					WHEN status = 'failed' THEN COALESCE(last_outcome, 'error')
-					WHEN status = 'parked' THEN COALESCE(last_outcome, 'cancelled')
-					ELSE last_outcome
-				END,
-				status = CASE
-					WHEN status IN ('completed', 'failed') THEN 'idle'
-					WHEN status = 'parked' THEN 'stopped'
-					ELSE status
-				END;
+			CREATE INDEX IF NOT EXISTS agents_parent ON agents(parent_id);
+			CREATE INDEX IF NOT EXISTS agents_run_created ON agents(run_id, created_at, id);
+			CREATE INDEX IF NOT EXISTS messages_run ON messages(run_id);
+			CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender_id);
+			CREATE INDEX IF NOT EXISTS messages_reply ON messages(reply_to);
+			CREATE INDEX IF NOT EXISTS agent_events_run ON agent_events(run_id);
+			CREATE INDEX IF NOT EXISTS agent_events_turn ON agent_events(turn_id);
+			CREATE INDEX IF NOT EXISTS artifacts_run_created ON artifacts(run_id, created_at, handle);
+			CREATE INDEX IF NOT EXISTS artifacts_path_run ON artifacts(path, run_id);
+			CREATE INDEX IF NOT EXISTS file_capabilities_run ON file_capabilities(run_id);
 		`);
-		this.backfillAgentTurns();
-		this.db.exec("UPDATE schema_version SET version = 4");
+		if (schemaVersion < AGENT_TURNS_SCHEMA_VERSION) {
+			this.db.exec(`
+				UPDATE agents
+				SET
+					last_outcome = CASE
+						WHEN status = 'completed' THEN COALESCE(last_outcome, 'ok')
+						WHEN status = 'failed' THEN COALESCE(last_outcome, 'error')
+						WHEN status = 'parked' THEN COALESCE(last_outcome, 'cancelled')
+						ELSE last_outcome
+					END,
+					status = CASE
+						WHEN status IN ('completed', 'failed') THEN 'idle'
+						WHEN status = 'parked' THEN 'stopped'
+						ELSE status
+					END;
+			`);
+			this.backfillAgentTurns();
+		}
+		if (schemaVersion < FILESYSTEM_SCHEMA_VERSION && hasLegacyPermissions) {
+			this.db.exec("ALTER TABLE agents DROP COLUMN permissions");
+		}
+		if (schemaVersion < CURRENT_SCHEMA_VERSION) {
+			this.db.prepare("UPDATE schema_version SET version = ?").run(CURRENT_SCHEMA_VERSION);
+		}
 	}
 
 	private backfillAgentTurns(): void {
@@ -543,11 +575,14 @@ export class RiemannStore {
 			.prepare("SELECT * FROM agent_events ORDER BY created_at, id")
 			.all() as unknown as AgentEventRow[];
 		const eventAgentIds = new Map<string, string>();
+		const pendingEventAgentIds = new Set<string>();
 		for (const event of events) {
 			const parsed: unknown = JSON.parse(event.payload_json);
 			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
 			const agentId = (parsed as Record<string, unknown>).agentId;
-			if (typeof agentId === "string") eventAgentIds.set(event.id, agentId);
+			if (typeof agentId !== "string") continue;
+			eventAgentIds.set(event.id, agentId);
+			if (event.delivered_at === null) pendingEventAgentIds.add(agentId);
 		}
 		const turnIds = new Map<string, string>();
 		const existingTurns = this.db
@@ -566,9 +601,7 @@ export class RiemannStore {
 				const active = row.status === "queued" || row.status === "running";
 				if (!turnId) {
 					turnId = randomUUID();
-					const pendingEvent = events.some(
-						(event) => eventAgentIds.get(event.id) === row.id && event.delivered_at === null,
-					);
+					const pendingEvent = pendingEventAgentIds.has(row.id);
 					const outcome: AgentOutcome | null = active
 						? null
 						: (row.last_outcome ?? (row.status === "stopped" ? "cancelled" : row.error ? "error" : "ok"));

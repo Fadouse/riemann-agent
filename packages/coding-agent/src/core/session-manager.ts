@@ -335,20 +335,7 @@ function buildEntryIndex(entries: SessionEntry[], byId?: Map<string, SessionEntr
 	return index;
 }
 
-function buildSessionPath(
-	entries: SessionEntry[],
-	leafId?: string | null,
-	byId?: Map<string, SessionEntry>,
-): SessionEntry[] {
-	const index = buildEntryIndex(entries, byId);
-	let leaf: SessionEntry | undefined;
-	if (leafId === null) {
-		return [];
-	}
-	if (leafId) {
-		leaf = index.get(leafId);
-	}
-	leaf ??= entries[entries.length - 1];
+function buildSessionPathFromLeaf(leaf: SessionEntry | undefined, byId: Map<string, SessionEntry>): SessionEntry[] {
 	if (!leaf) {
 		return [];
 	}
@@ -357,10 +344,24 @@ function buildSessionPath(
 	let current: SessionEntry | undefined = leaf;
 	while (current) {
 		path.push(current);
-		current = current.parentId ? index.get(current.parentId) : undefined;
+		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
 	path.reverse();
 	return path;
+}
+
+function buildSessionPath(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionEntry[] {
+	const index = buildEntryIndex(entries, byId);
+	if (leafId === null) {
+		return [];
+	}
+
+	const leaf = (leafId ? index.get(leafId) : undefined) ?? entries[entries.length - 1];
+	return buildSessionPathFromLeaf(leaf, index);
 }
 
 function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
@@ -421,20 +422,8 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 	return [];
 }
 
-/**
- * Build the active, compaction-aware session entry list.
- *
- * This follows the current leaf path. If the path contains compaction entries,
- * the latest compaction is represented by the compaction entry itself, followed
- * by the kept entries starting at firstKeptEntryId and all entries after the
- * compaction entry. Older summarized entries are omitted.
- */
-export function buildContextEntries(
-	entries: SessionEntry[],
-	leafId?: string | null,
-	byId?: Map<string, SessionEntry>,
-): SessionEntry[] {
-	const path = buildSessionPath(entries, leafId, byId);
+/** Resolve compaction against an already-built root-to-leaf path. */
+function buildContextEntriesFromPath(path: SessionEntry[]): SessionEntry[] {
 	let compaction: CompactionEntry | null = null;
 
 	for (const entry of path) {
@@ -463,8 +452,32 @@ export function buildContextEntries(
 			contextEntries.push(entry);
 		}
 	}
-	contextEntries.push(...path.slice(compactionIdx + 1));
+	for (let i = compactionIdx + 1; i < path.length; i++) {
+		contextEntries.push(path[i]);
+	}
 	return contextEntries;
+}
+
+/**
+ * Build the active, compaction-aware session entry list.
+ *
+ * This follows the current leaf path. If the path contains compaction entries,
+ * the latest compaction is represented by the compaction entry itself, followed
+ * by the kept entries starting at firstKeptEntryId and all entries after the
+ * compaction entry. Older summarized entries are omitted.
+ */
+export function buildContextEntries(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionEntry[] {
+	return buildContextEntriesFromPath(buildSessionPath(entries, leafId, byId));
+}
+
+function buildSessionContextFromPath(path: SessionEntry[]): SessionContext {
+	const { thinkingLevel, model } = getSessionContextSettings(path);
+	const messages = buildContextEntriesFromPath(path).flatMap(sessionEntryToContextMessages);
+	return { messages, thinkingLevel, model };
 }
 
 /**
@@ -477,10 +490,7 @@ export function buildSessionContext(
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionContext {
-	const path = buildSessionPath(entries, leafId, byId);
-	const { thinkingLevel, model } = getSessionContextSettings(path);
-	const messages = buildContextEntries(entries, leafId, byId).flatMap(sessionEntryToContextMessages);
-	return { messages, thinkingLevel, model };
+	return buildSessionContextFromPath(buildSessionPath(entries, leafId, byId));
 }
 
 /**
@@ -873,6 +883,7 @@ export class SessionManager {
 	private cwd: string;
 	private persist: boolean;
 	private flushed: boolean = false;
+	private hasAssistantMessage: boolean = false;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
@@ -960,6 +971,7 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this.hasAssistantMessage = false;
 		this.flushed = false;
 
 		if (this.persist) {
@@ -974,10 +986,14 @@ export class SessionManager {
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
+		this.hasAssistantMessage = false;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
 			this.leafId = entry.id;
+			if (entry.type === "message" && entry.message?.role === "assistant") {
+				this.hasAssistantMessage = true;
+			}
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -1029,8 +1045,7 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		if (!hasAssistant) {
+		if (!this.hasAssistantMessage) {
 			if (this.flushed) {
 				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
 			} else {
@@ -1057,6 +1072,9 @@ export class SessionManager {
 
 	private _appendEntry(entry: SessionEntry): void {
 		this.fileEntries.push(entry);
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			this.hasAssistantMessage = true;
+		}
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
@@ -1166,9 +1184,8 @@ export class SessionManager {
 	getSessionName(): string | undefined {
 		// Walk entries in reverse to find the latest session_info entry.
 		// Empty names explicitly clear the session title.
-		const entries = this.getEntries();
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const entry = entries[i];
+		for (let i = this.fileEntries.length - 1; i >= 0; i--) {
+			const entry = this.fileEntries[i];
 			if (entry.type === "session_info") {
 				return entry.name?.trim() || undefined;
 			}
@@ -1274,15 +1291,24 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
-		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
-		let current = startId ? this.byId.get(startId) : undefined;
-		while (current) {
-			path.push(current);
-			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		return buildSessionPathFromLeaf(startId ? this.byId.get(startId) : undefined, this.byId);
+	}
+
+	private _getContextPath(): SessionEntry[] {
+		if (this.leafId === null) return [];
+
+		let leaf = this.leafId ? this.byId.get(this.leafId) : undefined;
+		if (!leaf) {
+			for (let i = this.fileEntries.length - 1; i >= 0; i--) {
+				const entry = this.fileEntries[i];
+				if (entry.type !== "session") {
+					leaf = entry;
+					break;
+				}
+			}
 		}
-		path.reverse();
-		return path;
+		return buildSessionPathFromLeaf(leaf, this.byId);
 	}
 
 	/**
@@ -1290,7 +1316,7 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildContextEntries(): SessionEntry[] {
-		return buildContextEntries(this.getEntries(), this.leafId, this.byId);
+		return buildContextEntriesFromPath(this._getContextPath());
 	}
 
 	/**
@@ -1298,7 +1324,7 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.leafId, this.byId);
+		return buildSessionContextFromPath(this._getContextPath());
 	}
 
 	/**
@@ -1324,19 +1350,20 @@ export class SessionManager {
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
 	getTree(): SessionTreeNode[] {
-		const entries = this.getEntries();
 		const nodeMap = new Map<string, SessionTreeNode>();
 		const roots: SessionTreeNode[] = [];
 
 		// Create nodes with resolved labels
-		for (const entry of entries) {
+		for (const entry of this.fileEntries) {
+			if (entry.type === "session") continue;
 			const label = this.labelsById.get(entry.id);
 			const labelTimestamp = this.labelTimestampsById.get(entry.id);
 			nodeMap.set(entry.id, { entry, children: [], label, labelTimestamp });
 		}
 
 		// Build tree
-		for (const entry of entries) {
+		for (const entry of this.fileEntries) {
+			if (entry.type === "session") continue;
 			const node = nodeMap.get(entry.id)!;
 			if (entry.parentId === null || entry.parentId === entry.id) {
 				roots.push(node);
@@ -1357,7 +1384,9 @@ export class SessionManager {
 		while (stack.length > 0) {
 			const node = stack.pop()!;
 			node.children.sort((a, b) => new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime());
-			stack.push(...node.children);
+			for (const child of node.children) {
+				stack.push(child);
+			}
 		}
 
 		return roots;
@@ -1474,7 +1503,7 @@ export class SessionManager {
 			for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
 				const labelEntry: LabelEntry = {
 					type: "label",
-					id: generateId(new Set(pathEntryIds)),
+					id: generateId(pathEntryIds),
 					parentId,
 					timestamp: labelTimestamp,
 					targetId,
@@ -1495,8 +1524,7 @@ export class SessionManager {
 			// first assistant response, matching the newSession() contract
 			// and avoiding the duplicate-header bug when _persist()'s
 			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-			if (hasAssistant) {
+			if (this.hasAssistantMessage) {
 				this._rewriteFile();
 				this.flushed = true;
 			} else {
@@ -1512,12 +1540,13 @@ export class SessionManager {
 		for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
 			const labelEntry: LabelEntry = {
 				type: "label",
-				id: generateId(new Set([...pathEntryIds, ...labelEntries.map((e) => e.id)])),
+				id: generateId(pathEntryIds),
 				parentId,
 				timestamp: labelTimestamp,
 				targetId,
 				label,
 			};
+			pathEntryIds.add(labelEntry.id);
 			labelEntries.push(labelEntry);
 			parentId = labelEntry.id;
 		}
@@ -1633,16 +1662,20 @@ export class SessionManager {
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
 		};
-		writeFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`, { flag: "wx" });
-
-		// Copy all non-header entries from source
-		for (const entry of sourceEntries) {
-			if (entry.type !== "session") {
-				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
+		const forkedEntries: FileEntry[] = [newHeader];
+		const fd = openSync(newSessionFile, "wx");
+		try {
+			writeFileSync(fd, `${JSON.stringify(newHeader)}\n`);
+			for (const entry of sourceEntries) {
+				if (entry.type === "session") continue;
+				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+				forkedEntries.push(entry);
 			}
+		} finally {
+			closeSync(fd);
 		}
 
-		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
+		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true, undefined, forkedEntries);
 	}
 
 	/**

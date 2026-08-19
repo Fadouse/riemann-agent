@@ -100,33 +100,46 @@ export class ArtifactStore {
 
 	async get(handle: string, options: { offset?: number; limit?: number } = {}): Promise<JsonValue> {
 		const artifact = this.getMetadata(handle);
-		const data = await readFile(artifact.path);
-		const offset = Math.max(0, options.offset ?? 0);
-		const end =
-			options.limit === undefined ? data.length : Math.min(data.length, offset + Math.max(0, options.limit));
-		const slice = data.subarray(offset, end);
-		if (
-			artifact.mimeType.startsWith("text/") ||
-			artifact.mimeType.includes("json") ||
-			artifact.mimeType.includes("xml")
-		) {
+		const file = await open(artifact.path, "r");
+		try {
+			const fileSize = (await file.stat()).size;
+			const offset = Math.max(0, options.offset ?? 0);
+			const end = options.limit === undefined ? fileSize : Math.min(fileSize, offset + Math.max(0, options.limit));
+			const readStart = Math.min(fileSize, Number.isNaN(offset) ? 0 : Math.trunc(offset));
+			const readEnd = Math.min(fileSize, Number.isNaN(end) ? 0 : Math.trunc(end));
+			const data = Buffer.allocUnsafe(Math.max(0, readEnd - readStart));
+			let bytesRead = 0;
+			while (bytesRead < data.length) {
+				const result = await file.read(data, bytesRead, data.length - bytesRead, readStart + bytesRead);
+				if (result.bytesRead === 0) break;
+				bytesRead += result.bytesRead;
+			}
+			const slice = bytesRead === data.length ? data : data.subarray(0, bytesRead);
+			if (
+				artifact.mimeType.startsWith("text/") ||
+				artifact.mimeType.includes("json") ||
+				artifact.mimeType.includes("xml")
+			) {
+				return {
+					handle,
+					mime_type: artifact.mimeType,
+					size: artifact.size,
+					offset,
+					content: slice.toString("utf8"),
+					truncated: end < fileSize,
+				};
+			}
 			return {
 				handle,
 				mime_type: artifact.mimeType,
 				size: artifact.size,
 				offset,
-				content: slice.toString("utf8"),
-				truncated: end < data.length,
+				base64: slice.toString("base64"),
+				truncated: end < fileSize,
 			};
+		} finally {
+			await file.close();
 		}
-		return {
-			handle,
-			mime_type: artifact.mimeType,
-			size: artifact.size,
-			offset,
-			base64: slice.toString("base64"),
-			truncated: end < data.length,
-		};
 	}
 
 	async materialize(handle: string, destination: string): Promise<JsonValue> {

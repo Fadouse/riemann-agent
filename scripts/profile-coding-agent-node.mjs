@@ -14,6 +14,9 @@ const defaultNodeProfileDir = join(repoRoot, "profiles-node");
 const defaultBunProfileDir = join(repoRoot, "profiles-bun");
 const agentDirEnvName = "RIEMANN_CODING_AGENT_DIR";
 const startupBenchmarkEnvName = "PI_STARTUP_BENCHMARK";
+const timingEnvName = "PI_TIMING";
+const tuiTerminalReplyDrainMs = 150;
+const processStartupTimingLabel = "process/module startup";
 
 function printHelp() {
 	console.log(`Usage:
@@ -43,6 +46,7 @@ Options:
 Notes:
   - By default the benchmark uses your normal configured agent dir, so global models/auth/settings work.
   - TUI mode measures startup until the interactive UI reaches first usable state.
+  - Its fixed 150ms terminal-reply drain is reported separately from first-ready time.
   - RPC mode measures startup until a real get_state request receives a response, then closes stdin to exit cleanly.
   - CPU profiles are kept in the selected profile directory for later analysis.
 `);
@@ -202,7 +206,7 @@ function toDisplayPath(path) {
 	return path;
 }
 
-function summarize(values) {
+export function summarize(values) {
 	const sorted = [...values].sort((a, b) => a - b);
 	const total = sorted.reduce((sum, value) => sum + value, 0);
 	const middle = Math.floor(sorted.length / 2);
@@ -215,33 +219,37 @@ function summarize(values) {
 	};
 }
 
-function parseStartupTimings(stderr) {
-	const lines = stderr.split(/\r?\n/);
+export function parseStartupTimings(stderr) {
 	const timings = new Map();
-	let inBlock = false;
+	let namespace;
 
-	for (const line of lines) {
-		if (line.includes("--- Startup Timings ---")) {
-			inBlock = true;
+	for (const line of stderr.split(/\r?\n/)) {
+		const headerMatch = line.match(/^\s*--- Startup Timings(?::\s*(.+?))?\s*---\s*$/);
+		if (headerMatch) {
+			namespace = headerMatch[1]?.trim() || "main";
 			continue;
 		}
-		if (!inBlock) {
+		if (!namespace) {
 			continue;
 		}
-		if (line.includes("------------------------")) {
-			break;
-		}
-		const match = line.match(/^\s+([^:]+):\s+(\d+)ms$/);
-		if (!match) {
+		if (/^\s*-{3,}\s*$/.test(line)) {
+			namespace = undefined;
 			continue;
 		}
-		timings.set(match[1], Number.parseInt(match[2], 10));
+
+		const timingMatch = line.match(/^\s+(.+):\s+(\d+(?:\.\d+)?)ms\s*$/);
+		if (!timingMatch) {
+			continue;
+		}
+
+		const label = namespace === "main" ? timingMatch[1] : `${namespace}: ${timingMatch[1]}`;
+		timings.set(label, Number.parseFloat(timingMatch[2]));
 	}
 
 	return timings;
 }
 
-function summarizeTimingMaps(runs) {
+export function summarizeTimingMaps(runs) {
 	const valuesByLabel = new Map();
 	for (const run of runs) {
 		for (const [label, value] of run.timings.entries()) {
@@ -361,6 +369,7 @@ function getRuntimeCommand(runtime, mode, profileDir, profileName, cpuProfile) {
 
 function createBenchmarkEnv(options, isolatedAgentDir) {
 	const env = { ...process.env };
+	env[timingEnvName] = "1";
 	if (options.agentDir) {
 		env[agentDirEnvName] = options.agentDir;
 	} else if (isolatedAgentDir) {
@@ -387,10 +396,11 @@ async function runTuiBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 	}
 
 	const command = getRuntimeCommand(runtime, "tui", profileDir, profileName, options.cpuProfile);
+	const startedAt = performance.now();
 	const child = spawn(command.executable, command.args, {
 		cwd: packageDir,
 		env: createBenchmarkEnv(options, isolatedAgentDir),
-		stdio: ["inherit", "ignore", "pipe"],
+		stdio: ["inherit", "inherit", "pipe"],
 		shell: process.platform === "win32" && runtime === "bun",
 	});
 
@@ -400,9 +410,11 @@ async function runTuiBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 		stderr += chunk;
 	});
 
-	const startedAt = performance.now();
-	const exitCode = await waitForExit(child, `Benchmark ${measuredIndex === undefined ? `warmup ${runNumber}` : `run ${measuredIndex}`}`);
-	const elapsedMs = performance.now() - startedAt;
+	const exitCode = await waitForExit(
+		child,
+		`Benchmark ${measuredIndex === undefined ? `warmup ${runNumber}` : `run ${measuredIndex}`}`,
+	);
+	const processElapsedMs = performance.now() - startedAt;
 
 	try {
 		if (exitCode !== 0) {
@@ -414,7 +426,16 @@ async function runTuiBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 			throw new Error(`CPU profile was not written: ${profilePath}`);
 		}
 
-		return { elapsedMs, profilePath, timings: parseStartupTimings(stderr) };
+		const timings = parseStartupTimings(stderr);
+		const timedReadyElapsedMs = timings.has(processStartupTimingLabel) ? timings.get("TOTAL") : undefined;
+		return {
+			elapsedMs: timedReadyElapsedMs ?? Math.max(0, processElapsedMs - tuiTerminalReplyDrainMs),
+			processElapsedMs,
+			fixedDrainMs: tuiTerminalReplyDrainMs,
+			readyEstimated: timedReadyElapsedMs === undefined,
+			profilePath,
+			timings,
+		};
 	} finally {
 		if (tempRoot) {
 			rmSync(tempRoot, { recursive: true, force: true });
@@ -446,6 +467,7 @@ async function runRpcBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 	}
 
 	const command = getRuntimeCommand(runtime, "rpc", profileDir, profileName, options.cpuProfile);
+	const startedAt = performance.now();
 	const child = spawn(command.executable, command.args, {
 		cwd: packageDir,
 		env: createBenchmarkEnv(options, isolatedAgentDir),
@@ -458,7 +480,6 @@ async function runRpcBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 	let readyElapsedMs;
 	let responseError;
 	const requestId = `startup-benchmark-${runNumber}`;
-	const startedAt = performance.now();
 
 	child.stdout.setEncoding("utf8");
 	child.stdout.on("data", (chunk) => {
@@ -578,9 +599,15 @@ async function main() {
 			profileDir,
 		});
 
-		process.stdout.write(
-			`[${measuredIndex === undefined ? `warmup ${runIndex + 1}` : `run ${measuredIndex}`}] elapsed=${formatMs(result.elapsedMs)}\n`,
-		);
+		const runLabel = measuredIndex === undefined ? `warmup ${runIndex + 1}` : `run ${measuredIndex}`;
+		if (options.mode === "tui") {
+			const readyLabel = result.readyEstimated ? "first-ready-estimate" : "first-ready";
+			process.stdout.write(
+				`[${runLabel}] ${readyLabel}=${formatMs(result.elapsedMs)} child-exit=${formatMs(result.processElapsedMs)} fixed-drain=${formatMs(result.fixedDrainMs)}\n`,
+			);
+		} else {
+			process.stdout.write(`[${runLabel}] elapsed=${formatMs(result.elapsedMs)}\n`);
+		}
 
 		if (measuredIndex !== undefined) {
 			measuredRuns.push(result);
@@ -593,13 +620,26 @@ async function main() {
 	}
 
 	const elapsedSummary = summarize(measuredRuns.map((run) => run.elapsedMs));
+	const processElapsedSummary =
+		options.mode === "tui" ? summarize(measuredRuns.map((run) => run.processElapsedMs)) : undefined;
+	const readyIsEstimated = options.mode === "tui" && measuredRuns.some((run) => run.readyEstimated);
 	const timingSummaries = summarizeTimingMaps(measuredRuns);
 	const maxElapsedRun = measuredRuns.reduce((slowest, run) => (run.elapsedMs > slowest.elapsedMs ? run : slowest));
 	if (measuredRuns.length === 1) {
 		process.stdout.write("\nResult\n");
 		process.stdout.write(`  runtime:          ${runtime}\n`);
 		process.stdout.write(`  mode:             ${options.mode}\n`);
-		process.stdout.write(`  elapsed:          ${formatMs(measuredRuns[0].elapsedMs)}\n`);
+		if (options.mode === "tui") {
+			process.stdout.write(
+				`  ${readyIsEstimated ? "first ready est.:" : "first ready:"} ${formatMs(measuredRuns[0].elapsedMs)}\n`,
+			);
+			process.stdout.write(`  child exit:       ${formatMs(measuredRuns[0].processElapsedMs)}\n`);
+			process.stdout.write(
+				`  fixed TUI drain: ${formatMs(measuredRuns[0].fixedDrainMs)} (included in child exit only)\n`,
+			);
+		} else {
+			process.stdout.write(`  elapsed:          ${formatMs(measuredRuns[0].elapsedMs)}\n`);
+		}
 		for (const [label, summary] of timingSummaries.entries()) {
 			process.stdout.write(`  ${label}: ${formatMs(summary.median)}\n`);
 		}
@@ -608,6 +648,10 @@ async function main() {
 			process.stdout.write(`  profiles dir:     ${toDisplayPath(profileDir)}\n`);
 		}
 		process.stdout.write(`METRIC startup_time_ms=${measuredRuns[0].elapsedMs.toFixed(1)}\n`);
+		if (options.mode === "tui") {
+			process.stdout.write(`METRIC startup_process_elapsed_ms=${measuredRuns[0].processElapsedMs.toFixed(1)}\n`);
+			process.stdout.write(`METRIC startup_fixed_drain_ms=${measuredRuns[0].fixedDrainMs.toFixed(1)}\n`);
+		}
 		for (const [label, summary] of timingSummaries.entries()) {
 			process.stdout.write(`METRIC ${toMetricName(label)}=${summary.median.toFixed(1)}\n`);
 		}
@@ -617,10 +661,22 @@ async function main() {
 	process.stdout.write("\nSummary\n");
 	process.stdout.write(`  runtime:          ${runtime}\n`);
 	process.stdout.write(`  mode:             ${options.mode}\n`);
-	process.stdout.write(`  elapsed min:      ${formatMs(elapsedSummary.min)}\n`);
-	process.stdout.write(`  elapsed median:   ${formatMs(elapsedSummary.median)}\n`);
-	process.stdout.write(`  elapsed avg:      ${formatMs(elapsedSummary.avg)}\n`);
-	process.stdout.write(`  elapsed max:      ${formatMs(elapsedSummary.max)}\n`);
+	if (options.mode === "tui") {
+		const label = readyIsEstimated ? "first ready estimate" : "first ready";
+		process.stdout.write(`  ${label} min:    ${formatMs(elapsedSummary.min)}\n`);
+		process.stdout.write(`  ${label} median: ${formatMs(elapsedSummary.median)}\n`);
+		process.stdout.write(`  ${label} avg:    ${formatMs(elapsedSummary.avg)}\n`);
+		process.stdout.write(`  ${label} max:    ${formatMs(elapsedSummary.max)}\n`);
+		process.stdout.write(`  child exit median: ${formatMs(processElapsedSummary.median)}\n`);
+		process.stdout.write(
+			`  fixed TUI drain:   ${formatMs(measuredRuns[0].fixedDrainMs)} per run (included in child exit only)\n`,
+		);
+	} else {
+		process.stdout.write(`  elapsed min:      ${formatMs(elapsedSummary.min)}\n`);
+		process.stdout.write(`  elapsed median:   ${formatMs(elapsedSummary.median)}\n`);
+		process.stdout.write(`  elapsed avg:      ${formatMs(elapsedSummary.avg)}\n`);
+		process.stdout.write(`  elapsed max:      ${formatMs(elapsedSummary.max)}\n`);
+	}
 	for (const [label, summary] of timingSummaries.entries()) {
 		process.stdout.write(`  ${label} median: ${formatMs(summary.median)}\n`);
 	}
@@ -629,13 +685,19 @@ async function main() {
 		process.stdout.write(`  profiles dir:     ${toDisplayPath(profileDir)}\n`);
 	}
 	process.stdout.write(`METRIC startup_time_ms=${elapsedSummary.median.toFixed(1)}\n`);
+	if (options.mode === "tui") {
+		process.stdout.write(`METRIC startup_process_elapsed_ms=${processElapsedSummary.median.toFixed(1)}\n`);
+		process.stdout.write(`METRIC startup_fixed_drain_ms=${measuredRuns[0].fixedDrainMs.toFixed(1)}\n`);
+	}
 	for (const [label, summary] of timingSummaries.entries()) {
 		process.stdout.write(`METRIC ${toMetricName(label)}=${summary.median.toFixed(1)}\n`);
 	}
 }
 
-main().catch((error) => {
-	const message = error instanceof Error ? error.message : String(error);
-	console.error(message);
-	process.exit(1);
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+	main().catch((error) => {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(message);
+		process.exit(1);
+	});
+}

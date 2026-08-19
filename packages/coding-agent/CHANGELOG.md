@@ -23,6 +23,9 @@
 - Changed Linux Riemann isolation to a filesystem-only Bubblewrap policy that preserves workspace/state mounts while sharing host devices and system namespaces for ordinary commands.
 - Changed `agents.list()` to render compact `AgentInfo` summaries with bounded latest-output previews, while retaining full metadata as explicit fields and exact-Turn result retrieval through each item's handle methods.
 - Compacted Subagent Viewer transcript spacing and sized short overlays to their rendered content while preserving long-transcript scrolling.
+- Reduced startup and long-session overhead by coalescing model refreshes, gating Riemann migrations, using bounded artifact reads, and reusing session traversal results.
+- Reduced interactive streaming work by coalescing assistant, shell, and Subagent display updates and caching Mermaid transforms, footer totals, session search text, and fullscreen transcript search.
+- Reduced IPython checkpoint serialization to one common-path pass while retaining automatic snapshots and per-variable fallback diagnostics.
 
 ### Fixed
 

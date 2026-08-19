@@ -28,6 +28,7 @@ export class BashExecutionComponent extends Container {
 	private fullOutputPath?: string;
 	private expanded = false;
 	private contentContainer: Container;
+	private displayDirty = false;
 
 	constructor(command: string, ui: TUI, excludeFromContext = false) {
 		super();
@@ -64,6 +65,11 @@ export class BashExecutionComponent extends Container {
 		this.addChild(new DynamicBorder(borderColor));
 	}
 
+	override render(width: number): string[] {
+		if (this.displayDirty) this.updateDisplay();
+		return super.render(width);
+	}
+
 	/**
 	 * Set whether the output is expanded (shows full output) or collapsed (preview only).
 	 */
@@ -92,7 +98,7 @@ export class BashExecutionComponent extends Container {
 			this.outputLines.push(...newLines);
 		}
 
-		this.updateDisplay();
+		this.displayDirty = true;
 	}
 
 	setComplete(
@@ -117,6 +123,7 @@ export class BashExecutionComponent extends Container {
 	}
 
 	private updateDisplay(): void {
+		this.displayDirty = false;
 		// Apply truncation for LLM context limits (same limits as bash tool)
 		const fullOutput = this.outputLines.join("\n");
 		const contextTruncation = truncateTail(fullOutput, {

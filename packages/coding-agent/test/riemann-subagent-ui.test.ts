@@ -423,6 +423,57 @@ describe("Riemann Subagent UI", () => {
 		expect(closes).toBe(1);
 	});
 
+	test("reads one Viewer snapshot per render and ignores unrelated Agent updates", async () => {
+		vi.useFakeTimers();
+		let listCalls = 0;
+		let listener: ((agentId?: string) => void) | undefined;
+		const requestRender = vi.fn();
+		const runtime = {
+			listSubagentsForUi: () => {
+				listCalls += 1;
+				return [snapshot()];
+			},
+			subscribeSubagentUi: (next: (agentId?: string) => void) => {
+				listener = next;
+				return () => {
+					listener = undefined;
+				};
+			},
+		} as unknown as RiemannRuntime;
+		const viewer = new SubagentConversationViewer({
+			context: { mode: "tui", ui: { notify: () => undefined } } as unknown as ExtensionContext,
+			runtime,
+			agentId: "agent-1",
+			tui: { terminal: { rows: 40 }, requestRender } as unknown as TUI,
+			theme,
+			keybindings: new KeybindingsManager(),
+			done: () => undefined,
+		});
+		try {
+			listCalls = 0;
+			viewer.render(100);
+			expect(listCalls).toBe(1);
+
+			listCalls = 0;
+			requestRender.mockClear();
+			listener?.("agent-2");
+			await vi.advanceTimersByTimeAsync(32);
+			expect(listCalls).toBe(0);
+			expect(requestRender).not.toHaveBeenCalled();
+
+			listener?.("agent-1");
+			await vi.advanceTimersByTimeAsync(32);
+			expect(requestRender).toHaveBeenCalledTimes(1);
+		} finally {
+			viewer.dispose();
+			requestRender.mockClear();
+			await vi.advanceTimersByTimeAsync(200);
+			vi.useRealTimers();
+		}
+		expect(listener).toBeUndefined();
+		expect(requestRender).not.toHaveBeenCalled();
+	});
+
 	test("closes the viewer without interrupting the active cell", () => {
 		const runtime = {
 			listSubagentsForUi: () => [snapshot()],

@@ -125,6 +125,19 @@ describe("session selector search", () => {
 		expect(result).toEqual([]);
 	});
 
+	it("refreshes cached search text when session metadata changes", () => {
+		const session = makeSession({
+			id: "mutable",
+			modified: new Date("2026-01-01T00:00:00.000Z"),
+			allMessagesText: "before",
+		});
+
+		expect(filterAndSortSessions([session], "before", "recent")).toEqual([session]);
+		session.allMessagesText = "after";
+		expect(filterAndSortSessions([session], "before", "recent")).toEqual([]);
+		expect(filterAndSortSessions([session], "after", "recent")).toEqual([session]);
+	});
+
 	describe("name filter", () => {
 		const sessions: SessionInfo[] = [
 			makeSession({

@@ -36,6 +36,8 @@ interface ActiveExecution {
 	startedAt: number;
 	stdout: string;
 	stderr: string;
+	stdoutTruncated: boolean;
+	stderrTruncated: boolean;
 	displays: KernelDisplay[];
 	result?: KernelDisplay;
 	error?: KernelError;
@@ -360,8 +362,17 @@ export class IPythonKernelManager {
 		switch (message.header.msg_type) {
 			case "stream": {
 				const text = stringField(message.content.text) ?? "";
-				if (message.content.name === "stderr") execution.stderr = this.capOutput(execution.stderr + text);
-				else execution.stdout = this.capOutput(execution.stdout + text);
+				if (message.content.name === "stderr") {
+					if (execution.stderrTruncated) break;
+					const output = this.capOutput(execution.stderr, text);
+					execution.stderr = output.value;
+					execution.stderrTruncated = output.truncated;
+				} else {
+					if (execution.stdoutTruncated) break;
+					const output = this.capOutput(execution.stdout, text);
+					execution.stdout = output.value;
+					execution.stdoutTruncated = output.truncated;
+				}
 				break;
 			}
 			case "display_data": {
@@ -400,10 +411,21 @@ export class IPythonKernelManager {
 		}
 	}
 
-	private capOutput(value: string): string {
+	private capOutput(value: string, addition: string): { value: string; truncated: boolean } {
 		const cap = this.options.maxOutputChars ?? 100_000;
-		if (value.length <= cap) return value;
-		return `${value.slice(0, cap)}\n[output truncated by Riemann Agent]`;
+		if (cap >= 0) {
+			if (value.length + addition.length <= cap) return { value: value + addition, truncated: false };
+			return {
+				value: `${value}${addition.slice(0, cap - value.length)}\n[output truncated by Riemann Agent]`,
+				truncated: true,
+			};
+		}
+		const combined = value + addition;
+		if (combined.length <= cap) return { value: combined, truncated: false };
+		return {
+			value: `${combined.slice(0, cap)}\n[output truncated by Riemann Agent]`,
+			truncated: false,
+		};
 	}
 
 	private abortHostRequests(execution: ActiveExecution, reason: Error): void {
@@ -553,6 +575,8 @@ export class IPythonKernelManager {
 			startedAt: Date.now(),
 			stdout: "",
 			stderr: "",
+			stdoutTruncated: false,
+			stderrTruncated: false,
 			displays: [],
 			status: "ok",
 			idle: false,
@@ -700,16 +724,46 @@ export class IPythonKernelManager {
 		if (this.execution)
 			return { restored: [], skipped: [], error: "Cannot snapshot while an IPython cell is running" };
 		const escapedPath = JSON.stringify(kernelPath);
-		const code = `import builtins as _riemann_builtins, dill as _riemann_dill, json as _riemann_json, os as _riemann_os, pathlib as _riemann_pathlib, tempfile as _riemann_tempfile\n_riemann_snapshot_path = _riemann_pathlib.Path(${escapedPath})\n_riemann_snapshot_path.parent.mkdir(parents=True, exist_ok=True)\n_riemann_values, _riemann_skipped = {}, []\n_riemann_reserved = {name for name in globals() if name.startswith("_")} | {"In", "Out", "get_ipython", "exit", "quit"} | set(globals().get("_RIEMANN_PROTECTED", set()))\nfor _riemann_name, _riemann_value in list(globals().items()):\n    if _riemann_name in _riemann_reserved or isinstance(_riemann_value, type(_riemann_builtins)):\n        continue\n    try:\n        _riemann_dill.dumps(_riemann_value)\n        _riemann_values[_riemann_name] = _riemann_value\n    except Exception as _riemann_error:\n        _riemann_skipped.append({"name": _riemann_name, "reason": f"{type(_riemann_error).__name__}: {_riemann_error}"})\n_riemann_fd, _riemann_tmp = _riemann_tempfile.mkstemp(dir=str(_riemann_snapshot_path.parent), prefix=".snapshot-", suffix=".tmp")\ntry:\n    with _riemann_os.fdopen(_riemann_fd, "wb") as _riemann_file:\n        _riemann_dill.dump(_riemann_values, _riemann_file)\n        _riemann_file.flush()\n        _riemann_os.fsync(_riemann_file.fileno())\n    _riemann_os.replace(_riemann_tmp, _riemann_snapshot_path)\nfinally:\n    if _riemann_os.path.exists(_riemann_tmp): _riemann_os.unlink(_riemann_tmp)\nprint("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps({"restored": sorted(_riemann_values), "skipped": _riemann_skipped}, sort_keys=True))`;
+		const code = `import builtins as _riemann_builtins, dill as _riemann_dill, json as _riemann_json, os as _riemann_os, pathlib as _riemann_pathlib, tempfile as _riemann_tempfile
+_riemann_snapshot_path = _riemann_pathlib.Path(${escapedPath})
+_riemann_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+_riemann_candidates, _riemann_values, _riemann_skipped = {}, {}, []
+_riemann_reserved = {"In", "Out", "get_ipython", "exit", "quit"} | set(globals().get("_RIEMANN_PROTECTED", set()))
+for _riemann_name, _riemann_value in list(globals().items()):
+    if _riemann_name.startswith("_") or _riemann_name in _riemann_reserved or isinstance(_riemann_value, type(_riemann_builtins)):
+        continue
+    _riemann_candidates[_riemann_name] = _riemann_value
+_riemann_fd, _riemann_tmp = _riemann_tempfile.mkstemp(dir=str(_riemann_snapshot_path.parent), prefix=".snapshot-", suffix=".tmp")
+try:
+    with _riemann_os.fdopen(_riemann_fd, "wb") as _riemann_file:
+        try:
+            _riemann_dill.dump(_riemann_candidates, _riemann_file)
+            _riemann_values = _riemann_candidates
+        except Exception:
+            _riemann_file.seek(0)
+            _riemann_file.truncate()
+            for _riemann_name, _riemann_value in _riemann_candidates.items():
+                try:
+                    _riemann_dill.dumps(_riemann_value)
+                    _riemann_values[_riemann_name] = _riemann_value
+                except Exception as _riemann_error:
+                    _riemann_skipped.append({"name": _riemann_name, "reason": f"{type(_riemann_error).__name__}: {_riemann_error}"})
+            _riemann_dill.dump(_riemann_values, _riemann_file)
+        _riemann_file.flush()
+        _riemann_os.fsync(_riemann_file.fileno())
+    _riemann_os.replace(_riemann_tmp, _riemann_snapshot_path)
+finally:
+    if _riemann_os.path.exists(_riemann_tmp): _riemann_os.unlink(_riemann_tmp)
+print("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps({"restored": sorted(_riemann_values), "skipped": _riemann_skipped}, sort_keys=True))`;
 		const result = await this.execute(code, { internal: true });
 		if (result.status !== "ok") return { restored: [], skipped: [], error: result.error?.evalue ?? result.stderr };
 		const parsed = this.parseSnapshotResult(result);
 		try {
 			await this.persistStagedSnapshot(kernelPath);
-			return parsed;
 		} catch (error) {
 			return { ...parsed, error: `Could not persist snapshot: ${errorMessage(error)}` };
 		}
+		return parsed;
 	}
 
 	async close(): Promise<void> {

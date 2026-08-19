@@ -49,11 +49,11 @@ export function spawnProcessSync(
 export function waitForChildProcess(child: ChildProcess): Promise<number | null> {
 	return new Promise((resolve, reject) => {
 		let settled = false;
-		let exited = false;
-		let exitCode: number | null = null;
+		let exited = child.exitCode !== null || child.signalCode !== null;
+		let exitCode: number | null = child.exitCode;
 		let postExitTimer: NodeJS.Timeout | undefined;
-		let stdoutEnded = child.stdout === null;
-		let stderrEnded = child.stderr === null;
+		let stdoutEnded = child.stdout === null || child.stdout.readableEnded || child.stdout.destroyed;
+		let stderrEnded = child.stderr === null || child.stderr.readableEnded || child.stderr.destroyed;
 
 		const cleanup = () => {
 			if (postExitTimer) {
@@ -133,5 +133,18 @@ export function waitForChildProcess(child: ChildProcess): Promise<number | null>
 		child.once("error", onError);
 		child.once("exit", onExit);
 		child.once("close", onClose);
+
+		// The child may have exited before this helper was called, or in the
+		// narrow window before the listeners above were attached. ChildProcess
+		// retains exitCode/signalCode, so recover that state instead of waiting
+		// forever for an event that has already fired.
+		if (!exited && (child.exitCode !== null || child.signalCode !== null)) {
+			exited = true;
+			exitCode = child.exitCode;
+		}
+		if (exited) {
+			maybeFinalizeAfterExit();
+			if (!settled) armIdleTimer();
+		}
 	});
 }

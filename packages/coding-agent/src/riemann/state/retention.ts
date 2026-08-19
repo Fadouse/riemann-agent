@@ -88,7 +88,7 @@ async function defaultRemoveWorktree(path: string): Promise<void> {
 }
 
 async function inspectRun(store: RiemannStore, run: StoredRun): Promise<RunResources> {
-	const agents = store.listAgents(run.id);
+	const agents = store.listAgents(run.id, { includeReleased: true });
 	const artifacts = store.listArtifacts(run.id);
 	const artifactPaths = new Map<string, number>();
 	for (const artifact of artifacts) artifactPaths.set(artifact.path, artifact.size);

@@ -1,9 +1,4 @@
-import {
-	AltScreenSearchComponent,
-	type AltScreenSearchMatch,
-	findAltScreenSearchMatches,
-	getAltScreenSearchMatchKey,
-} from "./alt-screen-search.ts";
+import { AltScreenSearchCache, AltScreenSearchComponent, getAltScreenSearchMatchKey } from "./alt-screen-search.ts";
 import { AltScreenFlashContainer } from "./components/alt-screen-flash.ts";
 import { ScrollView } from "./components/scroll-view.ts";
 import { getKeybindings } from "./keybindings.ts";
@@ -127,7 +122,7 @@ interface ActiveSearch {
 	component: AltScreenSearchComponent;
 	overlay?: OverlayHandle;
 	query: string;
-	matches: AltScreenSearchMatch[];
+	cache: AltScreenSearchCache;
 	selectedIndex: number;
 	selectedKey?: string;
 	anchorRow: number;
@@ -429,7 +424,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		const search: ActiveSearch = {
 			component,
 			query: "",
-			matches: [],
+			cache: new AltScreenSearchCache(),
 			selectedIndex: -1,
 			anchorRow: this.getPrimaryScrollView().scrollTop,
 			selectionMode: "query",
@@ -454,7 +449,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private updateSearchQuery(query: string): void {
 		const search = this.activeSearch;
 		if (!search || query === search.query) return;
-		const selected = search.matches[search.selectedIndex];
+		const selected = search.cache.matches[search.selectedIndex];
 		search.anchorRow = selected?.segments[0]?.row ?? this.getPrimaryScrollView().scrollTop;
 		search.query = query;
 		search.selectionMode = "query";
@@ -475,17 +470,18 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		const scrollView = layout.primaryScrollView ?? this.implicitScrollView;
 		const box = getScrollViewBox(layout, scrollView);
 		const lines = box?.scrollContentLines;
+		const matchesChanged = search.cache.update(lines ?? [], search.query);
+		const matches = search.cache.matches;
 		if (!lines || !search.query.trim()) {
-			search.matches = [];
 			search.selectedIndex = -1;
 			search.selectedKey = undefined;
 			search.selectionMode = "retain";
 			search.component.setResult(-1, 0);
 			return false;
 		}
+		if (!matchesChanged && search.selectionMode === "retain") return false;
 
 		const shouldRevealSelection = search.selectionMode !== "retain";
-		const matches = findAltScreenSearchMatches(lines, search.query);
 		const exactIndex = search.selectedKey
 			? matches.findIndex((match) => getAltScreenSearchMatchKey(match) === search.selectedKey)
 			: -1;
@@ -506,7 +502,6 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			}
 		}
 
-		search.matches = matches;
 		search.selectedIndex = selectedIndex;
 		search.selectedKey = selectedIndex >= 0 ? getAltScreenSearchMatchKey(matches[selectedIndex]!) : undefined;
 		search.selectionMode = "retain";
@@ -1111,7 +1106,9 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	private applySearchHighlights(screen: string[], layout: LayoutFrame): string[] {
 		const search = this.activeSearch;
-		if (!search || search.selectedIndex < 0 || search.matches.length === 0) return screen;
+		if (!search || search.selectedIndex < 0) return screen;
+		const matches = search.cache.matches;
+		if (matches.length === 0) return screen;
 		const scrollView = layout.primaryScrollView ?? this.implicitScrollView;
 		const box = getScrollViewBox(layout, scrollView);
 		if (!box) return screen;
@@ -1127,8 +1124,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			box.clip.x + box.clip.width,
 			scrollbarColumn ?? Number.POSITIVE_INFINITY,
 		);
-		for (let matchIndex = 0; matchIndex < search.matches.length; matchIndex++) {
-			for (const segment of search.matches[matchIndex]!.segments) {
+		for (let matchIndex = 0; matchIndex < matches.length; matchIndex++) {
+			for (const segment of matches[matchIndex]!.segments) {
 				const row = box.rect.y + segment.row - scrollView.scrollTop;
 				if (row < minRow || row >= maxRow) continue;
 				const startCol = Math.max(minColumn, box.rect.x + segment.startCol);

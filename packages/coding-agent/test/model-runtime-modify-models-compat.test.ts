@@ -292,6 +292,31 @@ describe("extension provider model lifecycle", () => {
 		expect(await modelsStore.read("extension-dynamic")).toBeUndefined();
 	});
 
+	it("coalesces a queued registration refresh into an explicit refresh", async () => {
+		const runtime = await ModelRuntime.create({
+			credentials: AuthStorage.inMemory(),
+			modelsStore: new InMemoryModelsStore(),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		let refreshCalls = 0;
+		runtime.registerProvider("extension-coalesced", {
+			baseUrl: "http://localhost:8080/v1",
+			apiKey: "local",
+			api: "openai-completions",
+			refreshModels: async () => {
+				refreshCalls++;
+				return [{ ...model("live"), provider: "extension-coalesced" }];
+			},
+		});
+
+		await runtime.refresh({ allowNetwork: false });
+		await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+		expect(refreshCalls).toBe(1);
+		expect(runtime.getModel("extension-coalesced", "live")).toBeDefined();
+	});
+
 	it("applies legacy OAuth modifyModels after async credential initialization", async () => {
 		const runtime = await ModelRuntime.create({
 			credentials: AuthStorage.inMemory({

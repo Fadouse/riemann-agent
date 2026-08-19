@@ -23,8 +23,38 @@ function normalizeWhitespaceLower(text: string): string {
 	return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function getSessionSearchText(session: SessionInfo): string {
-	return `${session.id} ${session.name ?? ""} ${session.allMessagesText} ${session.cwd}`;
+interface SessionSearchText {
+	id: string;
+	name: string | undefined;
+	allMessagesText: string;
+	cwd: string;
+	lowerText: string;
+}
+
+const sessionSearchTextCache = new WeakMap<SessionInfo, SessionSearchText>();
+
+function getSessionSearchText(session: SessionInfo): SessionSearchText {
+	const cached = sessionSearchTextCache.get(session);
+	if (
+		cached &&
+		cached.id === session.id &&
+		cached.name === session.name &&
+		cached.allMessagesText === session.allMessagesText &&
+		cached.cwd === session.cwd
+	) {
+		return cached;
+	}
+
+	const text = `${session.id} ${session.name ?? ""} ${session.allMessagesText} ${session.cwd}`;
+	const next: SessionSearchText = {
+		id: session.id,
+		name: session.name,
+		allMessagesText: session.allMessagesText,
+		cwd: session.cwd,
+		lowerText: text.toLowerCase(),
+	};
+	sessionSearchTextCache.set(session, next);
+	return next;
 }
 
 export function hasSessionName(session: SessionInfo): boolean {
@@ -114,12 +144,13 @@ export function parseSearchQuery(query: string): ParsedSearchQuery {
 }
 
 export function matchSession(session: SessionInfo, parsed: ParsedSearchQuery): MatchResult {
-	const text = getSessionSearchText(session);
+	const searchText = getSessionSearchText(session);
 
 	if (parsed.mode === "regex") {
 		if (!parsed.regex) {
 			return { matches: false, score: 0 };
 		}
+		const text = `${session.id} ${session.name ?? ""} ${session.allMessagesText} ${session.cwd}`;
 		const idx = text.search(parsed.regex);
 		if (idx < 0) return { matches: false, score: 0 };
 		return { matches: true, score: idx * 0.1 };
@@ -130,22 +161,20 @@ export function matchSession(session: SessionInfo, parsed: ParsedSearchQuery): M
 	}
 
 	let totalScore = 0;
-	let normalizedText: string | null = null;
+	let normalizedText: string | undefined;
 
 	for (const token of parsed.tokens) {
 		if (token.kind === "phrase") {
-			if (normalizedText === null) {
-				normalizedText = normalizeWhitespaceLower(text);
-			}
 			const phrase = normalizeWhitespaceLower(token.value);
 			if (!phrase) continue;
+			normalizedText ??= normalizeWhitespaceLower(searchText.lowerText);
 			const idx = normalizedText.indexOf(phrase);
 			if (idx < 0) return { matches: false, score: 0 };
 			totalScore += idx * 0.1;
 			continue;
 		}
 
-		const m = fuzzyMatch(token.value, text);
+		const m = fuzzyMatch(token.value, searchText.lowerText);
 		if (!m.matches) return { matches: false, score: 0 };
 		totalScore += m.score;
 	}

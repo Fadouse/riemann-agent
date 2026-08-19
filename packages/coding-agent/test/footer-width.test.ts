@@ -25,6 +25,7 @@ function createSession(options: {
 	compactionUsage?: AssistantUsage;
 	toolUsage?: AssistantUsage;
 	usingSubscription?: boolean;
+	onUsageRead?: () => void;
 }): AgentSession {
 	const usage = options.usage;
 	const entries: Array<Record<string, unknown>> = [];
@@ -74,7 +75,10 @@ function createSession(options: {
 			thinkingLevel: options.thinkingLevel ?? "off",
 		},
 		sessionManager: {
-			getEntries: () => entries,
+			getEntries: () => {
+				options.onUsageRead?.();
+				return entries;
+			},
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",
 		},
@@ -248,5 +252,29 @@ describe("FooterComponent width handling", () => {
 
 		expect(stats).toContain("$1.234");
 		expect(stats).not.toContain("(sub)");
+	});
+
+	it("caches history usage scans until invalidated", () => {
+		let usageReads = 0;
+		const session = createSession({
+			sessionName: "",
+			onUsageRead: () => usageReads++,
+			usage: {
+				input: 100,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.001 },
+			},
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		footer.render(120);
+		footer.render(80);
+		expect(usageReads).toBe(1);
+
+		footer.invalidate();
+		footer.render(120);
+		expect(usageReads).toBe(2);
 	});
 });

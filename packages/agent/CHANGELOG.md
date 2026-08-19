@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Serialized tool progress delivery with bounded bookkeeping while preserving update ordering and completion waits.
+
 ## [0.84.2] - 2026-08-14
 
 ### Added

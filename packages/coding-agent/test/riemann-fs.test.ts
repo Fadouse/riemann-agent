@@ -49,13 +49,19 @@ describe("Riemann fs capabilities", () => {
 				await edit.handler(
 					{
 						snapshot: reference,
-						operations: [{ kind: "replace", start: 6, end: 10, text: "gamma" }],
+						operations: [
+							{ kind: "insert", at: 0, text: "[" },
+							{ kind: "replace", start: 6, end: 10, text: "gamma" },
+							{ kind: "insert", at: 10, text: "!" },
+							{ kind: "delete", start: 10, end: 11 },
+							{ kind: "insert", at: 0, text: ">" },
+						],
 					},
 					signal,
 				),
 			);
-			expect(edited.text).toBe("alpha gamma\n");
-			expect(await readFile(join(root, "src", "value.txt"), "utf8")).toBe("alpha gamma\n");
+			expect(edited.text).toBe(">[alpha gamma!");
+			expect(await readFile(join(root, "src", "value.txt"), "utf8")).toBe(">[alpha gamma!");
 
 			const current = objectValue(await read.handler({ path: "src/value.txt" }, signal));
 			await writeFile(join(root, "src", "value.txt"), "concurrent change\n", "utf8");

@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { Marked } from "@earendil-works/pi-tui";
+import { describe, expect, it, vi } from "vitest";
 import type { MarkdownTransformContext } from "../src/core/extensions/types.ts";
 import type { MermaidRenderingMode } from "../src/core/settings-manager.ts";
 import { createMermaidMarkdownTransformer } from "../src/modes/interactive/components/mermaid.ts";
@@ -25,6 +26,68 @@ function transformMermaid(markdown: string, options: TransformOptions = {}): str
 }
 
 describe("Mermaid rendering", () => {
+	it("returns without lexing when the source cannot contain a Mermaid fence", () => {
+		const lexer = vi.spyOn(Marked.prototype, "lexer");
+		try {
+			expect(transformMermaid("ordinary markdown")).toBe("ordinary markdown");
+			expect(transformMermaid("Mermaid is mentioned without a fence")).toBe("Mermaid is mentioned without a fence");
+			expect(transformMermaid("```ts\nconst diagram = true;\n```")).toBe("```ts\nconst diagram = true;\n```");
+			expect(lexer).not.toHaveBeenCalled();
+		} finally {
+			lexer.mockRestore();
+		}
+	});
+
+	it("caches exact transforms and invalidates width-dependent results", () => {
+		const lexer = vi.spyOn(Marked.prototype, "lexer");
+		try {
+			const transformer = createMermaidMarkdownTransformer({ getMode: () => "streaming" });
+			const markdown = "```mermaid\nflowchart LR\n  A --> B\n```";
+			const context: MarkdownTransformContext = {
+				availableWidth: 100,
+				isStreaming: false,
+				messageType: "assistant",
+			};
+
+			const first = transformer(markdown, context);
+			expect(transformer(markdown, context)).toBe(first);
+			expect(lexer).toHaveBeenCalledTimes(1);
+
+			transformer(markdown, { ...context, availableWidth: 10 });
+			expect(lexer).toHaveBeenCalledTimes(2);
+		} finally {
+			lexer.mockRestore();
+		}
+	});
+
+	it("does not reuse a themed transform after the theme output changes", () => {
+		let palette = "first";
+		const dynamicTheme = {
+			fg: (color: string, text: string) => `<${palette}-${color}>${text}</${palette}-${color}>`,
+			bold: (text: string) => `<${palette}-bold>${text}</${palette}-bold>`,
+		} as Theme;
+		const transformerOptions: { getMode: () => MermaidRenderingMode; theme?: Theme } = {
+			getMode: () => "streaming",
+			theme: dynamicTheme,
+		};
+		const transformer = createMermaidMarkdownTransformer(transformerOptions);
+		const markdown = "```mermaid\nflowchart LR\n  A --> B\n```";
+		const context: MarkdownTransformContext = {
+			availableWidth: 100,
+			isStreaming: false,
+			messageType: "assistant",
+		};
+
+		expect(transformer(markdown, context)).toContain("<first-accent>");
+		palette = "second";
+		expect(transformer(markdown, context)).toContain("<second-accent>");
+
+		transformerOptions.theme = undefined;
+		expect(transformer(markdown, context)).not.toContain("<second-accent>");
+		transformerOptions.theme = dynamicTheme;
+		expect(transformer(markdown, context)).toContain("<second-accent>");
+	});
+
 	it("replaces Mermaid code blocks with Unicode diagrams", () => {
 		const markdown = "Before\n\n```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```\nAfter";
 		const rendered = transformMermaid(markdown);

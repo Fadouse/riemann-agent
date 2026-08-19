@@ -98,6 +98,46 @@ describe("Riemann state retention", () => {
 		}
 	}, 60_000);
 
+	test("accounts for snapshots owned by released agents", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-retention-released-"));
+		roots.push(root);
+		const store = new RiemannStore(join(root, "agent"));
+		try {
+			const run = store.openRun("released-agent-session", root);
+			const main = store.ensureRootAgent(run.id, root);
+			const child = store.createAgent({
+				runId: run.id,
+				parentId: main.id,
+				name: "released",
+				status: "idle",
+				prompt: "",
+				modelRole: "inherit",
+				workspace: root,
+				workspaceMode: "shared",
+				filesystem: FULL_FILESYSTEM,
+				depth: 1,
+				capabilities: ["fs.read"],
+			});
+			store.releaseAgent(child.id);
+			const snapshot = join(store.snapshotsDir, `${child.id}.dill`);
+			const contents = "released snapshot";
+			await writeFile(snapshot, contents);
+			store.closeRun(run.id);
+
+			const report = await applyRetention(store, {
+				...policy,
+				maxAgeDays: 36_500,
+				maxSnapshotBytes: 0,
+			});
+			expect(report.errors).toEqual([]);
+			expect(report.removedRunIds).toEqual([run.id]);
+			expect(report.freedSnapshotBytes).toBe(Buffer.byteLength(contents));
+			expect(existsSync(snapshot)).toBe(false);
+		} finally {
+			store.close();
+		}
+	});
+
 	test("retains metadata and releases the reservation when worktree cleanup fails", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-retention-failure-"));
 		roots.push(root);

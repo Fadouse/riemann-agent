@@ -1,6 +1,6 @@
 import { Marked, type Token } from "@earendil-works/pi-tui";
 import { type MermaidArt, render, type Span } from "grok-mermaid";
-import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
+import type { MarkdownTransformContext, MarkdownTransformer } from "../../../core/extensions/types.ts";
 import type { MermaidRenderingMode } from "../../../core/settings-manager.ts";
 import type { Theme } from "../theme/theme.ts";
 
@@ -9,6 +9,16 @@ const markdownParser = new Marked();
 interface MermaidTransformerOptions {
 	getMode: () => MermaidRenderingMode;
 	theme?: Theme;
+}
+
+interface MermaidTransformCache {
+	markdown: string;
+	mode: MermaidRenderingMode;
+	messageType: MarkdownTransformContext["messageType"];
+	isStreaming: boolean;
+	availableWidth: number;
+	themeSignature: string | null | undefined;
+	result: string;
 }
 
 function isMermaid(token: Token): token is Token & { type: "code"; text: string; lang?: string } {
@@ -56,8 +66,22 @@ function themedLines(art: MermaidArt, theme: Theme): string[] {
 	return art.styled.map((row) => row.map((span) => styleSpan(span, theme)).join(""));
 }
 
+function getThemeSignature(theme: Theme): string {
+	const marker = "\u0000";
+	return JSON.stringify([
+		theme.fg("borderMuted", marker),
+		theme.fg("text", marker),
+		theme.fg("accent", marker),
+		theme.fg("muted", marker),
+		theme.fg("warning", marker),
+		theme.bold(marker),
+	]);
+}
+
 /** Create a transformer that replaces top-level Mermaid code blocks with Unicode terminal diagrams. */
 export function createMermaidMarkdownTransformer(options: MermaidTransformerOptions): MarkdownTransformer {
+	let cache: MermaidTransformCache | undefined;
+
 	return (markdown, context) => {
 		const mode = options.getMode();
 		if (
@@ -68,7 +92,25 @@ export function createMermaidMarkdownTransformer(options: MermaidTransformerOpti
 			return markdown;
 		}
 
-		return markdownParser
+		// Fenced code requires at least three backticks or tildes. Avoid lexing ordinary messages.
+		if (!/mermaid/i.test(markdown) || (!markdown.includes("```") && !markdown.includes("~~~"))) {
+			return markdown;
+		}
+
+		if (
+			cache?.markdown === markdown &&
+			cache.mode === mode &&
+			cache.messageType === context.messageType &&
+			cache.isStreaming === context.isStreaming &&
+			cache.availableWidth === context.availableWidth
+		) {
+			if (cache.themeSignature === undefined) return cache.result;
+			const themeSignature = options.theme ? getThemeSignature(options.theme) : null;
+			if (cache.themeSignature === themeSignature) return cache.result;
+		}
+
+		let dependsOnTheme = false;
+		const result = markdownParser
 			.lexer(markdown)
 			.map((token) => {
 				if (!isMermaid(token)) return token.raw;
@@ -77,13 +119,29 @@ export function createMermaidMarkdownTransformer(options: MermaidTransformerOpti
 				if (!context.isStreaming && art.warnings.length > 0) {
 					const suffix = art.warnings.length > 1 ? ` (+${art.warnings.length - 1} more)` : "";
 					const warning = `Mermaid diagram not rendered: ${art.warnings[0]}${suffix}`;
-					const styledWarning = options.theme ? options.theme.fg("warning", warning) : warning;
+					let styledWarning = warning;
+					dependsOnTheme = true;
+					if (options.theme) {
+						styledWarning = options.theme.fg("warning", warning);
+					}
 					return `${token.raw}\n${codeSpan(styledWarning)}  \n`;
 				}
+				dependsOnTheme = true;
 				const lines = options.theme ? themedLines(art, options.theme) : art.plain;
 				// Markdown hard breaks keep every diagram row on its own line.
 				return `${lines.map(codeSpan).join("  \n")}\n`;
 			})
 			.join("");
+
+		cache = {
+			markdown,
+			mode,
+			messageType: context.messageType,
+			isStreaming: context.isStreaming,
+			availableWidth: context.availableWidth,
+			themeSignature: dependsOnTheme ? (options.theme ? getThemeSignature(options.theme) : null) : undefined,
+			result,
+		};
+		return result;
 	};
 }

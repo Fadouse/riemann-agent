@@ -298,6 +298,159 @@ describe("Agent", () => {
 		expect(receivedSignal?.aborted).toBe(true);
 	});
 
+	it("orders tool updates through subscriber backpressure before tool completion", async () => {
+		const toolSchema = Type.Object({});
+		const firstUpdateStarted = createDeferred();
+		const releaseFirstUpdate = createDeferred();
+		const trace: string[] = [];
+		const tool: AgentTool<typeof toolSchema, { status: string }> = {
+			name: "progress_tool",
+			label: "Progress Tool",
+			description: "Emits ordered progress updates",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, _signal, onUpdate) {
+				for (const status of ["first", "second", "third"]) {
+					onUpdate?.({
+						content: [{ type: "text", text: status }],
+						details: { status },
+					});
+				}
+				return {
+					content: [{ type: "text", text: "done" }],
+					details: { status: "done" },
+					terminate: true,
+				};
+			},
+		};
+		const agent = new Agent({
+			initialState: { tools: [tool] },
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantToolUseMessage([
+							{ type: "toolCall", id: "call-1", name: "progress_tool", arguments: {} },
+						]),
+					});
+				});
+				return stream;
+			},
+		});
+		agent.subscribe(async (event) => {
+			if (event.type === "tool_execution_update") {
+				const status = (event.partialResult.details as { status: string }).status;
+				trace.push(`start:${status}`);
+				if (status === "first") {
+					firstUpdateStarted.resolve();
+					await releaseFirstUpdate.promise;
+				}
+				trace.push(`end:${status}`);
+			} else if (event.type === "tool_execution_end") {
+				trace.push("tool:end");
+			}
+		});
+
+		let promptResolved = false;
+		const promptPromise = agent.prompt("run tool").then(() => {
+			promptResolved = true;
+		});
+		await firstUpdateStarted.promise;
+
+		try {
+			expect(trace).toEqual(["start:first"]);
+			expect(promptResolved).toBe(false);
+		} finally {
+			releaseFirstUpdate.resolve();
+			await promptPromise;
+		}
+
+		expect(trace).toEqual([
+			"start:first",
+			"end:first",
+			"start:second",
+			"end:second",
+			"start:third",
+			"end:third",
+			"tool:end",
+		]);
+	});
+
+	it("waits for queued tool updates after an update subscriber rejects", async () => {
+		const toolSchema = Type.Object({});
+		const releaseLastUpdate = createDeferred();
+		const updates: string[] = [];
+		const eventTypes: AgentEvent["type"][] = [];
+		let lastUpdateFinished = false;
+		const tool: AgentTool<typeof toolSchema, { status: string }> = {
+			name: "failing_progress_tool",
+			label: "Failing Progress Tool",
+			description: "Emits progress handled by a failing subscriber",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, _signal, onUpdate) {
+				for (const status of ["first", "second", "third"]) {
+					onUpdate?.({
+						content: [{ type: "text", text: status }],
+						details: { status },
+					});
+				}
+				return {
+					content: [{ type: "text", text: "done" }],
+					details: { status: "done" },
+					terminate: true,
+				};
+			},
+		};
+		const agent = new Agent({
+			initialState: { tools: [tool] },
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantToolUseMessage([
+							{ type: "toolCall", id: "call-1", name: "failing_progress_tool", arguments: {} },
+						]),
+					});
+				});
+				return stream;
+			},
+		});
+		agent.subscribe(async (event) => {
+			eventTypes.push(event.type);
+			if (event.type !== "tool_execution_update") return;
+
+			const status = (event.partialResult.details as { status: string }).status;
+			updates.push(status);
+			if (status === "second") throw new Error("update listener failed");
+			if (status === "third") {
+				await releaseLastUpdate.promise;
+				lastUpdateFinished = true;
+			}
+		});
+
+		let promptResolved = false;
+		const promptPromise = agent.prompt("run tool").then(() => {
+			promptResolved = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		try {
+			expect(updates).toEqual(["first", "second", "third"]);
+			expect(promptResolved).toBe(false);
+		} finally {
+			releaseLastUpdate.resolve();
+			await promptPromise;
+		}
+
+		expect(lastUpdateFinished).toBe(true);
+		expect(agent.state.errorMessage).toBe("update listener failed");
+		expect(eventTypes).not.toContain("tool_execution_end");
+		expect(eventTypes.filter((type) => type === "agent_end")).toHaveLength(1);
+	});
+
 	it("should ignore tool updates after the tool execution settles", async () => {
 		const toolSchema = Type.Object({});
 		let delayedUpdate: AgentToolUpdateCallback<{ status: string }> | undefined;

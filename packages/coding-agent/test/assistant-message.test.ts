@@ -1,6 +1,10 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { describe, expect, test } from "vitest";
-import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
+import { describe, expect, test, vi } from "vitest";
+import {
+	AssistantMessageComponent,
+	flushAssistantMessageComponentUpdate,
+	queueAssistantMessageComponentUpdate,
+} from "../src/modes/interactive/components/assistant-message.ts";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
@@ -157,6 +161,39 @@ describe("AssistantMessageComponent", () => {
 		component.updateContent(message, false);
 		expect(stripAnsi(component.render(80).join("\n"))).toContain("partial transformed");
 		expect(streamingStates).toEqual([true, false]);
+	});
+
+	test("coalesces queued streaming updates until render and supports synchronous flush", () => {
+		initTheme("dark");
+		const transformed: string[] = [];
+		const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking...", 1, [
+			(markdown) => {
+				transformed.push(markdown);
+				return markdown;
+			},
+		]);
+		const reconcile = vi.spyOn(component, "updateContent");
+
+		for (let i = 1; i <= 100; i++) {
+			queueAssistantMessageComponentUpdate(
+				component,
+				createAssistantMessage([{ type: "text", text: `token ${i}` }]),
+				true,
+			);
+		}
+
+		expect(reconcile).not.toHaveBeenCalled();
+		expect(transformed).toEqual([]);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("token 100");
+		expect(reconcile).toHaveBeenCalledTimes(1);
+		expect(transformed).toEqual(["token 100"]);
+
+		const finalMessage = createAssistantMessage([{ type: "text", text: "final state" }]);
+		queueAssistantMessageComponentUpdate(component, finalMessage, false);
+		flushAssistantMessageComponentUpdate(component);
+		expect(reconcile).toHaveBeenCalledTimes(2);
+		expect(reconcile).toHaveBeenLastCalledWith(finalMessage, false);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("final state");
 	});
 
 	test("reapplies Markdown transformers when available width changes", () => {

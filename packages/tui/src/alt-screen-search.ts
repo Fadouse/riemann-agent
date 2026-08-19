@@ -10,6 +10,11 @@ interface SearchSourceSpan {
 	endCol: number;
 }
 
+interface SearchCorpus {
+	text: string;
+	source: Array<SearchSourceSpan | undefined>;
+}
+
 export interface AltScreenSearchSegment {
 	row: number;
 	startCol: number;
@@ -29,11 +34,8 @@ function appendMappedText(
 	for (let index = 0; index < text.length; index++) corpus.source.push(span);
 }
 
-function buildSearchCorpus(lines: readonly string[]): {
-	text: string;
-	source: Array<SearchSourceSpan | undefined>;
-} {
-	const corpus: { text: string; source: Array<SearchSourceSpan | undefined> } = { text: "", source: [] };
+function buildSearchCorpus(lines: readonly string[]): SearchCorpus {
+	const corpus: SearchCorpus = { text: "", source: [] };
 	let pendingSeparator = false;
 
 	for (let row = 0; row < lines.length; row++) {
@@ -68,11 +70,7 @@ function escapeRegExp(text: string): string {
 	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function findAltScreenSearchMatches(lines: readonly string[], query: string): AltScreenSearchMatch[] {
-	const normalizedQuery = normalizeQuery(query);
-	if (!normalizedQuery) return [];
-
-	const corpus = buildSearchCorpus(lines);
+function findMatchesInCorpus(corpus: SearchCorpus, normalizedQuery: string): AltScreenSearchMatch[] {
 	const expression = new RegExp(escapeRegExp(normalizedQuery), "giu");
 	const matches: AltScreenSearchMatch[] = [];
 
@@ -94,6 +92,62 @@ export function findAltScreenSearchMatches(lines: readonly string[], query: stri
 	}
 
 	return matches;
+}
+
+export function findAltScreenSearchMatches(lines: readonly string[], query: string): AltScreenSearchMatch[] {
+	const normalizedQuery = normalizeQuery(query);
+	return normalizedQuery ? findMatchesInCorpus(buildSearchCorpus(lines), normalizedQuery) : [];
+}
+
+function hasSameDocumentLines(previous: readonly string[] | undefined, lines: readonly string[]): boolean {
+	if (!previous || previous.length !== lines.length) return false;
+	for (let index = 0; index < lines.length; index++) {
+		if (previous[index] !== lines[index]) return false;
+	}
+	return true;
+}
+
+/**
+ * Internal rendered-document and query cache used by the alternate-screen renderer.
+ * @internal
+ */
+export class AltScreenSearchCache {
+	private documentLines: string[] | undefined;
+	private corpus: SearchCorpus = { text: "", source: [] };
+	private normalizedQuery: string | undefined;
+	private currentMatches: readonly AltScreenSearchMatch[] = [];
+	private currentDocumentRevision = 0;
+
+	get matches(): readonly AltScreenSearchMatch[] {
+		return this.currentMatches;
+	}
+
+	get documentRevision(): number {
+		return this.currentDocumentRevision;
+	}
+
+	/** Update the cache and return whether the match set was recomputed. */
+	update(lines: readonly string[], query: string): boolean {
+		const normalizedQuery = normalizeQuery(query);
+		if (!normalizedQuery) {
+			if (this.normalizedQuery === normalizedQuery && this.currentMatches.length === 0) return false;
+			this.normalizedQuery = normalizedQuery;
+			this.currentMatches = [];
+			return true;
+		}
+
+		const documentChanged = !hasSameDocumentLines(this.documentLines, lines);
+		if (documentChanged) {
+			this.documentLines = Array.from(lines);
+			this.corpus = buildSearchCorpus(this.documentLines);
+			this.currentDocumentRevision += 1;
+		}
+
+		if (!documentChanged && this.normalizedQuery === normalizedQuery) return false;
+		this.normalizedQuery = normalizedQuery;
+		this.currentMatches = findMatchesInCorpus(this.corpus, normalizedQuery);
+		return true;
+	}
 }
 
 export function getAltScreenSearchMatchKey(match: AltScreenSearchMatch): string {

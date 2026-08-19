@@ -70,6 +70,28 @@ class CollapsedThinkingRow implements Component {
 	invalidate(): void {}
 }
 
+const pendingContentUpdates = new WeakMap<
+	AssistantMessageComponent,
+	{ message: AssistantMessage; isStreaming: boolean }
+>();
+
+/** @internal Queue a display-only update until the component renders. */
+export function queueAssistantMessageComponentUpdate(
+	component: AssistantMessageComponent,
+	message: AssistantMessage,
+	isStreaming: boolean,
+): void {
+	pendingContentUpdates.set(component, { message, isStreaming });
+}
+
+/** @internal Reconcile the latest queued display update immediately. */
+export function flushAssistantMessageComponentUpdate(component: AssistantMessageComponent): void {
+	const pending = pendingContentUpdates.get(component);
+	if (!pending) return;
+	pendingContentUpdates.delete(component);
+	component.updateContent(pending.message, pending.isStreaming);
+}
+
 /**
  * Component that renders a complete assistant message
  */
@@ -138,6 +160,7 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	override render(width: number): string[] {
+		flushAssistantMessageComponentUpdate(this);
 		const lines = super.render(width);
 		if (this.hasToolCalls || lines.length === 0) {
 			return lines;
@@ -151,6 +174,7 @@ export class AssistantMessageComponent extends Container {
 	updateContent(message: AssistantMessage, isStreaming = this.isStreaming): void {
 		this.lastMessage = message;
 		this.isStreaming = isStreaming;
+		pendingContentUpdates.delete(this);
 
 		// Clear content container
 		this.contentContainer.clear();

@@ -11,6 +11,15 @@ import {
 	type ThinkingLevelChangeEntry,
 } from "../../src/core/session-manager.ts";
 
+class CountingEntryMap extends Map<string, SessionEntry> {
+	getCalls = 0;
+
+	override get(key: string): SessionEntry | undefined {
+		this.getCalls++;
+		return super.get(key);
+	}
+}
+
 function msg(id: string, parentId: string | null, role: "user" | "assistant", text: string): SessionMessageEntry {
 	const base = { type: "message" as const, id, parentId, timestamp: "2025-01-01T00:00:00Z" };
 	if (role === "user") {
@@ -282,6 +291,79 @@ describe("buildSessionContext", () => {
 			expect((ctxBranch.messages[2] as any).content).toBe("q2");
 			expect((ctxBranch.messages[3] as any).summary).toContain("Tried wrong approach");
 			expect((ctxBranch.messages[4] as any).content).toBe("better approach");
+		});
+	});
+
+	describe("large histories", () => {
+		it("walks a large branch only once when building context", () => {
+			const entries: SessionEntry[] = [];
+			let parentId: string | null = null;
+			for (let i = 0; i < 10_000; i++) {
+				const entry = custom(`state-${i}`, parentId, "state");
+				entries.push(entry);
+				parentId = entry.id;
+			}
+			const leaf = msg("leaf", parentId, "user", "done");
+			entries.push(leaf);
+
+			const byId = new CountingEntryMap();
+			for (const entry of entries) {
+				byId.set(entry.id, entry);
+			}
+
+			const ctx = buildSessionContext(entries, leaf.id, byId);
+
+			expect(ctx.messages).toEqual([leaf.message]);
+			expect(byId.getCalls).toBe(entries.length);
+		});
+
+		it("resolves a selected compacted branch without traversing a large off-path branch", () => {
+			const root = msg("root", null, "user", "start");
+			const level = thinkingLevel("level", root.id, "high");
+			const model = modelChange("model", level.id, "openai", "gpt-test");
+			const kept = msg("kept", model.id, "user", "keep me");
+			const response = msg("response", kept.id, "assistant", "kept response");
+			const selectedCompaction = compaction("selected-compaction", response.id, "Selected summary", kept.id);
+			const selectedLeaf = msg("selected-leaf", selectedCompaction.id, "user", "selected branch");
+			const entries: SessionEntry[] = [root, level, model, kept, response, selectedCompaction, selectedLeaf];
+
+			let offPathParentId = model.id;
+			let firstOffPathId = "";
+			for (let i = 0; i < 5_000; i++) {
+				const entry = custom(`off-path-${i}`, offPathParentId, "off-path-state");
+				if (i === 0) firstOffPathId = entry.id;
+				entries.push(entry);
+				offPathParentId = entry.id;
+			}
+			const offPathCompaction = compaction("off-path-compaction", offPathParentId, "Wrong summary", firstOffPathId);
+			entries.push(offPathCompaction, msg("off-path-leaf", offPathCompaction.id, "user", "wrong branch"));
+
+			const byId = new CountingEntryMap();
+			for (const entry of entries) {
+				byId.set(entry.id, entry);
+			}
+			const selectedPathLength = 7;
+
+			expect(buildContextEntries(entries, selectedLeaf.id, byId).map((entry) => entry.id)).toEqual([
+				selectedCompaction.id,
+				kept.id,
+				response.id,
+				selectedLeaf.id,
+			]);
+			expect(byId.getCalls).toBe(selectedPathLength);
+
+			byId.getCalls = 0;
+			const ctx = buildSessionContext(entries, selectedLeaf.id, byId);
+
+			expect(ctx.messages).toEqual([
+				expect.objectContaining({ role: "compactionSummary", summary: "Selected summary" }),
+				kept.message,
+				response.message,
+				selectedLeaf.message,
+			]);
+			expect(ctx.thinkingLevel).toBe("high");
+			expect(ctx.model).toEqual({ provider: "anthropic", modelId: "claude-test" });
+			expect(byId.getCalls).toBe(selectedPathLength);
 		});
 	});
 

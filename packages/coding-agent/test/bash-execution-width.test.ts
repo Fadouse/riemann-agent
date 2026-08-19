@@ -6,6 +6,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it } from "vitest";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { stripAnsi } from "../src/utils/ansi.ts";
 
 /** Minimal TUI stub that only exposes terminal.columns */
 function createTuiStub(columns: number): { columns: number; stub: any } {
@@ -76,5 +77,19 @@ describe("BashExecutionComponent width handling (#2569)", () => {
 			const w = visibleWidth(lines60[i]);
 			expect(w, `Line ${i} visibleWidth=${w} > 60`).toBeLessThanOrEqual(60);
 		}
+	});
+
+	it("coalesces output chunks until the next render", () => {
+		const { stub } = createTuiStub(100);
+		const component = new BashExecutionComponent("stream", stub);
+		const internals = component as unknown as { contentContainer: { children: unknown[] } };
+		const initialChildren = internals.contentContainer.children;
+
+		for (let index = 0; index < 100; index++) component.appendOutput(`line-${index}\n`);
+
+		expect(internals.contentContainer.children).toBe(initialChildren);
+		const rendered = stripAnsi(component.render(100).join("\n"));
+		expect(internals.contentContainer.children).not.toBe(initialChildren);
+		expect(rendered).toContain("line-99");
 	});
 });

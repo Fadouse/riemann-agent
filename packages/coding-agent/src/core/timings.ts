@@ -13,21 +13,30 @@ type TimingLabel = "main" | "extensions";
 
 const timingNamespaces = new Map<TimingLabel, TimingNamespace>();
 
+function createTimingNamespace(namespace: TimingLabel, now: number): TimingNamespace {
+	return {
+		timings: namespace === "main" ? [{ label: "process/module startup", ms: now }] : [],
+		lastTime: now,
+	};
+}
+
 export function resetTimings(namespace: TimingLabel = "main"): void {
 	if (!ENABLED) return;
-	timingNamespaces.set(namespace, { timings: [], lastTime: Date.now() });
+	const now = performance.now();
+	timingNamespaces.set(namespace, createTimingNamespace(namespace, now));
 }
 
 export function time(label: string, namespace: TimingLabel = "main"): void {
 	if (!ENABLED) return;
-	const now = Date.now();
+	const now = performance.now();
+	let timingNamespace = timingNamespaces.get(namespace);
 
-	if (!timingNamespaces.has(namespace)) {
-		resetTimings(namespace);
+	if (!timingNamespace) {
+		timingNamespace = createTimingNamespace(namespace, now);
+		timingNamespaces.set(namespace, timingNamespace);
 	}
 
-	const timingNamespace = timingNamespaces.get(namespace)!;
-	timingNamespace.timings.push({ label, ms: now - timingNamespace.lastTime });
+	timingNamespace.timings.push({ label, ms: Math.max(0, now - timingNamespace.lastTime) });
 	timingNamespace.lastTime = now;
 }
 
@@ -36,9 +45,9 @@ function printTimingGroup(title: string, timings: TimingNamespace["timings"]): v
 	if (printableTimings.length === 0) return;
 	console.error(`\n--- ${title} ---`);
 	for (const t of printableTimings) {
-		console.error(`  ${t.label}: ${t.ms}ms`);
+		console.error(`  ${t.label}: ${Math.round(t.ms)}ms`);
 	}
-	console.error(`  TOTAL: ${printableTimings.reduce((a, b) => a + b.ms, 0)}ms`);
+	console.error(`  TOTAL: ${Math.round(printableTimings.reduce((a, b) => a + b.ms, 0))}ms`);
 	console.error(`${"-".repeat(title.length + 8)}\n`);
 }
 

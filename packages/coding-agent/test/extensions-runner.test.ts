@@ -564,6 +564,60 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("context emission", () => {
+		it("returns the original messages without cloning when no handlers are registered", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const messages = [{ role: "user" as const, content: "hello", timestamp: 1 }];
+			const cloneSpy = vi.spyOn(globalThis, "structuredClone");
+
+			try {
+				const emittedMessages = await runner.emitContext(messages);
+
+				expect(emittedMessages).toBe(messages);
+				expect(cloneSpy).not.toHaveBeenCalled();
+			} finally {
+				cloneSpy.mockRestore();
+			}
+		});
+
+		it("isolates source messages from context handler mutations", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("context", (event) => {
+						event.messages[0].content[0].text = "mutated";
+						event.messages.push({ role: "user", content: "added", timestamp: 2 });
+						return { messages: event.messages };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "context.ts"), extCode);
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const messages = [
+				{
+					role: "user" as const,
+					content: [{ type: "text" as const, text: "original" }],
+					timestamp: 1,
+				},
+			];
+
+			const emittedMessages = await runner.emitContext(messages);
+
+			expect(emittedMessages).toHaveLength(2);
+			expect(emittedMessages).not.toBe(messages);
+			expect(emittedMessages[0]).not.toBe(messages[0]);
+			expect(emittedMessages[0]).toMatchObject({ content: [{ type: "text", text: "mutated" }] });
+			expect(messages).toEqual([
+				{
+					role: "user",
+					content: [{ type: "text", text: "original" }],
+					timestamp: 1,
+				},
+			]);
+		});
+	});
+
 	describe("error handling", () => {
 		it("calls error listeners when handler throws", async () => {
 			const extCode = `

@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { afterAll, describe, expect, test } from "vitest";
 import { FULL_FILESYSTEM, fileAccessPolicy } from "../src/riemann/access-policy.ts";
 import { IPythonKernelManager } from "../src/riemann/kernel/manager.ts";
-import type { JsonValue, KernelSandboxConfiguration } from "../src/riemann/kernel/types.ts";
+import type { JsonValue, JupyterMessage, KernelSandboxConfiguration } from "../src/riemann/kernel/types.ts";
 import { ensureManagedPython } from "../src/riemann/python/runtime.ts";
 
 const roots: string[] = [];
@@ -178,6 +178,172 @@ async function createKernel(
 }
 
 describe("Riemann IPython kernel", () => {
+	test("stops rewriting stream buffers after preserving capped output", () => {
+		const kernel = new IPythonKernelManager({
+			python: "python",
+			cwd: process.cwd(),
+			sessionId: "output-cap-test",
+			bootstrapCode: "",
+			sandbox: false,
+			maxOutputChars: 5,
+			hostRequest: () => Promise.resolve(null),
+		});
+		const execution = {
+			id: "output-cap-execution",
+			stdout: "",
+			stderr: "",
+			stdoutTruncated: false,
+			stderrTruncated: false,
+		};
+		let stdout = "";
+		let stderr = "";
+		let stdoutWrites = 0;
+		let stderrWrites = 0;
+		Object.defineProperty(execution, "stdout", {
+			get: () => stdout,
+			set: (value: string) => {
+				stdout = value;
+				stdoutWrites += 1;
+			},
+		});
+		Object.defineProperty(execution, "stderr", {
+			get: () => stderr,
+			set: (value: string) => {
+				stderr = value;
+				stderrWrites += 1;
+			},
+		});
+		const internals = kernel as unknown as {
+			execution?: typeof execution;
+			handleMessage(channel: "shell" | "control" | "iopub", message: JupyterMessage): void;
+		};
+		const streamMessage = (name: "stdout" | "stderr", text: string): JupyterMessage => ({
+			identities: [],
+			header: {
+				msg_id: `stream-${name}-${text}`,
+				username: "output-cap-test",
+				session: "output-cap-test",
+				date: "2026-08-19T00:00:00.000Z",
+				msg_type: "stream",
+				version: "5.3",
+			},
+			parentHeader: { msg_id: execution.id },
+			metadata: {},
+			content: { name, text },
+			buffers: [],
+		});
+
+		internals.execution = execution;
+		internals.handleMessage("iopub", streamMessage("stdout", "abc"));
+		internals.handleMessage("iopub", streamMessage("stdout", "def"));
+		internals.handleMessage("iopub", streamMessage("stdout", "ignored after cap"));
+		internals.handleMessage("iopub", streamMessage("stderr", "123456"));
+		internals.handleMessage("iopub", streamMessage("stderr", "ignored after cap"));
+		internals.execution = undefined;
+
+		const suffix = "\n[output truncated by Riemann Agent]";
+		expect(stdout).toBe(`abcde${suffix}`);
+		expect(stderr).toBe(`12345${suffix}`);
+		expect(stdoutWrites).toBe(2);
+		expect(stderrWrites).toBe(1);
+	});
+
+	test("serializes checkpoints once, diagnoses failures, and retries failed checkpoints", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-checkpoint-fast-path-"));
+		roots.push(root);
+		const snapshotPath = join(root, "snapshot.dill");
+		const dumpCallsPath = join(root, "dump-calls.txt");
+		const retryCallsPath = join(root, "retry-calls.txt");
+		await Promise.all([writeFile(dumpCallsPath, ""), writeFile(retryCallsPath, "")]);
+		const kernel = await stage("create checkpoint fast-path kernel", createKernel(root, snapshotPath));
+		try {
+			const tracking = await stage(
+				"install checkpoint serialization tracker",
+				kernel.execute(`import dill as _test_dill
+_test_original_dump = _test_dill.dump
+_test_original_dumps = _test_dill.dumps
+_test_dump_calls_path = ${JSON.stringify(dumpCallsPath)}
+def _test_record_dump():
+    with open(_test_dump_calls_path, "a", encoding="utf-8") as _test_file:
+        _test_file.write("dump\\n")
+def _test_counting_dump(value, file, *args, **kwargs):
+    _test_record_dump()
+    return _test_original_dump(value, file, *args, **kwargs)
+def _test_counting_dumps(value, *args, **kwargs):
+    _test_record_dump()
+    return _test_original_dumps(value, *args, **kwargs)
+_test_dill.dump = _test_counting_dump
+_test_dill.dumps = _test_counting_dumps
+answer = 41`),
+			);
+			expect(tracking.status).toBe("ok");
+
+			const first = await stage("serialize whole checkpoint", kernel.snapshot());
+			expect(first.error).toBeUndefined();
+			expect(first.restored).toContain("answer");
+			expect(await readFile(dumpCallsPath, "utf8")).toBe("dump\n");
+
+			const repeated = await stage("repeat checkpoint", kernel.snapshot());
+			expect(repeated).toEqual(first);
+			expect(await readFile(dumpCallsPath, "utf8")).toBe("dump\n".repeat(2));
+
+			await writeFile(dumpCallsPath, "");
+			const generator = await stage(
+				"add unserializable checkpoint value",
+				kernel.execute("bad = (value for value in range(3))"),
+			);
+			expect(generator.status).toBe("ok");
+			const diagnosed = await stage("diagnose checkpoint serialization failure", kernel.snapshot());
+			expect(diagnosed.error).toBeUndefined();
+			expect(diagnosed.restored).toContain("answer");
+			expect(diagnosed.skipped).toEqual([
+				expect.objectContaining({ name: "bad", reason: expect.stringContaining("generator") }),
+			]);
+			const diagnosedDumpCalls = await readFile(dumpCallsPath, "utf8");
+			expect(diagnosedDumpCalls).toBe("dump\n".repeat(diagnosed.restored.length + diagnosed.skipped.length + 2));
+
+			const diagnosedRepeat = await stage("repeat diagnosed checkpoint", kernel.snapshot());
+			expect(diagnosedRepeat).toEqual(diagnosed);
+			expect(await readFile(dumpCallsPath, "utf8")).toBe(diagnosedDumpCalls.repeat(2));
+
+			const flaky = await stage(
+				"install transient checkpoint failure",
+				kernel.execute(`del bad
+_test_retry_calls_path = ${JSON.stringify(retryCallsPath)}
+def _test_retry_dump(value, file, *args, **kwargs):
+    with open(_test_retry_calls_path, "a", encoding="utf-8") as _test_file:
+        _test_file.write("retry\\n")
+    return _test_original_dump(value, file, *args, **kwargs)
+_test_flaky_dictionary_calls = 0
+def _test_flaky_dump(value, file, *args, **kwargs):
+    global _test_flaky_dictionary_calls
+    if isinstance(value, dict) and "answer" in value:
+        _test_flaky_dictionary_calls += 1
+        if _test_flaky_dictionary_calls <= 2:
+            if _test_flaky_dictionary_calls == 2:
+                _test_dill.dump = _test_retry_dump
+            raise RuntimeError(f"forced checkpoint failure {_test_flaky_dictionary_calls}")
+    return _test_original_dump(value, file, *args, **kwargs)
+_test_dill.dump = _test_flaky_dump`),
+			);
+			expect(flaky.status).toBe("ok");
+			const failed = await stage("fail transient checkpoint", kernel.snapshot());
+			expect(failed.error).toContain("forced checkpoint failure 2");
+			expect(await readFile(retryCallsPath, "utf8")).toBe("");
+
+			const retried = await stage("retry dirty checkpoint", kernel.snapshot());
+			expect(retried.error).toBeUndefined();
+			expect(retried.restored).toContain("answer");
+			expect(await readFile(retryCallsPath, "utf8")).toBe("retry\n");
+
+			const retriedRepeat = await stage("repeat retried checkpoint", kernel.snapshot());
+			expect(retriedRepeat).toEqual(retried);
+			expect(await readFile(retryCallsPath, "utf8")).toBe("retry\n".repeat(2));
+		} finally {
+			await stage("close checkpoint fast-path kernel", kernel.close());
+		}
+	}, 45_000);
+
 	test("reports ordered host request lifecycle and streaming updates", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-events-"));
 		roots.push(root);

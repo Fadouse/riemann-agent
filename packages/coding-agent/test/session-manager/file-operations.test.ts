@@ -3,7 +3,13 @@ import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, w
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { findMostRecentSession, loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.ts";
+import { APP_NAME } from "../../src/config.ts";
+import {
+	type FileEntry,
+	findMostRecentSession,
+	loadEntriesFromFile,
+	SessionManager,
+} from "../../src/core/session-manager.ts";
 
 const HEADER_SCAN_LIMIT_BYTES = 1024 * 1024;
 
@@ -144,6 +150,107 @@ describe("loadEntriesFromFile", () => {
 		expect(sessionManager.getSessionId()).toBe("abc");
 		expect(sessionManager.getEntries()).toHaveLength(1);
 		expect(sessionManager.buildSessionContext().messages).toEqual([{ role: "user", content: "hi", timestamp: 1 }]);
+	});
+});
+
+describe("SessionManager large-history persistence", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `session-large-history-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("caches assistant presence while preserving forked JSONL order", () => {
+		const sourceFile = join(tempDir, "source.jsonl");
+		const timestamp = "2025-01-01T00:00:00Z";
+		const sourceEntries: FileEntry[] = [
+			{
+				type: "session",
+				version: 3,
+				id: "source",
+				timestamp,
+				cwd: tempDir,
+			},
+		];
+		let parentId: string | null = null;
+		for (let i = 0; i < 5_000; i++) {
+			const id = `history-${i}`;
+			sourceEntries.push({
+				type: "custom",
+				id,
+				parentId,
+				timestamp,
+				customType: "history",
+				data: { index: i },
+			});
+			parentId = id;
+		}
+		sourceEntries.push({
+			type: "message",
+			id: "assistant",
+			parentId,
+			timestamp,
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "ready" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "test",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 1,
+			},
+		});
+		writeFileSync(sourceFile, `${sourceEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+
+		const session = SessionManager.forkFrom(sourceFile, tempDir, tempDir, { id: "large-history-fork" });
+		const forkFile = session.getSessionFile();
+		expect(forkFile).toBeDefined();
+
+		const returnedEntries = session.getEntries();
+		expect(returnedEntries).toHaveLength(sourceEntries.length - 1);
+		returnedEntries.length = 0;
+		expect(session.getEntries()).toHaveLength(sourceEntries.length - 1);
+
+		const internalEntries = (session as unknown as { fileEntries: FileEntry[] }).fileEntries;
+		Object.defineProperty(internalEntries, "some", {
+			configurable: true,
+			value: () => {
+				throw new Error("append rescanned the session history");
+			},
+		});
+		const appendedId = session.appendCustomEntry("after-fork", { persisted: true });
+
+		const onDisk = loadEntriesFromFile(forkFile!);
+		expect(onDisk).toHaveLength(sourceEntries.length + 1);
+		expect(onDisk[0]).toMatchObject({
+			type: "session",
+			id: "large-history-fork",
+			parentSession: sourceFile,
+		});
+		expect(onDisk.slice(1, -1)).toEqual(sourceEntries.slice(1));
+		expect(onDisk.at(-1)).toMatchObject({
+			type: "custom",
+			id: appendedId,
+			parentId: "assistant",
+			customType: "after-fork",
+			data: { persisted: true },
+		});
+
+		const reopened = SessionManager.open(forkFile!, tempDir);
+		expect(reopened.getLeafId()).toBe(appendedId);
 	});
 });
 
@@ -336,7 +443,7 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		writeFileSync(noHeaderFile, originalContent);
 
 		expect(() => SessionManager.open(noHeaderFile, tempDir)).toThrow(
-			`Session file is not a valid pi session: ${noHeaderFile}`,
+			`Session file is not a valid ${APP_NAME} session: ${noHeaderFile}`,
 		);
 		expect(readFileSync(noHeaderFile, "utf-8")).toBe(originalContent);
 	});
@@ -347,7 +454,7 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		writeFileSync(nonSessionFile, originalContent);
 
 		expect(() => SessionManager.open(nonSessionFile, tempDir)).toThrow(
-			`Session file is not a valid pi session: ${nonSessionFile}`,
+			`Session file is not a valid ${APP_NAME} session: ${nonSessionFile}`,
 		);
 		expect(readFileSync(nonSessionFile, "utf-8")).toBe(originalContent);
 	});

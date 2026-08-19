@@ -672,7 +672,8 @@ async function executePreparedToolCall(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallOutcome> {
-	const updateEvents: Promise<void>[] = [];
+	let updateEventTail = Promise.resolve();
+	let updateError: { error: unknown } | undefined;
 	let acceptingUpdates = true;
 
 	try {
@@ -682,25 +683,29 @@ async function executePreparedToolCall(
 			signal,
 			(partialResult) => {
 				if (!acceptingUpdates) return;
-				updateEvents.push(
-					Promise.resolve(
-						emit({
+				updateEventTail = updateEventTail.then(async () => {
+					try {
+						await emit({
 							type: "tool_execution_update",
 							toolCallId: prepared.toolCall.id,
 							toolName: prepared.toolCall.name,
 							args: prepared.toolCall.arguments,
 							partialResult,
-						}),
-					),
-				);
+						});
+					} catch (error) {
+						updateError ??= { error };
+					}
+				});
 			},
 		);
 		acceptingUpdates = false;
-		await Promise.all(updateEvents);
+		await updateEventTail;
+		if (updateError) throw updateError.error;
 		return { result, isError: false };
 	} catch (error) {
 		acceptingUpdates = false;
-		await Promise.all(updateEvents);
+		await updateEventTail;
+		if (updateError) throw updateError.error;
 		return {
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 			isError: true,

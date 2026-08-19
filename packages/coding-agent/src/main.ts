@@ -80,13 +80,13 @@ async function readPipedStdin(): Promise<string | undefined> {
 	}
 
 	return new Promise((resolve) => {
-		let data = "";
+		const chunks: string[] = [];
 		process.stdin.setEncoding("utf8");
 		process.stdin.on("data", (chunk) => {
-			data += chunk;
+			chunks.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
 		});
 		process.stdin.on("end", () => {
-			resolve(data.trim() || undefined);
+			resolve(chunks.join("").trim() || undefined);
 		});
 		process.stdin.resume();
 	});

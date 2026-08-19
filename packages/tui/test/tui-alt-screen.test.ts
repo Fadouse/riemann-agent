@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { findAltScreenSearchMatches } from "../src/alt-screen-search.ts";
+import { AltScreenSearchCache, findAltScreenSearchMatches } from "../src/alt-screen-search.ts";
 import { HStack } from "../src/components/h-stack.ts";
 import { Image } from "../src/components/image.ts";
 import { ScrollView } from "../src/components/scroll-view.ts";
@@ -406,6 +406,39 @@ describe("TuiAltScreen", () => {
 		]);
 	});
 
+	it("caches matches by normalized query and exact rendered document", () => {
+		const cache = new AltScreenSearchCache();
+		const lines = ["\x1b[31mneedle\x1b[0m alpha", "needle beta"];
+
+		assert.strictEqual(cache.update(lines, "needle"), true);
+		assert.strictEqual(cache.documentRevision, 1);
+		assert.strictEqual(cache.matches.length, 2);
+		const initialMatches = cache.matches;
+
+		assert.strictEqual(cache.update(Array.from(lines), "needle"), false);
+		assert.strictEqual(cache.matches, initialMatches);
+		assert.strictEqual(cache.documentRevision, 1);
+
+		assert.strictEqual(cache.update(lines, "beta"), true);
+		assert.strictEqual(cache.documentRevision, 1, "query changes must reuse the rendered-document corpus");
+		assert.deepStrictEqual(cache.matches, [{ segments: [{ row: 1, startCol: 7, endCol: 11 }] }]);
+
+		const themedLines = ["\x1b[32mneedle\x1b[0m alpha", "needle beta"];
+		assert.strictEqual(cache.update(themedLines, "needle"), true);
+		assert.strictEqual(cache.documentRevision, 2, "ANSI theme changes must invalidate the rendered document");
+		assert.deepStrictEqual(cache.matches, initialMatches);
+
+		const appendedLines = [...themedLines, "needle gamma"];
+		assert.strictEqual(cache.update(appendedLines, "needle"), true);
+		assert.strictEqual(cache.documentRevision, 3);
+		assert.strictEqual(cache.matches.length, 3);
+
+		appendedLines[2] = "gamma only";
+		assert.strictEqual(cache.update(appendedLines, "needle"), true);
+		assert.strictEqual(cache.documentRevision, 4, "in-place document mutation must invalidate the cache");
+		assert.strictEqual(cache.matches.length, 2);
+	});
+
 	it("uses configured styles for current and non-current search matches", async () => {
 		const terminal = new RecordingTerminal(60, 4);
 		const tui = new TuiAltScreen(terminal, undefined, undefined, {
@@ -426,6 +459,77 @@ describe("TuiAltScreen", () => {
 		assert.ok(
 			terminal.events.some((event) => event.type === "write" && event.data.includes("\x1b[41mneedle\x1b[49m")),
 		);
+		tui.stop();
+	});
+
+	it("keeps search navigation and highlights correct across theme, document, query, and size changes", async () => {
+		const terminal = new RecordingTerminal(60, 6);
+		let currentMatchColor = 42;
+		const tui = new TuiAltScreen(terminal, undefined, undefined, {
+			searchMatchStyle: (text) => `\x1b[41m${text}\x1b[49m`,
+			searchCurrentMatchStyle: (text) => `\x1b[${currentMatchColor}m${text}\x1b[49m`,
+		});
+		const initialText = [
+			"needle alpha with enough trailing text to wrap after a narrow resize",
+			"separator",
+			"needle beta with enough trailing text to wrap after a narrow resize",
+		].join("\n");
+		const transcriptText = new Text(initialText, 0, 0);
+		const transcript = new ScrollView(transcriptText, { primary: true });
+		tui.setLayoutRoot(transcript);
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[102;6u");
+		terminal.sendInput("needle");
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().some((line) => line.includes("Find transcript") && line.includes("1/2")));
+		assert.ok(
+			terminal.events.some((event) => event.type === "write" && event.data.includes("\x1b[42mneedle\x1b[49m")),
+		);
+		assert.ok(
+			terminal.events.some((event) => event.type === "write" && event.data.includes("\x1b[41mneedle\x1b[49m")),
+		);
+
+		const themeEventCount = terminal.events.length;
+		currentMatchColor = 44;
+		tui.invalidate();
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(
+			terminal.events
+				.slice(themeEventCount)
+				.some((event) => event.type === "write" && event.data.includes("\x1b[44mneedle\x1b[49m")),
+		);
+
+		terminal.sendInput("\x07");
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().some((line) => line.includes("Find transcript") && line.includes("2/2")));
+
+		transcriptText.setText(`${initialText}\nneedle gamma`);
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().some((line) => line.includes("Find transcript") && line.includes("2/3")));
+
+		const resizeEventCount = terminal.events.length;
+		terminal.resize(32, 6);
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().some((line) => line.includes("Find transcript") && line.includes("2/3")));
+		assert.ok(
+			terminal.events
+				.slice(resizeEventCount)
+				.some((event) => event.type === "write" && event.data.includes("\x1b[44mneedle\x1b[49m")),
+		);
+
+		for (let index = 0; index < "needle".length; index++) terminal.sendInput("\x7f");
+		terminal.sendInput("gamma");
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().some((line) => line.includes("Find transcript") && line.includes("1/1")));
+		assert.ok(terminal.getViewport().some((line) => line.includes("needle gamma")));
+		assert.ok(
+			terminal.events.some((event) => event.type === "write" && event.data.includes("\x1b[44mgamma\x1b[49m")),
+		);
+
 		tui.stop();
 	});
 

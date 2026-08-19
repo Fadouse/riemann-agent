@@ -450,8 +450,14 @@ export class FileFunctions {
 							});
 						}
 						const edits = this.parseEdits(args.operations, current.length);
-						let next = current;
-						for (const edit of edits) next = `${next.slice(0, edit.start)}${edit.text}${next.slice(edit.end)}`;
+						const fragments: string[] = [];
+						let unchangedEnd = current.length;
+						for (const edit of edits) {
+							fragments.push(current.slice(edit.end, unchangedEnd), edit.text);
+							unchangedEnd = edit.start;
+						}
+						fragments.push(current.slice(0, unchangedEnd));
+						const next = fragments.reverse().join("");
 						const info = await stat(snapshot.path);
 						await this.writeAtomically(snapshot.path, next, info.mode);
 						return this.createSnapshot(snapshot.path, next);

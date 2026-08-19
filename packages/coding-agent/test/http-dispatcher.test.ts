@@ -110,4 +110,13 @@ describe("http dispatcher", () => {
 		expect(connectSpy.mock.calls[0]?.[0]).not.toHaveProperty("autoSelectFamily");
 		expect(net.getDefaultAutoSelectFamilyAttemptTimeout()).toBe(originalAttemptTimeoutMs);
 	});
+
+	it("reuses the dispatcher when effective settings are unchanged", () => {
+		configureHttpDispatcher();
+		const first = undici.getGlobalDispatcher();
+
+		configureHttpDispatcher();
+
+		expect(undici.getGlobalDispatcher()).toBe(first);
+	});
 });

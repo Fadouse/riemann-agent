@@ -1,9 +1,13 @@
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
 
+const QUEUE_COMPACTION_THRESHOLD = 1024;
+
 // Generic event stream class for async iteration
 export class EventStream<T, R = T> implements AsyncIterable<T> {
 	private queue: T[] = [];
+	private queueHead = 0;
 	private waiting: ((value: IteratorResult<T>) => void)[] = [];
+	private waitingHead = 0;
 	private done = false;
 	private finalResultPromise: Promise<R>;
 	private resolveFinalResult!: (result: R) => void;
@@ -27,8 +31,16 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		}
 
 		// Deliver to waiting consumer or queue it
-		const waiter = this.waiting.shift();
+		const waiter = this.waiting[this.waitingHead];
 		if (waiter) {
+			this.waitingHead++;
+			if (this.waitingHead === this.waiting.length) {
+				this.waiting = [];
+				this.waitingHead = 0;
+			} else if (this.waitingHead >= QUEUE_COMPACTION_THRESHOLD && this.waitingHead * 2 >= this.waiting.length) {
+				this.waiting = this.waiting.slice(this.waitingHead);
+				this.waitingHead = 0;
+			}
 			waiter({ value: event, done: false });
 		} else {
 			this.queue.push(event);
@@ -41,16 +53,26 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 			this.resolveFinalResult(result);
 		}
 		// Notify all waiting consumers that we're done
-		while (this.waiting.length > 0) {
-			const waiter = this.waiting.shift()!;
-			waiter({ value: undefined as any, done: true });
+		for (; this.waitingHead < this.waiting.length; this.waitingHead++) {
+			this.waiting[this.waitingHead]!({ value: undefined, done: true });
 		}
+		this.waiting = [];
+		this.waitingHead = 0;
 	}
 
 	async *[Symbol.asyncIterator](): AsyncIterator<T> {
 		while (true) {
-			if (this.queue.length > 0) {
-				yield this.queue.shift()!;
+			if (this.queueHead < this.queue.length) {
+				const event = this.queue[this.queueHead]!;
+				this.queueHead++;
+				if (this.queueHead === this.queue.length) {
+					this.queue = [];
+					this.queueHead = 0;
+				} else if (this.queueHead >= QUEUE_COMPACTION_THRESHOLD && this.queueHead * 2 >= this.queue.length) {
+					this.queue = this.queue.slice(this.queueHead);
+					this.queueHead = 0;
+				}
+				yield event;
 			} else if (this.done) {
 				return;
 			} else {

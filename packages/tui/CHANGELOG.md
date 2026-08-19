@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Cached fullscreen transcript search corpora and matches across unchanged render frames while preserving query, resize, theme, and document invalidation.
+
 ### Fixed
 
 - Made complete `[Image #N]` attachment markers atomic for cursor movement and deletion, matching existing paste-marker behavior.

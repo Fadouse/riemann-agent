@@ -150,6 +150,7 @@ export class ModelRuntime implements Models {
 	private readonly providerAvailabilitySeq = new Map<string, number>();
 	private availabilityError: string | undefined;
 	private readonly credentialOperations = new Map<string, Promise<unknown>>();
+	private providerRefreshQueued = false;
 
 	private constructor(
 		credentials: RuntimeCredentials,
@@ -166,7 +167,6 @@ export class ModelRuntime implements Models {
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		this.models = createModels({ credentials, modelsStore });
-		this.rebuildProviders();
 	}
 
 	static async create(options: CreateModelRuntimeOptions = {}): Promise<ModelRuntime> {
@@ -208,7 +208,7 @@ export class ModelRuntime implements Models {
 			: options.signal;
 		try {
 			if (options.refreshOnCreate !== false) {
-				await runtime.refresh({ allowNetwork: refreshFromNetwork, signal });
+				await runtime.refreshModels({ allowNetwork: refreshFromNetwork, signal });
 			}
 		} finally {
 			if (timeout) clearTimeout(timeout);
@@ -687,7 +687,19 @@ export class ModelRuntime implements Models {
 		});
 	}
 
+	private queueProviderRefresh(): void {
+		if (this.providerRefreshQueued) return;
+		this.providerRefreshQueued = true;
+		queueMicrotask(() => {
+			if (!this.providerRefreshQueued) return;
+			this.providerRefreshQueued = false;
+			void this.refresh({ allowNetwork: false });
+		});
+	}
+
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
+		// An explicit refresh supersedes a queued refresh from synchronous provider registration.
+		this.providerRefreshQueued = false;
 		this.config = await ModelConfig.load(this.modelsPath);
 		this.configureRadiusProviders();
 		if (options.providers) {
@@ -696,6 +708,10 @@ export class ModelRuntime implements Models {
 		} else {
 			this.rebuildProviders();
 		}
+		return this.refreshModels(options);
+	}
+
+	private async refreshModels(options: ModelsRefreshOptions): Promise<ModelsRefreshResult> {
 		const refreshOptions = {
 			...options,
 			allowNetwork: options.allowNetwork ?? this.modelNetworkEnabled,
@@ -736,7 +752,7 @@ export class ModelRuntime implements Models {
 		this.nativeExtensionProviders.set(provider.id, provider);
 		this.recomposeProvider(provider.id);
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.queueProviderRefresh();
 	}
 
 	registerProvider(providerId: string, config: ProviderConfigInput): void {
@@ -774,7 +790,7 @@ export class ModelRuntime implements Models {
 				available: this.snapshot.all.filter((model) => configuredProviders.has(model.provider)),
 			};
 		}
-		void this.refresh({ allowNetwork: false });
+		this.queueProviderRefresh();
 	}
 
 	unregisterProvider(providerId: string): void {
@@ -782,6 +798,6 @@ export class ModelRuntime implements Models {
 		this.nativeExtensionProviders.delete(providerId);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.queueProviderRefresh();
 	}
 }

@@ -63,6 +63,7 @@ interface LiveChild {
 	runtime?: ChildRiemannRuntime;
 	requestedStop: boolean;
 	unsubscribeUi?: () => void;
+	statsRefreshTimer?: NodeJS.Timeout;
 }
 
 interface SubagentRuntimeUi {
@@ -120,6 +121,7 @@ export interface AgentEventDelivery {
 
 const DEFAULT_CHILD_CAPABILITIES = ["fs.read", "fs.write", "shell.run", "web.search", "web.fetch", "mcp.*"];
 const AGENT_OUTPUT_PREVIEW_CHARS = 160;
+const SUBAGENT_STATS_REFRESH_MS = 32;
 
 function canonicalCapabilities(values: readonly string[]): string[] {
 	return [
@@ -334,9 +336,10 @@ export class AgentSupervisor {
 	}
 
 	subscribeSubagentUi(listener: () => void): () => void {
-		const guarded = () => {
+		const identifiedListener: (agentId?: string) => void = listener;
+		const guarded = (agentId?: string) => {
 			try {
-				listener();
+				identifiedListener(agentId);
 			} catch {}
 		};
 		this.events.on("subagents", guarded);
@@ -361,13 +364,13 @@ export class AgentSupervisor {
 		await this.releaseAgent(this.options.rootAgent.id, agent.id, agent.lastTurnId);
 	}
 
-	private notifySubagentUi(): void {
-		this.events.emit("subagents");
+	private notifySubagentUi(agentId?: string): void {
+		this.events.emit("subagents", agentId);
 	}
 
 	private notify(agentId: string): void {
 		this.events.emit(`agent:${agentId}`);
-		this.notifySubagentUi();
+		this.notifySubagentUi(agentId);
 	}
 
 	private notifyTurn(agentId: string, turnId: string): void {
@@ -732,6 +735,31 @@ export class AgentSupervisor {
 		runtime.tokens = stats.tokens.total;
 	}
 
+	private scheduleSubagentStatsRefresh(agentId: string, live: LiveChild): void {
+		if (live.statsRefreshTimer || !live.session?.getSessionStats) return;
+		live.statsRefreshTimer = setTimeout(() => {
+			live.statsRefreshTimer = undefined;
+			if (this.live.get(agentId) !== live) return;
+			this.refreshSubagentStats(agentId, live);
+			this.notifySubagentUi(agentId);
+		}, SUBAGENT_STATS_REFRESH_MS);
+		live.statsRefreshTimer.unref?.();
+	}
+
+	private flushSubagentStats(agentId: string, live: LiveChild): void {
+		if (live.statsRefreshTimer) {
+			clearTimeout(live.statsRefreshTimer);
+			live.statsRefreshTimer = undefined;
+		}
+		this.refreshSubagentStats(agentId, live);
+	}
+
+	private cancelSubagentStatsRefresh(live: LiveChild): void {
+		if (!live.statsRefreshTimer) return;
+		clearTimeout(live.statsRefreshTimer);
+		live.statsRefreshTimer = undefined;
+	}
+
 	private observeSubagentEvent(
 		agentId: string,
 		live: LiveChild,
@@ -748,8 +776,8 @@ export class AgentSupervisor {
 		} else if (event.type === "agent_end" || event.type === "agent_settled") {
 			runtime.currentTool = undefined;
 		}
-		this.refreshSubagentStats(agentId, live);
-		this.notifySubagentUi();
+		this.scheduleSubagentStatsRefresh(agentId, live);
+		this.notifySubagentUi(agentId);
 	}
 
 	private loadPersistedMessages(agent: StoredAgent): readonly unknown[] {
@@ -831,7 +859,7 @@ export class AgentSupervisor {
 			live.session = session;
 			live.unsubscribeUi = session.subscribe?.((event) => this.observeSubagentEvent(agent.id, live, event));
 			this.refreshSubagentStats(agent.id, live);
-			this.notifySubagentUi();
+			this.notifySubagentUi(agent.id);
 			if (this.closed || live.requestedStop) {
 				await session.abort();
 				throw new Error("Agent stopped before its turn started");
@@ -850,6 +878,7 @@ export class AgentSupervisor {
 		} finally {
 			const messages = [...(live.session?.state.messages ?? this.persistedMessages.get(agent.id) ?? [])];
 			try {
+				this.flushSubagentStats(agent.id, live);
 				await this.settleAgent(
 					runningAgent,
 					turn.id,
@@ -859,7 +888,7 @@ export class AgentSupervisor {
 					messages,
 				);
 			} finally {
-				this.refreshSubagentStats(agent.id, live);
+				this.cancelSubagentStatsRefresh(live);
 				live.unsubscribeUi?.();
 				live.unsubscribeUi = undefined;
 				live.session?.dispose();

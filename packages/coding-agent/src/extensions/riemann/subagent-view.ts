@@ -125,6 +125,7 @@ export class SubagentConversationViewer implements Component, Focusable {
 	private stopping = false;
 	private releasing = false;
 	private closed = false;
+	private disposed = false;
 	private composer: Input | undefined;
 	private clockTimer: NodeJS.Timeout | undefined;
 	private updateTimer: NodeJS.Timeout | undefined;
@@ -142,7 +143,9 @@ export class SubagentConversationViewer implements Component, Focusable {
 		this.theme = options.theme;
 		this.keys = createViewerKeys(options.keybindings);
 		this.done = options.done;
-		this.unsubscribe = this.runtime.subscribeSubagentUi(() => this.scheduleDataRender());
+		this.unsubscribe = this.runtime.subscribeSubagentUi((changedAgentId?: string) => {
+			if (changedAgentId === undefined || changedAgentId === this.agentId) this.scheduleDataRender();
+		});
 		this.syncClock();
 	}
 
@@ -248,7 +251,7 @@ export class SubagentConversationViewer implements Component, Focusable {
 		const innerWidth = width - 4;
 		this.lastInnerWidth = innerWidth;
 		const snapshot = this.snapshot();
-		if (this.composer && !this.canCompose()) {
+		if (this.composer && !this.canCompose(snapshot)) {
 			this.composer.focused = false;
 			this.composer = undefined;
 		}
@@ -285,7 +288,7 @@ export class SubagentConversationViewer implements Component, Focusable {
 			const gap = Math.max(1, innerWidth - visibleWidth(left) - visibleWidth(right));
 			lines.push(row(`${left}${" ".repeat(gap)}${right}`));
 		} else {
-			lines.push(row(this.footer(contentLines.length, viewport, start, innerWidth)));
+			lines.push(row(this.footer(contentLines.length, viewport, start, innerWidth, snapshot)));
 		}
 		lines.push(bottom);
 		return lines;
@@ -297,6 +300,8 @@ export class SubagentConversationViewer implements Component, Focusable {
 	}
 
 	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
 		this.closed = true;
 		this.unsubscribe();
 		if (this.clockTimer) {
@@ -433,17 +438,23 @@ export class SubagentConversationViewer implements Component, Focusable {
 		return Math.max(MIN_VIEWPORT_ROWS, Math.min(available, contentLineCount));
 	}
 
-	private footer(total: number, viewport: number, start: number, width: number): string {
+	private footer(
+		total: number,
+		viewport: number,
+		start: number,
+		width: number,
+		agent: SubagentUiSnapshot | undefined,
+	): string {
 		const actions: string[] = [];
-		if (this.canCompose()) actions.push(`${keyText("app.agents.message")} message`);
-		if (this.canStop()) {
+		if (this.canCompose(agent)) actions.push(`${keyText("app.agents.message")} message`);
+		if (this.canStop(agent)) {
 			actions.push(
 				this.stopArmed
 					? this.theme.fg("error", `${keyText("app.agents.stop")} again to STOP`)
 					: `${keyText("app.agents.stop")} stop`,
 			);
 		}
-		if (this.canRelease()) {
+		if (this.canRelease(agent)) {
 			actions.push(
 				this.releaseArmed
 					? this.theme.fg("error", `${keyText("app.agents.release")} again to RELEASE SLOT`)
@@ -464,19 +475,18 @@ export class SubagentConversationViewer implements Component, Focusable {
 		return `${left}${" ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)))}${right}`;
 	}
 
-	private canCompose(): boolean {
-		const status = this.snapshot()?.status;
+	private canCompose(agent = this.snapshot()): boolean {
+		const status = agent?.status;
 		return !this.sending && (status === "running" || status === "idle");
 	}
 
-	private canStop(): boolean {
-		const status = this.snapshot()?.status;
+	private canStop(agent = this.snapshot()): boolean {
+		const status = agent?.status;
 		return !this.stopping && (status === "queued" || status === "running" || status === "idle");
 	}
 
-	private canRelease(): boolean {
-		const snapshot = this.snapshot();
-		return snapshot !== undefined && !this.releasing && !isActiveSubagent(snapshot);
+	private canRelease(agent = this.snapshot()): boolean {
+		return agent !== undefined && !this.releasing && !isActiveSubagent(agent);
 	}
 
 	private openComposer(value = ""): void {
@@ -577,7 +587,7 @@ export class SubagentConversationViewer implements Component, Focusable {
 
 	private close(): void {
 		if (this.closed) return;
-		this.closed = true;
+		this.dispose();
 		this.done();
 	}
 }

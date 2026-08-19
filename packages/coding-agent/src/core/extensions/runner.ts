@@ -982,6 +982,8 @@ export class ExtensionRunner {
 	}
 
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+		if (!this.hasHandlers("context")) return messages;
+
 		const ctx = this.createContext();
 		let currentMessages = structuredClone(messages);
 

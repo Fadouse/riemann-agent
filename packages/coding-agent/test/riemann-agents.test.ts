@@ -5,6 +5,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fauxAssistantMessage, fauxProvider, type Model } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test } from "vitest";
+import type { AgentSessionEventListener } from "../src/core/agent-session.ts";
 import { execCommand } from "../src/core/exec.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -103,6 +104,38 @@ class FakeChildSession implements ChildAgentSession {
 	}
 }
 
+class ObservableChildSession extends FakeChildSession {
+	statsReads = 0;
+	tokenTotal = 1_234;
+	private listener: AgentSessionEventListener | undefined;
+
+	subscribe(listener: AgentSessionEventListener): () => void {
+		this.listener = listener;
+		return () => {
+			if (this.listener === listener) this.listener = undefined;
+		};
+	}
+
+	override getSessionStats() {
+		this.statsReads += 1;
+		const stats = super.getSessionStats();
+		return { ...stats, tokens: { ...stats.tokens, total: this.tokenTotal } };
+	}
+
+	emitMessageDelta(): void {
+		const message = fauxAssistantMessage("partial child response");
+		this.listener?.({
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x", partial: message },
+		});
+	}
+
+	get subscribed(): boolean {
+		return this.listener !== undefined;
+	}
+}
+
 function fakeRuntime(close: () => Promise<void> = async () => undefined): ChildRiemannRuntime {
 	return {
 		tool: {
@@ -170,6 +203,7 @@ interface SupervisorHarnessOptions {
 	defaultSession?: boolean;
 	rootModel?: Model<any>;
 	modelRegistry?: ModelRegistry;
+	createSession?: () => FakeChildSession;
 }
 
 async function createHarness(
@@ -215,7 +249,7 @@ async function createHarness(
 			? {}
 			: {
 					createChildSession: async (agent, childModel, _runtime, resume) => {
-						const session = new FakeChildSession();
+						const session = options.createSession?.() ?? new FakeChildSession();
 						sessions.set(agent.id, [...(sessions.get(agent.id) ?? []), session]);
 						resumeFlags.set(agent.id, [...(resumeFlags.get(agent.id) ?? []), resume]);
 						modelIds.push(`${childModel.provider}/${childModel.id}`);
@@ -365,6 +399,35 @@ describe("Riemann reusable Agent slots", () => {
 			await expect(
 				supervisor.spawn(childId, { task: "Attempt recursive delegation", name: "nested" }),
 			).rejects.toMatchObject({ code: "limit_exceeded" });
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("coalesces session stat scans during message deltas and flushes final stats", async () => {
+		const session = new ObservableChildSession();
+		const harness = await createHarness({}, undefined, undefined, { createSession: () => session });
+		const { supervisor, store, mainId } = harness;
+		try {
+			const handle = objectValue(await supervisor.spawn(mainId, { task: "stream a response", name: "worker" }));
+			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
+			await waitFor(() => supervisor.listSubagentsForUi().find((agent) => agent.id === handle.id)?.live === true);
+			expect(session.statsReads).toBe(1);
+
+			for (let index = 0; index < 50; index += 1) session.emitMessageDelta();
+			expect(session.statsReads).toBe(1);
+			await waitFor(() => session.statsReads === 2);
+
+			session.tokenTotal = 9_876;
+			session.emitMessageDelta();
+			session.finish();
+			await waitFor(() => store.getAgent(handle.id as string)?.status === "idle");
+			expect(supervisor.listSubagentsForUi().find((agent) => agent.id === handle.id)?.tokens).toBe(9_876);
+			expect(session.statsReads).toBe(3);
+			expect(session.subscribed).toBe(false);
+			await delay(40);
+			expect(session.statsReads).toBe(3);
 		} finally {
 			await supervisor.close();
 			store.close();

@@ -15,6 +15,8 @@ export const HTTP_IDLE_TIMEOUT_CHOICES = [
 
 const originalGlobalFetch = globalThis.fetch;
 let installedGlobalFetch: typeof globalThis.fetch | undefined;
+let installedDispatcher: undici.Dispatcher | undefined;
+let installedDispatcherKey: string | undefined;
 
 export function parseHttpIdleTimeoutMs(value: unknown): number | undefined {
 	if (typeof value === "string") {
@@ -83,6 +85,17 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 	if (normalizedTimeoutMs === undefined) {
 		throw new Error(`Invalid HTTP idle timeout: ${String(timeoutMs)}`);
 	}
+	const dispatcherKey = JSON.stringify([
+		normalizedTimeoutMs,
+		process.env.HTTP_PROXY,
+		process.env.HTTPS_PROXY,
+		process.env.NO_PROXY,
+		process.env.http_proxy,
+		process.env.https_proxy,
+		process.env.no_proxy,
+	]);
+	if (installedDispatcherKey === dispatcherKey && undici.getGlobalDispatcher() === installedDispatcher) return;
+
 	const dispatcher = withUndiciErrorListener(
 		new undici.EnvHttpProxyAgent({
 			allowH2: false,
@@ -96,6 +109,8 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 		}),
 	);
 	undici.setGlobalDispatcher(dispatcher);
+	installedDispatcher = dispatcher;
+	installedDispatcherKey = dispatcherKey;
 	// Keep fetch and the dispatcher on the same undici implementation. Node 26.0's
 	// bundled fetch can otherwise consume compressed responses through npm undici's
 	// dispatcher without decompressing them, causing response.json() failures.
