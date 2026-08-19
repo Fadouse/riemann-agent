@@ -85,15 +85,15 @@ export class WebFunctions {
 				promptSnippet: "Search the current web with excerpts and source URLs.",
 				parameters: [
 					{ name: "query", description: "Search query", type: "str", required: true },
-					{ name: "num_results", description: "Result count from 1 to 30", type: "int | None", required: false },
+					{ name: "limit", description: "Result count from 1 to 30", type: "int | None", required: false },
 					{
-						name: "include_domains",
+						name: "domains",
 						description: "Optional domain allowlist",
 						type: "list[str] | None",
 						required: false,
 					},
 					{
-						name: "start_published_date",
+						name: "since",
 						description: "Optional ISO timestamp lower bound",
 						type: "str | None",
 						required: false,
@@ -101,7 +101,7 @@ export class WebFunctions {
 				],
 				returns: "list[SearchHit]",
 				examples: [
-					"hits = await web.search(query='Node.js sqlite DatabaseSync documentation', num_results=5)",
+					"hits = await web.search(query='Node.js sqlite DatabaseSync documentation', limit=5)",
 					"display(hits[:3])",
 				],
 				capability: "web.search",
@@ -112,34 +112,19 @@ export class WebFunctions {
 							`Exa is not configured. Set web.exaApiKey in ~/.riemann/agent/config.yaml, preferably as \${EXA_API_KEY}.`,
 						);
 					const query = requiredString(args, "query");
-					const numResults = args.num_results === undefined || args.num_results === null ? 10 : args.num_results;
-					if (
-						typeof numResults !== "number" ||
-						!Number.isInteger(numResults) ||
-						numResults < 1 ||
-						numResults > 30
-					) {
-						throw new RiemannHostError("invalid_arguments", "num_results must be an integer from 1 to 30");
+					const limit = args.limit === undefined || args.limit === null ? 10 : args.limit;
+					if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 30) {
+						throw new RiemannHostError("invalid_arguments", "limit must be an integer from 1 to 30");
 					}
-					let includeDomains: string[] | undefined;
-					if (args.include_domains !== undefined && args.include_domains !== null) {
-						if (
-							!Array.isArray(args.include_domains) ||
-							args.include_domains.some((item) => typeof item !== "string")
-						) {
-							throw new RiemannHostError("invalid_arguments", "include_domains must be a list of strings");
+					let domains: string[] | undefined;
+					if (args.domains !== undefined && args.domains !== null) {
+						if (!Array.isArray(args.domains) || args.domains.some((item) => typeof item !== "string")) {
+							throw new RiemannHostError("invalid_arguments", "domains must be a list of strings");
 						}
-						includeDomains = args.include_domains as string[];
+						domains = args.domains as string[];
 					}
-					if (
-						args.start_published_date !== undefined &&
-						args.start_published_date !== null &&
-						typeof args.start_published_date !== "string"
-					) {
-						throw new RiemannHostError(
-							"invalid_arguments",
-							"start_published_date must be an ISO timestamp string",
-						);
+					if (args.since !== undefined && args.since !== null && typeof args.since !== "string") {
+						throw new RiemannHostError("invalid_arguments", "since must be an ISO timestamp string");
 					}
 					const response = await fetch("https://api.exa.ai/search", {
 						method: "POST",
@@ -151,11 +136,9 @@ export class WebFunctions {
 						body: JSON.stringify({
 							query,
 							type: "auto",
-							numResults,
-							...(includeDomains ? { includeDomains } : {}),
-							...(typeof args.start_published_date === "string"
-								? { startPublishedDate: args.start_published_date }
-								: {}),
+							numResults: limit,
+							...(domains ? { includeDomains: domains } : {}),
+							...(typeof args.since === "string" ? { startPublishedDate: args.since } : {}),
 							contents: { highlights: { query, maxCharacters: 1_200 } },
 						}),
 						signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),

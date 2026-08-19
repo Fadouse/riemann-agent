@@ -243,6 +243,8 @@ describe("Riemann fs capabilities", () => {
 		try {
 			const result = await search.handler({ query: "find-me" }, new AbortController().signal);
 			expect(result).toEqual([{ path: "inside.txt", line: 1, text: "find-me inside" }]);
+			const scoped = await search.handler({ query: "find-me", glob: "secret.txt" }, new AbortController().signal);
+			expect(scoped).toEqual([]);
 		} finally {
 			store.close();
 		}

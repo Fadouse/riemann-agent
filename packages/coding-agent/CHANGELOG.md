@@ -12,6 +12,8 @@
 - Collapsed the Riemann `shell` operations into one script-based `shell.run(script, cwd, env, timeout)`; removed `shell.exec` and the argv `command`/`args` form.
 - Removed the `state.checkpoint()` and `catalog.namespaces()` Python operations; kernel checkpointing remains automatic after each cell and the operation inventory remains in the system prompt.
 - Hidden `artifacts.get`, `artifacts.view`, and `artifacts.materialize` from the model surface; use the `Artifact` dataclass methods `read()`, `view()`, and `materialize()` instead.
+- Renamed `web.search` arguments `num_results`/`include_domains`/`start_published_date` to `limit`/`domains`/`since`, aligning the search `limit` vocabulary across `fs.glob`, `fs.search`, and `catalog.search`.
+- Renamed the `fs.search` file-filter argument `pattern` to `glob`, removing the `query`/`pattern` ambiguity.
 
 ### Added
 

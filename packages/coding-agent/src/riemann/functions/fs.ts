@@ -318,12 +318,7 @@ export class FileFunctions {
 				description: "List readable files matching one or more glob patterns without reading their contents.",
 				promptSnippet: "Find files without reading them.",
 				parameters: [
-					{
-						name: "pattern",
-						description: "Glob string or list is represented as a comma-separated brace glob",
-						type: "str",
-						required: true,
-					},
+					{ name: "pattern", description: "Glob pattern", type: "str", required: true },
 					{ name: "include_hidden", description: "Include dotfiles", type: "bool | None", required: false },
 					{ name: "limit", description: "Maximum paths", type: "int | None", required: false },
 				],
@@ -357,7 +352,7 @@ export class FileFunctions {
 						type: "str",
 						required: true,
 					},
-					{ name: "pattern", description: "File glob", type: "str | None", required: false },
+					{ name: "glob", description: "File glob", type: "str | None", required: false },
 					{
 						name: "regex",
 						description: "Treat query as a regular expression",
@@ -381,7 +376,7 @@ export class FileFunctions {
 						? new RegExp(query, caseSensitive ? "g" : "gi")
 						: undefined;
 					const needle = caseSensitive ? query : query.toLowerCase();
-					const files = await this.globMatches(typeof args.pattern === "string" ? args.pattern : "**/*", false);
+					const files = await this.globMatches(typeof args.glob === "string" ? args.glob : "**/*", false);
 					const limit = Math.max(1, Math.min(optionalInteger(args, "limit", 100), 2_000));
 					const hits: JsonValue[] = [];
 					for (const file of files.sort()) {
