@@ -141,7 +141,7 @@ describe("Riemann IPython transcript", () => {
 
 	test("renders shell, subagent, file, and patch activities inside the IPython cell", () => {
 		const component = new IPythonCellComponent({
-			code: "result = await shell.exec(script='npm test')",
+			code: "result = await shell.run(script='npm test')",
 			content: [{ type: "text", text: "Cell completed. No explicit output." }],
 			details: { status: "ok", durationMs: 250 },
 			activities: [
@@ -149,7 +149,7 @@ describe("Riemann IPython transcript", () => {
 					id: "shell-1",
 					kind: "shell",
 					status: "ok",
-					operation: "exec",
+					operation: "run",
 					command: "npm test",
 					stdout: "Tests 12 passed",
 					exitCode: 0,
@@ -199,7 +199,7 @@ describe("Riemann IPython transcript", () => {
 		expect(collapsed).toContain("-1");
 
 		component.update({
-			code: "result = await shell.exec(script='npm test')",
+			code: "result = await shell.run(script='npm test')",
 			content: [{ type: "text", text: "Cell completed. No explicit output." }],
 			details: { status: "ok", durationMs: 250 },
 			activities: [
@@ -230,7 +230,7 @@ describe("Riemann IPython transcript", () => {
 			id: "shell-wrapped",
 			kind: "shell",
 			status: "ok",
-			operation: "exec",
+			operation: "run",
 			command: "cat logs/vllm.log",
 			stdout: [longLine, longLine, longLine, `${longLine}tail-sentinel`].join("\n"),
 			exitCode: 0,

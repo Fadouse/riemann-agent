@@ -23,11 +23,53 @@ function record(value: JsonValue): Record<string, JsonValue> {
 	return value;
 }
 
-function restrictedPolicy(cwd: string, read: string[], write: string[]) {
-	return fileAccessPolicy(cwd, { read, readExclude: [], write, writeExclude: [] });
+async function shellDefinition(workspace: string, root: string, read: string[], write: string[]) {
+	const store = new RiemannStore(join(root, "agent"));
+	const run = store.openRun("shell-test", workspace);
+	const shell = new ShellFunctions(
+		fileAccessPolicy(workspace, { read, readExclude: [], write, writeExclude: [] }),
+		new ArtifactStore(store, run.id),
+		100_000,
+		false,
+	);
+	const definition = shell.definitions().find((item) => item.name === "run");
+	if (!definition) throw new Error("shell.run is unavailable");
+	return { definition, store };
 }
 
-describe("Riemann shell command resolution", () => {
+describe("Riemann shell argument validation", () => {
+	test("rejects invalid script, timeout, env, and cwd arguments before spawning", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-args-"));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		const outside = join(root, "outside");
+		await Promise.all([mkdir(workspace), mkdir(outside)]);
+		const { definition, store } = await shellDefinition(workspace, root, [workspace], []);
+		const signal = new AbortController().signal;
+		try {
+			await expect(definition.handler({}, signal)).rejects.toMatchObject({ code: "invalid_arguments" });
+			await expect(definition.handler({ script: "" }, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+			});
+			await expect(definition.handler({ script: "true", timeout: 0 }, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+			});
+			await expect(definition.handler({ script: "true", timeout: 1.5 }, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+			});
+			await expect(definition.handler({ script: "true", env: { VALUE: null } }, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+			});
+			await expect(definition.handler({ script: "true", cwd: outside }, signal)).rejects.toMatchObject({
+				code: "permission_denied",
+			});
+		} finally {
+			store.close();
+		}
+	});
+});
+
+describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 	test("returns a structured command-not-found process result", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-missing-"));
 		roots.push(root);
@@ -46,7 +88,7 @@ describe("Riemann shell command resolution", () => {
 			if (!definition) throw new Error("shell.run is unavailable");
 			const result = record(
 				await definition.handler(
-					{ command: "riemann-command-that-does-not-exist", timeout: 10 },
+					{ script: "riemann-command-that-does-not-exist", timeout: 10 },
 					new AbortController().signal,
 				),
 			);
@@ -54,17 +96,15 @@ describe("Riemann shell command resolution", () => {
 				command: "riemann-command-that-does-not-exist",
 				exit_code: 127,
 				stdout: "",
-				stderr: "riemann-command-that-does-not-exist: command not found\n",
 				timed_out: false,
 				artifact: null,
 			});
+			expect(String(result.stderr)).toContain("command not found");
 		} finally {
 			store.close();
 		}
 	});
-});
 
-describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 	test("enforces read-only workspace, host filesystem, and environment boundaries", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-sandbox-"));
 		roots.push(root);
@@ -73,25 +113,19 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		await mkdir(workspace);
 		await writeFile(join(workspace, "inside.txt"), "inside");
 		await writeFile(outside, "secret");
-		const store = new RiemannStore(join(root, "agent"));
+		const { definition, store } = await shellDefinition(workspace, root, [workspace], []);
 		try {
-			const run = store.openRun("shell-sandbox", workspace);
-			const shell = new ShellFunctions(
-				restrictedPolicy(workspace, [workspace], []),
-				new ArtifactStore(store, run.id),
-				100_000,
-				false,
-			);
-			const definition = shell.definitions().find((item) => item.name === "run");
-			if (!definition) throw new Error("shell.run is unavailable");
 			process.env.RIEMANN_HOST_SECRET_TEST = "hidden";
-			const script = `const fs=require("node:fs");const out={inside:fs.readFileSync("inside.txt","utf8"),hostSecret:process.env.RIEMANN_HOST_SECRET_TEST??null,explicit:process.env.EXPLICIT_VALUE??null};try{fs.writeFileSync("write.txt","bad");out.write="allowed"}catch(e){out.write=e.code}try{fs.readFileSync(${JSON.stringify(outside)},"utf8");out.outside="allowed"}catch(e){out.outside=e.code}console.log(JSON.stringify(out))`;
+			const script = `${process.execPath} - <<'PROBE'
+const fs=require("node:fs");const out={inside:fs.readFileSync("inside.txt","utf8"),hostSecret:process.env.RIEMANN_HOST_SECRET_TEST??null,explicit:process.env.EXPLICIT_VALUE??null};try{fs.writeFileSync("write.txt","bad");out.write="allowed"}catch(e){out.write=e.code}try{fs.readFileSync(${JSON.stringify(outside)},"utf8");out.outside="allowed"}catch(e){out.outside=e.code}console.log(JSON.stringify(out))
+PROBE`;
 			const result = record(
 				await definition.handler(
-					{ command: process.execPath, args: ["-e", script], env: { EXPLICIT_VALUE: "visible" }, timeout: 10 },
+					{ script, env: { EXPLICIT_VALUE: "visible" }, timeout: 10 },
 					new AbortController().signal,
 				),
 			);
+			expect(result.exit_code).toBe(0);
 			const output = JSON.parse(String(result.stdout).trim()) as Record<string, string | null>;
 			expect(output).toMatchObject({ inside: "inside", hostSecret: null, explicit: "visible" });
 			expect(output.write).not.toBe("allowed");
@@ -112,20 +146,11 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		const executable = join(bin, "path-probe");
 		await writeFile(executable, "#!/bin/sh\nprintf 'path-ok\\n'\n");
 		await chmod(executable, 0o755);
-		const store = new RiemannStore(join(root, "agent"));
+		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
 		try {
-			const run = store.openRun("shell-path", workspace);
-			const shell = new ShellFunctions(
-				fileAccessPolicy(workspace, FULL_FILESYSTEM),
-				new ArtifactStore(store, run.id),
-				100_000,
-				false,
-			);
-			const definition = shell.definitions().find((item) => item.name === "run");
-			if (!definition) throw new Error("shell.run is unavailable");
 			const result = record(
 				await definition.handler(
-					{ command: "path-probe", env: { PATH: bin }, timeout: 10 },
+					{ script: "path-probe", env: { PATH: bin }, timeout: 10 },
 					new AbortController().signal,
 				),
 			);
@@ -154,22 +179,35 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 			);
 			const definition = shell.definitions().find((item) => item.name === "run");
 			if (!definition) throw new Error("shell.run is unavailable");
-			const script = `const fs=require("node:fs");const out={visible:fs.readFileSync("visible.txt","utf8")};try{fs.readFileSync(${JSON.stringify(join(agentDir, "auth.json"))},"utf8");out.state="allowed"}catch(error){out.state=error.code}console.log(JSON.stringify(out))`;
-			const result = record(
-				await definition.handler(
-					{ command: process.execPath, args: ["-e", script], timeout: 10 },
-					new AbortController().signal,
-				),
-			);
+			const script = `${process.execPath} - <<'PROBE'
+const fs=require("node:fs");const out={visible:fs.readFileSync("visible.txt","utf8")};try{fs.readFileSync(${JSON.stringify(join(agentDir, "auth.json"))},"utf8");out.state="allowed"}catch(error){out.state=error.code}console.log(JSON.stringify(out))
+PROBE`;
+			const result = record(await definition.handler({ script, timeout: 10 }, new AbortController().signal));
+			expect(result.exit_code).toBe(0);
 			const output = JSON.parse(String(result.stdout).trim()) as Record<string, string>;
 			expect(output.visible).toBe("visible");
 			expect(output.state).not.toBe("allowed");
-			await expect(
-				definition.handler(
-					{ command: process.execPath, args: ["-e", ""], cwd: agentDir, timeout: 10 },
-					new AbortController().signal,
-				),
-			).rejects.toMatchObject({ code: "permission_denied" });
+		} finally {
+			store.close();
+		}
+	}, 30_000);
+
+	test("terminates timed-out and aborted scripts", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-terminate-"));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		await mkdir(workspace);
+		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
+		try {
+			const timeoutResult = record(
+				await definition.handler({ script: "sleep 30", timeout: 1 }, new AbortController().signal),
+			);
+			expect(timeoutResult).toMatchObject({ timed_out: true, exit_code: null });
+
+			const controller = new AbortController();
+			setTimeout(() => controller.abort(), 300);
+			const abortedResult = record(await definition.handler({ script: "sleep 30", timeout: 30 }, controller.signal));
+			expect(abortedResult).toMatchObject({ timed_out: false, exit_code: null });
 		} finally {
 			store.close();
 		}
@@ -183,24 +221,15 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		const outside = join(outsideDirectory, "secret.txt");
 		await Promise.all([mkdir(workspace), mkdir(outsideDirectory)]);
 		await writeFile(outside, "secret");
-		const store = new RiemannStore(join(root, "agent"));
+		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
 		try {
-			const run = store.openRun("shell-host", workspace);
-			const shell = new ShellFunctions(
-				fileAccessPolicy(workspace, FULL_FILESYSTEM),
-				new ArtifactStore(store, run.id),
-				100_000,
-				false,
-			);
-			const definition = shell.definitions().find((item) => item.name === "run");
-			if (!definition) throw new Error("shell.run is unavailable");
-			const script = `const fs=require("node:fs");fs.writeFileSync("created.txt","created");console.log(fs.readFileSync("secret.txt","utf8"))`;
+			const script = `${process.execPath} - <<'PROBE'
+const fs=require("node:fs");fs.writeFileSync("created.txt","created");console.log(fs.readFileSync("secret.txt","utf8"))
+PROBE`;
 			const result = record(
-				await definition.handler(
-					{ command: process.execPath, args: ["-e", script], cwd: outsideDirectory, timeout: 10 },
-					new AbortController().signal,
-				),
+				await definition.handler({ script, cwd: outsideDirectory, timeout: 10 }, new AbortController().signal),
 			);
+			expect(result.exit_code).toBe(0);
 			expect(String(result.stdout).trim()).toBe("secret");
 			expect(await readFile(join(outsideDirectory, "created.txt"), "utf8")).toBe("created");
 		} finally {

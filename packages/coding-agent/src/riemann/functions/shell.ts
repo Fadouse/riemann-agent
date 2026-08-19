@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
+import { getShellConfig } from "../../utils/shell.ts";
 import { assertReadable, type FileAccessPolicy } from "../access-policy.ts";
 import { RiemannHostError } from "../errors.ts";
 import { resolveSandboxExecutable, type SandboxedCommand, sandboxedKernelCommand } from "../kernel/sandbox.ts";
@@ -20,11 +21,12 @@ function requiredString(args: Record<string, JsonValue>, name: string): string {
 	return value;
 }
 
-function parseStringArray(value: JsonValue | undefined, name: string): string[] {
-	if (value === undefined || value === null) return [];
-	if (!Array.isArray(value) || value.some((item) => typeof item !== "string"))
-		throw new RiemannHostError("invalid_arguments", `${name} must be a list of strings`);
-	return value as string[];
+function parseTimeout(value: JsonValue | undefined): number {
+	const timeout = value === undefined || value === null ? 120 : value;
+	if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1 || timeout > 86_400) {
+		throw new RiemannHostError("invalid_arguments", "timeout must be an integer from 1 to 86400 seconds");
+	}
+	return timeout;
 }
 
 function parseEnvironment(value: JsonValue | undefined): Record<string, string> {
@@ -69,8 +71,8 @@ export class ShellFunctions {
 	}
 
 	private async run(
-		command: string,
-		commandArgs: string[],
+		command: { executable: string; args: string[]; stdin?: string },
+		commandLine: string,
 		options: {
 			cwd: string;
 			env: Record<string, string>;
@@ -80,14 +82,18 @@ export class ShellFunctions {
 		},
 	): Promise<JsonValue> {
 		const started = Date.now();
-		const executable = resolveSandboxExecutable(command, options.cwd, options.env.PATH ?? process.env.PATH);
+		const executable = resolveSandboxExecutable(
+			command.executable,
+			options.cwd,
+			options.env.PATH ?? process.env.PATH,
+		);
 		if (!executable) {
 			return {
 				$riemann: "process_result",
-				command: [command, ...commandArgs].join(" "),
+				command: commandLine,
 				exit_code: 127,
 				stdout: "",
-				stderr: `${command}: command not found\n`,
+				stderr: `${command.executable}: command not found\n`,
 				duration_ms: Date.now() - started,
 				timed_out: false,
 				artifact: null,
@@ -108,7 +114,7 @@ export class ShellFunctions {
 					connectionDir: sandboxDir,
 					environment: options.env,
 				},
-				commandArgs,
+				command.args,
 			);
 		} catch (error) {
 			await rm(sandboxDir, { recursive: true, force: true });
@@ -117,8 +123,12 @@ export class ShellFunctions {
 		const child = spawnProcess(launch.command, launch.args, {
 			cwd: options.cwd,
 			env: launch.env,
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio: [command.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 		});
+		if (command.stdin !== undefined && child.stdin) {
+			child.stdin.on("error", () => {});
+			child.stdin.end(command.stdin);
+		}
 		const stdout: Buffer[] = [];
 		const stderr: Buffer[] = [];
 		let stdoutBytes = 0;
@@ -189,7 +199,7 @@ export class ShellFunctions {
 		let artifact: JsonValue = null;
 		if (totalBytes > this.previewChars) {
 			artifact = await this.artifacts.putText(
-				`$ ${[command, ...commandArgs].join(" ")}\n\n[stdout]\n${stdoutText}\n\n[stderr]\n${stderrText}${totalBytes > MAX_CAPTURE_BYTES ? "\n[output capture limit reached]" : ""}`,
+				`$ ${commandLine}\n\n[stdout]\n${stdoutText}\n\n[stderr]\n${stderrText}${totalBytes > MAX_CAPTURE_BYTES ? "\n[output capture limit reached]" : ""}`,
 				{ name: "process-output.txt" },
 			);
 		}
@@ -199,7 +209,7 @@ export class ShellFunctions {
 				: `${text.slice(0, this.previewChars)}\n[preview truncated; inspect artifact]`;
 		return {
 			$riemann: "process_result",
-			command: [command, ...commandArgs].join(" "),
+			command: commandLine,
 			exit_code: exitCode,
 			stdout: preview(stdoutText),
 			stderr: preview(stderrText),
@@ -216,11 +226,10 @@ export class ShellFunctions {
 			{
 				name: "run",
 				namespace: "shell",
-				description: "Run one executable without a shell and return a structured ProcessResult.",
-				promptSnippet: "Run one executable without a shell.",
+				description: "Run a shell script and return a structured ProcessResult.",
+				promptSnippet: "Run a shell script; pipes, redirection, and compound syntax are supported.",
 				parameters: [
-					{ name: "command", description: "Executable name or path", type: "str", required: true },
-					{ name: "args", description: "Argument list", type: "list[str] | None", required: false },
+					{ name: "script", description: "Shell script source", type: "str", required: true },
 					{ name: "cwd", description: cwdDescription, type: "str | None", required: false },
 					{
 						name: "env",
@@ -232,65 +241,29 @@ export class ShellFunctions {
 				],
 				returns: "ProcessResult",
 				examples: [
-					"result = await shell.run(command='npm', args=['test'], timeout=300)",
-					"display(result.stderr[-2000:])",
+					"result = await shell.run(script='npm test 2>&1 | tail -40', timeout=300)",
+					"display((result.exit_code, result.stderr[-2000:]))",
 				],
 				capability: "shell.run",
 				promptGuidelines: [
 					"Use the target project's own commands and environment for builds, tests, scripts, and dependency checks.",
 				],
 				handler: async (args, signal, onUpdate) => {
-					const timeout = args.timeout === undefined || args.timeout === null ? 120 : args.timeout;
-					if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1 || timeout > 86_400) {
-						throw new RiemannHostError("invalid_arguments", "timeout must be an integer from 1 to 86400 seconds");
-					}
-					return this.run(requiredString(args, "command"), parseStringArray(args.args, "args"), {
-						cwd: this.resolveCwd(args.cwd),
-						env: parseEnvironment(args.env),
-						timeoutSeconds: timeout,
-						signal,
-						onUpdate,
-					});
-				},
-			},
-			{
-				name: "exec",
-				namespace: "shell",
-				description: "Run a shell script when pipes, redirection, or compound shell syntax is required.",
-				promptSnippet: "Use a shell only for pipes, redirection, or compound syntax.",
-				parameters: [
-					{ name: "script", description: "Shell source", type: "str", required: true },
-					{ name: "cwd", description: cwdDescription, type: "str | None", required: false },
-					{
-						name: "env",
-						description: "Additional environment variables",
-						type: "dict[str,str] | None",
-						required: false,
-					},
-					{ name: "timeout", description: "Timeout in seconds", type: "int | None", required: false },
-				],
-				returns: "ProcessResult",
-				capability: "shell.run",
-				promptGuidelines: [
-					"Use the target project's own commands and environment for builds, tests, scripts, and dependency checks.",
-				],
-				handler: async (args, signal, onUpdate) => {
-					const timeout = args.timeout === undefined || args.timeout === null ? 120 : args.timeout;
-					if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1 || timeout > 86_400) {
-						throw new RiemannHostError("invalid_arguments", "timeout must be an integer from 1 to 86400 seconds");
-					}
 					const script = requiredString(args, "script");
-					const [command, commandArgs] =
-						process.platform === "win32"
-							? [process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", script]]
-							: [process.env.SHELL ?? "/bin/sh", ["-lc", script]];
-					return this.run(command, commandArgs, {
-						cwd: this.resolveCwd(args.cwd),
-						env: parseEnvironment(args.env),
-						timeoutSeconds: timeout,
-						signal,
-						onUpdate,
-					});
+					const cwd = this.resolveCwd(args.cwd);
+					const environment = parseEnvironment(args.env);
+					const timeoutSeconds = parseTimeout(args.timeout);
+					const shell = getShellConfig();
+					const fromStdin = shell.commandTransport === "stdin";
+					return this.run(
+						{
+							executable: shell.shell,
+							args: fromStdin ? shell.args : [...shell.args, script],
+							...(fromStdin ? { stdin: script } : {}),
+						},
+						script,
+						{ cwd, env: environment, timeoutSeconds, signal, onUpdate },
+					);
 				},
 			},
 		];

@@ -26,7 +26,7 @@ describe("Riemann IPython activity tracking", () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-activity-shell-"));
 		roots.push(root);
 		const tracker = new RiemannActivityTracker(root, () => undefined);
-		const shellRequest = request("shell.exec", { script: "npm test", cwd: "packages/agent" });
+		const shellRequest = request("shell.run", { script: "npm test", cwd: "packages/agent" });
 		let activities = await observe(tracker, {
 			phase: "start",
 			requestId: "shell-1",

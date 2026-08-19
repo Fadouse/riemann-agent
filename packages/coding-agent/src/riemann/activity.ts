@@ -79,18 +79,8 @@ function diffDetails(before: string, after: string): DiffDetails {
 	return { diff: preview.join("\n"), additions, removals, diffTruncated: true };
 }
 
-function quoteArgument(value: string): string {
-	if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
-	return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
-
-function shellCommand(type: string, args: Record<string, JsonValue>): string {
-	if (type === "shell.exec") return stringValue(args.script) ?? "…";
-	const command = stringValue(args.command) ?? "…";
-	const commandArgs = Array.isArray(args.args)
-		? args.args.filter((item): item is string => typeof item === "string")
-		: [];
-	return [command, ...commandArgs].map(quoteArgument).join(" ");
+function shellCommand(args: Record<string, JsonValue>): string {
+	return stringValue(args.script) ?? "…";
 }
 
 function appendStream(current: string | undefined, delta: string | undefined): string | undefined {
@@ -152,13 +142,13 @@ export class RiemannActivityTracker {
 		type: string,
 		args: Record<string, JsonValue>,
 	): Promise<TrackedActivity | undefined> {
-		if (type === "shell.run" || type === "shell.exec") {
+		if (type === "shell.run") {
 			const activity: IPythonShellActivity = {
 				id,
 				kind: "shell",
 				status: "running",
 				operation: type.slice("shell.".length),
-				command: shellCommand(type, args),
+				command: shellCommand(args),
 				...(typeof args.cwd === "string" ? { cwd: args.cwd } : {}),
 			};
 			return { activity };
