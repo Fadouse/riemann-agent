@@ -281,6 +281,9 @@ export class FileFunctions {
 					"image = await fs.read(path='/abs/path/screenshot.png')",
 				],
 				capability: "fs.read",
+				promptGuidelines: [
+					"Files: prefer fs.search / fs.glob / fs.edit over shell grep / find / sed; snapshot edits detect concurrent modification that exit codes cannot.",
+				],
 				handler: async (args) => {
 					const path = await this.resolveExisting(requiredString(args, "path"));
 					const bytes = await readFile(path);

@@ -204,7 +204,7 @@ describe("Riemann session extension", () => {
 				"Execute Python in a persistent IPython environment. The operation namespaces listed in the system prompt are preinstalled globals; calls can be assigned and composed with top-level await. Variables persist across executions.",
 			);
 			expect(JSON.stringify(registered[0]?.parameters)).not.toContain("IPython");
-			expect(JSON.stringify(registered[0]?.parameters)).toContain("asyncio.gather");
+			expect(JSON.stringify(registered[0]?.parameters)).not.toContain("asyncio.gather");
 			expect(sessionStart).toBeDefined();
 			await sessionStart?.({}, sessionStartContext);
 			expect(beforeStart).toBeDefined();
@@ -222,9 +222,10 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).toMatch(/- Kernel: \S+/);
 			expect(systemPrompt).toMatch(/- Architecture: \S+/);
 			expect(systemPrompt).not.toContain("- Shell:");
-			expect(systemPrompt).toContain("`ipython` is a persistent Python environment");
-			expect(systemPrompt).toContain("already available as globals");
-			expect(systemPrompt).toContain("compose operations with normal Python");
+			expect(systemPrompt).toContain("`ipython` is a persistent Python kernel");
+			expect(systemPrompt).toContain("## Tool discipline");
+			expect(systemPrompt).toContain("## Verification");
+			expect(systemPrompt).toContain("reproduce first, fix, then confirm");
 			expect(systemPrompt).toContain("## Available operations");
 			expect(systemPrompt).toContain("`await fs.read(path) -> TextSnapshot | ImageSnapshot`");
 			expect(systemPrompt).toContain("`await shell.run(");
@@ -239,15 +240,14 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).toContain(
 				"`await agents.run(task, name=None, profile=None, timeout=None) -> AgentResult`",
 			);
-			expect(systemPrompt).toContain("`await handle.wait(timeout=None) -> AgentResult`");
+			expect(systemPrompt).toContain(
+				"`handle.wait()` returns `AgentResult.output` and suppresses the background completion reminder",
+			);
 			expect(systemPrompt).toContain("`await agents.list() -> list[AgentInfo]`");
 			expect(systemPrompt).toContain(
 				"AgentInfo items are handles; inspect `name`, `status`, `task`, `last_outcome`, and `output_preview`, then use `await info.wait()` for the full `AgentResult.output`.",
 			);
-			expect(systemPrompt).toContain(
-				"`import asyncio; handles = await asyncio.gather(agents.spawn(...), agents.spawn(...))`",
-			);
-			expect(systemPrompt).toContain("`results = await asyncio.gather(*(handle.wait() for handle in handles))`");
+			expect(systemPrompt).toContain("Agents: `await agents.run(...)` when the result is needed before continuing");
 			expect(systemPrompt).not.toContain("`agents.wait(");
 			expect(systemPrompt).not.toContain("`agents.result(");
 			expect(systemPrompt).not.toContain("`agents.inbox(");

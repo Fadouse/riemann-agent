@@ -9,7 +9,7 @@ export const IPythonSchema = Type.Object(
 	{
 		code: Type.String({
 			description:
-				"Python code to execute. Every operation namespace call is async and must be awaited. For independent operations, import asyncio and use await asyncio.gather(...); for background Agents use handles = await asyncio.gather(agents.spawn(...), agents.spawn(...)). Assign large results and display only the needed slice.",
+				"Python code to execute. Every operation namespace call is async and must be awaited. Assign large results and display only the needed slice.",
 		}),
 		timeout: Type.Optional(
 			Type.Integer({ minimum: 1, maximum: 86_400, description: "Cell timeout in seconds. Default 300." }),

@@ -25,6 +25,7 @@
 
 ### Changed
 
+- Restructured the Riemann system prompt: tightened the contract, condensed the runtime section, compressed agent handle guidelines into two rules, and added a work-type Verification section; the ipython tool schema no longer repeats the gather idiom.
 - Changed Riemann shell execution to resolve bash through pi's shared shell configuration (`bash -c`, legacy WSL stdin transport) instead of `$SHELL -lc`/`cmd /d /s /c`.
 - Changed child delegation to durable per-Turn `AgentHandle` results with `info()`, `wait()`, `send()`, `stop()`, and `release()` lifecycle controls; standard `asyncio.gather(...)` composes independent runs and waits.
 - Changed Linux Riemann isolation to a filesystem-only Bubblewrap policy that preserves workspace/state mounts while sharing host devices and system namespaces for ordinary commands.

@@ -245,9 +245,7 @@ export class ShellFunctions {
 					"display((result.exit_code, result.stderr[-2000:]))",
 				],
 				capability: "shell.run",
-				promptGuidelines: [
-					"Use the target project's own commands and environment for builds, tests, scripts, and dependency checks.",
-				],
+				promptGuidelines: ["Use shell.run for the target project's own builds, tests, and one-shot pipelines."],
 				handler: async (args, signal, onUpdate) => {
 					const script = requiredString(args, "script");
 					const cwd = this.resolveCwd(args.cwd);

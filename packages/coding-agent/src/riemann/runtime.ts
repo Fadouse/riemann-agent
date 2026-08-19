@@ -417,7 +417,7 @@ export class RiemannRuntime {
 	private operationGuidelines(): string {
 		const guidelines = this.registry.promptGuidelines(this.capabilities);
 		if (guidelines.length === 0) return "";
-		return `## Operation guidance\n\n${guidelines.map((guideline) => `- ${guideline}`).join("\n")}`;
+		return `## Tool discipline\n\n${guidelines.map((guideline) => `- ${guideline}`).join("\n")}`;
 	}
 
 	private agentProfiles(): string {
