@@ -554,12 +554,13 @@ export class RiemannRuntime {
 		if (this.closed) throw new Error("Riemann runtime is closed");
 		if (this.kernel) return this.kernel;
 		this.kernelStartup ??= (async () => {
-			const python = await ensureManagedPython();
+			const { python, environment } = await ensureManagedPython();
 			const prelude = await readFile(preludePath(), "utf8");
 			const specifications = JSON.stringify(this.registry.pythonSpecifications(undefined, this.capabilities));
 			const bootstrapCode = `${prelude}\n\n_install_functions(_json.loads(${JSON.stringify(specifications)}))`;
 			const kernel = new IPythonKernelManager({
 				python,
+				env: environment,
 				cwd: this.agent.workspace,
 				sessionId: this.agent.id,
 				bootstrapCode,

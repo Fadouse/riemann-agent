@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Fixed managed Python startup on NixOS by resolving the host C++ runtime for ZeroMQ wheels while preserving existing library-path entries.
 - Fixed active IPython cells remaining uninterruptible behind non-cooperative host requests, including managed-Python startup on NixOS hosts.
 - Kept the strict Riemann configuration schema at `version: 1`; settings writes and examples no longer force an unrelated version-two migration.
 - Fixed async Agent calls being presented as synchronous expressions, and replaced delayed result-bearing completion injection with immediate minimal steering reminders.

@@ -83,7 +83,7 @@ async function createKernel(
 	sandbox: KernelSandboxConfiguration | false = false,
 ): Promise<IPythonKernelManager> {
 	process.env.RIEMANN_CODING_AGENT_DIR = join(root, "agent");
-	const python = await ensureManagedPython();
+	const { python, environment } = await ensureManagedPython();
 	const prelude = await readFile(join(import.meta.dirname, "..", "src", "riemann", "python", "prelude.py"), "utf8");
 	const specifications = JSON.stringify([
 		{
@@ -124,6 +124,7 @@ async function createKernel(
 	]);
 	return new IPythonKernelManager({
 		python,
+		env: environment,
 		cwd: root,
 		sessionId: "kernel-test",
 		bootstrapCode: `${prelude}\n\n_install_functions(_json.loads(${JSON.stringify(specifications)}))`,
