@@ -1665,60 +1665,73 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			}
 		}
 
-		// Process Cloudflare AI Gateway models
+		// Process Cloudflare AI Gateway models. models.dev occasionally omits
+		// Workers AI passthrough entries even though the Gateway compat endpoint
+		// supports them, so fill those entries from the Workers AI catalog below.
+		const cloudflareAIGatewaySourceIds = new Set<string>();
+		const addCloudflareAIGatewayModel = (prefixedId: string, model: ModelsDevModel): void => {
+			if (model.tool_call !== true) return;
+
+			const slashIdx = prefixedId.indexOf("/");
+			if (slashIdx === -1) return;
+			const upstream = prefixedId.slice(0, slashIdx);
+			const nativeId = prefixedId.slice(slashIdx + 1);
+
+			let api: "anthropic-messages" | "openai-completions" | "openai-responses";
+			let baseUrl: string;
+			let id: string;
+			if (upstream === "openai") {
+				api = "openai-responses";
+				baseUrl = CLOUDFLARE_AI_GATEWAY_OPENAI_BASE_URL;
+				id = nativeId;
+			} else if (upstream === "anthropic") {
+				api = "anthropic-messages";
+				baseUrl = CLOUDFLARE_AI_GATEWAY_ANTHROPIC_BASE_URL;
+				id = nativeId;
+			} else if (upstream === "workers-ai") {
+				api = "openai-completions";
+				baseUrl = CLOUDFLARE_AI_GATEWAY_COMPAT_BASE_URL;
+				id = prefixedId;
+			} else {
+				return;
+			}
+
+			cloudflareAIGatewaySourceIds.add(prefixedId);
+			const compat =
+				upstream === "anthropic" || upstream === "workers-ai" ? { sendSessionAffinityHeaders: true } : undefined;
+
+			models.push({
+				id,
+				name: model.name || id,
+				api,
+				provider: "cloudflare-ai-gateway",
+				baseUrl,
+				reasoning: model.reasoning === true,
+				input: model.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+				cost: {
+					input: model.cost?.input || 0,
+					output: model.cost?.output || 0,
+					cacheRead: model.cost?.cache_read || 0,
+					cacheWrite: model.cost?.cache_write || 0,
+				},
+				contextWindow: model.limit?.context || 4096,
+				maxTokens: model.limit?.output || 4096,
+				...(compat ? { compat } : {}),
+			});
+			recordModelsDevReasoningOptions("cloudflare-ai-gateway", id, model);
+		};
+
 		if (data["cloudflare-ai-gateway"]?.models) {
 			for (const [prefixedId, model] of Object.entries(data["cloudflare-ai-gateway"].models)) {
-				const m = model as ModelsDevModel;
-				if (m.tool_call !== true) continue;
-
-				const slashIdx = prefixedId.indexOf("/");
-				if (slashIdx === -1) continue;
-				const upstream = prefixedId.slice(0, slashIdx);
-				const nativeId = prefixedId.slice(slashIdx + 1);
-
-				let api: "anthropic-messages" | "openai-completions" | "openai-responses";
-				let baseUrl: string;
-				let id: string;
-				if (upstream === "openai") {
-					api = "openai-responses";
-					baseUrl = CLOUDFLARE_AI_GATEWAY_OPENAI_BASE_URL;
-					id = nativeId;
-				} else if (upstream === "anthropic") {
-					api = "anthropic-messages";
-					baseUrl = CLOUDFLARE_AI_GATEWAY_ANTHROPIC_BASE_URL;
-					id = nativeId;
-				} else if (upstream === "workers-ai") {
-					api = "openai-completions";
-					baseUrl = CLOUDFLARE_AI_GATEWAY_COMPAT_BASE_URL;
-					id = prefixedId;
-				} else {
-					continue;
+				addCloudflareAIGatewayModel(prefixedId, model as ModelsDevModel);
+			}
+		}
+		if (data["cloudflare-workers-ai"]?.models) {
+			for (const [modelId, model] of Object.entries(data["cloudflare-workers-ai"].models)) {
+				const prefixedId = `workers-ai/${modelId}`;
+				if (!cloudflareAIGatewaySourceIds.has(prefixedId)) {
+					addCloudflareAIGatewayModel(prefixedId, model as ModelsDevModel);
 				}
-
-				// Gateway passthroughs forward session affinity headers to upstreams that
-				// use them for cache/routing affinity.
-				const compat =
-					upstream === "anthropic" || upstream === "workers-ai" ? { sendSessionAffinityHeaders: true } : undefined;
-
-				models.push({
-					id,
-					name: m.name || id,
-					api,
-					provider: "cloudflare-ai-gateway",
-					baseUrl,
-					reasoning: m.reasoning === true,
-					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
-					contextWindow: m.limit?.context || 4096,
-					maxTokens: m.limit?.output || 4096,
-					...(compat ? { compat } : {}),
-				});
-				recordModelsDevReasoningOptions("cloudflare-ai-gateway", id, m);
 			}
 		}
 

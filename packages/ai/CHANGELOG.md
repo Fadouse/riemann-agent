@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Cloudflare AI Gateway API typing and retained Workers AI passthrough models when upstream catalog data omits them.
+
 ## [0.84.3] - 2026-08-24
 
 ### Breaking Changes
