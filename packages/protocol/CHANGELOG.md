@@ -6,6 +6,8 @@
 
 - Bumped the remote session protocol to version 2 and added image attachments, including image detail hints, to prompt and steer commands.
 
+## [0.84.3] - 2026-08-24
+
 ## [0.84.2] - 2026-08-14
 
 ## [0.84.1] - 2026-08-07

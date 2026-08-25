@@ -1,10 +1,10 @@
 {
 	"name": "riemann-agent-install",
-	"version": "0.84.2",
+	"version": "0.84.3",
 	"private": true,
 	"description": "Lockfile root used by the Riemann Agent installer and updater.",
 	"dependencies": {
-		"riemann-agent": "0.84.2"
+		"riemann-agent": "0.84.3"
 	},
 	"overrides": {
 		"protobufjs": "7.6.5",

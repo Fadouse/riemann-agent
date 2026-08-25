@@ -6,6 +6,8 @@
 
 - Added image forwarding for remote prompt and steer commands and preserved image detail hints in transcript adapters.
 
+## [0.84.3] - 2026-08-24
+
 ## [0.84.2] - 2026-08-14
 
 ## [0.84.1] - 2026-08-07

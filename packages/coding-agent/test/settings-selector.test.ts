@@ -21,7 +21,10 @@ describe("SettingsSelectorComponent", () => {
 			fullscreenExitOutput: "transcript",
 			fullscreenScrollbar: "auto",
 			warnings: {},
+			defaultModel: "not set",
+			availableDefaultModels: [],
 			availableThinkingLevels: [],
+			modelThinkingLevels: {},
 			availableThemes: [],
 			riemann: {
 				maxAgents: 8,
@@ -97,7 +100,10 @@ describe("SettingsSelectorComponent", () => {
 			fullscreenExitOutput: "transcript",
 			fullscreenScrollbar: "auto",
 			warnings: {},
+			defaultModel: "not set",
+			availableDefaultModels: [],
 			availableThinkingLevels: [],
+			modelThinkingLevels: {},
 			availableThemes: [],
 			availableAgentModels: ["openai/worker"],
 			riemann: {
