@@ -843,6 +843,11 @@ export class InteractiveMode {
 		}
 	}
 
+	private startInteractiveTui(): void {
+		this.ui.setWorkingDirectory?.(this.sessionManager.getCwd());
+		this.ui.start();
+	}
+
 	private stopInteractiveTui(fullscreenExitOutput: FullscreenExitOutput): void {
 		if (this.renderer.mode === "fullscreen" && fullscreenExitOutput === "transcript") {
 			while (this.renderer.hasOverlayEntries) this.renderer.hideOverlay();
@@ -890,7 +895,7 @@ export class InteractiveMode {
 		nextUi.invalidate();
 		nextUi.setFocus(focus);
 		if (!startRenderer) return true;
-		nextUi.start();
+		this.startInteractiveTui();
 		this.themeController.rebindTui();
 		this.rebindExtensionTerminalInputListeners();
 		if (
@@ -963,7 +968,7 @@ export class InteractiveMode {
 		this.ui.setFocus(this.editor);
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
-		this.ui.start();
+		this.startInteractiveTui();
 		this.isInitialized = true;
 
 		await this.themeController.applyFromSettings();
@@ -2002,6 +2007,7 @@ export class InteractiveMode {
 		this.footer.setSession(this.session);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 		this.footerDataProvider.setCwd(this.sessionManager.getCwd());
+		this.ui.setWorkingDirectory?.(this.sessionManager.getCwd());
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 		this.outputPad = this.settingsManager.getOutputPad();
 		this.ui.setShowHardwareCursor(this.settingsManager.getShowHardwareCursor());
@@ -4129,7 +4135,7 @@ export class InteractiveMode {
 		process.once("SIGCONT", () => {
 			clearInterval(suspendKeepAlive);
 			process.removeListener("SIGINT", ignoreSigint);
-			this.ui.start();
+			this.startInteractiveTui();
 			this.ui.requestRender(true);
 		});
 
@@ -4281,7 +4287,7 @@ export class InteractiveMode {
 				this.editor.setText(result.content);
 			}
 		} finally {
-			this.ui.start();
+			this.startInteractiveTui();
 			this.ui.requestRender(true);
 		}
 	}

@@ -1,6 +1,12 @@
-import { accessSync, constants, existsSync, readlinkSync, realpathSync } from "node:fs";
+import { accessSync, constants, existsSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
-import { type FileAccessPolicy, isInside, unrestrictedRead, unrestrictedWrite } from "../access-policy.ts";
+import {
+	type FileAccessPolicy,
+	isInside,
+	unrestrictedRead,
+	unrestrictedWrite,
+	validateFileAccessPolicy,
+} from "../access-policy.ts";
 
 export interface SandboxedLaunchConfig {
 	policy: FileAccessPolicy;
@@ -19,14 +25,32 @@ export interface SandboxedCommand {
 	env: NodeJS.ProcessEnv;
 	transport: "ipc";
 	endpointPrefix: string;
+	detachedProcessGroup: boolean;
 }
 
 const SAFE_ENVIRONMENT = [
+	"HOME",
+	"USERPROFILE",
+	"TMPDIR",
+	"TMP",
+	"TEMP",
 	"LANG",
 	"LC_ALL",
 	"LC_CTYPE",
 	"PATH",
 	"TERM",
+	"COLORTERM",
+	"TERM_PROGRAM",
+	"TERM_PROGRAM_VERSION",
+	"TERMINAL_EMULATOR",
+	"TMUX",
+	"TMUX_PANE",
+	"KITTY_WINDOW_ID",
+	"KITTY_LISTEN_ON",
+	"NO_COLOR",
+	"FORCE_COLOR",
+	"CLICOLOR",
+	"CLICOLOR_FORCE",
 	"TZ",
 	"SSL_CERT_FILE",
 	"SSL_CERT_DIR",
@@ -74,18 +98,12 @@ function sanitizedEnvironment(config: SandboxedLaunchConfig): NodeJS.ProcessEnv 
 	for (const name of SAFE_ENVIRONMENT) {
 		if (process.env[name] !== undefined) env[name] = process.env[name];
 	}
-	const home = join(config.connectionDir, "home");
-	const temporary = join(config.connectionDir, "tmp");
 	return {
 		...env,
 		...config.environment,
-		HOME: home,
-		USERPROFILE: home,
-		TMPDIR: temporary,
-		TMP: temporary,
-		TEMP: temporary,
 		IPYTHONDIR: join(config.connectionDir, "ipython"),
 		JUPYTER_CONFIG_DIR: join(config.connectionDir, "jupyter"),
+		PWD: config.policy.cwd,
 		PYTHONDONTWRITEBYTECODE: "1",
 		PYTHONNOUSERSITE: "1",
 	};
@@ -95,11 +113,21 @@ function coveredBy(path: string, roots: readonly string[]): boolean {
 	return roots.some((root) => isInside(root, path));
 }
 
+function outermostPaths(paths: readonly string[]): string[] {
+	const sorted = [...paths].sort((a, b) => a.length - b.length || a.localeCompare(b));
+	const result: string[] = [];
+	for (const path of sorted) {
+		if (!coveredBy(path, result)) result.push(path);
+	}
+	return result;
+}
+
 /**
  * Linux sandbox: read-only base for every read root, then writable binds for
  * write roots, then tmpfs masks for exclusions so excludes always win.
  */
 function linuxCommand(config: SandboxedLaunchConfig, pythonArgs: string[]): SandboxedCommand {
+	validateFileAccessPolicy(config.policy);
 	const bubblewrap = config.bubblewrapPath ?? process.env.RIEMANN_BWRAP_PATH ?? executableFromPath("bwrap");
 	if (!bubblewrap) {
 		throw new Error(
@@ -110,7 +138,7 @@ function linuxCommand(config: SandboxedLaunchConfig, pythonArgs: string[]): Sand
 	const runtime = dirname(dirname(resolve(config.python)));
 	const unrestricted = unrestrictedRead(policy) && unrestrictedWrite(policy);
 	const rootReadable = coveredBy("/", policy.readRoots);
-	const args = ["--die-with-parent", "--new-session"];
+	const args = ["--die-with-parent", "--new-session", "--unshare-pid"];
 	if (unrestricted) {
 		args.push("--bind", "/", "/");
 	} else if (rootReadable) {
@@ -146,19 +174,30 @@ function linuxCommand(config: SandboxedLaunchConfig, pythonArgs: string[]): Sand
 	for (const path of existingRoots(policy.writeExcludes)) {
 		if (coveredBy(path, policy.readRoots)) args.push("--ro-bind", path, path);
 	}
-	for (const path of existingRoots(policy.readExcludes)) {
-		// An excluded directory is fully inaccessible: mask it with a private
-		// tmpfs and remount read-only so writes fail instead of hitting scratch.
-		args.push("--tmpfs", path, "--remount-ro", path);
+	const readExclusions = outermostPaths(policy.readExcludes);
+	const excludedDirectories: string[] = [];
+	for (const path of readExclusions) {
+		if (statSync(path).isDirectory()) {
+			// Keep the private tmpfs writable while creating an explicit runtime
+			// carve-out below it, then remount it read-only before exec.
+			args.push("--tmpfs", path);
+			excludedDirectories.push(path);
+		} else {
+			// tmpfs can only mask directories. A read-only /dev/null bind hides
+			// an excluded file and prevents writes to the underlying file.
+			args.push("--ro-bind", "/dev/null", path);
+		}
 	}
 	args.push("--bind", resolve(config.connectionDir), resolve(config.connectionDir));
-	args.push("--chdir", resolve(policy.cwd), "--", resolve(config.python), ...pythonArgs);
+	for (const path of excludedDirectories) args.push("--remount-ro", path);
+	args.push("--chdir", policy.cwd, "--", resolve(config.python), ...pythonArgs);
 	return {
 		command: bubblewrap,
 		args,
 		env: sanitizedEnvironment(config),
 		transport: "ipc",
 		endpointPrefix: join(config.connectionDir, "kernel"),
+		detachedProcessGroup: true,
 	};
 }
 
@@ -178,21 +217,20 @@ function seatbeltRootFilter(root: string, excludes: readonly string[]): string {
 }
 
 export function macOSSandboxProfile(config: SandboxedLaunchConfig): string {
+	validateFileAccessPolicy(config.policy);
 	const policy = config.policy;
-	const readableRoots = existingRoots([
-		...policy.readRoots,
-		...(coveredBy(config.connectionDir, policy.readRoots) ? [] : [config.connectionDir]),
-	]);
-	const writableRoots = existingRoots([
-		...policy.writeRoots,
-		...(coveredBy(config.connectionDir, policy.writeRoots) ? [] : [config.connectionDir]),
-	]);
+	const readableRoots = existingRoots(policy.readRoots);
+	const writableRoots = existingRoots(policy.writeRoots);
 	const allowRead = unrestrictedRead(policy)
 		? ["(allow file-read*)"]
 		: readableRoots.map((root) => `(allow file-read* ${seatbeltRootFilter(root, policy.readExcludes)})`);
 	const allowWrite = unrestrictedWrite(policy)
 		? ["(allow file-write*)"]
-		: writableRoots.map((root) => `(allow file-write* ${seatbeltRootFilter(root, policy.writeExcludes)})`);
+		: writableRoots.map(
+				(root) =>
+					`(allow file-write* ${seatbeltRootFilter(root, [...policy.writeExcludes, ...policy.readExcludes])})`,
+			);
+	const runtimePath = seatbeltPath(config.connectionDir);
 	const lines = [
 		"(version 1)",
 		"(deny default)",
@@ -210,6 +248,8 @@ export function macOSSandboxProfile(config: SandboxedLaunchConfig): string {
 		'(allow file-read* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom"))',
 		...allowRead,
 		...allowWrite,
+		`(allow file-read* (subpath ${runtimePath}))`,
+		`(allow file-write* (subpath ${runtimePath}))`,
 		...(config.networkAllowed
 			? ["(allow network*)"]
 			: [`(allow network* (subpath ${seatbeltPath(config.connectionDir)}))`]),
@@ -228,6 +268,7 @@ function macOSCommand(config: SandboxedLaunchConfig, pythonArgs: string[]): Sand
 		env: sanitizedEnvironment(config),
 		transport: "ipc",
 		endpointPrefix: join(config.connectionDir, "kernel"),
+		detachedProcessGroup: false,
 	};
 }
 

@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { accessSync, constants, existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve, sep } from "node:path";
 import { RiemannHostError } from "./errors.ts";
@@ -104,13 +104,15 @@ export function resolveFilesystemSnapshot(options: {
 
 /** Builds a runtime policy from a stored snapshot, re-canonicalizing roots. */
 export function fileAccessPolicy(cwd: string, snapshot: FilesystemSnapshot): FileAccessPolicy {
-	return {
+	const policy = {
 		cwd: resolve(cwd),
 		readRoots: snapshot.read.map(canonicalBestEffort),
 		readExcludes: snapshot.readExclude.map(canonicalBestEffort),
 		writeRoots: snapshot.write.map(canonicalBestEffort),
 		writeExcludes: snapshot.writeExclude.map(canonicalBestEffort),
 	};
+	validateFileAccessPolicy(policy);
+	return policy;
 }
 
 export function policyAllowsRead(policy: FileAccessPolicy, path: string): boolean {
@@ -121,6 +123,7 @@ export function policyAllowsRead(policy: FileAccessPolicy, path: string): boolea
 
 export function policyAllowsWrite(policy: FileAccessPolicy, path: string): boolean {
 	const target = resolve(path);
+	if (!policyAllowsRead(policy, target)) return false;
 	if (policy.writeExcludes.some((exclude) => isInside(exclude, target))) return false;
 	return policy.writeRoots.some((root) => isInside(root, target));
 }
@@ -142,7 +145,60 @@ export function unrestrictedRead(policy: FileAccessPolicy): boolean {
 }
 
 export function unrestrictedWrite(policy: FileAccessPolicy): boolean {
-	return policy.writeRoots.length === 1 && policy.writeRoots[0] === "/" && policy.writeExcludes.length === 0;
+	return (
+		policy.writeRoots.length === 1 &&
+		policy.writeRoots[0] === "/" &&
+		policy.writeExcludes.length === 0 &&
+		policy.readExcludes.length === 0
+	);
+}
+
+function assertPathsExist(paths: readonly string[], label: string): void {
+	for (const path of paths) {
+		if (!existsSync(path)) throw new Error(`Sandbox ${label} does not exist: ${path}`);
+	}
+}
+
+/** Validates the invariants required to turn a policy into OS sandbox mounts. */
+export function validateFileAccessPolicy(policy: FileAccessPolicy): void {
+	assertPathsExist(policy.readRoots, "read root");
+	assertPathsExist(policy.readExcludes, "read exclusion");
+	assertPathsExist(policy.writeRoots, "write root");
+	assertPathsExist(policy.writeExcludes, "write exclusion");
+
+	for (const path of policy.writeRoots) {
+		if (!policy.readRoots.some((root) => isInside(root, path))) {
+			throw new Error(`Sandbox write root must be covered by a read root: ${path}`);
+		}
+	}
+	for (const path of policy.readExcludes) {
+		if (!policy.readRoots.some((root) => isInside(root, path))) {
+			throw new Error(`Sandbox read exclusion must be covered by a read root: ${path}`);
+		}
+	}
+	for (const path of policy.writeExcludes) {
+		if (!policy.writeRoots.some((root) => isInside(root, path))) {
+			throw new Error(`Sandbox write exclusion must be covered by a write root: ${path}`);
+		}
+	}
+
+	if (!existsSync(policy.cwd)) throw new Error(`Sandbox cwd does not exist: ${policy.cwd}`);
+	if (!statSync(policy.cwd).isDirectory()) throw new Error(`Sandbox cwd is not a directory: ${policy.cwd}`);
+	const canonicalCwd = realpathSync(policy.cwd);
+	if (policy.readExcludes.some((exclude) => isInside(exclude, policy.cwd) || isInside(exclude, canonicalCwd))) {
+		throw new Error(`Sandbox cwd is excluded from read access: ${policy.cwd}`);
+	}
+	if (
+		!policy.readRoots.some((root) => isInside(root, policy.cwd)) ||
+		!policy.readRoots.some((root) => isInside(root, canonicalCwd))
+	) {
+		throw new Error(`Sandbox cwd is not readable under the filesystem policy: ${policy.cwd}`);
+	}
+	try {
+		accessSync(policy.cwd, constants.R_OK | constants.X_OK);
+	} catch {
+		throw new Error(`Sandbox cwd is not readable by the current user: ${policy.cwd}`);
+	}
 }
 
 function rootsCovered(childRoots: readonly string[], parentRoots: readonly string[]): boolean {

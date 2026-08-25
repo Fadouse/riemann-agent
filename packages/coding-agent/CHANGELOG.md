@@ -14,6 +14,7 @@
 - Hidden `artifacts.get`, `artifacts.view`, and `artifacts.materialize` from the model surface; use the `Artifact` dataclass methods `read()`, `view()`, and `materialize()` instead.
 - Renamed `web.search` arguments `num_results`/`include_domains`/`start_published_date` to `limit`/`domains`/`since`, aligning the search `limit` vocabulary across `fs.glob`, `fs.search`, and `catalog.search`.
 - Renamed the `fs.search` file-filter argument `pattern` to `glob`, removing the `query`/`pattern` ambiguity.
+- Filesystem policies now require every configured root and exclusion to exist, require write roots to be covered by read roots, and treat `readExclude` as denying both reads and writes.
 
 ### Added
 
@@ -27,7 +28,7 @@
 - Restructured the Riemann system prompt: tightened the contract, condensed the runtime section, compressed agent handle guidelines into two rules, and added a work-type Verification section; the ipython tool schema no longer repeats the gather idiom.
 - Changed Riemann shell execution to resolve bash through pi's shared shell configuration (`bash -c`, legacy WSL stdin transport) instead of `$SHELL -lc`/`cmd /d /s /c`.
 - Changed child delegation to durable per-Turn `AgentHandle` results with `info()`, `wait()`, `send()`, `stop()`, and `release()` lifecycle controls; standard `asyncio.gather(...)` composes independent runs and waits.
-- Changed Linux Riemann isolation to a filesystem-only Bubblewrap policy that preserves workspace/state mounts while sharing host devices and system namespaces for ordinary commands.
+- Changed Linux Riemann isolation to a filesystem-focused Bubblewrap policy that preserves workspace/state paths, shares host devices and networking, and uses a private PID namespace for deterministic descendant cleanup.
 - Changed `agents.list()` to render compact `AgentInfo` summaries with bounded latest-output previews, while retaining full metadata as explicit fields and exact-Turn result retrieval through each item's handle methods.
 - Compacted Subagent Viewer transcript spacing and sized short overlays to their rendered content while preserving long-transcript scrolling.
 - Reduced startup and long-session overhead by coalescing model refreshes, gating Riemann migrations, using bounded artifact reads, and reusing session traversal results.
@@ -48,6 +49,7 @@
 - Fixed the model-facing Agent profile contract: empty configurations omit `profile`, configured profiles expose exact policy keys, and unknown keys report valid alternatives without allocating a child slot.
 - Removed redundant Shell metadata and empty Agent-profile inventory from the Riemann system prompt.
 - Fixed Riemann and tool output decoding, grapheme-boundary previews, and trailing-newline expansion so Unicode streams render without mojibake or extra rows.
+- Fixed Bubblewrap launches to preserve host cwd, HOME, temporary and terminal environment values; validate same-path mount policies; keep private IPC writable through exclusions; and detach brokers from the terminal foreground group.
 
 ## [0.84.3] - 2026-08-24
 

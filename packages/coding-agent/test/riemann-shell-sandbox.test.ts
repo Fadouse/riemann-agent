@@ -1,7 +1,8 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, test } from "vitest";
 import { FULL_FILESYSTEM, fileAccessPolicy } from "../src/riemann/access-policy.ts";
 import { ShellFunctions } from "../src/riemann/functions/shell.ts";
@@ -23,11 +24,40 @@ function record(value: JsonValue): Record<string, JsonValue> {
 	return value;
 }
 
-async function shellDefinition(workspace: string, root: string, read: string[], write: string[]) {
+function processExists(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function findProcessWithExactArgument(argument: string): number | undefined {
+	for (const entry of readdirSync("/proc")) {
+		if (!/^\d+$/.test(entry)) continue;
+		try {
+			const args = readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0");
+			if (args.includes(argument)) return Number.parseInt(entry, 10);
+		} catch {
+			// Process exited or is not inspectable.
+		}
+	}
+	return undefined;
+}
+
+async function shellDefinition(
+	workspace: string,
+	root: string,
+	read: string[],
+	write: string[],
+	readExclude: string[] = [],
+	writeExclude: string[] = [],
+) {
 	const store = new RiemannStore(join(root, "agent"));
 	const run = store.openRun("shell-test", workspace);
 	const shell = new ShellFunctions(
-		fileAccessPolicy(workspace, { read, readExclude: [], write, writeExclude: [] }),
+		fileAccessPolicy(workspace, { read, readExclude, write, writeExclude }),
 		new ArtifactStore(store, run.id),
 		100_000,
 		false,
@@ -159,6 +189,53 @@ PROBE`;
 			store.close();
 		}
 	});
+	test("preserves the requested cwd and environment without precreating fake directories", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-launch-"));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		await mkdir(workspace);
+		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
+		try {
+			const script = `${process.execPath} - <<'PROBE'
+console.log(JSON.stringify({ cwdMatches: process.cwd().endsWith(${JSON.stringify(workspace)}), value: process.env.RIEMANN_TEST_VALUE, home: process.env.HOME ?? null, tmp: process.env.TMPDIR ?? null }));
+PROBE`;
+			const result = record(
+				await definition.handler(
+					{ script, env: { RIEMANN_TEST_VALUE: "visible" }, timeout: 10 },
+					new AbortController().signal,
+				),
+			);
+			expect(result.exit_code).toBe(0);
+			expect(JSON.parse(String(result.stdout).trim())).toEqual({
+				cwdMatches: true,
+				value: "visible",
+				home: process.env.HOME ?? null,
+				tmp: process.env.TMPDIR ?? null,
+			});
+		} finally {
+			store.close();
+		}
+	});
+
+	test.skipIf(process.platform !== "linux")(
+		"keeps runtime IPC writable through an excluded temp ancestor",
+		async () => {
+			const root = await mkdtemp(join(tmpdir(), "riemann-shell-runtime-carve-"));
+			roots.push(root);
+			const workspace = process.cwd();
+			const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"], [tmpdir()]);
+			try {
+				const result = record(
+					await definition.handler({ script: "pwd", timeout: 10 }, new AbortController().signal),
+				);
+				expect(result).toMatchObject({ exit_code: 0, stdout: `${workspace}\n` });
+			} finally {
+				store.close();
+			}
+		},
+		30_000,
+	);
+
 	test("applies user-configured read exclusions without blocking normal commands", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-nested-state-"));
 		roots.push(root);
@@ -212,6 +289,50 @@ PROBE`;
 			store.close();
 		}
 	}, 30_000);
+
+	test.skipIf(process.platform !== "linux")(
+		"kills signal-resistant detached descendants through the Bubblewrap PID namespace",
+		async () => {
+			const root = await mkdtemp(join(tmpdir(), "riemann-shell-descendant-"));
+			roots.push(root);
+			const workspace = join(root, "workspace");
+			const daemonFile = join(workspace, "daemon.cjs");
+			const daemonLog = join(workspace, "daemon.log");
+			await mkdir(workspace);
+			await writeFile(
+				daemonFile,
+				`process.on("SIGHUP", () => {});
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+`,
+			);
+			const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
+			let daemonPid: number | undefined;
+			try {
+				const execution = definition.handler(
+					{
+						script: `/run/current-system/sw/bin/setsid ${JSON.stringify(process.execPath)} ${JSON.stringify(daemonFile)} >${JSON.stringify(daemonLog)} 2>&1 & sleep 30`,
+						timeout: 1,
+					},
+					new AbortController().signal,
+				);
+				for (let attempt = 0; attempt < 40 && daemonPid === undefined; attempt++) {
+					daemonPid = findProcessWithExactArgument(daemonFile);
+					if (daemonPid === undefined) await delay(25);
+				}
+				expect(daemonPid).toBeDefined();
+
+				const result = record(await execution);
+				expect(result).toMatchObject({ timed_out: true, exit_code: null });
+				for (let attempt = 0; attempt < 40 && processExists(daemonPid!); attempt++) await delay(25);
+				expect(processExists(daemonPid!)).toBe(false);
+			} finally {
+				if (daemonPid && processExists(daemonPid)) process.kill(daemonPid, "SIGKILL");
+				store.close();
+			}
+		},
+		30_000,
+	);
 
 	test("allows an unrestricted policy to access paths outside its workspace", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-host-"));

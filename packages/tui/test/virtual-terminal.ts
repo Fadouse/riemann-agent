@@ -1,3 +1,4 @@
+import { pathToFileURL } from "node:url";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import xterm from "@xterm/headless";
 import type { Terminal } from "../src/terminal.ts";
@@ -14,6 +15,7 @@ export class VirtualTerminal implements Terminal {
 	private resizeHandler?: () => void;
 	private _columns: number;
 	private _rows: number;
+	readonly workingDirectoryReports: string[] = [];
 
 	constructor(columns = 80, rows = 24) {
 		this._columns = columns;
@@ -98,6 +100,11 @@ export class VirtualTerminal implements Terminal {
 	setTitle(title: string): void {
 		// OSC 0;title BEL - set terminal window title
 		this.xterm.write(`\x1b]0;${title}\x07`);
+	}
+
+	setWorkingDirectory(workingDirectory: string): void {
+		this.workingDirectoryReports.push(workingDirectory);
+		this.xterm.write(`\x1b]7;${pathToFileURL(workingDirectory).href}\x07`);
 	}
 
 	setProgress(_active: boolean): void {}

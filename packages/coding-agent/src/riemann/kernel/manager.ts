@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Dealer, Subscriber } from "zeromq";
-import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
+import { signalProcessGroup, spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { policyAllowsRead, policyAllowsWrite } from "../access-policy.ts";
 import { sandboxedKernelCommand } from "./sandbox.ts";
 import type {
@@ -181,6 +181,15 @@ export class IPythonKernelManager {
 		return this.startup;
 	}
 
+	private signalKernelProcess(child: ChildProcess, signal: NodeJS.Signals): boolean {
+		if (this.options.sandbox) return signalProcessGroup(child, signal);
+		try {
+			return child.kill(signal);
+		} catch {
+			return false;
+		}
+	}
+
 	private async cleanupKernelResources(): Promise<void> {
 		const process = this.process;
 		const tempDir = this.tempDir;
@@ -200,12 +209,16 @@ export class IPythonKernelManager {
 		this.shellLoop = undefined;
 		this.controlLoop = undefined;
 		this.iopubLoop = undefined;
-		if (process?.exitCode === null) {
-			process.kill("SIGKILL");
-			process.stdout?.destroy();
-			process.stderr?.destroy();
+		if (process) {
+			this.signalKernelProcess(process, "SIGTERM");
+			await Promise.race([waitForChildProcess(process), delay(INTERRUPT_GRACE_MS)]);
+			this.signalKernelProcess(process, "SIGKILL");
+			if (process.exitCode === null) {
+				process.stdout?.destroy();
+				process.stderr?.destroy();
+			}
+			await Promise.race([waitForChildProcess(process), delay(SHUTDOWN_GRACE_MS)]);
 		}
-		if (process) await Promise.race([waitForChildProcess(process), delay(SHUTDOWN_GRACE_MS)]);
 		await Promise.allSettled(loops);
 		this.options.onProcess?.(undefined);
 		if (tempDir) await rm(tempDir, { recursive: true, force: true });
@@ -213,8 +226,6 @@ export class IPythonKernelManager {
 
 	private async startKernel(): Promise<void> {
 		this.tempDir = await mkdtemp(join(tmpdir(), "riemann-kernel-"));
-		await mkdir(join(this.tempDir, "home"), { recursive: true, mode: 0o700 });
-		await mkdir(join(this.tempDir, "tmp"), { recursive: true, mode: 0o700 });
 		if (this.options.snapshotPath) {
 			await mkdir(dirname(this.options.snapshotPath), { recursive: true, mode: 0o700 });
 		}
@@ -255,6 +266,7 @@ export class IPythonKernelManager {
 		const child = spawnProcess(launch.command, launch.args, {
 			cwd: this.options.cwd,
 			env: { ...launch.env, PYDEVD_DISABLE_FILE_VALIDATION: "1" },
+			detached: "detachedProcessGroup" in launch && launch.detachedProcessGroup,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		this.process = child;
@@ -621,7 +633,12 @@ export class IPythonKernelManager {
 		await delay(INTERRUPT_GRACE_MS);
 		if (this.execution !== execution || execution.settled) return;
 		this.kernelReady = false;
-		if (this.process?.exitCode === null) this.process.kill("SIGKILL");
+		const process = this.process;
+		if (process) {
+			this.signalKernelProcess(process, "SIGTERM");
+			await delay(INTERRUPT_GRACE_MS);
+			this.signalKernelProcess(process, "SIGKILL");
+		}
 		execution.replied = true;
 		execution.idle = true;
 		this.settleIfComplete(execution);

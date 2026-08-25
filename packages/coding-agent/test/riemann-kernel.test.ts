@@ -1,4 +1,4 @@
-import type { ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -124,7 +124,7 @@ async function createKernel(
 	]);
 	return new IPythonKernelManager({
 		python,
-		env: environment,
+		env: { ...environment, RIEMANN_TEST_VALUE: "visible" },
 		cwd: root,
 		sessionId: "kernel-test",
 		bootstrapCode: `${prelude}\n\n_install_functions(_json.loads(${JSON.stringify(specifications)}))`,
@@ -247,6 +247,63 @@ describe("Riemann IPython kernel", () => {
 		expect(stdoutWrites).toBe(2);
 		expect(stderrWrites).toBe(1);
 	});
+
+	test.skipIf(process.platform === "win32")(
+		"closes a sandbox broker process group",
+		async () => {
+			const child = spawn(
+				process.execPath,
+				[
+					"-e",
+					`const { spawn } = require("node:child_process");
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+console.log(descendant.pid);
+setInterval(() => {}, 1000);`,
+				],
+				{ detached: true, stdio: ["ignore", "pipe", "pipe"] },
+			);
+			const descendantPid = await new Promise<number>((resolve, reject) => {
+				child.once("error", reject);
+				child.stdout.once("data", (chunk: Buffer) => resolve(Number(chunk.toString("utf8").trim())));
+			});
+			const kernel = new IPythonKernelManager({
+				python: "python",
+				cwd: process.cwd(),
+				sessionId: "sandbox-close-test",
+				bootstrapCode: "",
+				sandbox: {
+					policy: fileAccessPolicy(process.cwd(), FULL_FILESYSTEM),
+				},
+				hostRequest: () => Promise.resolve(null),
+			});
+			(kernel as unknown as { process?: ChildProcess }).process = child;
+			try {
+				await kernel.close();
+				await stage(
+					"sandbox process group cleanup",
+					new Promise<void>((resolve) => {
+						const check = () => {
+							try {
+								process.kill(descendantPid, 0);
+								setTimeout(check, 10);
+							} catch {
+								resolve();
+							}
+						};
+						check();
+					}),
+				);
+			} finally {
+				try {
+					if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+				} catch {
+					// The process group is already gone.
+				}
+				await kernel.close();
+			}
+		},
+		10_000,
+	);
 
 	test("serializes checkpoints once, diagnoses failures, and retries failed checkpoints", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-checkpoint-fast-path-"));
@@ -543,6 +600,13 @@ released is None`,
 				first.execute("answer = await testing.echo(value=41)\nanswer + 1"),
 			);
 			expect(result.status).toBe("ok");
+			if (process.platform === "linux") {
+				const unsandboxedProcess = kernelProcess;
+				if (!unsandboxedProcess?.pid) throw new Error("Kernel process was not observed");
+				const fields = (await readFile(`/proc/${unsandboxedProcess.pid}/stat`, "utf8")).split(" ");
+				expect(Number(fields[4])).not.toBe(unsandboxedProcess.pid);
+				expect(Number(fields[5])).not.toBe(unsandboxedProcess.pid);
+			}
 			expect(result.result?.data["text/plain"]).toBe("42");
 			expect(result.stderr).toBe("");
 			const explicitNull = await stage("explicit null", first.execute("await testing.optional_echo(value=None)"));
@@ -634,13 +698,28 @@ released is None`,
 					? { bubblewrapPath: process.env.RIEMANN_BWRAP_PATH ?? "/usr/bin/bwrap" }
 					: {}),
 			};
+			let broker: ChildProcess | undefined;
 			const kernel = await stage(
 				"create sandboxed kernel",
-				createKernel(workspace, join(state, "kernel.dill"), undefined, undefined, sandbox),
+				createKernel(
+					workspace,
+					join(state, "kernel.dill"),
+					undefined,
+					(process) => {
+						if (process) broker = process;
+					},
+					sandbox,
+				),
 			);
 			try {
-				const code = `import json, pathlib
-out = {"workspace_read": pathlib.Path("read.txt").read_text()}
+				const code = `import json, os, pathlib
+out = {
+    "workspace_read": pathlib.Path("read.txt").read_text(),
+    "cwd_matches": os.getcwd().endswith(${JSON.stringify(workspace)}),
+    "environment": os.environ.get("RIEMANN_TEST_VALUE"),
+    "home": os.environ.get("HOME"),
+    "tmp": os.environ.get("TMPDIR"),
+}
 try:
     pathlib.Path("write.txt").write_text("bad")
     out["workspace_write"] = "allowed"
@@ -653,9 +732,24 @@ except Exception as error:
     out["outside_read"] = type(error).__name__
 print(json.dumps(out, sort_keys=True))`;
 				const result = await stage("execute sandbox probes", kernel.execute(code));
+				if (process.platform === "linux") {
+					const brokerProcess = broker;
+					if (!brokerProcess?.pid) throw new Error("Sandbox broker process was not observed");
+					const fields = (await readFile(`/proc/${brokerProcess.pid}/stat`, "utf8")).split(" ");
+					expect({ processGroup: Number(fields[4]), session: Number(fields[5]) }).toEqual({
+						processGroup: brokerProcess.pid,
+						session: brokerProcess.pid,
+					});
+				}
 				expect(result.status).toBe("ok");
-				const probe = JSON.parse(result.stdout.trim()) as Record<string, string>;
-				expect(probe).toMatchObject({ workspace_read: "ok" });
+				const probe = JSON.parse(result.stdout.trim()) as Record<string, string | boolean>;
+				expect(probe).toMatchObject({
+					workspace_read: "ok",
+					cwd_matches: true,
+					environment: "visible",
+					home: process.env.HOME,
+					tmp: process.env.TMPDIR,
+				});
 				expect(probe.workspace_write).not.toBe("allowed");
 				expect(probe.outside_read).not.toBe("allowed");
 			} finally {

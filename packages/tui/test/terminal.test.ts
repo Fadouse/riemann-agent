@@ -1,5 +1,8 @@
 import assert from "node:assert";
+import { hostname } from "node:os";
+import * as path from "node:path";
 import { describe, it, mock } from "node:test";
+import { pathToFileURL } from "node:url";
 import { setKittyProtocolActive } from "../src/keys.ts";
 import {
 	normalizeAppleTerminalInput,
@@ -251,6 +254,31 @@ describe("ProcessTerminal progress", () => {
 		try {
 			terminal.setProgress(false);
 			assert.deepEqual(writes, ["\x1b]9;4;0\x07"]);
+		} finally {
+			process.stdout.write = previousWrite;
+		}
+	});
+});
+
+describe("ProcessTerminal working directory", () => {
+	it("reports a safely encoded file URI with OSC 7", () => {
+		const terminal = new ProcessTerminal();
+		const writes: string[] = [];
+		const previousWrite = process.stdout.write;
+		const workingDirectory = path.join(process.cwd(), "space # ? \x07 \x1b");
+
+		process.stdout.write = ((chunk: string | Uint8Array) => {
+			writes.push(String(chunk));
+			return true;
+		}) as typeof process.stdout.write;
+
+		try {
+			terminal.setWorkingDirectory(workingDirectory);
+			const url = pathToFileURL(workingDirectory);
+			url.hostname = hostname();
+			assert.deepEqual(writes, [`\x1b]7;${url.href}\x07`]);
+			assert.equal(writes[0].slice(1, -1).includes("\x1b"), false);
+			assert.equal(writes[0].slice(1, -1).includes("\x07"), false);
 		} finally {
 			process.stdout.write = previousWrite;
 		}

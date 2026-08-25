@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
+import { signalProcessGroup, spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { getShellConfig } from "../../utils/shell.ts";
 import { graphemeSafePrefix } from "../../utils/text.ts";
 import { assertReadable, type FileAccessPolicy } from "../access-policy.ts";
@@ -101,10 +101,6 @@ export class ShellFunctions {
 			};
 		}
 		const sandboxDir = await mkdtemp(join(tmpdir(), "riemann-shell-"));
-		await Promise.all([
-			mkdir(join(sandboxDir, "home"), { recursive: true, mode: 0o700 }),
-			mkdir(join(sandboxDir, "tmp"), { recursive: true, mode: 0o700 }),
-		]);
 		let launch: SandboxedCommand;
 		try {
 			launch = sandboxedKernelCommand(
@@ -124,6 +120,7 @@ export class ShellFunctions {
 		const child = spawnProcess(launch.command, launch.args, {
 			cwd: options.cwd,
 			env: launch.env,
+			detached: launch.detachedProcessGroup,
 			stdio: [command.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 		});
 		if (command.stdin !== undefined && child.stdin) {
@@ -175,11 +172,9 @@ export class ShellFunctions {
 		let timedOut = false;
 		let forceKill: NodeJS.Timeout | undefined;
 		const terminate = () => {
-			if (child.exitCode !== null) return;
-			child.kill("SIGTERM");
-			forceKill = setTimeout(() => {
-				if (child.exitCode === null) child.kill("SIGKILL");
-			}, 2_000);
+			if (forceKill) return;
+			signalProcessGroup(child, "SIGTERM");
+			forceKill = setTimeout(() => signalProcessGroup(child, "SIGKILL"), 2_000);
 		};
 		const onAbort = () => terminate();
 		options.signal.addEventListener("abort", onAbort, { once: true });
@@ -187,12 +182,16 @@ export class ShellFunctions {
 			timedOut = true;
 			terminate();
 		}, options.timeoutSeconds * 1_000);
+		if (options.signal.aborted) onAbort();
 		let exitCode: number | null;
 		try {
 			exitCode = await waitForChildProcess(child);
 		} finally {
 			clearTimeout(timeout);
-			if (forceKill) clearTimeout(forceKill);
+			if (forceKill) {
+				clearTimeout(forceKill);
+				signalProcessGroup(child, "SIGKILL");
+			}
 			options.signal.removeEventListener("abort", onAbort);
 			await rm(sandboxDir, { recursive: true, force: true });
 		}

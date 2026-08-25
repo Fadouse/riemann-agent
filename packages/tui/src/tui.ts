@@ -299,6 +299,7 @@ export interface TUI extends Component {
 	clear(): void;
 	getShowHardwareCursor(): boolean;
 	setShowHardwareCursor(enabled: boolean): void;
+	setWorkingDirectory?(workingDirectory: string): void;
 	getClearOnShrink(): boolean;
 	setClearOnShrink(enabled: boolean): void;
 	setFocus(component: Component | null): void;
@@ -349,6 +350,9 @@ export abstract class TuiBase extends Container implements TUI {
 	private pendingOsc11BackgroundQueries: PendingOsc11BackgroundQuery[] = [];
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
+	private workingDirectory = process.cwd();
+	private reportedWorkingDirectory: string | undefined;
+	private terminalStarted = false;
 	protected readonly logDirectory: string;
 
 	// Overlay stack for modal components rendered on top of base content
@@ -397,6 +401,24 @@ export abstract class TuiBase extends Container implements TUI {
 			this.terminal.hideCursor();
 		}
 		this.requestRender();
+	}
+
+	setWorkingDirectory(workingDirectory: string): void {
+		if (this.workingDirectory === workingDirectory) return;
+		this.workingDirectory = workingDirectory;
+		this.reportWorkingDirectory();
+	}
+
+	private reportWorkingDirectory(): void {
+		if (
+			!this.terminalStarted ||
+			this.reportedWorkingDirectory === this.workingDirectory ||
+			!this.terminal.setWorkingDirectory
+		) {
+			return;
+		}
+		this.terminal.setWorkingDirectory(this.workingDirectory);
+		this.reportedWorkingDirectory = this.workingDirectory;
 	}
 
 	getClearOnShrink(): boolean {
@@ -703,7 +725,9 @@ export abstract class TuiBase extends Container implements TUI {
 			(data) => this.handleTerminalInput(data),
 			() => this.requestRender(),
 		);
+		this.terminalStarted = true;
 		this.afterTerminalStart();
+		this.reportWorkingDirectory();
 		this.terminal.hideCursor();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031h");
@@ -752,6 +776,8 @@ export abstract class TuiBase extends Container implements TUI {
 
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
+		this.terminalStarted = false;
+		this.reportedWorkingDirectory = undefined;
 		this.cancelRenderTimer();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");

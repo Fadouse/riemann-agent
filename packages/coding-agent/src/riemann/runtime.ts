@@ -393,11 +393,22 @@ export class RiemannRuntime {
 					workspace: this.agent.workspace,
 					config_files: this.shared.config.files,
 					filesystem: {
+						backend:
+							process.platform === "linux"
+								? "bubblewrap-v1"
+								: process.platform === "darwin"
+									? "seatbelt-v1"
+									: "unsupported",
 						cwd: this.policy.cwd,
 						read: [...this.policy.readRoots],
 						read_exclude: [...this.policy.readExcludes],
 						write: [...this.policy.writeRoots],
 						write_exclude: [...this.policy.writeExcludes],
+						semantics: {
+							write_requires_read: true,
+							read_exclude_denies_write: true,
+							same_path_mounts: true,
+						},
 					},
 					subagent_defaults: this.shared.config.agentDefaults,
 					agent_slots: {

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { describe, expect, test } from "vitest";
-import { waitForChildProcess } from "../src/utils/child-process.ts";
+import { signalProcessGroup, waitForChildProcess } from "../src/utils/child-process.ts";
 
 async function withTimeout<T>(promise: Promise<T>): Promise<T> {
 	return await Promise.race([
@@ -30,5 +30,46 @@ describe("waitForChildProcess", () => {
 		await once(child, "close");
 
 		await expect(withTimeout(waitForChildProcess(child))).resolves.toBeNull();
+	});
+
+	test.skipIf(process.platform === "win32")("signals a detached child process group", async () => {
+		const child = spawn(
+			process.execPath,
+			[
+				"-e",
+				`const { spawn } = require("node:child_process");
+const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+console.log(descendant.pid);
+setInterval(() => {}, 1000);`,
+			],
+			{ detached: true, stdio: ["ignore", "pipe", "pipe"] },
+		);
+		const [chunk] = await once(child.stdout, "data");
+		const descendantPid = Number(String(chunk).trim());
+		try {
+			expect(signalProcessGroup(child, "SIGTERM")).toBe(true);
+			await expect(withTimeout(waitForChildProcess(child))).resolves.toBeNull();
+			await expect(
+				withTimeout(
+					new Promise<void>((resolve) => {
+						const check = () => {
+							try {
+								process.kill(descendantPid, 0);
+								setTimeout(check, 10);
+							} catch {
+								resolve();
+							}
+						};
+						check();
+					}),
+				),
+			).resolves.toBeUndefined();
+		} finally {
+			try {
+				if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+			} catch {
+				// The process group is already gone.
+			}
+		}
 	});
 });

@@ -35,6 +35,23 @@ export function spawnProcessSync(
 		: nodeSpawnSync(command, args, options);
 }
 
+/** Signal a detached POSIX process group, falling back to the direct child. */
+export function signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): boolean {
+	if (child.exitCode !== null || child.signalCode !== null) return false;
+	if (process.platform !== "win32" && child.pid !== undefined) {
+		try {
+			return process.kill(-child.pid, signal);
+		} catch {
+			// The child may not be a process-group leader. Fall back to its PID.
+		}
+	}
+	try {
+		return child.kill(signal);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Wait for a child process to terminate without hanging on inherited stdio handles.
  *

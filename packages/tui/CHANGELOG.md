@@ -10,6 +10,7 @@
 
 - Made complete `[Image #N]` attachment markers atomic for cursor movement and deletion, matching existing paste-marker behavior.
 - Fixed malformed Unicode and unsafe terminal controls causing width drift, cursor corruption, extra rows, and slow terminal-sequence scanning.
+- Fixed inherited terminal working directories by reporting the active session cwd with OSC 7 across startup, session switches, and TUI resumes.
 
 ## [0.84.3] - 2026-08-24
 

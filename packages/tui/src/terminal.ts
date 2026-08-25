@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
+import { hostname } from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { setKittyProtocolActive } from "./keys.ts";
 import { isNativeModifierPressed } from "./native-modifiers.ts";
 import { getNativeModuleCandidates } from "./native-module-path.ts";
@@ -96,6 +98,9 @@ export interface Terminal {
 
 	// Title operations
 	setTitle(title: string): void; // Set terminal window title
+
+	// Working directory reporting (OSC 7). Optional for custom terminals.
+	setWorkingDirectory?(workingDirectory: string): void;
 
 	// Progress indicator (OSC 9;4)
 	setProgress(active: boolean): void;
@@ -526,6 +531,12 @@ export class ProcessTerminal implements Terminal {
 	setTitle(title: string): void {
 		// OSC 0;title BEL - set terminal window title
 		process.stdout.write(`\x1b]0;${title}\x07`);
+	}
+
+	setWorkingDirectory(workingDirectory: string): void {
+		const url = pathToFileURL(path.resolve(workingDirectory));
+		url.hostname = hostname();
+		process.stdout.write(`\x1b]7;${url.href}\x07`);
 	}
 
 	setProgress(active: boolean): void {

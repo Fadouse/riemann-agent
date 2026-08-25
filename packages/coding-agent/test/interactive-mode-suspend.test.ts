@@ -9,6 +9,7 @@ type FakeUi = {
 
 type HandleCtrlZThis = {
 	ui: FakeUi;
+	startInteractiveTui: () => void;
 };
 
 type ProcessSignalHandler = () => void;
@@ -35,7 +36,11 @@ describe("InteractiveMode.handleCtrlZ", () => {
 			requestRender: vi.fn(),
 		};
 		const showStatus = vi.fn();
-		const context: HandleCtrlZThis & { showStatus: (message: string) => void } = { ui, showStatus };
+		const context: HandleCtrlZThis & { showStatus: (message: string) => void } = {
+			ui,
+			startInteractiveTui: () => ui.start(),
+			showStatus,
+		};
 		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
 		Object.defineProperty(process, "platform", {
 			configurable: true,
@@ -68,7 +73,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
 			stop: vi.fn(),
 			requestRender: vi.fn(),
 		};
-		const context: HandleCtrlZThis = { ui };
+		const context: HandleCtrlZThis = { ui, startInteractiveTui: () => ui.start() };
 		const keepAliveHandle = setTimeout(() => undefined, 0);
 		clearTimeout(keepAliveHandle);
 
@@ -118,7 +123,7 @@ describe("InteractiveMode.handleCtrlZ", () => {
 			stop: vi.fn(),
 			requestRender: vi.fn(),
 		};
-		const context: HandleCtrlZThis = { ui };
+		const context: HandleCtrlZThis = { ui, startInteractiveTui: () => ui.start() };
 		const keepAliveHandle = setTimeout(() => undefined, 0);
 		clearTimeout(keepAliveHandle);
 		const suspendError = new Error("suspend failed");

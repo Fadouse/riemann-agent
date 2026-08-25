@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import { type FilesystemSnapshot, fileAccessPolicy } from "../src/riemann/access-policy.ts";
+import { type FilesystemSnapshot, fileAccessPolicy, policyAllowsWrite } from "../src/riemann/access-policy.ts";
 import {
 	macOSSandboxProfile,
 	resolveSandboxExecutable,
@@ -69,6 +69,7 @@ describe("Riemann kernel system sandbox", () => {
 			expect(command.command).toBe("/usr/bin/bwrap");
 			expect(command.args).not.toContain("--unshare-all");
 			expect(command.args).toContain("--new-session");
+			expect(command.args).toContain("--unshare-pid");
 			expect(command.transport).toBe("ipc");
 			expect(command.args).toEqual(expect.arrayContaining(["--dev-bind", "/dev", "/dev"]));
 			expect(command.args).toEqual(expect.arrayContaining(["--bind", "/", "/"]));
@@ -139,6 +140,128 @@ describe("Riemann kernel system sandbox", () => {
 		expect(macOSSandboxProfile({ ...config, networkAllowed: true, platform: "darwin" })).toContain(
 			"(allow network*)",
 		);
+	});
+
+	test("preserves host and terminal environment while keeping Jupyter state private", async () => {
+		const names = [
+			"HOME",
+			"USERPROFILE",
+			"TMPDIR",
+			"TMP",
+			"TEMP",
+			"TERM",
+			"COLORTERM",
+			"TERM_PROGRAM",
+			"TERM_PROGRAM_VERSION",
+			"TMUX",
+			"TMUX_PANE",
+			"KITTY_WINDOW_ID",
+			"KITTY_LISTEN_ON",
+			"NO_COLOR",
+		] as const;
+		const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+		const { config, connectionDir } = await launch();
+		try {
+			for (const name of names) process.env[name] = `host-${name.toLowerCase()}`;
+			const command = sandboxedKernelCommand(
+				{
+					...config,
+					platform: "linux",
+					bubblewrapPath: "/usr/bin/bwrap",
+					environment: { PWD: "wrong", IPYTHONDIR: "wrong", JUPYTER_CONFIG_DIR: "wrong" },
+				},
+				[],
+			);
+
+			for (const name of names) expect(command.env[name]).toBe(`host-${name.toLowerCase()}`);
+			expect(command.env.IPYTHONDIR).toBe(join(connectionDir, "ipython"));
+			expect(command.env.JUPYTER_CONFIG_DIR).toBe(join(connectionDir, "jupyter"));
+			expect(command.env.PWD).toBe(config.policy.cwd);
+		} finally {
+			for (const name of names) {
+				const value = previous[name];
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
+	});
+
+	test("rejects invalid filesystem policies with explicit errors", async () => {
+		const { config, root, workspace, connectionDir } = await launch({ readHost: false, writeHost: false });
+		const existingFile = join(root, "file");
+		await writeFile(existingFile, "not a directory");
+		const command = (policy: typeof config.policy) =>
+			sandboxedKernelCommand({ ...config, policy, platform: "linux", bubblewrapPath: "/usr/bin/bwrap" }, []);
+
+		const missing = join(root, "missing");
+		expect(() => command({ ...config.policy, cwd: missing })).toThrow(/cwd.*does not exist/i);
+		expect(() => command({ ...config.policy, cwd: existingFile })).toThrow(/cwd.*directory/i);
+		expect(() => command({ ...config.policy, cwd: workspace, readExcludes: [workspace] })).toThrow(/cwd.*excluded/i);
+		expect(() => command({ ...config.policy, readRoots: [missing] })).toThrow(/read root.*does not exist/i);
+		expect(() => command({ ...config.policy, writeRoots: [missing] })).toThrow(/write root.*does not exist/i);
+		expect(() => command({ ...config.policy, readExcludes: [missing] })).toThrow(/read exclusion.*does not exist/i);
+		expect(() => command({ ...config.policy, writeExcludes: [missing] })).toThrow(/write exclusion.*does not exist/i);
+		expect(() => command({ ...config.policy, writeRoots: [connectionDir] })).toThrow(
+			/write root.*covered by a read root/i,
+		);
+		expect(() => command({ ...config.policy, readExcludes: [connectionDir] })).toThrow(
+			/read exclusion.*covered by a read root/i,
+		);
+		expect(() => command({ ...config.policy, writeExcludes: [connectionDir] })).toThrow(
+			/write exclusion.*covered by a write root/i,
+		);
+
+		const outside = join(root, "outside");
+		const linkedCwd = join(workspace, "linked-cwd");
+		await mkdir(outside);
+		await symlink(outside, linkedCwd);
+		expect(() => command({ ...config.policy, cwd: linkedCwd })).toThrow(/cwd.*not readable/i);
+	});
+
+	test("read exclusions override writes and mask excluded files with read-only dev-null binds", async () => {
+		const { config, workspace } = await launch({ readHost: false, writeHost: false });
+		const excludedFile = join(workspace, "secret.txt");
+		await writeFile(excludedFile, "secret");
+		const policy = fileAccessPolicy(
+			workspace,
+			snapshot({ read: [workspace], readExclude: [excludedFile], write: [workspace] }),
+		);
+
+		expect(policyAllowsWrite(policy, excludedFile)).toBe(false);
+		const command = sandboxedKernelCommand(
+			{ ...config, policy, platform: "linux", bubblewrapPath: "/usr/bin/bwrap" },
+			[],
+		);
+		expect(command.args).toEqual(expect.arrayContaining(["--ro-bind", "/dev/null", excludedFile]));
+		expect(flagIndex(command.args, "--tmpfs", excludedFile)).toBe(-1);
+		const profile = macOSSandboxProfile({ ...config, policy, platform: "darwin" });
+		expect(profile).toContain(
+			`(allow file-write* (require-all (subpath ${JSON.stringify(workspace)}) (require-not (literal ${JSON.stringify(excludedFile)}))`,
+		);
+	});
+
+	test("carves the runtime directory through excluded ancestors and removes redundant nested masks", async () => {
+		const { config, root, connectionDir } = await launch();
+		const excludedTmp = tmpdir();
+		const policy = fileAccessPolicy(
+			process.cwd(),
+			snapshot({ read: ["/"], readExclude: [excludedTmp, root], write: ["/"] }),
+		);
+		const command = sandboxedKernelCommand(
+			{ ...config, policy, platform: "linux", bubblewrapPath: "/usr/bin/bwrap" },
+			[],
+		);
+		const tmpfs = flagIndex(command.args, "--tmpfs", excludedTmp);
+		const runtimeBind = flagIndex(command.args, "--bind", connectionDir);
+		const remount = flagIndex(command.args, "--remount-ro", excludedTmp);
+		expect(tmpfs).toBeGreaterThan(-1);
+		expect(runtimeBind).toBeGreaterThan(tmpfs);
+		expect(remount).toBeGreaterThan(runtimeBind);
+		expect(flagIndex(command.args, "--tmpfs", root)).toBe(-1);
+
+		const profile = macOSSandboxProfile({ ...config, policy, platform: "darwin" });
+		expect(profile).toContain(`(allow file-read* (subpath ${JSON.stringify(connectionDir)}))`);
+		expect(profile).toContain(`(allow file-write* (subpath ${JSON.stringify(connectionDir)}))`);
 	});
 
 	test("uses the effective PATH and canonical executable target", async () => {
