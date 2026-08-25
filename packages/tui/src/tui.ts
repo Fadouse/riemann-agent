@@ -14,7 +14,7 @@ import {
 	type RgbColor,
 	type TerminalColorScheme,
 } from "./terminal-colors.ts";
-import { getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
+import { getCapabilities, isImageLine, normalizeImageLine, setCellDimensions } from "./terminal-image.ts";
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
 
 /**
@@ -1162,9 +1162,7 @@ export abstract class TuiBase extends Container implements TUI {
 		const reset = SEGMENT_RESET;
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
-			if (!isImageLine(line)) {
-				lines[i] = normalizeTerminalOutput(line) + reset;
-			}
+			lines[i] = (isImageLine(line) ? normalizeImageLine(line) : normalizeTerminalOutput(line)) + reset;
 		}
 		return lines;
 	}

@@ -47,9 +47,14 @@ const terminalSpacingMarkRegex =
 	/^(?:[\p{Spacing_Mark}--[\u1734\u302E\u302F]]|[\u065F\u0F7F\u102B\u102C\u1031\u1033-\u1035\u1038\u103A-\u103E])+$/v;
 const rgiEmojiRegex = /^\p{RGI_Emoji}$/v;
 
-// Cache for non-ASCII strings
+// Keep width caches bounded by both entry count and key size. Whole rendered lines
+// can be very large, while graphemes are usually short and repeat frequently.
 const WIDTH_CACHE_SIZE = 512;
+const WIDTH_CACHE_MAX_KEY_LENGTH = 256;
+const GRAPHEME_WIDTH_CACHE_SIZE = 2048;
+const GRAPHEME_WIDTH_CACHE_MAX_KEY_LENGTH = 64;
 const widthCache = new Map<string, number>();
+const graphemeWidthCache = new Map<string, number>();
 
 export const cjkBreakRegex =
 	/[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Hangul}\p{Script_Extensions=Bopomofo}]/u;
@@ -172,6 +177,27 @@ function finalizeTruncatedResult(
  * check to avoid running the RGI_Emoji regex unnecessarily.
  */
 function graphemeWidth(segment: string): number {
+	// Node replaces lone UTF-16 surrogates with U+FFFD when encoding stdout as
+	// UTF-8. Measure the same well-formed text that reaches the terminal.
+	const safeSegment = segment === "\t" ? segment : sanitizeTerminalText(segment);
+	const cacheable = safeSegment.length <= GRAPHEME_WIDTH_CACHE_MAX_KEY_LENGTH;
+	if (cacheable) {
+		const cached = graphemeWidthCache.get(safeSegment);
+		if (cached !== undefined) return cached;
+	}
+
+	const width = calculateGraphemeWidth(safeSegment);
+	if (cacheable) {
+		if (graphemeWidthCache.size >= GRAPHEME_WIDTH_CACHE_SIZE) {
+			const firstKey = graphemeWidthCache.keys().next().value;
+			if (firstKey !== undefined) graphemeWidthCache.delete(firstKey);
+		}
+		graphemeWidthCache.set(safeSegment, width);
+	}
+	return width;
+}
+
+function calculateGraphemeWidth(segment: string): number {
 	if (segment === "\t") {
 		return 3;
 	}
@@ -242,26 +268,25 @@ export function visibleWidth(str: string): number {
 		return 0;
 	}
 
+	// Measure the same safe, well-formed text emitted to the terminal.
+	let clean = sanitizeTerminalText(str);
+
 	// Fast path: pure ASCII printable
-	if (isPrintableAscii(str)) {
-		return str.length;
+	if (isPrintableAscii(clean)) {
+		return clean.length;
 	}
 
-	// Check cache
-	const cached = widthCache.get(str);
-	if (cached !== undefined) {
-		return cached;
+	const cacheable = clean.length <= WIDTH_CACHE_MAX_KEY_LENGTH;
+	const cacheKey = clean;
+	if (cacheable) {
+		const cached = widthCache.get(cacheKey);
+		if (cached !== undefined) return cached;
 	}
 
-	// Normalize: tabs to 3 spaces, strip ANSI escape codes
-	let clean = str;
-	if (str.includes("\t")) {
-		clean = clean.replace(/\t/g, "   ");
-	}
+	// Strip preserved renderer-safe terminal sequences.
 	if (clean.includes("\x1b")) {
-		// Strip supported ANSI/OSC/APC escape sequences in one pass.
-		// This covers CSI styling/cursor codes, OSC hyperlinks and prompt markers,
-		// and APC sequences like CURSOR_MARKER.
+		// Strip preserved renderer-safe sequences in one pass: CSI styling,
+		// OSC hyperlinks and prompt markers, and the APC cursor marker.
 		let stripped = "";
 		let i = 0;
 		while (i < clean.length) {
@@ -282,14 +307,13 @@ export function visibleWidth(str: string): number {
 		width += graphemeWidth(segment);
 	}
 
-	// Cache result
-	if (widthCache.size >= WIDTH_CACHE_SIZE) {
-		const firstKey = widthCache.keys().next().value;
-		if (firstKey !== undefined) {
-			widthCache.delete(firstKey);
+	if (cacheable) {
+		if (widthCache.size >= WIDTH_CACHE_SIZE) {
+			const firstKey = widthCache.keys().next().value;
+			if (firstKey !== undefined) widthCache.delete(firstKey);
 		}
+		widthCache.set(cacheKey, width);
 	}
-	widthCache.set(str, width);
 
 	return width;
 }
@@ -371,75 +395,134 @@ export function getOsc8LinkAtColumn(line: string, column: number): string | unde
  * differential repaint. Their compatibility decompositions have the same cell
  * width but avoid stale-cell artifacts in terminal renderers. Visible tabs are
  * expanded to the fixed width used by layout so terminal tab stops cannot wrap
- * a logical line, while tabs inside terminal string sequences stay untouched.
+ * a logical line. Unsafe terminal controls are removed in the same canonical pass.
  */
-const THAI_LAO_AM_REGEX = /[\u0e33\u0eb3]/;
-const THAI_LAO_AM_GLOBAL_REGEX = /[\u0e33\u0eb3]/g;
+const BIDI_CONTROL_REGEX = /\p{Bidi_Control}/v;
 
-export function normalizeTerminalOutput(str: string): string {
-	let normalized = str;
-	if (THAI_LAO_AM_REGEX.test(normalized)) {
-		normalized = normalized.replace(THAI_LAO_AM_GLOBAL_REGEX, (char) =>
-			char === "\u0e33" ? "\u0e4d\u0e32" : "\u0ecd\u0eb2",
-		);
-	}
-	if (!normalized.includes("\t")) return normalized;
+const CURSOR_MARKER_SEQUENCE = "\x1b_pi:c\x07";
+const SAFE_SGR_REGEX = /^\x1b\[[0-?]*m$/;
 
-	let result = "";
-	let i = 0;
-	while (i < normalized.length) {
-		const ansi = extractAnsiCode(normalized, i);
-		if (ansi) {
-			result += ansi.code;
-			i += ansi.length;
-			continue;
-		}
-		result += normalized[i] === "\t" ? "   " : normalized[i];
-		i++;
-	}
-	return result;
+function isRendererSafeSequence(code: string): boolean {
+	if (code === CURSOR_MARKER_SEQUENCE || SAFE_SGR_REGEX.test(code)) return true;
+	if (!code.startsWith("\x1b]")) return false;
+
+	const terminatorLength = code.endsWith("\x07") ? 1 : 2;
+	const body = code.slice(2, -terminatorLength);
+	if (/[\x00-\x1f\x7f-\x9f]/.test(body)) return false;
+	if (body.startsWith("8;")) return body.indexOf(";", 2) !== -1;
+	return body === "133;A" || body === "133;B" || body === "133;C";
 }
 
-/**
- * Extract ANSI escape sequences from a string at the given position.
- */
+/** Convert component text to the canonical form that is safe to write to a terminal. */
+function sanitizeTerminalText(str: string): string {
+	if (isPrintableAscii(str)) return str;
+
+	let parts: string[] | undefined;
+	let copyStart = 0;
+	let i = 0;
+	const replaceRange = (end: number, replacement: string): void => {
+		parts ??= [];
+		if (copyStart < i) parts.push(str.slice(copyStart, i));
+		if (replacement) parts.push(replacement);
+		copyStart = end;
+		i = end;
+	};
+
+	while (i < str.length) {
+		const codeUnit = str.charCodeAt(i);
+		if (codeUnit === 0x1b) {
+			const sequence = extractAnsiCode(str, i);
+			if (sequence) {
+				if (isRendererSafeSequence(sequence.code)) {
+					i += sequence.length;
+				} else {
+					replaceRange(i + sequence.length, "");
+				}
+			} else {
+				// Remove an unrecognized ESC byte so its visible tail is inert text.
+				replaceRange(i + 1, "");
+			}
+			continue;
+		}
+		if (codeUnit === 0x09) {
+			replaceRange(i + 1, "   ");
+			continue;
+		}
+		if (codeUnit < 0x20 || (codeUnit >= 0x7f && codeUnit <= 0x9f)) {
+			replaceRange(i + 1, "");
+			continue;
+		}
+		const char = str[i]!;
+		if (BIDI_CONTROL_REGEX.test(char)) {
+			replaceRange(i + 1, "");
+			continue;
+		}
+		if (codeUnit === 0x0e33 || codeUnit === 0x0eb3) {
+			replaceRange(i + 1, codeUnit === 0x0e33 ? "\u0e4d\u0e32" : "\u0ecd\u0eb2");
+			continue;
+		}
+		if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+			const next = str.charCodeAt(i + 1);
+			if (next >= 0xdc00 && next <= 0xdfff) {
+				i += 2;
+			} else {
+				replaceRange(i + 1, "�");
+			}
+			continue;
+		}
+		if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+			replaceRange(i + 1, "�");
+			continue;
+		}
+		i++;
+	}
+	if (!parts) return str;
+	if (copyStart < str.length) parts.push(str.slice(copyStart));
+	return parts.join("");
+}
+
+export function normalizeTerminalOutput(str: string): string {
+	return sanitizeTerminalText(str);
+}
+
+/** Extract one syntactically complete ECMA-48 terminal sequence at `pos`. */
 export function extractAnsiCode(str: string, pos: number): { code: string; length: number } | null {
 	if (pos >= str.length || str[pos] !== "\x1b") return null;
 
 	const next = str[pos + 1];
-
-	// CSI sequence: ESC [ ... m/G/K/H/J
 	if (next === "[") {
 		let j = pos + 2;
-		while (j < str.length && !/[mGKHJ]/.test(str[j]!)) j++;
-		if (j < str.length) return { code: str.substring(pos, j + 1), length: j + 1 - pos };
+		while (j < str.length && str.charCodeAt(j) >= 0x30 && str.charCodeAt(j) <= 0x3f) j++;
+		while (j < str.length && str.charCodeAt(j) >= 0x20 && str.charCodeAt(j) <= 0x2f) j++;
+		const final = str.charCodeAt(j);
+		if (final >= 0x40 && final <= 0x7e) {
+			return { code: str.slice(pos, j + 1), length: j + 1 - pos };
+		}
 		return null;
 	}
 
-	// OSC sequence: ESC ] ... BEL or ESC ] ... ST (ESC \)
-	// Used for hyperlinks (OSC 8), window titles, etc.
-	if (next === "]") {
+	if (next === "]" || next === "_") {
 		let j = pos + 2;
 		while (j < str.length) {
-			if (str[j] === "\x07") return { code: str.substring(pos, j + 1), length: j + 1 - pos };
-			if (str[j] === "\x1b" && str[j + 1] === "\\") return { code: str.substring(pos, j + 2), length: j + 2 - pos };
+			if (str[j] === "\x07") return { code: str.slice(pos, j + 1), length: j + 1 - pos };
+			if (str[j] === "\x1b") {
+				if (str[j + 1] === "\\") return { code: str.slice(pos, j + 2), length: j + 2 - pos };
+				// A nested ESC makes this prefix malformed. Stopping here keeps
+				// repeated malformed prefixes linear across caller scans.
+				return null;
+			}
 			j++;
 		}
 		return null;
 	}
 
-	// APC sequence: ESC _ ... BEL or ESC _ ... ST (ESC \)
-	// Used for cursor marker and application-specific commands
-	if (next === "_") {
-		let j = pos + 2;
-		while (j < str.length) {
-			if (str[j] === "\x07") return { code: str.substring(pos, j + 1), length: j + 1 - pos };
-			if (str[j] === "\x1b" && str[j + 1] === "\\") return { code: str.substring(pos, j + 2), length: j + 2 - pos };
-			j++;
-		}
-		return null;
+	// ESC sequences consist of optional intermediate bytes and one final byte.
+	let j = pos + 1;
+	while (j < str.length && str.charCodeAt(j) >= 0x20 && str.charCodeAt(j) <= 0x2f) j++;
+	const final = str.charCodeAt(j);
+	if (final >= 0x30 && final <= 0x7e) {
+		return { code: str.slice(pos, j + 1), length: j + 1 - pos };
 	}
-
 	return null;
 }
 
@@ -841,14 +924,15 @@ export function wrapTextWithAnsi(text: string, width: number): string[] {
 	const tracker = new AnsiCodeTracker();
 
 	for (const inputLine of inputLines) {
+		const safeInputLine = sanitizeTerminalText(inputLine);
 		// Prepend active ANSI codes from previous lines (except for first line)
 		const prefix = result.length > 0 ? tracker.getActiveCodes() : "";
-		const wrappedLines = wrapSingleLine(prefix + inputLine, width);
+		const wrappedLines = wrapSingleLine(prefix + safeInputLine, width);
 		for (const wrappedLine of wrappedLines) {
 			result.push(wrappedLine);
 		}
 		// Update tracker with codes from this line for next iteration
-		updateTrackerFromText(inputLine, tracker);
+		updateTrackerFromText(safeInputLine, tracker);
 	}
 
 	return result.length > 0 ? result : [""];
@@ -995,9 +1079,14 @@ function breakLongWord(word: string, width: number, tracker: AnsiCodeTracker): s
 		// Skip empty graphemes to avoid issues with string-width calculation
 		if (!grapheme) continue;
 
-		const graphemeWidth = visibleWidth(grapheme);
+		let renderedGrapheme = grapheme;
+		let graphemeWidth = visibleWidth(grapheme);
+		if (graphemeWidth > width) {
+			renderedGrapheme = "?";
+			graphemeWidth = 1;
+		}
 
-		if (currentWidth + graphemeWidth > width) {
+		if (currentWidth > 0 && currentWidth + graphemeWidth > width) {
 			// Add specific reset for underline only (preserves background)
 			const lineEndReset = tracker.getLineEndReset();
 			if (lineEndReset) {
@@ -1008,7 +1097,7 @@ function breakLongWord(word: string, width: number, tracker: AnsiCodeTracker): s
 			currentWidth = 0;
 		}
 
-		currentLine += grapheme;
+		currentLine += renderedGrapheme;
 		currentWidth += graphemeWidth;
 	}
 
@@ -1056,6 +1145,8 @@ export function truncateToWidth(
 	ellipsis: string = "...",
 	pad: boolean = false,
 ): string {
+	text = sanitizeTerminalText(text);
+	ellipsis = sanitizeTerminalText(ellipsis);
 	if (maxWidth <= 0) {
 		return "";
 	}

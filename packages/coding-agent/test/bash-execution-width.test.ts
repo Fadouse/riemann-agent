@@ -79,6 +79,28 @@ describe("BashExecutionComponent width handling (#2569)", () => {
 		}
 	});
 
+	it("does not count a terminal newline in collapsed or expanded output", () => {
+		const { stub } = createTuiStub(100);
+		const component = new BashExecutionComponent("stream", stub);
+		const output = `${Array.from({ length: 25 }, (_, index) => `line-${index + 1}`).join("\n")}\n`;
+		component.appendOutput(output);
+		component.setComplete(0, false);
+
+		const collapsedLines = component.render(100).map((line) => stripAnsi(line).trimEnd());
+		expect(collapsedLines.some((line) => line.includes("line-6"))).toBe(true);
+		expect(collapsedLines.some((line) => line.includes("5 more lines"))).toBe(true);
+		expect(collapsedLines.some((line) => line.includes("6 more lines"))).toBe(false);
+		const collapsedLastOutput = collapsedLines.findIndex((line) => line.includes("line-25"));
+		const collapsedStatus = collapsedLines.findIndex((line) => line.includes("5 more lines"));
+		expect(collapsedLines.slice(collapsedLastOutput + 1, collapsedStatus)).toEqual([""]);
+
+		component.setExpanded(true);
+		const expandedLines = component.render(100).map((line) => stripAnsi(line).trimEnd());
+		const expandedLastOutput = expandedLines.findIndex((line) => line.includes("line-25"));
+		const expandedStatus = expandedLines.findIndex((line) => line.includes("to collapse"));
+		expect(expandedLines.slice(expandedLastOutput + 1, expandedStatus)).toEqual([""]);
+	});
+
 	it("coalesces output chunks until the next render", () => {
 		const { stub } = createTuiStub(100);
 		const component = new BashExecutionComponent("stream", stub);

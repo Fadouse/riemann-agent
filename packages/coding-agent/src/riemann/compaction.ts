@@ -4,6 +4,7 @@ import { type CompactionPreparation, type CompactionResult, estimateTokens } fro
 import { collectConversationImages, serializeConversation } from "../core/compaction/utils.ts";
 import type { ExtensionContext } from "../core/extensions/types.ts";
 import { convertToLlm } from "../core/messages.ts";
+import { graphemeSafePrefix } from "../utils/text.ts";
 import type { JsonValue } from "./kernel/types.ts";
 import { loadRiemannPrompt } from "./prompts.ts";
 import * as snapshot from "./snapshot-compaction.ts";
@@ -19,7 +20,7 @@ function boundedConversation(messages: CompactionPreparation["messagesToSummariz
 		.map((section) =>
 			section.length <= MAX_SERIALIZED_SECTION_CHARS
 				? section
-				: `${section.slice(0, MAX_SERIALIZED_SECTION_CHARS)}\n[section truncated for compaction]`,
+				: `${graphemeSafePrefix(section, MAX_SERIALIZED_SECTION_CHARS)}\n[section truncated for compaction]`,
 		)
 		.join("\n\n");
 }

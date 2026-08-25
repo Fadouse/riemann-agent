@@ -171,19 +171,32 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 		}
 
 		if (gWidth > maxWidth) {
-			// Single atomic segment wider than maxWidth (e.g. a paste or image
-			// marker in a narrow terminal). Re-wrap it at grapheme granularity.
-
-			// The segment remains logically atomic for cursor
-			// movement / editing — the split is purely visual for word-wrap layout.
-			const subChunks = wordWrapLine(grapheme, maxWidth);
-			for (let j = 0; j < subChunks.length - 1; j++) {
-				const sc = subChunks[j]!;
-				chunks.push({ text: sc.text, startIndex: charIndex + sc.startIndex, endIndex: charIndex + sc.endIndex });
+			const subSegments = [...graphemeSegmenter.segment(grapheme)];
+			if (subSegments.length > 1) {
+				// Atomic paste/image markers remain logically indivisible but may wrap
+				// across visual lines using their ordinary grapheme segments.
+				const subChunks = wordWrapLine(grapheme, maxWidth, subSegments);
+				for (let j = 0; j < subChunks.length - 1; j++) {
+					const subChunk = subChunks[j]!;
+					chunks.push({
+						text: subChunk.text,
+						startIndex: charIndex + subChunk.startIndex,
+						endIndex: charIndex + subChunk.endIndex,
+					});
+				}
+				const last = subChunks[subChunks.length - 1]!;
+				chunkStart = charIndex + last.startIndex;
+				currentWidth = visibleWidth(last.text);
+				wrapOppIndex = -1;
+				continue;
 			}
-			const last = subChunks[subChunks.length - 1]!;
-			chunkStart = charIndex + last.startIndex;
-			currentWidth = visibleWidth(last.text);
+
+			// Preserve source indices while rendering an indivisible wide grapheme
+			// as one safe cell in an impossibly narrow viewport.
+			const graphemeEnd = charIndex + grapheme.length;
+			chunks.push({ text: "?", startIndex: charIndex, endIndex: graphemeEnd });
+			chunkStart = graphemeEnd;
+			currentWidth = 0;
 			wrapOppIndex = -1;
 			continue;
 		}
@@ -209,8 +222,10 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 		}
 	}
 
-	// Push final chunk.
-	chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart, endIndex: line.length });
+	// Push final chunk unless an oversized final grapheme already produced it.
+	if (chunkStart < line.length || chunks.length === 0) {
+		chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart, endIndex: line.length });
+	}
 
 	return chunks;
 }

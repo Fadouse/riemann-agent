@@ -74,12 +74,11 @@ export async function executeBashWithOperations(
 	};
 
 	const decoder = new TextDecoder();
+	let decoderFlushed = false;
 
-	const onData = (data: Buffer) => {
-		totalBytes += data.length;
-
+	const appendDecodedText = (decodedText: string) => {
 		// Sanitize: strip ANSI, replace binary garbage, normalize newlines
-		const text = sanitizeBinaryOutput(stripAnsi(decoder.decode(data, { stream: true }))).replace(/\r/g, "");
+		const text = sanitizeBinaryOutput(stripAnsi(decodedText)).replace(/\r/g, "");
 
 		// Start writing to temp file if exceeds threshold
 		if (totalBytes > DEFAULT_MAX_BYTES) {
@@ -104,11 +103,24 @@ export async function executeBashWithOperations(
 		}
 	};
 
+	const flushDecoder = () => {
+		if (decoderFlushed) return;
+		decoderFlushed = true;
+		const text = decoder.decode();
+		if (text) appendDecodedText(text);
+	};
+
+	const onData = (data: Buffer) => {
+		totalBytes += data.length;
+		appendDecodedText(decoder.decode(data, { stream: true }));
+	};
+
 	try {
 		const result = await operations.exec(command, cwd, {
 			onData,
 			signal: options?.signal,
 		});
+		flushDecoder();
 
 		const fullOutput = outputChunks.join("");
 		const truncationResult = truncateTail(fullOutput);
@@ -128,6 +140,8 @@ export async function executeBashWithOperations(
 			fullOutputPath: tempFilePath,
 		};
 	} catch (err) {
+		flushDecoder();
+
 		// Check if it was an abort
 		if (options?.signal?.aborted) {
 			const fullOutput = outputChunks.join("");

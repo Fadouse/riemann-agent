@@ -374,6 +374,30 @@ describe("ToolExecutionComponent parity", () => {
 		expect(expanded).not.toContain("more lines");
 	});
 
+	test("does not count a terminal newline as a fallback output row", () => {
+		const component = new ToolExecutionComponent(
+			"custom_tool",
+			"tool-terminal-newline",
+			{},
+			{},
+			createBaseToolDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+		const output = `${Array.from({ length: 15 }, (_, index) => `line-${index + 1}`).join("\n")}\n`;
+		component.updateResult({ content: [{ type: "text", text: output }], details: {}, isError: false }, false);
+
+		const collapsed = stripAnsi(component.render(120).join("\n"));
+		expect(collapsed).toContain("5 more lines");
+		expect(collapsed).not.toContain("6 more lines");
+
+		component.setExpanded(true);
+		const expandedLines = component.render(120).map((line) => stripAnsi(line).trimEnd());
+		const lastOutputLine = expandedLines.findIndex((line) => line.includes("line-15"));
+		expect(lastOutputLine).toBeGreaterThan(-1);
+		expect(expandedLines.slice(lastOutputLine + 1)).toEqual([""]);
+	});
+
 	test("trims trailing blank display lines from write previews", () => {
 		const component = new ToolExecutionComponent(
 			"write",

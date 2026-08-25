@@ -4,6 +4,7 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { contentText, type ImageContent, type Message } from "@earendil-works/pi-ai";
+import { graphemeSafePrefix } from "../../utils/text.ts";
 
 // ============================================================================
 // File Operation Tracking
@@ -94,8 +95,9 @@ const TOOL_RESULT_MAX_CHARS = 2000;
  */
 function truncateForSummary(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
-	const truncatedChars = text.length - maxChars;
-	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+	const prefix = graphemeSafePrefix(text, maxChars);
+	const truncatedChars = text.length - prefix.length;
+	return `${prefix}\n\n[... ${truncatedChars} more characters truncated]`;
 }
 
 /** Collect unique user and tool-result images in conversation order. */

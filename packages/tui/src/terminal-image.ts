@@ -2,6 +2,7 @@ import { execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
+import { normalizeTerminalOutput } from "./utils.ts";
 
 export type ImageProtocol = "kitty" | "iterm2" | null;
 
@@ -161,6 +162,41 @@ export function isImageLine(line: string): boolean {
 	}
 	// Slow path: sequence elsewhere (multi-row images have cursor-up prefix)
 	return line.includes(KITTY_PREFIX) || line.includes(ITERM2_PREFIX);
+}
+
+const KITTY_COMMON_PATTERN = String.raw`a=T,f=100,q=2(?:,C=1)?(?:,c=\d+)?`;
+const KITTY_SINGLE_CONTROLS_PATTERN = String.raw`${KITTY_COMMON_PATTERN}(?:,r=\d+)?(?:,i=\d+)?`;
+const KITTY_CROPPED_CONTROLS_PATTERN = String.raw`${KITTY_COMMON_PATTERN}(?:,i=\d+)?,y=\d+,h=\d+,r=\d+`;
+const KITTY_CROPPED_CHUNK_CONTROLS_PATTERN = String.raw`${KITTY_COMMON_PATTERN}(?:,i=\d+)?,m=1,y=\d+,h=\d+,r=\d+`;
+const KITTY_PAYLOAD_PATTERN = String.raw`[A-Za-z0-9+/=]*\x1b\\`;
+const KITTY_CONTINUATIONS_PATTERN = String.raw`(?:\x1b_Gm=1;${KITTY_PAYLOAD_PATTERN})*\x1b_Gm=0;${KITTY_PAYLOAD_PATTERN}`;
+const KITTY_IMAGE_PATTERN = String.raw`(?:\x1b_G${KITTY_SINGLE_CONTROLS_PATTERN},m=1;${KITTY_PAYLOAD_PATTERN}${KITTY_CONTINUATIONS_PATTERN}|\x1b_G${KITTY_CROPPED_CHUNK_CONTROLS_PATTERN};${KITTY_PAYLOAD_PATTERN}${KITTY_CONTINUATIONS_PATTERN}|\x1b_G${KITTY_SINGLE_CONTROLS_PATTERN};${KITTY_PAYLOAD_PATTERN}|\x1b_G${KITTY_CROPPED_CONTROLS_PATTERN};${KITTY_PAYLOAD_PATTERN})`;
+const ITERM2_IMAGE_PATTERN = String.raw`\x1b\]1337;File=inline=[01];size=\d+(?:;width=[^;:\x00-\x1f\x7f-\x9f]+)?(?:;height=[^;:\x00-\x1f\x7f-\x9f]+)?(?:;name=[A-Za-z0-9+/=]+)?(?:;preserveAspectRatio=0)?:[A-Za-z0-9+/=]*\x07`;
+const IMAGE_SEQUENCE_REGEX = new RegExp(`${KITTY_IMAGE_PATTERN}|${ITERM2_IMAGE_PATTERN}`, "g");
+const CURSOR_UP_SUFFIX_REGEX = /\x1b\[\d+A$/;
+
+/** Sanitize non-image text while preserving complete generated image sequences. */
+export function normalizeImageLine(line: string): string {
+	let result = "";
+	let lastIndex = 0;
+	let found = false;
+	for (const match of line.matchAll(IMAGE_SEQUENCE_REGEX)) {
+		found = true;
+		const index = match.index;
+		let prefix = line.slice(lastIndex, index);
+		let cursorUp = "";
+		if (match[0].startsWith(ITERM2_PREFIX)) {
+			const cursorMatch = CURSOR_UP_SUFFIX_REGEX.exec(prefix);
+			if (cursorMatch) {
+				cursorUp = cursorMatch[0];
+				prefix = prefix.slice(0, -cursorUp.length);
+			}
+		}
+		result += normalizeTerminalOutput(prefix) + cursorUp + match[0];
+		lastIndex = index + match[0].length;
+	}
+	if (!found) return normalizeTerminalOutput(line);
+	return result + normalizeTerminalOutput(line.slice(lastIndex));
 }
 
 /**

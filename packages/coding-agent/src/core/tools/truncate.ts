@@ -1,3 +1,5 @@
+import { graphemeSafePrefix, graphemeSafeSuffix } from "../../utils/text.ts";
+
 /**
  * Shared truncation utilities for tool outputs.
  *
@@ -258,7 +260,8 @@ function truncateStringToBytesFromEnd(str: string, maxBytes: number): string {
 		start++;
 	}
 
-	return buf.slice(start).toString("utf-8");
+	const decoded = buf.slice(start).toString("utf-8");
+	return graphemeSafeSuffix(str, decoded.length);
 }
 
 /**
@@ -272,5 +275,5 @@ export function truncateLine(
 	if (line.length <= maxChars) {
 		return { text: line, wasTruncated: false };
 	}
-	return { text: `${line.slice(0, maxChars)}... [truncated]`, wasTruncated: true };
+	return { text: `${graphemeSafePrefix(line, maxChars)}... [truncated]`, wasTruncated: true };
 }

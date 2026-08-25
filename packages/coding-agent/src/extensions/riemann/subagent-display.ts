@@ -3,6 +3,7 @@ import { keyText } from "../../modes/interactive/components/keybinding-hints.ts"
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { SubagentUiSnapshot } from "../../riemann/agents/supervisor.ts";
 import type { AgentStatus } from "../../riemann/state/store.ts";
+import { graphemeSafePrefix } from "../../utils/text.ts";
 
 export const ACTIVE_SUBAGENT_STATUSES = new Set<AgentStatus>(["queued", "running"]);
 export const MAX_FLEET_AGENT_ROWS = 5;
@@ -32,7 +33,7 @@ export function compactLine(value: string, limit = 70): string {
 			.split("\n")
 			.find((candidate) => candidate.trim().length > 0)
 			?.trim() ?? "";
-	return line.length <= limit ? line : `${line.slice(0, Math.max(0, limit - 1))}…`;
+	return line.length <= limit ? line : `${graphemeSafePrefix(line, Math.max(0, limit - 1))}…`;
 }
 
 export function rightAlign(left: string, right: string, width: number, minGap = 1): string {

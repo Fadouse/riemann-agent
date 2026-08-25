@@ -2,6 +2,7 @@ import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import { graphemeSafePrefix } from "../../utils/text.ts";
 import { RiemannHostError } from "../errors.ts";
 import type { JsonValue } from "../kernel/types.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
@@ -43,8 +44,19 @@ function parseUrl(value: string): URL {
 	return url;
 }
 
+function decodeBody(data: Uint8Array, contentType: string | null): string {
+	const match = /(?:^|;)\s*charset\s*=\s*(?:"([^"]*)"|'([^']*)'|([^;\s]*))/i.exec(contentType ?? "");
+	const charset = match?.[1] || match?.[2] || match?.[3];
+	if (charset) {
+		try {
+			return new TextDecoder(charset, { ignoreBOM: true }).decode(data);
+		} catch {}
+	}
+	return new TextDecoder("utf-8", { ignoreBOM: true }).decode(data);
+}
+
 function responseError(body: string): string {
-	return body.replace(/\s+/g, " ").trim().slice(0, 500) || "empty response";
+	return graphemeSafePrefix(body.replace(/\s+/g, " ").trim(), 500) || "empty response";
 }
 
 function readableHtml(html: string, finalUrl: string): { title: string | null; text: string } {
@@ -205,7 +217,7 @@ export class WebFunctions {
 					const contentType =
 						response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() ??
 						"application/octet-stream";
-					const source = data.toString("utf8");
+					const source = decodeBody(data, response.headers.get("content-type"));
 					const extracted = contentType.includes("html")
 						? readableHtml(source, response.url)
 						: { title: null, text: source.replace(/\u0000/g, "").trim() };
@@ -223,7 +235,7 @@ export class WebFunctions {
 						title: extracted.title,
 						text:
 							fullText.length > this.previewChars
-								? `${fullText.slice(0, this.previewChars)}\n[preview truncated; inspect artifact]`
+								? `${graphemeSafePrefix(fullText, this.previewChars)}\n[preview truncated; inspect artifact]`
 								: fullText,
 						content_type: contentType,
 						artifact,

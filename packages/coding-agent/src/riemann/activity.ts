@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { generateDiffString } from "../core/tools/edit-diff.ts";
+import { graphemeSafePrefix, graphemeSafeSuffix } from "../utils/text.ts";
 import type {
 	IPythonActivity,
 	IPythonAgentActivity,
@@ -87,7 +88,7 @@ function appendStream(current: string | undefined, delta: string | undefined): s
 	if (!delta) return current;
 	const combined = `${current ?? ""}${delta}`;
 	if (combined.length <= MAX_STREAM_CHARS) return combined;
-	return `${OMITTED_OUTPUT}${combined.slice(-MAX_STREAM_CHARS)}`;
+	return `${OMITTED_OUTPUT}${graphemeSafeSuffix(combined, MAX_STREAM_CHARS)}`;
 }
 
 function agentInfo(value: JsonValue | undefined): Record<string, JsonValue> | undefined {
@@ -230,7 +231,7 @@ export class RiemannActivityTracker {
 			...tracked.activity,
 			status: error ? "error" : "ok",
 			durationMs,
-			...(error ? { error: error.slice(0, 2_000) } : {}),
+			...(error ? { error: graphemeSafePrefix(error, 2_000) } : {}),
 		};
 		if (!error && activity.kind === "shell") {
 			const value = objectValue(result);

@@ -236,4 +236,31 @@ PROBE`;
 			store.close();
 		}
 	}, 30_000);
+
+	test("streams split UTF-8 sequences across timed updates and flushes incomplete EOF input", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-stream-unicode-"));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		await mkdir(workspace);
+		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
+		try {
+			const stdoutDeltas: string[] = [];
+			const stderrDeltas: string[] = [];
+			const script = `${process.execPath} - <<'PROBE'
+const first=Buffer.from([0xf0,0x9f]);process.stdout.write(first);process.stderr.write(first);setTimeout(()=>process.stdout.write(Buffer.from([0x98,0x80])),150)
+PROBE`;
+			const result = record(
+				await definition.handler({ script, timeout: 10 }, new AbortController().signal, (update) => {
+					const value = record(update);
+					if (typeof value.stdout_delta === "string") stdoutDeltas.push(value.stdout_delta);
+					if (typeof value.stderr_delta === "string") stderrDeltas.push(value.stderr_delta);
+				}),
+			);
+			expect(result).toMatchObject({ exit_code: 0, stdout: "😀", stderr: "�" });
+			expect(stdoutDeltas.join("")).toBe("😀");
+			expect(stderrDeltas.join("")).toBe("�");
+		} finally {
+			store.close();
+		}
+	}, 30_000);
 });

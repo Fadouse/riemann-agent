@@ -13,6 +13,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { SessionTreeNode } from "../../../core/session-manager.ts";
+import { graphemeSafePrefix } from "../../../utils/text.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { formatKeyText, keyHint } from "./keybinding-hints.ts";
@@ -787,7 +788,7 @@ class TreeList implements Component {
 					} else if (msgWithContent.stopReason === "aborted") {
 						result = theme.fg("success", "assistant: ") + theme.fg("muted", "(aborted)");
 					} else if (msgWithContent.errorMessage) {
-						const errMsg = normalize(msgWithContent.errorMessage).slice(0, 80);
+						const errMsg = graphemeSafePrefix(normalize(msgWithContent.errorMessage), 80);
 						result = theme.fg("success", "assistant: ") + theme.fg("error", errMsg);
 					} else {
 						result = theme.fg("success", "assistant: ") + theme.fg("muted", "(no content)");
@@ -877,7 +878,7 @@ class TreeList implements Component {
 	}
 
 	private extractContent(content: unknown): string {
-		return this.extractFullContent(content).slice(0, 200);
+		return graphemeSafePrefix(this.extractFullContent(content), 200);
 	}
 
 	private extractFullContent(content: unknown): string {
@@ -965,10 +966,7 @@ class TreeList implements Component {
 			}
 			case "bash": {
 				const rawCmd = String(args.command || "");
-				const cmd = rawCmd
-					.replace(/[\n\t]/g, " ")
-					.trim()
-					.slice(0, 50);
+				const cmd = graphemeSafePrefix(rawCmd.replace(/[\n\t]/g, " ").trim(), 50);
 				return `[bash: ${cmd}${rawCmd.length > 50 ? "..." : ""}]`;
 			}
 			case "grep": {
@@ -987,7 +985,7 @@ class TreeList implements Component {
 			}
 			default: {
 				// Custom tool - show name and truncated JSON args
-				const argsStr = JSON.stringify(args).slice(0, 40);
+				const argsStr = graphemeSafePrefix(JSON.stringify(args), 40);
 				return `[${name}: ${argsStr}${JSON.stringify(args).length > 40 ? "..." : ""}]`;
 			}
 		}
@@ -1077,7 +1075,7 @@ class TreeList implements Component {
 			this.applyFilter();
 		} else if (kb.matches(keyData, "tui.editor.deleteCharBackward")) {
 			if (this.searchQuery.length > 0) {
-				this.searchQuery = this.searchQuery.slice(0, -1);
+				this.searchQuery = graphemeSafePrefix(this.searchQuery, this.searchQuery.length - 1);
 				this.foldedNodes.clear();
 				this.applyFilter();
 			}

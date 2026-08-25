@@ -124,4 +124,34 @@ describe("Riemann IPython activity tracking", () => {
 			agentStatus: "running",
 		});
 	});
+
+	test("keeps bounded stream and error text on grapheme boundaries", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-activity-unicode-"));
+		roots.push(root);
+		const tracker = new RiemannActivityTracker(root, () => undefined);
+		const shellRequest = request("shell.run", { script: "unicode" });
+		await observe(tracker, { phase: "start", requestId: "shell-unicode", request: shellRequest, startedAt: 1 });
+		let activities = await observe(tracker, {
+			phase: "update",
+			requestId: "shell-unicode",
+			request: shellRequest,
+			update: { stdout_delta: `a😀${"x".repeat(19_999)}` },
+		});
+		const running = activities[0];
+		expect(running?.kind).toBe("shell");
+		const runningStdout = running?.kind === "shell" ? running.stdout : undefined;
+		expect(Buffer.from(runningStdout ?? "", "utf8").toString("utf8")).toBe(runningStdout);
+		expect(runningStdout).toBe(`[earlier output omitted]\n${"x".repeat(19_999)}`);
+
+		activities = await observe(tracker, {
+			phase: "end",
+			requestId: "shell-unicode",
+			request: shellRequest,
+			durationMs: 2,
+			error: { code: "execution_error", message: `${"x".repeat(1_999)}😀z` },
+		});
+		const finished = activities[0];
+		expect(Buffer.from(finished?.error ?? "", "utf8").toString("utf8")).toBe(finished?.error);
+		expect(finished?.error).toBe("x".repeat(1_999));
+	});
 });

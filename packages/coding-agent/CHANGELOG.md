@@ -47,6 +47,7 @@
 - Fixed pasted image routing so deleting an `[Image #N]` marker omits that image from submission, while undo, history recall, retries, and restored queued messages preserve stable marker identity.
 - Fixed the model-facing Agent profile contract: empty configurations omit `profile`, configured profiles expose exact policy keys, and unknown keys report valid alternatives without allocating a child slot.
 - Removed redundant Shell metadata and empty Agent-profile inventory from the Riemann system prompt.
+- Fixed Riemann and tool output decoding, grapheme-boundary previews, and trailing-newline expansion so Unicode streams render without mojibake or extra rows.
 
 ## [0.84.3] - 2026-08-24
 

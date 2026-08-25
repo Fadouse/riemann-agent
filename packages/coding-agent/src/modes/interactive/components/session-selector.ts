@@ -16,6 +16,7 @@ import {
 import { KeybindingsManager } from "../../../core/keybindings.ts";
 import type { SessionInfo, SessionListProgress } from "../../../core/session-manager.ts";
 import { canonicalizePath as _canonicalizePath } from "../../../utils/paths.ts";
+import { graphemeSafePrefix } from "../../../utils/text.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, keyText } from "./keybinding-hints.ts";
@@ -659,7 +660,7 @@ async function deleteSessionFile(
 			parts.push(stderr.split("\n")[0] ?? stderr);
 		}
 		if (parts.length === 0) return null;
-		return `trash: ${parts.join(" · ").slice(0, 200)}`;
+		return `trash: ${graphemeSafePrefix(parts.join(" · "), 200)}`;
 	};
 
 	// If trash reports success, or the file is gone afterwards, treat it as successful

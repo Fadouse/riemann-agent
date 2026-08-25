@@ -20,6 +20,7 @@ import {
 	hyperlink,
 	imageFallback,
 	isImageLine,
+	normalizeImageLine,
 	registerKittyImageMetadata,
 	renderImage,
 	resetCapabilitiesCache,
@@ -440,7 +441,9 @@ describe("Kitty image cursor movement", () => {
 				widthPx: 100,
 				heightPx: 100,
 			});
-			assert.ok(cropKittyImageLine(result.sequence, 2, 1).includes("y=66,h=34,r=1"));
+			const cropped = cropKittyImageLine(result.sequence, 2, 1);
+			assert.ok(cropped.includes("y=66,h=34,r=1"));
+			assert.strictEqual(normalizeImageLine(cropped), cropped);
 		} finally {
 			resetCapabilitiesCache();
 			setCellDimensions({ widthPx: 9, heightPx: 18 });
@@ -456,6 +459,7 @@ describe("Kitty image cursor movement", () => {
 			moveCursor: false,
 		});
 		const line = `left ${cropKittyImageLine(transmission, 2, 1)} right`;
+		assert.strictEqual(normalizeImageLine(line), line);
 		const placement = getKittyImagePlacement(line);
 		assert.ok(placement);
 		assert.strictEqual(placement.transmissionBytes, line.length - "left ".length - " right".length);

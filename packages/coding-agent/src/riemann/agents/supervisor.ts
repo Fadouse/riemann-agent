@@ -13,6 +13,7 @@ import { DefaultResourceLoader } from "../../core/resource-loader.ts";
 import { createAgentSession } from "../../core/sdk.ts";
 import { findMostRecentSession, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
+import { graphemeSafePrefix } from "../../utils/text.ts";
 import { isFilesystemSubset, resolveFilesystemSnapshot } from "../access-policy.ts";
 import type { AgentProfileConfig, RiemannConfig } from "../config.ts";
 import { RiemannHostError } from "../errors.ts";
@@ -215,7 +216,7 @@ function outputPreview(value: string): string | null {
 	if (!compact) return null;
 	return compact.length <= AGENT_OUTPUT_PREVIEW_CHARS
 		? compact
-		: `${compact.slice(0, AGENT_OUTPUT_PREVIEW_CHARS - 1)}…`;
+		: `${graphemeSafePrefix(compact, AGENT_OUTPUT_PREVIEW_CHARS - 1)}…`;
 }
 
 function artifactHandle(value: JsonValue): string {

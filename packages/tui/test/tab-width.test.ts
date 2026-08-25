@@ -58,16 +58,14 @@ describe("tab width accounting", () => {
 		assert.strictEqual(visibleWidth(tabFits.before), tabFits.beforeWidth);
 	});
 
-	it("keeps tabs inside terminal control sequences byte-identical", () => {
-		const controlSequences = [
-			"\x1b]8;;https://example.test/a\tb\x07",
-			"\x1b]0;window\ttitle\x1b\\",
-			"\x1b_payload\tdata\x1b\\",
-		];
+	it("preserves safe terminal sequences and removes controls containing tabs", () => {
+		const safeSequences = ["\x1b[31m", "\x1b]8;;https://example.test/a-b\x07", "\x1b]133;A\x1b\\", "\x1b_pi:c\x07"];
 
-		for (const controlSequence of controlSequences) {
+		for (const controlSequence of safeSequences) {
 			assert.strictEqual(normalizeTerminalOutput(`${controlSequence}label\ttext`), `${controlSequence}label   text`);
 		}
+		assert.strictEqual(normalizeTerminalOutput("\x1b]0;window\ttitle\x1b\\label\ttext"), "label   text");
+		assert.strictEqual(normalizeTerminalOutput("\x1b_payload\tdata\x1b\\label\ttext"), "label   text");
 	});
 
 	it("keeps tab-containing overlays on one physical terminal row", async () => {

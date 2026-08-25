@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { getShellConfig } from "../../utils/shell.ts";
+import { graphemeSafePrefix } from "../../utils/text.ts";
 import { assertReadable, type FileAccessPolicy } from "../access-policy.ts";
 import { RiemannHostError } from "../errors.ts";
 import { resolveSandboxExecutable, type SandboxedCommand, sandboxedKernelCommand } from "../kernel/sandbox.ts";
@@ -139,15 +140,18 @@ export class ShellFunctions {
 		let updateStdoutBytes = 0;
 		let updateStderrBytes = 0;
 		let updateTimer: NodeJS.Timeout | undefined;
-		const flushUpdate = (): void => {
-			if (!options.onUpdate || (updateStdoutBytes === 0 && updateStderrBytes === 0)) return;
-			const stdoutDelta = Buffer.concat(updateStdout).toString("utf8");
-			const stderrDelta = Buffer.concat(updateStderr).toString("utf8");
+		// Keep decoder state across timer windows so a UTF-8 sequence can span updates.
+		const stdoutUpdateDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
+		const stderrUpdateDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
+		const flushUpdate = (end = false): void => {
+			if (!options.onUpdate) return;
+			const stdoutDelta = stdoutUpdateDecoder.decode(Buffer.concat(updateStdout), { stream: !end });
+			const stderrDelta = stderrUpdateDecoder.decode(Buffer.concat(updateStderr), { stream: !end });
 			updateStdout = [];
 			updateStderr = [];
 			updateStdoutBytes = 0;
 			updateStderrBytes = 0;
-			options.onUpdate({ stdout_delta: stdoutDelta, stderr_delta: stderrDelta });
+			if (stdoutDelta || stderrDelta) options.onUpdate({ stdout_delta: stdoutDelta, stderr_delta: stderrDelta });
 		};
 		const scheduleUpdate = (): void => {
 			if (!options.onUpdate || updateTimer) return;
@@ -193,7 +197,7 @@ export class ShellFunctions {
 			await rm(sandboxDir, { recursive: true, force: true });
 		}
 		if (updateTimer) clearTimeout(updateTimer);
-		flushUpdate();
+		flushUpdate(true);
 		const stdoutText = Buffer.concat(stdout).toString("utf8");
 		const stderrText = Buffer.concat(stderr).toString("utf8");
 		let artifact: JsonValue = null;
@@ -206,7 +210,7 @@ export class ShellFunctions {
 		const preview = (text: string): string =>
 			text.length <= this.previewChars
 				? text
-				: `${text.slice(0, this.previewChars)}\n[preview truncated; inspect artifact]`;
+				: `${graphemeSafePrefix(text, this.previewChars)}\n[preview truncated; inspect artifact]`;
 		return {
 			$riemann: "process_result",
 			command: commandLine,
