@@ -11,12 +11,15 @@ agents:
   # Up to four run concurrently; use 0 to disable delegation.
   maxAgents: 4
   main:
+    # One policy controls both the persistent IPython kernel and shell.run.
+    network: allow # allow | deny | inherit; Main inherit resolves to built-in deny
     # Defaults to read and write "/" with no exclusions. Relative entries
     # resolve against the project working directory; `~` expands to the user home.
     filesystem:
       read: ["/"]
       write: ["/"]
   defaults:
+    network: inherit # children inherit their caller; allow cannot elevate a denied parent
     # Omit model to inherit the Main Agent model.
     model: anthropic/claude-sonnet-4-5
     workspace: shared

@@ -1,13 +1,14 @@
 import { type Static, Type } from "typebox";
 import type { KernelExecuteStatus } from "./kernel/types.ts";
 
-export const IPYTHON_TOOL_DESCRIPTION = "Execute code in the persistent Riemann IPython runtime.";
+export const IPYTHON_TOOL_DESCRIPTION =
+	"The only valid model tool-call name is ipython. Execute every documented Python API inside its code field.";
 
-export const IPYTHON_TOOL_PROMPT_SNIPPET = "Run persistent Python";
+export const IPYTHON_TOOL_PROMPT_SNIPPET = "The only model tool; execute persistent Python";
 
 export const IPythonSchema = Type.Object(
 	{
-		code: Type.String({ description: "Python code to execute" }),
+		code: Type.String({ description: "Python code. Put every namespace operation here and use top-level await." }),
 		timeout: Type.Optional(
 			Type.Integer({ minimum: 1, maximum: 86_400, default: 300, description: "Cell timeout in seconds" }),
 		),

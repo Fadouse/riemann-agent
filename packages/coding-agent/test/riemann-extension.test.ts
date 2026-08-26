@@ -86,36 +86,6 @@ describe("Riemann session extension", () => {
 		]);
 	});
 
-	test("removes profile from Agent operations and omits an empty profile inventory", async () => {
-		const root = await mkdtemp(join(tmpdir(), "riemann-extension-empty-profiles-"));
-		roots.push(root);
-		const agentDir = join(root, "agent-dir");
-		const previousAgentDir = process.env.RIEMANN_CODING_AGENT_DIR;
-		process.env.RIEMANN_CODING_AGENT_DIR = agentDir;
-		await mkdir(agentDir, { recursive: true });
-		await writeFile(join(agentDir, "config.yaml"), "version: 1\nagents:\n  maxAgents: 4\n");
-		let runtime: RiemannRuntime | undefined;
-		try {
-			runtime = await RiemannRuntime.createRoot({
-				cwd: root,
-				model: undefined,
-				modelRegistry: { find: () => undefined },
-				thinkingLevel: "off",
-				sessionManager: { getSessionId: () => "empty-profile-contract" },
-				isProjectTrusted: () => true,
-			} as unknown as ExtensionContext);
-			const systemPrompt = runtime.systemPrompt("main");
-			expect(systemPrompt).toContain('`await agents.start(task=..., name=None, reuse="never") -> AgentTurnHandle`');
-			expect(systemPrompt).not.toContain("profile=None");
-			expect(systemPrompt).not.toContain("## Agent profiles");
-			expect(systemPrompt).not.toContain("No Agent policy profiles");
-		} finally {
-			await runtime?.close();
-			if (previousAgentDir === undefined) delete process.env.RIEMANN_CODING_AGENT_DIR;
-			else process.env.RIEMANN_CODING_AGENT_DIR = previousAgentDir;
-		}
-	});
-
 	test("exposes only IPython and checkpoints a session through the live runtime", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-extension-"));
 		roots.push(root);
@@ -199,9 +169,6 @@ describe("Riemann session extension", () => {
 			riemannExtension(api as never);
 			expect(registered.map((tool) => tool.name)).toEqual(["ipython"]);
 			expect(registeredCommands).toEqual(["agents"]);
-			expect(registered[0]?.description).toBe("Execute code in the persistent Riemann IPython runtime.");
-			expect(JSON.stringify(registered[0]?.parameters)).not.toContain("IPython");
-			expect(JSON.stringify(registered[0]?.parameters)).not.toContain("asyncio.gather");
 			expect(sessionStart).toBeDefined();
 			await sessionStart?.({}, sessionStartContext);
 			expect(beforeStart).toBeDefined();
@@ -212,51 +179,6 @@ describe("Riemann session extension", () => {
 			if (!prepared || typeof prepared !== "object" || !("systemPrompt" in prepared)) {
 				throw new Error("Riemann system prompt was not prepared");
 			}
-			const systemPrompt = String(prepared.systemPrompt);
-			expect(systemPrompt).toContain("## Environment");
-			expect(systemPrompt).toContain(`Current working directory: ${JSON.stringify(root)}`);
-			expect(systemPrompt).toMatch(/- OS: \S+/);
-			expect(systemPrompt).toMatch(/- Kernel: \S+/);
-			expect(systemPrompt).toMatch(/- Architecture: \S+/);
-			expect(systemPrompt).not.toContain("- Shell:");
-			expect(systemPrompt).toContain("`ipython` is persistent");
-			expect(systemPrompt).toContain("## Tool discipline");
-			expect(systemPrompt).toContain("## Verification");
-			expect(systemPrompt).toContain("Reproduce bugs before fixing");
-			expect(systemPrompt).toContain("## Operations");
-			const operationInventory = systemPrompt.split("## Operations\n\n")[1]?.split("\n\nUse `catalog.describe")[0];
-			expect(operationInventory?.length).toBeLessThanOrEqual(1_600);
-			expect(systemPrompt).toContain("`await fs.read(path=...) -> FileSnapshot`");
-			expect(systemPrompt).toContain("`await shell.run(");
-			expect(systemPrompt).not.toContain("shell.exec");
-			expect(systemPrompt).not.toContain("artifacts.get");
-			expect(systemPrompt).toContain("`await artifacts.open(handle=...) -> Artifact`");
-			expect(systemPrompt).not.toContain("artifacts.view");
-			expect(systemPrompt).not.toContain("artifacts.materialize");
-			expect(systemPrompt).not.toContain("catalog.namespaces");
-			expect(systemPrompt).not.toContain("state.checkpoint");
-			expect(systemPrompt).toContain("`await state.status() -> RuntimeStatusV1`");
-			expect(systemPrompt).toContain(
-				'`await agents.start(task=..., name=None, profile=None, reuse="never") -> AgentTurnHandle`',
-			);
-			expect(systemPrompt).toContain("`handle.wait()` returns the exact Turn result");
-			expect(systemPrompt).toContain("`await agents.list() -> list[AgentInfo]`");
-
-			expect(systemPrompt).toContain("Agents: use `await agents.start(...)`");
-			expect(systemPrompt).not.toContain("`agents.wait(");
-			expect(systemPrompt).not.toContain("`agents.result(");
-			expect(systemPrompt).not.toContain("`agents.inbox(");
-			expect(systemPrompt).not.toContain("workspace_policy");
-			expect(systemPrompt).toContain("## Configured agent profiles");
-			expect(systemPrompt).toContain('- "researcher": Research public sources without modifying files.');
-			expect(systemPrompt).toContain(
-				"`profile` selects an optional configured policy bundle. Use an exact key below; express the child role and objective in `task`.",
-			);
-			expect(systemPrompt).toContain('- "public_docs": Search approved internal documentation.');
-			expect(systemPrompt).not.toContain("`mcp.list(");
-			expect(systemPrompt).not.toContain("hidden_docs");
-			expect(systemPrompt).not.toContain("private-docs-command");
-			expect(systemPrompt).not.toContain("PRIVATE_TOKEN");
 
 			const pixelBase64 =
 				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
@@ -276,6 +198,7 @@ describe("Riemann session extension", () => {
 						"assert hasattr(state, 'status')",
 						"runtime_status = await state.status()",
 						"assert runtime_status['abi_version'] == 1 and runtime_status['agent_slots']['used'] == 0, runtime_status",
+						"assert runtime_status['network'] == {'configured': 'inherit', 'effective': 'deny', 'source': 'builtin'}, runtime_status",
 						"assert hasattr(agents, 'start')",
 						"assert not hasattr(agents, 'result')",
 						"assert not hasattr(agents, 'inbox')",

@@ -98,6 +98,7 @@ describe("Riemann configuration", () => {
 		expect(bounded.agentDefaults).toEqual({
 			model: "anthropic/project-agent",
 			workspace: "worktree",
+			network: "inherit",
 			filesystem: { read: "inherit", write: "inherit" },
 		});
 		expect(bounded.web.searchBackend).toBe("disabled");
@@ -221,6 +222,7 @@ describe("Riemann configuration", () => {
 		expect(config.mainAgent.filesystem).toEqual({ read: ["/"], write: ["/tmp/riemann-created"] });
 		expect(config.agentDefaults).toEqual({
 			workspace: "worktree",
+			network: "inherit",
 			filesystem: { read: "inherit", write: ["."] },
 		});
 		expect(await readFile(join(agentDir, "config.yaml"), "utf8")).toContain("version: 1");
@@ -322,5 +324,30 @@ describe("Riemann configuration", () => {
 		await expect(loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false })).rejects.toThrow(
 			"Invalid Riemann config",
 		);
+	});
+	test("loads allow, deny, and inherit Agent network policies", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-config-network-"));
+		roots.push(root);
+		const agentDir = join(root, "agent");
+		await mkdir(agentDir, { recursive: true });
+		await writeFile(
+			join(agentDir, "config.yaml"),
+			[
+				"version: 1",
+				"agents:",
+				"  main:",
+				"    network: allow",
+				"  defaults:",
+				"    network: inherit",
+				"  profiles:",
+				"    offline:",
+				"      network: deny",
+				"",
+			].join("\n"),
+		);
+		const config = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
+		expect(config.mainAgent.network).toBe("allow");
+		expect(config.agentDefaults.network).toBe("inherit");
+		expect(config.profiles.offline?.network).toBe("deny");
 	});
 });

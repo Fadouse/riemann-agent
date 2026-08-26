@@ -288,6 +288,7 @@ class AgentInfo(AgentTurnHandle):
     profile: str | None
     model: str
     workspace: str
+    network: str
     active_turn_id: str | None
     last_turn_id: str
     last_outcome: str | None

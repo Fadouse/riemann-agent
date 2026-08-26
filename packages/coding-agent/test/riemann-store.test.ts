@@ -30,6 +30,7 @@ describe("Riemann state schema", () => {
 			workspace: root,
 			workspaceMode: "shared",
 			filesystem: FULL_FILESYSTEM,
+			network: "deny",
 			depth: 1,
 			capabilities: ["fs.read"],
 		});
@@ -38,14 +39,16 @@ describe("Riemann state schema", () => {
 		const databasePath = join(agentDir, "state", "riemann.db");
 		let database = new DatabaseSync(databasePath);
 		try {
-			database.exec("DROP INDEX artifacts_path_run; ALTER TABLE agents DROP COLUMN released_at;");
+			database.exec(
+				"DROP INDEX artifacts_path_run; ALTER TABLE agents DROP COLUMN released_at; ALTER TABLE agents DROP COLUMN network;",
+			);
 		} finally {
 			database.close();
 		}
 
 		store = new RiemannStore(agentDir);
 		try {
-			expect(store.getAgent(child.id)).toMatchObject({ lastTurnId: null, releasedAt: null });
+			expect(store.getAgent(child.id)).toMatchObject({ lastTurnId: null, releasedAt: null, network: "deny" });
 			expect(store.listAgentTurns(child.id)).toEqual([]);
 		} finally {
 			store.close();
@@ -94,6 +97,7 @@ describe("Riemann state schema", () => {
 			workspace: root,
 			workspaceMode: "shared",
 			filesystem: FULL_FILESYSTEM,
+			network: "deny",
 			depth: 1,
 			capabilities: ["fs.read"],
 		});

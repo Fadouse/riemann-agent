@@ -21,6 +21,7 @@ const FilesystemSchema = Type.Object(
 	{ additionalProperties: false },
 );
 const SubagentWorkspaceSchema = Type.Union([Type.Literal("shared"), Type.Literal("worktree")]);
+const AgentNetworkSchema = Type.Union([Type.Literal("allow"), Type.Literal("deny"), Type.Literal("inherit")]);
 const ThinkingLevelSchema = Type.Union([
 	Type.Literal("off"),
 	Type.Literal("minimal"),
@@ -42,6 +43,7 @@ const AgentProfileSchema = Type.Object(
 		promptFile: Type.Optional(Type.String()),
 		model: Type.Optional(Type.String()),
 		thinkingLevel: Type.Optional(ThinkingLevelSchema),
+		network: Type.Optional(AgentNetworkSchema),
 		capabilities: Type.Optional(Type.Array(Type.String())),
 		workspace: Type.Optional(SubagentWorkspaceSchema),
 		filesystem: Type.Optional(FilesystemSchema),
@@ -77,12 +79,16 @@ const ConfigSchema = Type.Object(
 				{
 					maxAgents: Type.Optional(Type.Integer({ minimum: 0, maximum: 16 })),
 					main: Type.Optional(
-						Type.Object({ filesystem: Type.Optional(FilesystemSchema) }, { additionalProperties: false }),
+						Type.Object(
+							{ filesystem: Type.Optional(FilesystemSchema), network: Type.Optional(AgentNetworkSchema) },
+							{ additionalProperties: false },
+						),
 					),
 					defaults: Type.Optional(
 						Type.Object(
 							{
 								model: Type.Optional(Type.String({ minLength: 1 })),
+								network: Type.Optional(AgentNetworkSchema),
 								workspace: Type.Optional(SubagentWorkspaceSchema),
 								filesystem: Type.Optional(FilesystemSchema),
 							},
@@ -118,13 +124,17 @@ export type AgentProfileConfig = Static<typeof AgentProfileSchema>;
 export type McpServerConfig = Static<typeof McpServerSchema>;
 export type RiemannFilesystemConfig = Static<typeof FilesystemSchema>;
 export type SubagentWorkspace = Static<typeof SubagentWorkspaceSchema>;
+export type AgentNetworkPolicy = Static<typeof AgentNetworkSchema>;
+export type EffectiveAgentNetwork = Exclude<AgentNetworkPolicy, "inherit">;
 
 export type RiemannSettingPath =
 	| "agents.maxAgents"
 	| "agents.defaults.model"
 	| "compaction.strategy"
 	| "agents.main.filesystem"
+	| "agents.main.network"
 	| "agents.defaults.workspace"
+	| "agents.defaults.network"
 	| "agents.defaults.filesystem"
 	| `mcp.servers.${string}.enabled`
 	| `mcp.servers.${string}.exposeToModel`
@@ -151,11 +161,13 @@ export interface RiemannConfig {
 	};
 	mainAgent: {
 		filesystem?: FilesystemConfig;
+		network: AgentNetworkPolicy;
 	};
 	agentDefaults: {
 		workspace: SubagentWorkspace;
 		filesystem?: FilesystemConfig;
 		model?: string;
+		network: AgentNetworkPolicy;
 	};
 	profiles: Record<string, AgentProfileConfig>;
 	mcpServers: Record<string, McpServerConfig>;
@@ -181,8 +193,8 @@ const DEFAULTS: Omit<RiemannConfig, "files"> = {
 		maxWorktreeBytes: 5_368_709_120,
 	},
 	compaction: { strategy: "automatic" },
-	mainAgent: {},
-	agentDefaults: { workspace: "shared" },
+	mainAgent: { network: "inherit" },
+	agentDefaults: { workspace: "shared", network: "inherit" },
 	profiles: {},
 	mcpServers: {},
 	web: { searchBackend: "exa" },
@@ -211,7 +223,9 @@ function configuredSettingPaths(config: RiemannConfigFile): Set<RiemannSettingPa
 	if (config.agents?.maxAgents !== undefined) paths.add("agents.maxAgents");
 	if (config.compaction?.strategy !== undefined) paths.add("compaction.strategy");
 	if (config.agents?.main?.filesystem !== undefined) paths.add("agents.main.filesystem");
+	if (config.agents?.main?.network !== undefined) paths.add("agents.main.network");
 	if (config.agents?.defaults?.model !== undefined) paths.add("agents.defaults.model");
+	if (config.agents?.defaults?.network !== undefined) paths.add("agents.defaults.network");
 	if (config.agents?.defaults?.workspace !== undefined) paths.add("agents.defaults.workspace");
 	if (config.agents?.defaults?.filesystem !== undefined) paths.add("agents.defaults.filesystem");
 	for (const [name, server] of Object.entries(config.mcp?.servers ?? {})) {

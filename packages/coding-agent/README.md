@@ -60,16 +60,20 @@ version: 1
 agents:
   maxAgents: 4 # Main Agent excluded; 0 disables delegation
   main:
+    network: allow # allow | deny | inherit; Main inherit resolves to built-in deny
     filesystem:
       read: ["/"] # omit for the default unrestricted read root
       write: ["/"] # omit for the default unrestricted write root
   defaults:
+    network: inherit # inherit the caller; allow cannot elevate a denied parent
     model: anthropic/claude-sonnet-4-5 # omit to inherit the Main Agent model
     workspace: shared # shared | worktree
     filesystem:
       read: inherit # inherit the calling Agent's read policy
       write: inherit # shared inherits; worktree defaults to its own worktree
 ```
+
+`network` is one Agent sandbox policy for both the persistent IPython kernel and `shell.run`: `allow` exposes the host network, `deny` creates an isolated network, and `inherit` follows the caller. Main `inherit` resolves to the built-in `deny`. This policy does not affect host-side `web.fetch`, `web.search`, or MCP operations, which remain capability-controlled.
 
 Named profiles remain optional for specialist prompts, model overrides, or narrower capabilities. `await agents.start()` returns an exact `AgentTurnHandle` whose `status` is `queued` or `running`; retrieve its durable `AgentResult.output` with `await handle.wait()`. Use `reuse="never"` for a new identity or `reuse="exact"` with a compatible settled name. `handle.steer()` only targets that actively streaming Turn and never starts another Turn.
 
@@ -97,11 +101,12 @@ The Codex subscription endpoint is a private first-party ChatGPT backend, not th
 
 Riemann displays non-blocking warnings when encrypted OpenAI context may be unavailable after a model or strategy change, when Snapshot is selected with a model that lacks image input, or when OpenAI compaction lacks a compatible Codex model or OAuth. Warnings do not change the selected model or strategy.
 
-## Python operations
+## One tool, persistent Python namespaces
 
-The system prompt identifies the current date, working directory, OS, Linux distribution (for example NixOS or Debian), kernel, and architecture so the model can select commands compatible with the actual host. It also lists every built-in async Python operation available to the current agent, filtered by its capability allowlist. These namespaces are preinstalled globals in the persistent IPython environment: bind results to variables and compose multiple operations with normal Python and top-level `await`. Use `help(fs.edit)` or `await catalog.describe(name="fs.edit")` only when the compact signature and description are insufficient. `await catalog.search(query="...")` remains available for task-based discovery.
+The provider receives exactly one callable model tool: `ipython`. Its `code` field executes persistent Python. The displayed `fs`, `shell`, `web`, `artifacts`, `agents`, `mcp`, `catalog`, and `state` signatures are preinstalled Python namespaces available only inside that code field; they are never separate model tools. Namespace calls use normal Python and top-level `await`. Use `help(fs.edit)` or `await catalog.describe(name="fs.edit")` inside an IPython cell only when the compact signature is insufficient.
 
 ```python
+# This entire block is code executed by the single `ipython` model tool.
 import asyncio
 
 snap = await fs.read(path=\"src/main.ts\")

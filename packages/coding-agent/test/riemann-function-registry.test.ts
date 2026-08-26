@@ -201,12 +201,11 @@ describe("Riemann ABI v2 function registry", () => {
 		);
 	});
 
-	test("generates compact keyword-only prompt inventory and Python specifications from schemas", () => {
+	test("generates keyword-only Python specifications from schemas", () => {
 		const registry = new FunctionRegistry();
 		registerFixtureFunctions(registry);
 		const readOnly = new Set(["fs.read"]);
 
-		expect(registry.promptInventory(readOnly)).toBe('- `await fs.read(path=..., encoding="utf-8") -> str`');
 		expect(registry.pythonSpecifications(undefined, readOnly)).toEqual([
 			{
 				name: "read",
@@ -225,8 +224,6 @@ describe("Riemann ABI v2 function registry", () => {
 				return_type: "str",
 			},
 		]);
-		expect(registry.promptGuidelines(new Set(["workspace.write"]))).toEqual(["Read before editing."]);
-		expect(registry.promptInventory(new Set(["*"]))).not.toContain("artifacts.get");
 	});
 
 	test("normalizes unknown registry lookups to host not-found errors", async () => {

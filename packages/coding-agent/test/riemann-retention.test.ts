@@ -60,6 +60,7 @@ describe("Riemann state retention", () => {
 				workspace: repository,
 				workspaceMode: "worktree",
 				filesystem: FULL_FILESYSTEM,
+				network: "deny",
 				depth: 1,
 				capabilities: ["fs.read"],
 			});
@@ -115,6 +116,7 @@ describe("Riemann state retention", () => {
 				workspace: root,
 				workspaceMode: "shared",
 				filesystem: FULL_FILESYSTEM,
+				network: "deny",
 				depth: 1,
 				capabilities: ["fs.read"],
 			});

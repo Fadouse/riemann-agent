@@ -129,13 +129,12 @@ function promptArgument(name: string, schema: TSchema, required: boolean): strin
 	return required ? `${name}=...` : `${name}=None`;
 }
 
-function promptInventoryLine(definition: FunctionDefinition): string {
-	const qualifiedName = `${definition.namespace}.${definition.name}`;
+function promptInventoryItem(definition: FunctionDefinition): string {
 	const required = new Set(definition.inputSchema.required ?? []);
 	const argumentsText = Object.entries(definition.inputSchema.properties)
 		.map(([name, schema]) => promptArgument(name, schema, required.has(name)))
 		.join(", ");
-	return `- \`await ${qualifiedName}(${argumentsText}) -> ${definition.pythonReturnType}\``;
+	return `\`${definition.name}(${argumentsText}) -> ${definition.pythonReturnType}\``;
 }
 
 export class FunctionRegistry {
@@ -246,16 +245,19 @@ export class FunctionRegistry {
 	}
 
 	promptInventory(capabilities: ReadonlySet<string>): string {
-		return publicDefinitions(this.list(capabilities), capabilities)
-			.sort((left, right) => {
-				const namespaceOrder =
-					(PROMPT_NAMESPACE_ORDER.get(left.namespace) ?? Number.MAX_SAFE_INTEGER) -
-					(PROMPT_NAMESPACE_ORDER.get(right.namespace) ?? Number.MAX_SAFE_INTEGER);
-				if (namespaceOrder !== 0) return namespaceOrder;
-				return left.name.localeCompare(right.name);
-			})
-			.map(promptInventoryLine)
-			.join("\n");
+		const grouped = new Map<string, string[]>();
+		for (const definition of publicDefinitions(this.list(capabilities), capabilities).sort((left, right) => {
+			const namespaceOrder =
+				(PROMPT_NAMESPACE_ORDER.get(left.namespace) ?? Number.MAX_SAFE_INTEGER) -
+				(PROMPT_NAMESPACE_ORDER.get(right.namespace) ?? Number.MAX_SAFE_INTEGER);
+			if (namespaceOrder !== 0) return namespaceOrder;
+			return left.name.localeCompare(right.name);
+		})) {
+			const items = grouped.get(definition.namespace) ?? [];
+			items.push(promptInventoryItem(definition));
+			grouped.set(definition.namespace, items);
+		}
+		return [...grouped].map(([namespace, items]) => `- \`${namespace}\`: ${items.join("; ")}`).join("\n");
 	}
 
 	promptGuidelines(capabilities: ReadonlySet<string>): string[] {

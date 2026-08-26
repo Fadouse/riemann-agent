@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { type FilesystemSnapshot, FULL_FILESYSTEM, parseFilesystemSnapshot } from "../access-policy.ts";
+import type { EffectiveAgentNetwork } from "../config.ts";
 import { DatabaseSync, type RiemannDatabase } from "./database.ts";
 
 export type AgentStatus = "queued" | "running" | "idle" | "stopped";
@@ -30,6 +31,7 @@ export interface StoredAgent {
 	workspace: string;
 	workspaceMode: "shared" | "worktree";
 	filesystem: FilesystemSnapshot;
+	network: EffectiveAgentNetwork;
 	depth: number;
 	capabilities: string[];
 	activeTurnId: string | null;
@@ -111,6 +113,7 @@ export interface AgentCreateInput {
 	workspace: string;
 	workspaceMode: "shared" | "worktree";
 	filesystem: FilesystemSnapshot;
+	network: EffectiveAgentNetwork;
 	depth: number;
 	capabilities: string[];
 }
@@ -164,6 +167,7 @@ interface AgentRow {
 	workspace: string;
 	workspace_mode: "shared" | "worktree";
 	filesystem_json: string;
+	network: EffectiveAgentNetwork;
 	depth: number;
 	capabilities_json: string;
 	active_turn_id: string | null;
@@ -287,6 +291,7 @@ function agentFromRow(row: AgentRow): StoredAgent {
 		workspace: row.workspace,
 		workspaceMode: row.workspace_mode,
 		filesystem: parseFilesystemSnapshot(row.filesystem_json),
+		network: row.network,
 		depth: row.depth,
 		capabilities: parseStringArray(row.capabilities_json),
 		activeTurnId: row.active_turn_id,
@@ -402,6 +407,7 @@ export class RiemannStore {
 				workspace TEXT NOT NULL,
 				workspace_mode TEXT NOT NULL DEFAULT 'shared',
 				filesystem_json TEXT NOT NULL DEFAULT '{}',
+				network TEXT NOT NULL DEFAULT 'deny' CHECK(network IN ('allow','deny')),
 				depth INTEGER NOT NULL,
 				capabilities_json TEXT NOT NULL,
 				active_turn_id TEXT,
@@ -489,6 +495,11 @@ export class RiemannStore {
 		const hasFilesystem = agentColumns.some((column) => column.name === "filesystem_json");
 		if (!agentColumns.some((column) => column.name === "workspace_mode")) {
 			this.db.exec("ALTER TABLE agents ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'shared'");
+		}
+		if (!agentColumns.some((column) => column.name === "network")) {
+			this.db.exec(
+				"ALTER TABLE agents ADD COLUMN network TEXT NOT NULL DEFAULT 'deny' CHECK(network IN ('allow','deny'))",
+			);
 		}
 		if (!agentColumns.some((column) => column.name === "last_outcome")) {
 			this.db.exec("ALTER TABLE agents ADD COLUMN last_outcome TEXT");
@@ -675,15 +686,20 @@ export class RiemannStore {
 		this.db.prepare("UPDATE runs SET status = 'closed', updated_at = ? WHERE id = ?").run(now(), runId);
 	}
 
-	ensureRootAgent(runId: string, cwd: string, filesystem: FilesystemSnapshot = FULL_FILESYSTEM): StoredAgent {
+	ensureRootAgent(
+		runId: string,
+		cwd: string,
+		filesystem: FilesystemSnapshot = FULL_FILESYSTEM,
+		network: EffectiveAgentNetwork = "deny",
+	): StoredAgent {
 		const existing = this.db.prepare("SELECT * FROM agents WHERE run_id = ? AND parent_id IS NULL").get(runId) as
 			| AgentRow
 			| undefined;
 		if (existing) {
 			const agent = agentFromRow(existing);
-			return JSON.stringify(agent.filesystem) === JSON.stringify(filesystem)
+			return JSON.stringify(agent.filesystem) === JSON.stringify(filesystem) && agent.network === network
 				? agent
-				: this.updateAgent(agent.id, { filesystem });
+				: this.updateAgent(agent.id, { filesystem, network });
 		}
 		return this.createAgent({
 			runId,
@@ -695,6 +711,7 @@ export class RiemannStore {
 			workspace: cwd,
 			workspaceMode: "shared",
 			filesystem,
+			network,
 			depth: 0,
 			capabilities: ["*"],
 		});
@@ -718,7 +735,7 @@ export class RiemannStore {
 		};
 		this.db
 			.prepare(
-				"INSERT INTO agents(id, run_id, parent_id, name, status, prompt, model_role, workspace, workspace_mode, filesystem_json, depth, capabilities_json, active_turn_id, last_turn_id, result, error, last_outcome, transcript_handle, patch_handle, released_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)",
+				"INSERT INTO agents(id, run_id, parent_id, name, status, prompt, model_role, workspace, workspace_mode, filesystem_json, network, depth, capabilities_json, active_turn_id, last_turn_id, result, error, last_outcome, transcript_handle, patch_handle, released_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)",
 			)
 			.run(
 				agent.id,
@@ -731,6 +748,7 @@ export class RiemannStore {
 				agent.workspace,
 				agent.workspaceMode,
 				JSON.stringify(agent.filesystem),
+				agent.network,
 				agent.depth,
 				JSON.stringify(agent.capabilities),
 				agent.createdAt,
@@ -1006,6 +1024,7 @@ export class RiemannStore {
 			patchHandle?: string | null;
 			workspace?: string;
 			filesystem?: FilesystemSnapshot;
+			network?: EffectiveAgentNetwork;
 		},
 	): StoredAgent {
 		const current = this.getAgent(id);
@@ -1019,10 +1038,11 @@ export class RiemannStore {
 		const patchHandle = patch.patchHandle === undefined ? current.patchHandle : patch.patchHandle;
 		const workspace = patch.workspace ?? current.workspace;
 		const filesystem = patch.filesystem === undefined ? current.filesystem : patch.filesystem;
+		const network = patch.network ?? current.network;
 		const updatedAt = now();
 		this.db
 			.prepare(
-				"UPDATE agents SET status = ?, prompt = ?, result = ?, error = ?, last_outcome = ?, transcript_handle = ?, patch_handle = ?, workspace = ?, filesystem_json = ?, updated_at = ? WHERE id = ?",
+				"UPDATE agents SET status = ?, prompt = ?, result = ?, error = ?, last_outcome = ?, transcript_handle = ?, patch_handle = ?, workspace = ?, filesystem_json = ?, network = ?, updated_at = ? WHERE id = ?",
 			)
 			.run(
 				status,
@@ -1034,6 +1054,7 @@ export class RiemannStore {
 				patchHandle,
 				workspace,
 				JSON.stringify(filesystem),
+				network,
 				updatedAt,
 				id,
 			);
@@ -1048,6 +1069,7 @@ export class RiemannStore {
 			patchHandle,
 			workspace,
 			filesystem,
+			network,
 			updatedAt,
 		};
 	}

@@ -251,6 +251,7 @@ export class IPythonKernelManager {
 			? sandboxedKernelCommand(
 					{
 						policy: { ...sandbox.policy, cwd: this.options.cwd },
+						networkAllowed: sandbox.networkAllowed,
 						python: this.options.python,
 						connectionDir: this.tempDir,
 						platform: sandbox.platform,

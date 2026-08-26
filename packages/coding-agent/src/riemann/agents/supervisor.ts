@@ -595,6 +595,7 @@ export class AgentSupervisor {
 			profile: agent.modelRole === "inherit" ? null : agent.modelRole,
 			model: this.modelLabel(agent),
 			workspace: agent.workspace,
+			network: agent.network,
 			active_turn_id: agent.activeTurnId,
 			last_turn_id: agent.lastTurnId,
 			last_outcome: agent.lastOutcome,
@@ -1335,6 +1336,14 @@ export class AgentSupervisor {
 
 		const workspaceMode = requestedProfile?.workspace ?? this.options.config.agentDefaults.workspace;
 		const filesystemConfig = requestedProfile?.filesystem ?? this.options.config.agentDefaults.filesystem;
+		const configuredNetwork = requestedProfile?.network ?? this.options.config.agentDefaults.network;
+		if (configuredNetwork === "allow" && caller.network === "deny") {
+			throw new RiemannHostError(
+				"permission_denied",
+				`Child Agent ${name} cannot enable network when parent ${caller.name} denies it`,
+			);
+		}
+		const network = configuredNetwork === "inherit" ? caller.network : configuredNetwork;
 		const childFilesystem = (workspace: string, mode: "shared" | "worktree", granted: string[] = []) => {
 			const snapshot = resolveFilesystemSnapshot({
 				config: filesystemConfig,
@@ -1378,6 +1387,7 @@ export class AgentSupervisor {
 				existing.workspaceMode === workspaceMode &&
 				(workspaceMode === "worktree" || existing.workspace === caller.workspace) &&
 				JSON.stringify(existing.filesystem) === JSON.stringify(expectedFilesystem) &&
+				existing.network === network &&
 				JSON.stringify(existing.capabilities) === JSON.stringify(capabilities);
 			if (!compatible) {
 				throw new RiemannHostError(
@@ -1412,6 +1422,7 @@ export class AgentSupervisor {
 				workspace: caller.workspace,
 				workspaceMode,
 				filesystem,
+				network,
 				depth: 1,
 				capabilities,
 			},
@@ -1679,6 +1690,7 @@ export class AgentSupervisor {
 				profile: Type.Union([Type.String(), Type.Null()]),
 				model: Type.String(),
 				workspace: Type.String(),
+				network: Type.Union([Type.Literal("allow"), Type.Literal("deny")]),
 				active_turn_id: Type.Union([Type.String(), Type.Null()]),
 				last_turn_id: Type.String(),
 				last_outcome: Type.Union([outcomeSchema, Type.Null()]),

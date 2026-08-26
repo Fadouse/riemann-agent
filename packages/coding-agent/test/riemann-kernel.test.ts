@@ -46,6 +46,7 @@ function testAgentWire(agent: (typeof TEST_AGENTS)[number], status = "idle"): Re
 		profile: null,
 		model: "faux/test-model",
 		workspace: "/tmp/riemann-agent-test",
+		network: "deny",
 		active_turn_id: status === "queued" || status === "running" ? turnId : null,
 		last_turn_id: turnId,
 		last_outcome: status === "stopped" ? "cancelled" : "ok",

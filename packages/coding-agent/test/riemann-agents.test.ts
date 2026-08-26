@@ -183,8 +183,8 @@ const config: RiemannConfig = {
 		maxWorktreeBytes: 1_000_000,
 	},
 	compaction: { strategy: "snapshot" },
-	mainAgent: {},
-	agentDefaults: { workspace: "shared" },
+	mainAgent: { network: "inherit" },
+	agentDefaults: { workspace: "shared", network: "inherit" },
 	profiles: {
 		privileged: { filesystem: { read: ["/"], write: ["/"] } },
 		isolated: { workspace: "worktree" },
@@ -214,6 +214,7 @@ interface SupervisorHarnessOptions {
 	modelRegistry?: ModelRegistry;
 	createSession?: (model: Model<any>) => FakeChildSession;
 	warningSink?: (message: string) => void | Promise<void>;
+	rootNetwork?: "allow" | "deny";
 }
 
 async function createHarness(
@@ -232,7 +233,7 @@ async function createHarness(
 	const agentDir = join(root, ".agent");
 	const store = new RiemannStore(agentDir);
 	const run = store.openRun(`run-${roots.length}`, root);
-	const main = store.ensureRootAgent(run.id, root);
+	const main = store.ensureRootAgent(run.id, root, FULL_FILESYSTEM, options.rootNetwork ?? "deny");
 	const model = options.rootModel ?? getModel("openai", "gpt-4o-mini");
 	if (!model) throw new Error("Built-in test model is unavailable");
 	const sessions = new Map<string, FakeChildSession[]>();
@@ -668,6 +669,7 @@ describe("Riemann reusable Agent slots", () => {
 			{
 				agentDefaults: {
 					workspace: "shared",
+					network: "inherit",
 					model: `${childModel.provider}/${childModel.id}`,
 				},
 			},
@@ -797,7 +799,11 @@ describe("Riemann reusable Agent slots", () => {
 		const harness = await createHarness(
 			{
 				compaction: { strategy: "automatic" },
-				agentDefaults: { workspace: "shared", model: `${childModel.provider}/${childModel.id}` },
+				agentDefaults: {
+					workspace: "shared",
+					network: "inherit",
+					model: `${childModel.provider}/${childModel.id}`,
+				},
 			},
 			undefined,
 			childModel,
@@ -844,7 +850,11 @@ describe("Riemann reusable Agent slots", () => {
 			{
 				compaction: { strategy: "default" },
 				projectOverrides: new Set(["compaction.strategy"]),
-				agentDefaults: { workspace: "shared", model: `${childModel.provider}/${childModel.id}` },
+				agentDefaults: {
+					workspace: "shared",
+					network: "inherit",
+					model: `${childModel.provider}/${childModel.id}`,
+				},
 			},
 			undefined,
 			childModel,
@@ -1112,6 +1122,7 @@ describe("Riemann reusable Agent slots", () => {
 			workspace: root,
 			workspaceMode: "shared",
 			filesystem: FULL_FILESYSTEM,
+			network: "deny",
 			depth: 1,
 			capabilities: ["fs.read"],
 		});
@@ -1241,6 +1252,46 @@ describe("Riemann reusable Agent slots", () => {
 		} finally {
 			await supervisor.close();
 			store.close();
+		}
+	});
+
+	test("inherits one network policy for child IPython and shell without allowing elevation", async () => {
+		const inherited = await createHarness(
+			{ agentDefaults: { workspace: "shared", network: "inherit" } },
+			undefined,
+			undefined,
+			{ rootNetwork: "allow" },
+		);
+		const denied = await createHarness({
+			profiles: { offline: { network: "deny" }, elevated: { network: "allow" } },
+			agentDefaults: { workspace: "shared", network: "inherit" },
+		});
+		try {
+			const inheritedHandle = objectValue(
+				await inherited.supervisor.start(inherited.mainId, { task: "inherit network", name: "inherited" }),
+			);
+			expect(inherited.store.getAgent(String(inheritedHandle.id))?.network).toBe("allow");
+
+			const offlineHandle = objectValue(
+				await denied.supervisor.start(denied.mainId, {
+					task: "deny network",
+					name: "offline",
+					profile: "offline",
+				}),
+			);
+			expect(denied.store.getAgent(String(offlineHandle.id))?.network).toBe("deny");
+			await expect(
+				denied.supervisor.start(denied.mainId, {
+					task: "invalid elevation",
+					name: "elevated",
+					profile: "elevated",
+				}),
+			).rejects.toMatchObject({ code: "permission_denied" });
+		} finally {
+			await inherited.supervisor.close();
+			inherited.store.close();
+			await denied.supervisor.close();
+			denied.store.close();
 		}
 	});
 });

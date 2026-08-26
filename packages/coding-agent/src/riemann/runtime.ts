@@ -18,7 +18,13 @@ import {
 } from "./agents/supervisor.ts";
 import { createRiemannCompaction, createRiemannSnapshotCompaction } from "./compaction.ts";
 import { type CompactionStrategyResolution, resolveCompactionStrategy } from "./compaction-strategy.ts";
-import { expandConfigSecret, getRiemannAgentDir, loadRiemannConfig, type RiemannConfig } from "./config.ts";
+import {
+	type AgentNetworkPolicy,
+	expandConfigSecret,
+	getRiemannAgentDir,
+	loadRiemannConfig,
+	type RiemannConfig,
+} from "./config.ts";
 import { formatEnvironmentContext } from "./environment.ts";
 import { RiemannHostError } from "./errors.ts";
 import { FileFunctions } from "./functions/fs.ts";
@@ -163,7 +169,7 @@ export class RiemannRuntime {
 			policy,
 			shared.artifacts,
 			shared.config.limits.maxArtifactPreviewChars,
-			hasCapability(this.capabilities, "shell.network", "shell"),
+			agent.network === "allow",
 		);
 		this.web = new WebFunctions(
 			shared.config.web.searchBackend === "exa" ? exaApiKey : undefined,
@@ -197,7 +203,8 @@ export class RiemannRuntime {
 			workspace: ctx.cwd,
 			parent: undefined,
 		});
-		const rootAgent = store.ensureRootAgent(run.id, ctx.cwd, mainFilesystem);
+		const mainNetwork = config.mainAgent.network === "allow" ? "allow" : "deny";
+		const rootAgent = store.ensureRootAgent(run.id, ctx.cwd, mainFilesystem, mainNetwork);
 		const artifacts = new ArtifactStore(store, run.id);
 		const rootContext = {
 			cwd: ctx.cwd,
@@ -643,6 +650,14 @@ export class RiemannRuntime {
 						agent_id: Type.String(),
 						agent_name: Type.String(),
 						workspace: Type.String(),
+						network: Type.Object(
+							{
+								configured: Type.Union([Type.Literal("allow"), Type.Literal("deny"), Type.Literal("inherit")]),
+								effective: Type.Union([Type.Literal("allow"), Type.Literal("deny")]),
+								source: Type.String(),
+							},
+							{ additionalProperties: false },
+						),
 						configuration: Type.Object(
 							{ freshness: Type.Literal("startup-snapshot"), files: Type.Array(Type.String()) },
 							{ additionalProperties: false },
@@ -675,6 +690,7 @@ export class RiemannRuntime {
 								workspace: Type.Union([Type.Literal("shared"), Type.Literal("worktree")]),
 								filesystem: Type.Optional(filesystemConfigSchema),
 								model: Type.Optional(Type.String()),
+								network: Type.Union([Type.Literal("allow"), Type.Literal("deny"), Type.Literal("inherit")]),
 							},
 							{ additionalProperties: false },
 						),
@@ -731,6 +747,7 @@ export class RiemannRuntime {
 						agent_id: this.agent.id,
 						agent_name: this.agent.name,
 						workspace: this.agent.workspace,
+						network: this.networkStatus(),
 						configuration: { freshness: "startup-snapshot", files: this.shared.config.files },
 						filesystem: {
 							backend:
@@ -765,14 +782,42 @@ export class RiemannRuntime {
 		];
 	}
 
-	private availableOperations(): string {
+	private networkStatus(): {
+		configured: AgentNetworkPolicy;
+		effective: "allow" | "deny";
+		source: "builtin" | "main" | "defaults" | `profile:${string}` | "parent";
+	} {
+		if (this.root) {
+			const configured = this.shared.config.mainAgent.network;
+			return {
+				configured,
+				effective: this.agent.network,
+				source: configured === "inherit" ? "builtin" : "main",
+			};
+		}
+		const profile =
+			this.agent.modelRole === "inherit" ? undefined : this.shared.config.profiles[this.agent.modelRole];
+		const configured = profile?.network ?? this.shared.config.agentDefaults.network;
+		return {
+			configured,
+			effective: this.agent.network,
+			source:
+				configured === "inherit"
+					? "parent"
+					: profile?.network !== undefined
+						? `profile:${this.agent.modelRole}`
+						: "defaults",
+		};
+	}
+
+	private pythonNamespaceInventory(): string {
 		return this.registry.promptInventory(this.capabilities);
 	}
 
 	private operationGuidelines(): string {
 		const guidelines = this.registry.promptGuidelines(this.capabilities);
 		if (guidelines.length === 0) return "";
-		return `## Tool discipline\n\n${guidelines.map((guideline) => `- ${guideline}`).join("\n")}`;
+		return `## Python operation discipline\n\n${guidelines.map((guideline) => `- ${guideline}`).join("\n")}`;
 	}
 
 	private agentProfiles(): string {
@@ -785,7 +830,9 @@ export class RiemannRuntime {
 
 	private exposedMcpServers(): string {
 		const inventory = this.mcp.promptInventory(this.capabilities);
-		return inventory ? `## Configured MCP servers\n\n${inventory}` : "";
+		return inventory
+			? `## Configured MCP servers\n\nInside \`ipython.code\`, \`await mcp.open(name=...)\` returns a Python namespace.\n\n${inventory}`
+			: "";
 	}
 
 	private durableState(compaction: CompactionDispatch): JsonValue {
@@ -890,7 +937,7 @@ export class RiemannRuntime {
 	systemPrompt(kind: "main" | "child"): string {
 		const values = {
 			environment: formatEnvironmentContext(this.agent.workspace),
-			availableOperations: this.availableOperations(),
+			pythonNamespaceInventory: this.pythonNamespaceInventory(),
 			agentProfiles: this.agentProfiles(),
 			operationGuidelines: this.operationGuidelines(),
 			exposedMcpServers: this.exposedMcpServers(),
@@ -906,6 +953,7 @@ export class RiemannRuntime {
 				workspaceMode: this.agent.workspaceMode,
 				modelRole: this.agent.modelRole,
 				capabilities: this.agent.capabilities,
+				network: this.networkStatus(),
 				filesystem: {
 					cwd: this.policy.cwd,
 					read: [...this.policy.readRoots],
@@ -937,7 +985,7 @@ export class RiemannRuntime {
 				hostRequest: (request, signal, onUpdate) =>
 					this.registry.dispatch(request, this.capabilities, signal, onUpdate),
 				snapshotPath: join(this.shared.store.snapshotsDir, this.agent.id, "kernel.dill"),
-				sandbox: { policy: this.policy },
+				sandbox: { policy: this.policy, networkAllowed: this.agent.network === "allow" },
 				maxOutputChars: Math.max(this.shared.config.limits.maxCellOutputChars * 4, 400_000),
 				onRestore: (result) => {
 					this.pendingRestoreNotice = restoreNotice(result);
