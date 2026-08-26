@@ -4,7 +4,7 @@
 
 ### Breaking Changes
 
-- Renamed the public `AgentResult.result` field to `AgentResult.output`; update consumers of `agents.run()`, `AgentHandle.wait()`, and `AgentHandle.stop()`.
+- Renamed the public `AgentResult.result` field to `AgentResult.output` and replaced `AgentHandle` with exact-Turn `AgentTurnHandle`.
 - Renamed the `workspace` Python namespace to `fs` (`fs.read`, `fs.glob`, `fs.search`, `fs.edit`, `fs.create`, `fs.remove`); capabilities are now `fs.read`/`fs.write`.
 - Removed `permissions: host|workspace` from `agents.main`, `agents.defaults`, and profiles; configure `filesystem: {read?, readExclude?, write?, writeExclude?}` instead, where each field is an absolute-path list or `inherit`.
 - Changed the main Agent default filesystem to unrestricted read and write of `/` with no built-in exclusions; tools, shell, and the kernel sandbox all consume one `FileAccessPolicy`.
@@ -16,21 +16,24 @@
 - Renamed the `fs.search` file-filter argument `pattern` to `glob`, removing the `query`/`pattern` ambiguity.
 - Filesystem policies now require every configured root and exclusion to exist, require write roots to be covered by read roots, and treat `readExclude` as denying both reads and writes.
 - Omitted Riemann `compaction.strategy` now resolves automatically: OpenAI Codex models use cloud compaction and all other providers use the semantic default strategy; set `default` explicitly to force semantic compaction on Codex.
+- Replaced the Riemann Python operation bridge with strict ABI v2 schemas, keyword-only calls, versioned result tags, normalized errors, and a single `agents.start()`/`mcp.open()` lifecycle surface; removed `agents.run()`, `agents.spawn()`, `AgentHandle.send()`, and `mcp.activate()`.
+- Replaced `fs.search(regex=...)` with `fs.search(mode="literal" | "regex")`, defined edit offsets as Unicode code points, and changed Shell, Web, Artifact, and MCP result records to their exact ABI v2 shapes.
 
 ### Added
 
 - Added configurable reusable Agent slots and default child-model selection to the settings panel.
 - Added durable Agent completion delivery, standard transcript rendering, configurable Hub/viewer controls, and confirmed settled-slot release.
-- Added synchronous `agents.run()`, exact-Turn `AgentHandle.wait()`, cancellable settlement, and race-free suppression of duplicate background completion wakes.
-- Added direct-session image attachments across clipboard input with highlighted attachment markers, remote sessions, compaction, and Riemann workspace, artifact, IPython, and MCP results.
+- Added exact-Turn `AgentTurnHandle.wait()`, `steer()`, cancellable settlement, durable results, and explicit queued/running admission status.
+- Added direct-session image attachments across clipboard input with highlighted attachment markers, remote sessions, compaction, and explicit Riemann artifact image views.
 - Added live Riemann compaction strategy switching with complete Automatic, Default, OpenAI Codex, and Snapshot settings choices.
 - Added non-blocking compaction warnings for encrypted OpenAI context transitions, Snapshot models without image input, and incompatible OpenAI Codex model or OAuth selections.
+- Added schema-derived operation discovery, bounded Python result representations, explicit image viewing, Unicode-safe snapshot editing, and structured artifact recovery metadata.
 
 ### Changed
 
-- Restructured the Riemann system prompt: tightened the contract, condensed the runtime section, compressed agent handle guidelines into two rules, and added a work-type Verification section; the ipython tool schema no longer repeats the gather idiom.
+- Restructured and budgeted the Riemann main, child, operation, and compaction prompts around one runtime contract and catalog-backed ABI discovery.
 - Changed Riemann shell execution to resolve bash through pi's shared shell configuration (`bash -c`, legacy WSL stdin transport) instead of `$SHELL -lc`/`cmd /d /s /c`.
-- Changed child delegation to durable per-Turn `AgentHandle` results with `info()`, `wait()`, `send()`, `stop()`, and `release()` lifecycle controls; standard `asyncio.gather(...)` composes independent runs and waits.
+- Changed child delegation to one `agents.start()` operation returning durable `AgentTurnHandle` values with deterministic `info()`, `wait()`, `steer()`, `stop()`, and `release()` lifecycle controls.
 - Changed Linux Riemann isolation to a filesystem-focused Bubblewrap policy that preserves workspace/state paths, shares host devices and networking, and uses a private PID namespace for deterministic descendant cleanup.
 - Changed `agents.list()` to render compact `AgentInfo` summaries with bounded latest-output previews, while retaining full metadata as explicit fields and exact-Turn result retrieval through each item's handle methods.
 - Compacted Subagent Viewer transcript spacing and sized short overlays to their rendered content while preserving long-transcript scrolling.

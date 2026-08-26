@@ -8,12 +8,7 @@ import {
 	latestActiveCompactionHasOpenAIContext,
 } from "../../riemann/compaction-warning.ts";
 import { getRiemannAgentDir, loadRiemannConfig } from "../../riemann/config.ts";
-import {
-	IPYTHON_TOOL_DESCRIPTION,
-	IPYTHON_TOOL_PROMPT_SNIPPET,
-	IPythonSchema,
-	type IPythonToolDetails,
-} from "../../riemann/ipython.ts";
+import { IPYTHON_TOOL_METADATA, type IPythonSchema, type IPythonToolDetails } from "../../riemann/ipython.ts";
 import { getPreservedOpenAICompaction } from "../../riemann/openai-compaction-state.ts";
 import { RiemannRuntime } from "../../riemann/runtime.ts";
 import { installSubagentUi, type SubagentUiController } from "./subagent-ui.ts";
@@ -267,12 +262,7 @@ const riemannExtension: ExtensionFactory = (pi) => {
 	};
 
 	pi.registerTool<typeof IPythonSchema, IPythonToolDetails>({
-		name: "ipython",
-		label: "IPython",
-		description: IPYTHON_TOOL_DESCRIPTION,
-		promptSnippet: IPYTHON_TOOL_PROMPT_SNIPPET,
-		parameters: IPythonSchema,
-		executionMode: "sequential",
+		...IPYTHON_TOOL_METADATA,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const current = await getRuntime(ctx);
 			return current.toolDefinition().execute(toolCallId, params, signal, onUpdate, ctx);

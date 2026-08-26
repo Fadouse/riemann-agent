@@ -11,8 +11,8 @@ afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-function request(type: string, args: KernelHostRequest["args"]): KernelHostRequest {
-	return { type, args, cellId: "cell-1" };
+function request(type: string, args: KernelHostRequest["arguments"]): KernelHostRequest {
+	return { abiVersion: 2, requestId: `request-${type}`, operation: type, arguments: args, cellId: "cell-1" };
 }
 
 async function observe(tracker: RiemannActivityTracker, event: KernelHostRequestEvent) {
@@ -38,7 +38,7 @@ describe("Riemann IPython activity tracking", () => {
 			phase: "update",
 			requestId: "shell-1",
 			request: shellRequest,
-			update: { stdout_delta: "Tests 12 passed\n", stderr_delta: "" },
+			update: { sequence: 1, kind: "stdout", value: "Tests 12 passed\n", truncated: false },
 		});
 		expect(activities[0]).toMatchObject({ stdout: "Tests 12 passed\n" });
 		activities = await observe(tracker, {
@@ -47,13 +47,14 @@ describe("Riemann IPython activity tracking", () => {
 			request: shellRequest,
 			durationMs: 40,
 			result: {
-				$riemann: "process_result",
-				command: "npm test",
+				$riemann: "process_result.v1",
 				exit_code: 0,
 				stdout: "Tests 12 passed\n",
 				stderr: "",
 				duration_ms: 40,
-				timed_out: false,
+				termination: "exited",
+				stdout_truncated: false,
+				stderr_truncated: false,
 				artifact: null,
 			},
 		});
@@ -69,7 +70,7 @@ describe("Riemann IPython activity tracking", () => {
 			capability === "file-capability" ? path : undefined,
 		);
 		const editRequest = request("fs.edit", {
-			snapshot: { $riemann: "text_snapshot_ref", capability: "file-capability" },
+			snapshot: { $riemann: "text_snapshot_ref.v1", capability: "file-capability" },
 			operations: [{ kind: "replace", start: 14, end: 15, text: "2" }],
 		});
 		await observe(tracker, { phase: "start", requestId: "edit-1", request: editRequest, startedAt: 1 });
@@ -79,7 +80,8 @@ describe("Riemann IPython activity tracking", () => {
 			request: editRequest,
 			durationMs: 10,
 			result: {
-				$riemann: "text_snapshot",
+				$riemann: "text_snapshot.v1",
+				kind: "text",
 				path,
 				text: "const value = 2;\n",
 				encoding: "utf-8",
@@ -100,7 +102,7 @@ describe("Riemann IPython activity tracking", () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-activity-agent-"));
 		roots.push(root);
 		const tracker = new RiemannActivityTracker(root, () => undefined);
-		const spawnRequest = request("agents.spawn", {
+		const spawnRequest = request("agents.start", {
 			task: "Review the parser",
 			name: "Reviewer",
 			profile: "deep",
@@ -111,11 +113,17 @@ describe("Riemann IPython activity tracking", () => {
 			requestId: "agent-1",
 			request: spawnRequest,
 			durationMs: 8,
-			result: { $riemann: "agent_handle", id: "child-1", name: "Reviewer" },
+			result: {
+				$riemann: "agent_turn_handle.v1",
+				id: "child-1",
+				name: "Reviewer",
+				turn_id: "turn-1",
+				status: "running",
+			},
 		});
 		expect(activities[0]).toMatchObject({
 			kind: "agent",
-			operation: "spawn",
+			operation: "start",
 			status: "ok",
 			agentId: "child-1",
 			name: "Reviewer",
@@ -135,7 +143,7 @@ describe("Riemann IPython activity tracking", () => {
 			phase: "update",
 			requestId: "shell-unicode",
 			request: shellRequest,
-			update: { stdout_delta: `a😀${"x".repeat(19_999)}` },
+			update: { sequence: 1, kind: "stdout", value: `a😀${"x".repeat(19_999)}`, truncated: false },
 		});
 		const running = activities[0];
 		expect(running?.kind).toBe("shell");
@@ -148,7 +156,13 @@ describe("Riemann IPython activity tracking", () => {
 			requestId: "shell-unicode",
 			request: shellRequest,
 			durationMs: 2,
-			error: { code: "execution_error", message: `${"x".repeat(1_999)}😀z` },
+			error: {
+				code: "execution_error",
+				message: `${"x".repeat(1_999)}😀z`,
+				operation: "shell.run",
+				requestId: "shell-unicode",
+				retryable: false,
+			},
 		});
 		const finished = activities[0];
 		expect(Buffer.from(finished?.error ?? "", "utf8").toString("utf8")).toBe(finished?.error);

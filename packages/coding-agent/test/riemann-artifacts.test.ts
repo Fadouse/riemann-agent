@@ -33,6 +33,7 @@ describe("Riemann artifact storage", () => {
 				mime_type: "text/plain; charset=utf-8",
 				size: 10,
 				offset: 3,
+				next_offset: 7,
 				content: "3456",
 				truncated: true,
 			});
@@ -41,13 +42,15 @@ describe("Riemann artifact storage", () => {
 				content: "012",
 				truncated: true,
 			});
-			expect(await artifacts.get(textHandle, { offset: 3, limit: -1 })).toMatchObject({
-				offset: 3,
-				content: "",
-				truncated: true,
+			await expect(artifacts.get(textHandle, { offset: 3, limit: -1 })).rejects.toMatchObject({
+				code: "invalid_arguments",
+			});
+			await expect(artifacts.get(textHandle, { limit: 1_048_577 })).rejects.toMatchObject({
+				code: "invalid_arguments",
 			});
 			expect(await artifacts.get(textHandle, { offset: 50, limit: 4 })).toMatchObject({
-				offset: 50,
+				offset: 10,
+				next_offset: 10,
 				content: "",
 				truncated: false,
 			});
@@ -65,8 +68,38 @@ describe("Riemann artifact storage", () => {
 				mime_type: "application/octet-stream",
 				size: binary.length,
 				offset: 2,
+				next_offset: 5,
 				base64: binary.subarray(2, 5).toString("base64"),
 				truncated: true,
+			});
+		} finally {
+			store.close();
+		}
+	});
+
+	test("keeps metadata identity stable and rounds UTF-8 slices to complete code points", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-artifact-identity-"));
+		roots.push(root);
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("artifact-identity", root);
+		const artifacts = new ArtifactStore(store, run.id);
+		try {
+			const first = artifactHandle(await artifacts.putText("😀x", { name: "first.txt" }));
+			const second = artifactHandle(
+				await artifacts.putBuffer(Buffer.from("😀x"), { name: "second.bin", mimeType: "application/octet-stream" }),
+			);
+			expect(first).not.toBe(second);
+			expect(artifacts.getMetadata(first).name).toBe("first.txt");
+			expect(artifacts.getMetadata(second).name).toBe("second.bin");
+			expect(await artifacts.get(first, { offset: 0, limit: 3 })).toMatchObject({
+				offset: 0,
+				next_offset: 0,
+				content: "",
+				truncated: true,
+			});
+			expect(await artifacts.get(first, { offset: 0, limit: 4 })).toMatchObject({
+				next_offset: 4,
+				content: "😀",
 			});
 		} finally {
 			store.close();

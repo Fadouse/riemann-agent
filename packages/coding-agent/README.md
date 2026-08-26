@@ -12,7 +12,7 @@ The model sees one tool: `ipython`. Workspace I/O, shell processes, web access, 
 - SQLite-backed runs, agents, messages, artifacts, and revision capabilities.
 - Content-addressed large-result artifacts.
 - Lazy MCP activation; discovered tools use a Python/catalog namespace derived from the configured server name, with collision-safe fallback.
-- Asynchronous reusable child Agents with durable handles, automatic completion delivery, steering, default-model selection, bounded run slots, shared/worktree topology, and host/workspace permissions.
+- Asynchronous reusable child Agents with durable handles, automatic completion delivery, steering, default-model selection, bounded run slots, shared/worktree topology, and per-Agent filesystem/capability policies.
 - A `pi-subagents`-style Fleet below the editor plus an `/agents` hub for standard live transcripts, messaging, scrolling, stop, and slot-release controls.
 - Strictly configured context compaction: subscription-backed OpenAI Codex, OMP snapshot archives, or Riemann semantic checkpoints.
 - Pi's TUI, session management, model providers, authentication, settings, RPC mode, and extension ecosystem.
@@ -71,14 +71,14 @@ agents:
       write: inherit # shared inherits; worktree defaults to its own worktree
 ```
 
-Named profiles remain optional for specialist prompts, model overrides, or narrower capabilities. `await agents.run()` returns an `AgentResult` whose final response is `output`. `await agents.spawn()` returns a handle after admission while the child continues in the background. Completion reminders are progress signals, not batch barriers: retain every expected handle and retrieve each durable result with `await handle.wait()` before synthesis.
+Named profiles remain optional for specialist prompts, model overrides, or narrower capabilities. `await agents.start()` returns an exact `AgentTurnHandle` whose `status` is `queued` or `running`; retrieve its durable `AgentResult.output` with `await handle.wait()`. Use `reuse="never"` for a new identity or `reuse="exact"` with a compatible settled name. `handle.steer()` only targets that actively streaming Turn and never starts another Turn.
 
 ```bash
 mkdir -p ~/.riemann/agent
 cp packages/coding-agent/examples/riemann-config.yaml ~/.riemann/agent/config.yaml
 ```
 
-Remove or disable the example Exa and MCP entries until their credentials and commands are configured. Secrets support `${ENVIRONMENT_VARIABLE}` expansion. Every enabled MCP server is listed to the model by default using only its configured name and required non-empty `description`; set `exposeToModel: false` to hide one. Commands, URLs, headers, environment variables, and discovered tool schemas remain hidden until activation. Activation remains lazy, and there is no redundant `mcp.list()` model operation.
+Remove or disable the example Exa and MCP entries until their credentials and commands are configured. Secrets support `${ENVIRONMENT_VARIABLE}` expansion. Every enabled MCP server is listed to the model by default using only its configured name and required non-empty `description`; set `exposeToModel: false` to hide one. Commands, URLs, headers, environment variables, and discovered tool schemas remain hidden until `mcp.open()`. Connection remains lazy, and there is no redundant `mcp.list()` model operation. The returned namespace exposes `status()`, `refresh()`, and `close()` lifecycle methods; each discovered tool accepts one schema-validated `input={...}` object.
 
 Context compaction is selected in Riemann configuration:
 
@@ -99,7 +99,7 @@ Riemann displays non-blocking warnings when encrypted OpenAI context may be unav
 
 ## Python operations
 
-The system prompt identifies the current date, working directory, OS, Linux distribution (for example NixOS or Debian), kernel, architecture, and shell so the model can select commands compatible with the actual host. It also lists every built-in async Python operation available to the current agent, filtered by its capability allowlist. These namespaces are preinstalled globals in the persistent IPython environment: bind results to variables and compose multiple operations with normal Python and top-level `await`. Use `help(fs.edit)` or `await catalog.describe(name="fs.edit")` only when the compact signature and description are insufficient. `await catalog.search(query="...")` remains available for task-based discovery.
+The system prompt identifies the current date, working directory, OS, Linux distribution (for example NixOS or Debian), kernel, and architecture so the model can select commands compatible with the actual host. It also lists every built-in async Python operation available to the current agent, filtered by its capability allowlist. These namespaces are preinstalled globals in the persistent IPython environment: bind results to variables and compose multiple operations with normal Python and top-level `await`. Use `help(fs.edit)` or `await catalog.describe(name="fs.edit")` only when the compact signature and description are insufficient. `await catalog.search(query="...")` remains available for task-based discovery.
 
 ```python
 import asyncio
@@ -110,33 +110,39 @@ display(snap.lines(1, 80))
 result = await shell.run(script=\"npm test 2>&1 | tail -40\", timeout=300)
 display((result.exit_code, result.stderr[-2000:]))
 
-docs = await mcp.activate(name=\"filesystem_docs\")
-matches = await catalog.search(query=\"filesystem documentation\")
+docs = await mcp.open(name="filesystem_docs")
+matches = await catalog.search(query="filesystem documentation")
 display(matches)
-handle = await agents.spawn(
-    task=\"Review the changed API and report concrete defects.\",
-    name=\"reviewer\",
+# MCP tools use one schema-validated input object.
+doc_result = await docs.search(input={"query": "filesystem policy"})
+
+handle = await agents.start(
+    task="Review the changed API and report concrete defects.",
+    name="reviewer",
+    reuse="never",
 )
 review = await handle.wait(timeout=600)
 display(review.output)
 
 parallel_handles = await asyncio.gather(
-    agents.spawn(task="Review parser behavior.", name="parser-review"),
-    agents.spawn(task="Review API compatibility.", name="api-review"),
+    agents.start(task="Review parser behavior.", name="parser-review", reuse="never"),
+    agents.start(task="Review API compatibility.", name="api-review", reuse="never"),
 )
 parallel_results = await asyncio.gather(*(handle.wait() for handle in parallel_handles))
 display([result.output for result in parallel_results])
 
-sync_result = await agents.run(
+sync_result = await (await agents.start(
     task="Check the focused regression and return the failure trace.",
     name="test-reviewer",
-    timeout=600,
-)
+    reuse="exact",
+)).wait(timeout=600)
 display(sync_result.output)
 
 ```
 
-Without a profile, `agents.run()` and `agents.spawn()` use `agents.defaults`. Select a configured profile for a different model, workspace topology, permissions, prompt, or capability set; model calls cannot supply filesystem paths or elevate a child beyond its parent. Capability overrides accept exact operations such as `web.search` and namespace shorthand such as `web`, which is normalized to `web.*`. Configured profile names and descriptions are listed directly in the system prompt.
+Without a profile, `agents.start()` uses `agents.defaults`. Select a configured profile for a different model, workspace topology, permissions, prompt, or capability set; model calls cannot supply filesystem paths or elevate a child beyond its parent. Capability overrides accept exact operations such as `web.search` and namespace shorthand such as `web`, which is normalized to `web.*`. Configured profile names and descriptions are listed directly in the system prompt.
+
+Operation arguments are keyword-only and validated against the same ABI v2 schema used by `catalog.describe()`. Generated Python signatures reject unknown keyword arguments locally with `TypeError`; host-dispatched schema violations fail with `invalid_arguments`. Domain results are versioned and discriminated, while mutation receipts use exact named schemas. `fs.search()` selects `mode="literal"` or `mode="regex"`. `fs.edit()` offsets are zero-based Unicode code-point indices with an exclusive end, and multiple inserts at the same offset are rejected. Image reads return metadata without attaching pixels; call `await image.view()` or `await image.artifact.view()` explicitly when visual context is required.
 
 Large values should remain in variables or artifacts; display only the slice needed for the next decision. A cancelled cell can have completed an external side effect, so inspect durable state before retrying.
 
@@ -576,11 +582,13 @@ See [docs/rpc.md](docs/rpc.md) for the protocol.
 
 ## Philosophy
 
+The statements below distinguish the minimal upstream Pi core from the additional Riemann runtime shipped by this package.
+
 Pi is aggressively extensible so it doesn't have to dictate your workflow. Features that other tools bake in can be built with [extensions](#extensions), [skills](#skills), or installed from third-party [pi packages](#pi-packages). This keeps the core minimal while letting you shape pi to fit how you work.
 
-**No MCP.** Build CLI tools with READMEs (see [Skills](#skills)), or build an extension that adds MCP support. [Why?](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/)
+**Base Pi has no MCP.** Riemann intentionally adds lazily opened, capability-bounded MCP namespaces; other Pi deployments can use CLI skills or extensions. [Background](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/)
 
-**No sub-agents.** There's many ways to do this. Spawn pi instances via tmux, or build your own with [extensions](#extensions), or install a package that does it your way.
+**Base Pi has no sub-agents.** Riemann intentionally adds durable, bounded child Agent Turns; other Pi deployments can use tmux, extensions, or packages.
 
 **No permission popups.** Run in a container, or build your own confirmation flow with [extensions](#extensions) inline with your environment and security requirements.
 

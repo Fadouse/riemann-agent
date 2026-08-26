@@ -56,7 +56,7 @@ describe("Riemann context compaction", () => {
 		expect(result.firstKeptEntryId).toBe("kept-entry");
 		const call = completeCalls[0];
 		if (!call) throw new Error("Compaction model was not called");
-		expect(call.context.systemPrompt).toContain("Riemann Agent's context compaction engine");
+		expect(call.context.systemPrompt).toContain("Riemann Agent's compaction engine");
 		expect(contentText(call.context.messages[0]?.content ?? "")).toContain("<kind>initial</kind>");
 		expect(call.options?.cacheRetention).toBe("none");
 	});

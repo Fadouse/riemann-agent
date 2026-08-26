@@ -1,41 +1,27 @@
+import type { TSchema } from "typebox";
+import { Value } from "typebox/value";
 import { RiemannHostError } from "../errors.ts";
-import type { JsonValue, KernelHostRequest, KernelHostResult } from "../kernel/types.ts";
+import { isKernelHostResult, type JsonValue, type KernelHostRequest, type KernelHostResult } from "../kernel/types.ts";
+import type { FunctionDefinition, FunctionUpdateCallback } from "./contracts.ts";
 
-export interface FunctionParameter {
-	name: string;
-	description: string;
-	type: string;
-	required: boolean;
-}
-
-export type FunctionUpdateCallback = (update: JsonValue) => void;
-
-export interface FunctionDefinition {
-	name: string;
-	namespace: string;
-	description: string;
-	parameters: FunctionParameter[];
-	returns: string;
-	examples?: string[];
-	capability?: string;
-	promptSnippet?: string;
-	includeInSystemPrompt?: boolean;
-	/** Install a Python namespace proxy. Internal handle methods set this false. */
-	installInPythonNamespace?: boolean;
-	promptGuidelines?: readonly string[];
-	handler: (
-		args: Record<string, JsonValue>,
-		signal: AbortSignal,
-		onUpdate?: FunctionUpdateCallback,
-	) => Promise<JsonValue | KernelHostResult>;
-}
+export type {
+	FunctionCancellationSpecification,
+	FunctionDefinition,
+	FunctionEffectSpecification,
+	FunctionErrorSpecification,
+	FunctionIdempotency,
+	FunctionPromptSpecification,
+	FunctionUpdateCallback,
+	FunctionVisibility,
+} from "./contracts.ts";
 
 export interface PythonFunctionSpecification {
 	name: string;
 	namespace: string;
 	qualified_name: string;
 	description: string;
-	parameters: Array<{ name: string; required: boolean }>;
+	input_schema: JsonValue;
+	return_type: string;
 }
 
 const PROMPT_NAMESPACE_ORDER = new Map(
@@ -45,9 +31,73 @@ const PROMPT_NAMESPACE_ORDER = new Map(
 	]),
 );
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const PYTHON_KEYWORDS = new Set([
+	"False",
+	"None",
+	"True",
+	"and",
+	"as",
+	"assert",
+	"async",
+	"await",
+	"break",
+	"class",
+	"continue",
+	"def",
+	"del",
+	"elif",
+	"else",
+	"except",
+	"finally",
+	"for",
+	"from",
+	"global",
+	"if",
+	"import",
+	"in",
+	"is",
+	"lambda",
+	"nonlocal",
+	"not",
+	"or",
+	"pass",
+	"raise",
+	"return",
+	"try",
+	"while",
+	"with",
+	"yield",
+]);
+
+function isPythonIdentifier(value: string): boolean {
+	return IDENTIFIER.test(value) && !PYTHON_KEYWORDS.has(value);
+}
 
 function words(value: string): string[] {
 	return value.toLowerCase().match(/[a-z0-9_]+/g) ?? [];
+}
+
+function metadataValue(value: unknown): JsonValue {
+	const encoded = JSON.stringify(value);
+	if (encoded === undefined) return null;
+	return JSON.parse(encoded) as JsonValue;
+}
+
+function validationDetails(schema: TSchema, value: unknown): JsonValue {
+	return {
+		errors: [...Value.Errors(schema, value)].slice(0, 8).map((error) => ({
+			path: error.instancePath,
+			message: error.message,
+		})),
+	};
+}
+
+function schemaDefaults(definition: FunctionDefinition): JsonValue {
+	const defaults: Record<string, JsonValue> = {};
+	for (const [name, schema] of Object.entries(definition.inputSchema.properties)) {
+		if ("default" in schema) defaults[name] = metadataValue(schema.default);
+	}
+	return defaults;
 }
 
 export function hasCapability(capabilities: ReadonlySet<string>, capability: string, namespace: string): boolean {
@@ -65,32 +115,50 @@ function isFunctionAvailable(definition: FunctionDefinition, capabilities: Reado
 	);
 }
 
+function publicDefinitions(
+	definitions: readonly FunctionDefinition[],
+	capabilities: ReadonlySet<string> | undefined,
+): FunctionDefinition[] {
+	return definitions.filter(
+		(definition) => definition.visibility === "public" && isFunctionAvailable(definition, capabilities),
+	);
+}
+
+function promptArgument(name: string, schema: TSchema, required: boolean): string {
+	if ("default" in schema) return `${name}=${JSON.stringify(schema.default)}`;
+	return required ? `${name}=...` : `${name}=None`;
+}
+
 function promptInventoryLine(definition: FunctionDefinition): string {
 	const qualifiedName = `${definition.namespace}.${definition.name}`;
-	const parameters = definition.parameters
-		.map((parameter) => (parameter.required ? parameter.name : `${parameter.name}=None`))
+	const required = new Set(definition.inputSchema.required ?? []);
+	const argumentsText = Object.entries(definition.inputSchema.properties)
+		.map(([name, schema]) => promptArgument(name, schema, required.has(name)))
 		.join(", ");
-	const description = (definition.promptSnippet ?? definition.description).replace(/\s+/g, " ").trim();
-	return `- \`await ${qualifiedName}(${parameters}) -> ${definition.returns}\`: ${description}`;
+	return `- \`await ${qualifiedName}(${argumentsText}) -> ${definition.pythonReturnType}\``;
 }
 
 export class FunctionRegistry {
 	private readonly definitions = new Map<string, FunctionDefinition>();
 
 	register(definition: FunctionDefinition): void {
-		if (!IDENTIFIER.test(definition.namespace) || !IDENTIFIER.test(definition.name)) {
+		if (!isPythonIdentifier(definition.namespace) || !isPythonIdentifier(definition.name)) {
 			throw new Error(`Invalid Python function name: ${definition.namespace}.${definition.name}`);
 		}
-		const seen = new Set<string>();
-		let optionalSeen = false;
-		for (const parameter of definition.parameters) {
-			if (!IDENTIFIER.test(parameter.name)) throw new Error(`Invalid parameter name: ${parameter.name}`);
-			if (seen.has(parameter.name)) throw new Error(`Duplicate parameter name: ${parameter.name}`);
-			seen.add(parameter.name);
-			if (!parameter.required) optionalSeen = true;
-			else if (optionalSeen) throw new Error(`Required parameter ${parameter.name} follows an optional parameter`);
+		const qualifiedName = `${definition.namespace}.${definition.name}`;
+		if (this.definitions.has(qualifiedName)) throw new Error(`Function is already registered: ${qualifiedName}`);
+		if (definition.abiVersion !== 2) throw new Error(`Unsupported ABI version for ${qualifiedName}`);
+		if (
+			definition.inputSchema.type !== "object" ||
+			!("additionalProperties" in definition.inputSchema) ||
+			definition.inputSchema.additionalProperties !== false
+		) {
+			throw new Error(`Input schema for ${qualifiedName} must be an object with additionalProperties false`);
 		}
-		this.definitions.set(`${definition.namespace}.${definition.name}`, definition);
+		for (const name of Object.keys(definition.inputSchema.properties)) {
+			if (!isPythonIdentifier(name)) throw new Error(`Invalid parameter name: ${name}`);
+		}
+		this.definitions.set(qualifiedName, definition);
 	}
 
 	unregisterNamespace(namespace: string): void {
@@ -114,26 +182,28 @@ export class FunctionRegistry {
 	}
 
 	pythonSpecifications(namespace?: string, capabilities?: ReadonlySet<string>): PythonFunctionSpecification[] {
-		return this.list(capabilities)
-			.filter((definition) => definition.installInPythonNamespace !== false)
+		return publicDefinitions(this.list(capabilities), capabilities)
 			.filter((definition) => namespace === undefined || definition.namespace === namespace)
 			.map((definition) => ({
 				name: definition.name,
 				namespace: definition.namespace,
 				qualified_name: `${definition.namespace}.${definition.name}`,
 				description: definition.description,
-				parameters: definition.parameters.map(({ name, required }) => ({ name, required })),
+				input_schema: metadataValue(definition.inputSchema),
+				return_type: definition.pythonReturnType,
 			}));
 	}
 
 	search(query: string, limit = 8, capabilities?: ReadonlySet<string>): JsonValue {
+		if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+			throw new RiemannHostError("invalid_arguments", "limit must be an integer from 1 to 50");
+		}
 		const terms = words(query);
-		return this.list(capabilities)
-			.filter((definition) => definition.installInPythonNamespace !== false)
+		return publicDefinitions(this.list(capabilities), capabilities)
 			.map((definition) => {
 				const qualifiedName = `${definition.namespace}.${definition.name}`;
 				const haystack = words(
-					`${qualifiedName} ${definition.description} ${definition.parameters.map((item) => item.description).join(" ")}`,
+					`${qualifiedName} ${definition.description} ${definition.capability ?? ""} ${JSON.stringify(definition.inputSchema)}`,
 				);
 				const score = terms.reduce((total, term) => {
 					if (qualifiedName.toLowerCase() === term) return total + 20;
@@ -144,40 +214,39 @@ export class FunctionRegistry {
 			})
 			.filter((item) => terms.length === 0 || item.score > 0)
 			.sort((left, right) => right.score - left.score || left.qualifiedName.localeCompare(right.qualifiedName))
-			.slice(0, Math.max(1, Math.min(limit, 50)))
+			.slice(0, limit)
 			.map(({ definition, qualifiedName }) => ({
 				name: qualifiedName,
 				description: definition.description,
-				returns: definition.returns,
+				pythonReturnType: definition.pythonReturnType,
+				capability: definition.capability ?? null,
 			}));
 	}
 
 	describe(name: string, capabilities?: ReadonlySet<string>): JsonValue {
 		const definition = this.definitions.get(name);
-		if (
-			!definition ||
-			definition.installInPythonNamespace === false ||
-			!isFunctionAvailable(definition, capabilities)
-		)
-			throw new Error(`Function not found: ${name}`);
+		if (!definition || definition.visibility !== "public" || !isFunctionAvailable(definition, capabilities)) {
+			throw new RiemannHostError("not_found", `Function not found: ${name}`);
+		}
 		return {
+			abiVersion: definition.abiVersion,
 			name,
 			description: definition.description,
-			parameters: definition.parameters.map((parameter) => ({
-				name: parameter.name,
-				type: parameter.type,
-				required: parameter.required,
-				description: parameter.description,
-			})),
-			returns: definition.returns,
-			examples: definition.examples ?? [],
+			inputSchema: metadataValue(definition.inputSchema),
+			outputSchema: metadataValue(definition.outputSchema),
+			defaults: schemaDefaults(definition),
+			pythonReturnType: definition.pythonReturnType,
+			errors: metadataValue(definition.errors),
+			effects: metadataValue(definition.effects),
+			idempotency: definition.idempotency,
+			cancellation: metadataValue(definition.cancellation),
 			capability: definition.capability ?? null,
+			example: definition.prompt.example,
 		};
 	}
 
 	promptInventory(capabilities: ReadonlySet<string>): string {
-		return this.list(capabilities)
-			.filter((definition) => definition.includeInSystemPrompt !== false)
+		return publicDefinitions(this.list(capabilities), capabilities)
 			.sort((left, right) => {
 				const namespaceOrder =
 					(PROMPT_NAMESPACE_ORDER.get(left.namespace) ?? Number.MAX_SAFE_INTEGER) -
@@ -191,8 +260,8 @@ export class FunctionRegistry {
 
 	promptGuidelines(capabilities: ReadonlySet<string>): string[] {
 		const guidelines = new Set<string>();
-		for (const definition of this.list(capabilities)) {
-			for (const guideline of definition.promptGuidelines ?? []) {
+		for (const definition of publicDefinitions(this.list(capabilities), capabilities)) {
+			for (const guideline of definition.prompt.guidelines ?? []) {
 				const normalized = guideline.replace(/\s+/g, " ").trim();
 				if (normalized) guidelines.add(normalized);
 			}
@@ -206,14 +275,39 @@ export class FunctionRegistry {
 		signal: AbortSignal,
 		onUpdate?: FunctionUpdateCallback,
 	): Promise<JsonValue | KernelHostResult> {
-		const definition = this.definitions.get(request.type);
-		if (!definition) throw new Error(`Function is not registered: ${request.type}`);
+		const definition = this.definitions.get(request.operation);
+		if (!definition) throw new RiemannHostError("not_found", `Function is not registered: ${request.operation}`);
 		if (!isFunctionAvailable(definition, capabilities)) {
 			throw new RiemannHostError(
 				"permission_denied",
 				`Capability ${definition.capability} is not available to this agent`,
 			);
 		}
-		return definition.handler(request.args, signal, onUpdate);
+		if (!Value.Check(definition.inputSchema, request.arguments)) {
+			throw new RiemannHostError(
+				"invalid_arguments",
+				`Invalid arguments for ${request.operation}`,
+				validationDetails(definition.inputSchema, request.arguments),
+			);
+		}
+		let result: JsonValue | KernelHostResult;
+		try {
+			result = await definition.handler(request.arguments, signal, onUpdate);
+		} catch (error) {
+			if (error instanceof RiemannHostError) {
+				const retryable = definition.errors.find((item) => item.code === error.code)?.retryable ?? error.retryable;
+				throw new RiemannHostError(error.code, error.message, error.details, retryable);
+			}
+			throw error;
+		}
+		const output = isKernelHostResult(result) ? result.value : result;
+		if (!Value.Check(definition.outputSchema, output)) {
+			throw new RiemannHostError(
+				"invalid_output",
+				`Invalid output from ${request.operation}`,
+				validationDetails(definition.outputSchema, output),
+			);
+		}
+		return result;
 	}
 }

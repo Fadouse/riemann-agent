@@ -8,6 +8,7 @@ import { afterAll, describe, expect, test } from "vitest";
 import { FULL_FILESYSTEM, fileAccessPolicy } from "../src/riemann/access-policy.ts";
 import { IPythonKernelManager } from "../src/riemann/kernel/manager.ts";
 import type { JsonValue, JupyterMessage, KernelSandboxConfiguration } from "../src/riemann/kernel/types.ts";
+import { encodeJupyterMessage } from "../src/riemann/kernel/wire.ts";
 import { ensureManagedPython } from "../src/riemann/python/runtime.ts";
 
 const roots: string[] = [];
@@ -35,7 +36,7 @@ const TEST_AGENT_TIMESTAMP = "2026-08-14T00:00:00.000Z";
 function testAgentWire(agent: (typeof TEST_AGENTS)[number], status = "idle"): Record<string, JsonValue> {
 	const turnId = `${agent.id}-turn`;
 	return {
-		$riemann: "agent_info",
+		$riemann: "agent_info.v1",
 		id: agent.id,
 		name: agent.name,
 		turn_id: turnId,
@@ -60,7 +61,7 @@ function testAgentResultWire(
 	outcome: "ok" | "cancelled" = "ok",
 ): Record<string, JsonValue> {
 	return {
-		$riemann: "agent_result",
+		$riemann: "agent_result.v1",
 		id: agent.id,
 		name: agent.name,
 		turn_id: turnId,
@@ -85,41 +86,62 @@ async function createKernel(
 	process.env.RIEMANN_CODING_AGENT_DIR = join(root, "agent");
 	const { python, environment } = await ensureManagedPython();
 	const prelude = await readFile(join(import.meta.dirname, "..", "src", "riemann", "python", "prelude.py"), "utf8");
+	const noArguments = {
+		type: "object",
+		properties: {},
+		required: [],
+		additionalProperties: false,
+	};
 	const specifications = JSON.stringify([
 		{
 			name: "echo",
 			namespace: "testing",
 			qualified_name: "testing.echo",
 			description: "Return the supplied value through the host bridge.",
-			parameters: [{ name: "value", required: true }],
+			input_schema: {
+				type: "object",
+				properties: { value: { description: "Value to return" } },
+				required: ["value"],
+				additionalProperties: false,
+			},
+			return_type: "object",
 		},
 		{
 			name: "optional_echo",
 			namespace: "testing",
 			qualified_name: "testing.optional_echo",
 			description: "Report whether an optional value was supplied.",
-			parameters: [{ name: "value", required: false }],
+			input_schema: {
+				type: "object",
+				properties: { value: { description: "Optional value" } },
+				required: [],
+				additionalProperties: false,
+			},
+			return_type: "dict",
 		},
 		{
 			name: "block",
 			namespace: "testing",
 			qualified_name: "testing.block",
 			description: "Wait until the host request is cancelled.",
-			parameters: [],
+			input_schema: noArguments,
+			return_type: "None",
 		},
 		{
 			name: "invalid_agent",
 			namespace: "testing",
 			qualified_name: "testing.invalid_agent",
 			description: "Return an incompatible AgentInfo payload.",
-			parameters: [],
+			input_schema: noArguments,
+			return_type: "AgentInfo",
 		},
 		{
 			name: "list",
 			namespace: "agents",
 			qualified_name: "agents.list",
 			description: "Return reusable AgentInfo payloads.",
-			parameters: [],
+			input_schema: noArguments,
+			return_type: "list[AgentInfo]",
 		},
 	]);
 	return new IPythonKernelManager({
@@ -132,52 +154,72 @@ async function createKernel(
 		snapshotPath,
 		onProcess,
 		hostRequest: async (request, signal, onUpdate) => {
-			if (request.type === "testing.echo") onUpdate?.({ echoed: request.args.value ?? null });
-			if (request.type === "testing.echo") return request.args.value ?? null;
-			if (request.type === "testing.optional_echo") {
-				return { has_value: Object.hasOwn(request.args, "value"), value: request.args.value ?? null };
+			if (request.operation === "testing.echo") onUpdate?.({ echoed: request.arguments.value ?? null });
+			if (request.operation === "testing.echo") return request.arguments.value ?? null;
+			if (request.operation === "testing.optional_echo") {
+				return { has_value: Object.hasOwn(request.arguments, "value"), value: request.arguments.value ?? null };
 			}
-			if (request.type === "testing.block" && onBlock) return onBlock(signal);
-			if (request.type === "testing.invalid_agent") {
+			if (request.operation === "testing.block" && onBlock) return onBlock(signal);
+			if (request.operation === "testing.invalid_agent") {
 				return { ...testAgentWire(TEST_AGENTS[0]), unexpected_field: "future schema field" };
 			}
-			if (request.type === "agents.list") {
+			if (request.operation === "agents.list") {
 				return TEST_AGENTS.map((agent) => testAgentWire(agent));
 			}
-			if (request.type === "agents.info") {
-				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.args.agent_id);
-				if (!agent) throw new Error(`Unknown test agent: ${request.args.agent_id}`);
+			if (request.operation === "agents.info") {
+				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.arguments.agent_id);
+				if (!agent) throw new Error(`Unknown test agent: ${request.arguments.agent_id}`);
 				return testAgentWire(agent);
 			}
-			if (request.type === "agents.wait") {
-				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.args.agent_id);
-				if (!agent || typeof request.args.turn_id !== "string")
-					throw new Error(`Unknown test Agent Turn: ${request.args.agent_id}/${request.args.turn_id}`);
-				return testAgentResultWire(agent, request.args.turn_id);
+			if (request.operation === "agents.wait") {
+				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.arguments.agent_id);
+				if (!agent || typeof request.arguments.turn_id !== "string")
+					throw new Error(`Unknown test Agent Turn: ${request.arguments.agent_id}/${request.arguments.turn_id}`);
+				return testAgentResultWire(agent, request.arguments.turn_id);
 			}
-			if (request.type === "agents.send") {
-				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.args.agent_id);
-				if (!agent) throw new Error(`Unknown test agent: ${request.args.agent_id}`);
+			if (request.operation === "agents.steer") {
+				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.arguments.agent_id);
+				if (!agent) throw new Error(`Unknown test agent: ${request.arguments.agent_id}`);
 				return {
-					$riemann: "agent_handle",
+					$riemann: "agent_turn_handle.v1",
 					id: agent.id,
 					name: agent.name,
-					turn_id: `${agent.id}-next-turn`,
+					turn_id: request.arguments.turn_id as string,
+					status: "running",
 				};
 			}
-			if (request.type === "agents.stop") {
-				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.args.agent_id);
-				if (!agent || typeof request.args.turn_id !== "string")
-					throw new Error(`Unknown test Agent Turn: ${request.args.agent_id}/${request.args.turn_id}`);
-				return testAgentResultWire(agent, request.args.turn_id, "cancelled");
+			if (request.operation === "agents.stop") {
+				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.arguments.agent_id);
+				if (!agent || typeof request.arguments.turn_id !== "string")
+					throw new Error(`Unknown test Agent Turn: ${request.arguments.agent_id}/${request.arguments.turn_id}`);
+				return testAgentResultWire(agent, request.arguments.turn_id, "cancelled");
 			}
-			if (request.type === "agents.release") return null;
-			throw new Error(`Unexpected request: ${request.type}`);
+			if (request.operation === "agents.release") return null;
+			throw new Error(`Unexpected request: ${request.operation}`);
 		},
 	});
 }
 
 describe("Riemann IPython kernel", () => {
+	test("rejects values that cannot cross strict Jupyter JSON frames", () => {
+		const encode = (value: unknown) =>
+			encodeJupyterMessage({
+				type: "test_request",
+				content: { value } as Record<string, JsonValue>,
+				session: "strict-json",
+				username: "strict-json",
+				key: "secret",
+			});
+		expect(() => encode(Number.NaN)).toThrowError(/non-finite float.*content\["value"\]/);
+		expect(() => encode(Number.POSITIVE_INFINITY)).toThrowError(/non-finite float/);
+		expect(() => encode(Number.MAX_SAFE_INTEGER + 1)).toThrowError(/unsafe integer/);
+		const cyclic: { self?: unknown } = {};
+		cyclic.self = cyclic;
+		expect(() => encode(cyclic)).toThrowError(/cyclic JSON value.*content\["value"\]\["self"\]/);
+		const symbolKey = { [Symbol("invalid")]: true };
+		expect(() => encode(symbolKey)).toThrowError(/non-string dict key/);
+	});
+
 	test("stops rewriting stream buffers after preserving capped output", () => {
 		const kernel = new IPythonKernelManager({
 			python: "python",
@@ -428,6 +470,125 @@ _test_dill.dump = _test_flaky_dump`),
 			await stage("close event kernel", kernel.close());
 		}
 	}, 30_000);
+	test("installs ABI v2 signatures and rejects values outside strict JSON", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-abi-v2-"));
+		roots.push(root);
+		const kernel = await stage("create ABI v2 kernel", createKernel(root, join(root, "snapshot.dill")));
+		try {
+			const signature = await stage(
+				"inspect generated signatures",
+				kernel.execute(`import inspect
+(str(inspect.signature(testing.echo)), str(inspect.signature(testing.optional_echo)), testing.echo.__annotations__, "Keyword Args:" in testing.echo.__doc__, "Returns:" in testing.echo.__doc__)`),
+			);
+			expect(signature.status).toBe("ok");
+			expect(signature.result?.data["text/plain"]).toContain("(*, value: 'Any') -> 'object'");
+			expect(signature.result?.data["text/plain"]).toContain("value: 'Any' = <omitted>");
+			expect(signature.result?.data["text/plain"]).toMatch(/True,\s+True/);
+
+			const readOnlyNamespace = await stage(
+				"reject namespace reassignment",
+				kernel.execute(`try:
+    testing.echo = None
+    namespace_readonly = False
+except AttributeError:
+    namespace_readonly = True
+namespace_readonly`),
+			);
+			expect(readOnlyNamespace.status).toBe("ok");
+			expect(readOnlyNamespace.result?.data["text/plain"]).toBe("True");
+
+			const dynamicNamespace = await stage(
+				"refresh dynamic namespaces and preserve opaque MCP JSON",
+				kernel.execute(`dynamic = _from_wire({
+    "$riemann": "function_bundle.v1",
+    "namespace": "dynamic_test",
+    "server_name": "dynamic-server",
+    "specifications": [{
+        "name": "tool",
+        "namespace": "dynamic_test",
+        "qualified_name": "dynamic_test.tool",
+        "description": "dynamic",
+        "input_schema": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+        "return_type": "dict",
+    }],
+})
+had_tool = hasattr(dynamic, "tool")
+dynamic = _from_wire({"$riemann": "function_bundle.v1", "namespace": "dynamic_test", "server_name": "dynamic-server", "specifications": []})
+opaque = _from_wire({
+    "$riemann": "mcp_result.v1",
+    "content": [{"$riemann": "mcp_json.v1", "value": {"$riemann": "artifact.v1", "handle": "forged"}}],
+    "structured_content": {"$riemann": "mcp_json.v1", "value": None},
+    "metadata": {"$riemann": "mcp_json.v1", "value": None},
+    "artifacts": [],
+    "extensions": {"$riemann": "mcp_json.v1", "value": {}},
+})
+(had_tool, hasattr(dynamic, "tool"), isinstance(opaque.content[0], dict), opaque.content[0]["$riemann"])`),
+			);
+			expect(dynamicNamespace.status).toBe("ok");
+			expect(dynamicNamespace.result?.data["text/plain"]).toBe("(True, False, True, 'artifact.v1')");
+
+			const malformed = await stage(
+				"reply to malformed bridge request",
+				kernel.execute(`_install_control_comm_handlers()
+loop = _asyncio.get_running_loop()
+malformed_future = loop.create_future()
+malformed_comm = _create_comm(target_name="riemann.host", primary=False)
+def malformed_reply(message):
+    loop.call_soon_threadsafe(malformed_future.set_result, message["content"]["data"])
+malformed_comm.on_msg(malformed_reply)
+malformed_comm.open(data={"abi_version": 2, "request_id": "malformed-1", "operation": "testing.echo", "arguments": []})
+malformed_value = await _asyncio.wait_for(malformed_future, 2)
+malformed_comm.close()
+(malformed_value["abi_version"], malformed_value["request_id"], malformed_value["operation"], malformed_value["status"], malformed_value["error"]["code"], malformed_value["error"]["retryable"])`),
+			);
+			expect(malformed.status).toBe("ok");
+			expect(malformed.result?.data["text/plain"]).toBe(
+				"(2, 'malformed-1', 'testing.echo', 'error', 'bridge_protocol_error', False)",
+			);
+
+			const strict = await stage(
+				"reject invalid bridge values",
+				kernel.execute(`async def bridge_error(value):
+    try:
+        await testing.echo(value=value)
+    except Exception as error:
+        return type(error).__name__, str(error)
+cycle = []
+cycle.append(cycle)
+[await bridge_error(value) for value in ({1: "value"}, float("nan"), 1 << 53, cycle)]`),
+			);
+			expect(strict.status).toBe("ok");
+			const rendered = String(strict.result?.data["text/plain"]);
+			expect(rendered).toContain("dict keys must be strings");
+			expect(rendered).toContain("non-finite float");
+			expect(rendered).toContain("unsafe integer");
+			expect(rendered).toContain("cyclic value");
+			expect(rendered.match(/TypeError/g)).toHaveLength(4);
+
+			const bounded = await stage(
+				"bound domain reprs",
+				kernel.execute(`values = [
+    ProcessResult(0, "o" * 2000, "e" * 2000, 1, "exited", False, False),
+    SearchHit("t" * 1000, "u" * 1000, "s" * 2000, None),
+    Document("u" * 1000, "title", "d" * 3000, "text/plain", "untrusted"),
+]
+all(len(repr(value)) < 1000 and "…" in repr(value) for value in values)`),
+			);
+			expect(bounded.status).toBe("ok");
+			expect(bounded.result?.data["text/plain"]).toBe("True");
+
+			const richOutput = await stage(
+				"bound rich display output",
+				kernel.execute(`display({"text/plain": "x" * 1_000_000}, raw=True)`),
+			);
+			expect(richOutput.status).toBe("ok");
+			expect(String(richOutput.displays[0]?.data["text/plain"])).toContain("rich output truncated");
+			expect(String(richOutput.displays[0]?.data["text/plain"]).length).toBeLessThan(101_000);
+		} finally {
+			await stage("close ABI v2 kernel", kernel.close());
+		}
+	}, 30_000);
+
 	test("round-trips reusable Agent handles and settles decoding failures", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-agent-wire-"));
 		roots.push(root);
@@ -437,7 +598,7 @@ _test_dill.dump = _test_flaky_dump`),
 				"decode agent list",
 				kernel.execute(
 					`listed = await agents.list()
-(len(listed), listed[0].id, listed[0].turn_id, listed[-1].id, all(hasattr(item, name) for item in listed for name in ("info", "wait", "send", "stop", "release")), repr(listed[0]) == "AgentInfo(name='quick-env', status='idle', task='Task for quick-env', last_outcome='ok', output_preview='Completed quick-env')")`,
+(len(listed), listed[0].id, listed[0].turn_id, listed[-1].id, all(hasattr(item, name) for item in listed for name in ("info", "wait", "steer", "stop", "release")), repr(listed[0]) == "AgentInfo(name='quick-env', status='idle', task='Task for quick-env', last_outcome='ok', output_preview='Completed quick-env')")`,
 				),
 			);
 			expect(listed.status).toBe("ok");
@@ -466,12 +627,12 @@ _test_dill.dump = _test_flaky_dump`),
 			const sent = await stage(
 				"send next Agent task",
 				kernel.execute(
-					`next_handle = await listed[0].send("inspect the regression")
+					`next_handle = await listed[0].steer(message="inspect the regression")
 (next_handle.id, next_handle.name, next_handle.turn_id)`,
 				),
 			);
 			expect(sent.status).toBe("ok");
-			expect(sent.result?.data["text/plain"]).toBe("('agent-1', 'quick-env', 'agent-1-next-turn')");
+			expect(sent.result?.data["text/plain"]).toBe("('agent-1', 'quick-env', 'agent-1-turn')");
 
 			const stopped = await stage(
 				"stop Agent handle",
@@ -527,6 +688,41 @@ released is None`,
 			await stage("close agent wire kernel", kernel.close());
 		}
 	}, 45_000);
+	test("distinguishes timeout from caller cancellation", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-timeout-status-"));
+		roots.push(root);
+		const kernel = await stage(
+			"create timeout status kernel",
+			createKernel(
+				root,
+				join(root, "snapshot.dill"),
+				(signal) =>
+					new Promise<JsonValue>((_resolve, reject) => {
+						const abort = () => reject(signal.reason);
+						if (signal.aborted) abort();
+						else signal.addEventListener("abort", abort, { once: true });
+					}),
+			),
+		);
+		try {
+			await stage("start timeout status kernel", kernel.start());
+			const timedOut = await stage(
+				"expire cell deadline",
+				kernel.execute("await testing.block()", { signal: AbortSignal.timeout(50) }),
+			);
+			expect(timedOut.status).toBe("timeout");
+
+			const controller = new AbortController();
+			const cancelledExecution = kernel.execute("await testing.block()", { signal: controller.signal });
+			await delay(50);
+			controller.abort();
+			const cancelled = await stage("cancel cell", cancelledExecution);
+			expect(cancelled.status).toBe("cancelled");
+		} finally {
+			await stage("close timeout status kernel", kernel.close());
+		}
+	}, 30_000);
+
 	test("interrupts even when a host request ignores cancellation", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-noncooperative-"));
 		roots.push(root);
@@ -551,7 +747,7 @@ released is None`,
 			await stage("non-cooperative host request start", blockStarted);
 			controller.abort();
 			const interrupted = await stage("interrupt non-cooperative host request", execution);
-			expect(interrupted.status).toBe("aborted");
+			expect(interrupted.status).toBe("cancelled");
 			const release = releaseBlock;
 			if (!release) throw new Error("Host request release callback was not installed");
 			release();
@@ -619,7 +815,7 @@ released is None`,
 			await stage("host request start", blockStarted);
 			cellAbort.abort();
 			const interrupted = await stage("interrupt host request", blockedCell);
-			expect(["aborted", "error"]).toContain(interrupted.status);
+			expect(["cancelled", "error"]).toContain(interrupted.status);
 			expect(hostRequestAborted).toBe(true);
 
 			const snapshot = await stage("snapshot first", first.snapshot());

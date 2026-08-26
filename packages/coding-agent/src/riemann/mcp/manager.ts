@@ -4,7 +4,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { Type } from "typebox";
 import { raceWithAbortSignal } from "../../utils/abort.ts";
 import type { McpServerConfig } from "../config.ts";
 import { expandConfigSecret } from "../config.ts";
@@ -17,7 +18,6 @@ import {
 } from "../functions/registry.ts";
 import { storeModelImage } from "../images.ts";
 import type { JsonValue } from "../kernel/types.ts";
-import { type KernelHostResult, type KernelModelContent, kernelHostResult } from "../kernel/types.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
 
 type McpCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
@@ -34,15 +34,122 @@ interface McpServerState {
 	functionNames?: string[];
 }
 
-const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const RESERVED_NAMESPACES = new Set(["fs", "shell", "web", "artifacts", "agents", "mcp", "catalog", "state"]);
+const RESERVED_NAMESPACES = new Set([
+	"fs",
+	"shell",
+	"web",
+	"artifacts",
+	"agents",
+	"mcp",
+	"catalog",
+	"state",
+	"Artifact",
+	"TextSnapshot",
+	"ImageSnapshot",
+	"ProcessResult",
+	"SearchHit",
+	"Document",
+	"RemovedFile",
+	"McpResult",
+	"AgentInfo",
+	"AgentResult",
+	"AgentTurnHandle",
+	"McpServerStatus",
+	"RiemannError",
+	"ConflictError",
+	"ApprovalRequired",
+	"NotFoundError",
+	"LimitExceededError",
+	"PermissionDeniedError",
+	"RiemannTimeoutError",
+	"CancelledError",
+	"UnavailableError",
+]);
+const MCP_NAMESPACE_METHODS = new Set(["status", "refresh", "close"]);
+const PYTHON_KEYWORDS = new Set([
+	"False",
+	"None",
+	"True",
+	"and",
+	"as",
+	"assert",
+	"async",
+	"await",
+	"break",
+	"class",
+	"continue",
+	"def",
+	"del",
+	"elif",
+	"else",
+	"except",
+	"finally",
+	"for",
+	"from",
+	"global",
+	"if",
+	"import",
+	"in",
+	"is",
+	"lambda",
+	"nonlocal",
+	"not",
+	"or",
+	"pass",
+	"raise",
+	"return",
+	"try",
+	"while",
+	"with",
+	"yield",
+]);
+
+const McpResultSchema = Type.Object(
+	{
+		$riemann: Type.Literal("mcp_result.v1"),
+		content: Type.Array(Type.Any()),
+		structured_content: Type.Any(),
+		metadata: Type.Any(),
+		artifacts: Type.Array(Type.Any()),
+		extensions: Type.Record(Type.String(), Type.Any()),
+	},
+	{ additionalProperties: false },
+);
+const FunctionBundleSchema = Type.Object(
+	{
+		$riemann: Type.Literal("function_bundle.v1"),
+		namespace: Type.String(),
+		server_name: Type.String(),
+		specifications: Type.Array(Type.Any()),
+	},
+	{ additionalProperties: false },
+);
+
+const McpServerStatusSchema = Type.Object(
+	{
+		$riemann: Type.Literal("mcp_server_status.v1"),
+		name: Type.String(),
+		namespace: Type.String(),
+		status: Type.Union([
+			Type.Literal("idle"),
+			Type.Literal("connecting"),
+			Type.Literal("ready"),
+			Type.Literal("failed"),
+			Type.Literal("closed"),
+		]),
+		tool_count: Type.Integer({ minimum: 0 }),
+		error: Type.Union([Type.String(), Type.Null()]),
+	},
+	{ additionalProperties: false },
+);
 
 function safeIdentifier(value: string): string {
 	const normalized = value
 		.replace(/[^A-Za-z0-9_]+/g, "_")
 		.replace(/^([^A-Za-z_])/, "_$1")
 		.replace(/_+/g, "_");
-	return normalized || "tool";
+	const identifier = normalized || "tool";
+	return PYTHON_KEYWORDS.has(identifier) ? `${identifier}_` : identifier;
 }
 
 function asJson(value: unknown): JsonValue {
@@ -65,26 +172,48 @@ export class RiemannMcpManager {
 	private readonly cwd: string;
 	private readonly artifacts: ArtifactStore;
 	private readonly registry: FunctionRegistry;
+	private readonly capabilities: ReadonlySet<string>;
 
 	constructor(
 		configs: Record<string, McpServerConfig>,
 		cwd: string,
 		registry: FunctionRegistry,
 		artifacts: ArtifactStore,
+		capabilities: ReadonlySet<string>,
 	) {
 		this.configs = configs;
 		this.cwd = cwd;
 		this.registry = registry;
 		this.artifacts = artifacts;
-		const usedNamespaces = new Set<string>(RESERVED_NAMESPACES);
-		for (const [name, config] of Object.entries(configs)) {
-			if (config.enabled === false) continue;
-			const serverNamespace = safeIdentifier(name);
-			const baseNamespace = usedNamespaces.has(serverNamespace) ? `mcp_${serverNamespace}` : serverNamespace;
-			const namespace = usedNamespaces.has(baseNamespace)
-				? `${baseNamespace}_${createHash("sha256").update(name).digest("hex").slice(0, 8)}`
-				: baseNamespace;
-			usedNamespaces.add(namespace);
+		this.capabilities = capabilities;
+		const enabledNames = Object.entries(configs)
+			.filter(([, config]) => config.enabled !== false)
+			.map(([name]) => name)
+			.sort();
+		const counts = new Map<string, number>();
+		for (const name of enabledNames) {
+			const normalized = safeIdentifier(name);
+			counts.set(normalized, (counts.get(normalized) ?? 0) + 1);
+		}
+		const canUsePlain = (normalized: string): boolean =>
+			!normalized.startsWith("_") && !RESERVED_NAMESPACES.has(normalized) && (counts.get(normalized) ?? 0) === 1;
+		const reservedCandidates = new Set(
+			enabledNames.map((name) => safeIdentifier(name)).filter((normalized) => canUsePlain(normalized)),
+		);
+		const used = new Set<string>();
+		for (const name of enabledNames) {
+			const normalized = safeIdentifier(name);
+			let namespace = normalized;
+			if (!canUsePlain(normalized)) {
+				const digest = createHash("sha256").update(name).digest("hex");
+				let length = 8;
+				do {
+					namespace = `mcp_${normalized.replace(/^_+/, "") || "server"}_${digest.slice(0, length)}`;
+					length += 4;
+				} while (used.has(namespace) || reservedCandidates.has(namespace) || RESERVED_NAMESPACES.has(namespace));
+			}
+			if (used.has(namespace)) throw new Error(`Could not allocate MCP namespace for ${name}`);
+			used.add(namespace);
 			this.states.set(name, { name, status: "idle", tools: [], namespace });
 		}
 	}
@@ -130,15 +259,25 @@ export class RiemannMcpManager {
 		return new StreamableHTTPClientTransport(url, { requestInit: { headers } });
 	}
 
-	private async listTools(client: Client, timeout: number): Promise<Tool[]> {
+	private async listTools(client: Client, timeout: number, signal: AbortSignal): Promise<Tool[]> {
 		const tools: Tool[] = [];
 		let cursor: string | undefined;
 		const cursors = new Set<string>();
+		const deadline = Date.now() + timeout;
 		do {
-			const result = await client.listTools(cursor ? { cursor } : undefined, { timeout, maxTotalTimeout: timeout });
+			if (cursors.size >= 100) throw new RiemannHostError("mcp_error", "MCP tools/list exceeded 100 pages");
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) throw new RiemannHostError("timeout", "MCP tools/list timed out");
+			const result = await client.listTools(cursor ? { cursor } : undefined, {
+				timeout: remaining,
+				maxTotalTimeout: remaining,
+				signal,
+			});
 			tools.push(...result.tools);
+			if (tools.length > 1_000) throw new RiemannHostError("mcp_error", "MCP server exposed more than 1000 tools");
 			cursor = result.nextCursor;
-			if (cursor && cursors.has(cursor)) throw new Error("MCP tools/list returned a duplicate cursor");
+			if (cursor && cursors.has(cursor))
+				throw new RiemannHostError("mcp_error", "MCP tools/list returned a duplicate cursor");
 			if (cursor) cursors.add(cursor);
 		} while (cursor);
 		return tools;
@@ -150,22 +289,22 @@ export class RiemannMcpManager {
 		return tools.filter((tool) => (!enabled || enabled.has(tool.name)) && !disabled.has(tool.name));
 	}
 
-	private async normalizeToolResult(result: McpCallToolResult): Promise<JsonValue | KernelHostResult> {
-		const wire = asJson(result);
-		if (!("content" in result) || !Array.isArray(result.content)) return wire;
-		if (typeof wire !== "object" || wire === null || Array.isArray(wire) || !Array.isArray(wire.content)) return wire;
-		const content = result.content as CallToolResult["content"];
-		const modelContent: KernelModelContent[] = [];
-		const normalizedContent: JsonValue[] = [];
-		for (let index = 0; index < content.length; index += 1) {
-			const item = content[index];
-			const wireItem = wire.content[index];
+	private async normalizeToolResult(result: McpCallToolResult): Promise<JsonValue> {
+		const raw = asJson(result);
+		if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+			throw new RiemannHostError("mcp_error", "MCP tool returned an invalid result");
+		}
+		const rawContent = Array.isArray(raw.content) ? raw.content : [];
+		const protocolContent = "content" in result && Array.isArray(result.content) ? result.content : [];
+		const content: JsonValue[] = [];
+		const artifacts: JsonValue[] = [];
+		for (let index = 0; index < rawContent.length; index += 1) {
+			const wireItem = rawContent[index];
+			const item = protocolContent[index];
 			if (!item || typeof wireItem !== "object" || wireItem === null || Array.isArray(wireItem)) {
-				if (wireItem !== undefined) normalizedContent.push(wireItem);
+				content.push(wireItem ?? null);
 				continue;
 			}
-			const audience = "annotations" in item ? item.annotations?.audience : undefined;
-			const visibleToModel = audience === undefined || audience.includes("assistant");
 			if (item.type === "image") {
 				const image = await storeModelImage({
 					artifacts: this.artifacts,
@@ -173,17 +312,12 @@ export class RiemannMcpManager {
 					claimedMimeType: item.mimeType,
 					name: `mcp-image-${index + 1}`,
 				});
-				const normalizedItem = { ...wireItem };
-				delete normalizedItem.data;
-				normalizedItem.mimeType = image.reference.mimeType;
-				normalizedItem.artifact = image.artifact;
-				normalizedContent.push(normalizedItem);
-				if (visibleToModel) {
-					modelContent.push(
-						{ type: "text", text: `MCP image result [${image.reference.mimeType}]` },
-						image.reference,
-					);
-				}
+				const normalized = { ...wireItem };
+				delete normalized.data;
+				normalized.mimeType = image.reference.mimeType;
+				normalized.artifact = image.artifact;
+				content.push(normalized);
+				artifacts.push(image.artifact);
 				continue;
 			}
 			if (item.type === "resource" && "blob" in item.resource && item.resource.mimeType?.startsWith("image/")) {
@@ -194,27 +328,34 @@ export class RiemannMcpManager {
 					name: `mcp-resource-image-${index + 1}`,
 				});
 				const wireResource = wireItem.resource;
-				if (typeof wireResource !== "object" || wireResource === null || Array.isArray(wireResource)) {
-					normalizedContent.push(wireItem);
+				if (typeof wireResource === "object" && wireResource !== null && !Array.isArray(wireResource)) {
+					const normalizedResource = { ...wireResource };
+					delete normalizedResource.blob;
+					normalizedResource.mimeType = image.reference.mimeType;
+					normalizedResource.artifact = image.artifact;
+					content.push({ ...wireItem, resource: normalizedResource });
+					artifacts.push(image.artifact);
 					continue;
 				}
-				const normalizedResource = { ...wireResource };
-				delete normalizedResource.blob;
-				normalizedResource.mimeType = image.reference.mimeType;
-				normalizedResource.artifact = image.artifact;
-				normalizedContent.push({ ...wireItem, resource: normalizedResource });
-				if (visibleToModel) {
-					modelContent.push(
-						{ type: "text", text: `MCP image resource [${image.reference.mimeType}]` },
-						image.reference,
-					);
-				}
-				continue;
 			}
-			normalizedContent.push(wireItem);
+			content.push(wireItem);
 		}
-		wire.content = normalizedContent;
-		return modelContent.length > 0 ? kernelHostResult(wire, modelContent) : wire;
+		const extensions = Object.fromEntries(
+			Object.entries(raw).filter(([key]) => !["content", "structuredContent", "_meta", "isError"].includes(key)),
+		);
+		const opaqueMcpJson = (value: JsonValue): JsonValue => ({ $riemann: "mcp_json.v1", value });
+		const normalized: JsonValue = {
+			$riemann: "mcp_result.v1",
+			content: content.map(opaqueMcpJson),
+			structured_content: opaqueMcpJson(raw.structuredContent ?? null),
+			metadata: opaqueMcpJson(raw._meta ?? null),
+			artifacts,
+			extensions: opaqueMcpJson(extensions),
+		};
+		if (result.isError) {
+			throw new RiemannHostError("mcp_tool_error", "MCP tool reported an error", normalized);
+		}
+		return normalized;
 	}
 
 	private definitionForTool(
@@ -224,73 +365,60 @@ export class RiemannMcpManager {
 		usedNames: Set<string>,
 	): FunctionDefinition {
 		let name = safeIdentifier(tool.name);
+		if (name.startsWith("_") || MCP_NAMESPACE_METHODS.has(name)) {
+			name = `tool_${name.replace(/^_+/, "") || "private"}_${createHash("sha256").update(tool.name).digest("hex").slice(0, 8)}`;
+		}
 		if (usedNames.has(name)) name = `${name}_${createHash("sha256").update(tool.name).digest("hex").slice(0, 8)}`;
 		usedNames.add(name);
-		const schema = tool.inputSchema;
-		const properties =
-			schema &&
-			typeof schema === "object" &&
-			"properties" in schema &&
-			schema.properties &&
-			typeof schema.properties === "object"
-				? (schema.properties as Record<string, unknown>)
-				: {};
-		const required = new Set(
-			Array.isArray(schema?.required)
-				? schema.required.filter((item): item is string => typeof item === "string")
-				: [],
+		const remoteInputSchema = Type.Unsafe<Record<string, JsonValue>>(
+			asJson(tool.inputSchema) as Record<string, JsonValue>,
 		);
-		const propertyNames = Object.keys(properties);
-		const directlyCallable =
-			propertyNames.length <= 24 && propertyNames.every((property) => IDENTIFIER.test(property));
-		const orderedNames = directlyCallable
-			? [
-					...propertyNames.filter((property) => required.has(property)),
-					...propertyNames.filter((property) => !required.has(property)),
-				]
-			: ["arguments"];
-		const parameters = orderedNames.map((parameter) => ({
-			name: parameter,
-			description: directlyCallable
-				? JSON.stringify(properties[parameter] ?? {})
-				: `Arguments matching the MCP input schema: ${JSON.stringify(schema ?? {})}`,
-			type: directlyCallable ? "Any" : "dict",
-			required: directlyCallable ? required.has(parameter) : true,
-		}));
 		return {
+			abiVersion: 2,
 			name,
 			namespace,
 			description: `${tool.description || tool.title || tool.name} [MCP ${serverName}/${tool.name}]`,
-			parameters,
-			returns: "MCP tool result",
+			inputSchema: Type.Object({ input: remoteInputSchema }, { additionalProperties: false }),
+			outputSchema: McpResultSchema,
+			pythonReturnType: "McpResult",
+			errors: [
+				{ code: "not_ready", description: "The MCP server is not connected", retryable: true },
+				{ code: "mcp_tool_error", description: "The MCP tool returned isError", retryable: false },
+				{ code: "mcp_error", description: "The MCP transport failed", retryable: true },
+			],
+			effects: [{ kind: "remote-call", resource: `MCP ${serverName}/${tool.name}` }],
+			idempotency: "conditional",
+			cancellation: { supported: true, description: "Cancels the MCP request" },
+			visibility: "public",
+			prompt: {
+				inventory: tool.description || tool.title || tool.name,
+				example: `await ${namespace}.${name}(input={})`,
+			},
 			capability: `mcp.${serverName}`,
-			includeInSystemPrompt: false,
 			handler: async (args, signal) => {
 				const state = this.states.get(serverName);
 				const config = this.configs[serverName];
-				if (!state?.client || state.status !== "ready" || !config)
+				if (!state?.client || state.status !== "ready" || !config) {
 					throw new RiemannHostError("not_ready", `MCP server ${serverName} is not ready`);
-				let callArguments: Record<string, JsonValue>;
-				if (directlyCallable) {
-					callArguments = {};
-					for (const property of propertyNames) {
-						const value = args[property];
-						if (value !== undefined) callArguments[property] = value;
-					}
-				} else {
-					if (typeof args.arguments !== "object" || args.arguments === null || Array.isArray(args.arguments)) {
-						throw new RiemannHostError("invalid_arguments", "arguments must be a dictionary");
-					}
-					callArguments = args.arguments;
+				}
+				const input = args.input;
+				if (typeof input !== "object" || input === null || Array.isArray(input)) {
+					throw new RiemannHostError("invalid_arguments", "input must be an object");
 				}
 				const timeout = config.toolTimeoutMs ?? 60_000;
-				const result = await state.client.callTool({ name: tool.name, arguments: callArguments }, undefined, {
-					timeout,
-					maxTotalTimeout: timeout,
-					resetTimeoutOnProgress: true,
-					signal,
-				});
-				return this.normalizeToolResult(result);
+				try {
+					const result = await state.client.callTool({ name: tool.name, arguments: input }, undefined, {
+						timeout,
+						maxTotalTimeout: timeout,
+						resetTimeoutOnProgress: true,
+						signal,
+					});
+					return this.normalizeToolResult(result);
+				} catch (error) {
+					if (error instanceof RiemannHostError) throw error;
+					if (signal.aborted) throw new RiemannHostError("cancelled", "MCP tool call was cancelled");
+					throw new RiemannHostError("mcp_error", `MCP tool call failed: ${errorMessage(error)}`);
+				}
 			},
 		};
 	}
@@ -300,39 +428,86 @@ export class RiemannMcpManager {
 		if (!namespace) throw new RiemannHostError("invalid_config", `MCP server ${serverName} has no Python namespace`);
 		this.registry.unregisterNamespace(namespace);
 		const usedNames = new Set<string>();
-		const definitions = state.tools.map((tool) => this.definitionForTool(serverName, namespace, tool, usedNames));
+		const definitions = [...state.tools]
+			.sort((left, right) => left.name.localeCompare(right.name))
+			.map((tool) => this.definitionForTool(serverName, namespace, tool, usedNames));
 		for (const definition of definitions) this.registry.register(definition);
 		state.namespace = namespace;
 		state.functionNames = definitions.map((definition) => `${namespace}.${definition.name}`);
 		return this.registry.pythonSpecifications(namespace);
 	}
 
-	async activate(serverName: string, signal: AbortSignal): Promise<JsonValue> {
-		if (this.closed) throw new RiemannHostError("closed", "MCP manager is closed");
-		const config = this.configs[serverName];
-		const state = this.states.get(serverName);
-		if (!config || !state) throw new RiemannHostError("not_found", `Unknown or disabled MCP server: ${serverName}`);
-		if (state.status === "ready") {
-			return asJson({
-				$riemann: "function_bundle",
-				namespace: state.namespace ?? "",
-				specifications: this.registry.pythonSpecifications(state.namespace),
-			});
-		}
-		let startup = this.startups.get(serverName);
-		if (!startup) {
-			startup = this.connect(serverName, config, state);
-			this.startups.set(serverName, startup);
-		}
-		const activated = await raceWithAbortSignal(startup, signal);
+	private functionBundle(serverName: string, state: McpServerState): JsonValue {
 		return asJson({
-			$riemann: "function_bundle",
-			namespace: activated.namespace ?? "",
-			specifications: this.registry.pythonSpecifications(activated.namespace),
+			$riemann: "function_bundle.v1",
+			namespace: state.namespace ?? "",
+			server_name: serverName,
+			specifications: this.registry.pythonSpecifications(state.namespace),
 		});
 	}
 
-	private async connect(serverName: string, config: McpServerConfig, state: McpServerState): Promise<McpServerState> {
+	private requireServer(serverName: string): McpServerState {
+		const state = this.states.get(serverName);
+		if (!state || !this.configs[serverName]) {
+			throw new RiemannHostError("not_found", `Unknown or disabled MCP server: ${serverName}`);
+		}
+		if (!hasCapability(this.capabilities, `mcp.${serverName}`, "mcp")) {
+			throw new RiemannHostError("permission_denied", `Capability mcp.${serverName} is not available to this agent`);
+		}
+		return state;
+	}
+
+	serverStatus(serverName: string): JsonValue {
+		const state = this.requireServer(serverName);
+		return {
+			$riemann: "mcp_server_status.v1",
+			name: serverName,
+			namespace: state.namespace ?? "",
+			status: state.status,
+			tool_count: state.tools.length,
+			error: state.error ?? null,
+		};
+	}
+
+	async closeServer(serverName: string): Promise<void> {
+		const state = this.requireServer(serverName);
+		state.status = "closed";
+		await state.client?.close().catch(() => undefined);
+		if (state.namespace) this.registry.unregisterNamespace(state.namespace);
+		state.client = undefined;
+		state.transport = undefined;
+		state.tools = [];
+		state.functionNames = [];
+		state.error = undefined;
+		state.status = "idle";
+	}
+
+	async refresh(serverName: string, signal: AbortSignal): Promise<JsonValue> {
+		await this.closeServer(serverName);
+		return this.open(serverName, signal);
+	}
+
+	async open(serverName: string, signal: AbortSignal): Promise<JsonValue> {
+		if (this.closed) throw new RiemannHostError("closed", "MCP manager is closed");
+		const config = this.configs[serverName];
+		const state = this.requireServer(serverName);
+		if (!config) throw new RiemannHostError("not_found", `Unknown MCP server: ${serverName}`);
+		if (state.status === "ready") return this.functionBundle(serverName, state);
+		let startup = this.startups.get(serverName);
+		if (!startup) {
+			startup = this.connect(serverName, config, state, signal);
+			this.startups.set(serverName, startup);
+		}
+		const activated = await raceWithAbortSignal(startup, signal);
+		return this.functionBundle(serverName, activated);
+	}
+
+	private async connect(
+		serverName: string,
+		config: McpServerConfig,
+		state: McpServerState,
+		callerSignal: AbortSignal,
+	): Promise<McpServerState> {
 		state.status = "connecting";
 		try {
 			const transport = this.createTransport(serverName, config, state);
@@ -344,10 +519,12 @@ export class RiemannMcpManager {
 			};
 			client.onclose = () => {
 				if (!this.closed && state.status !== "failed") state.status = "failed";
+				if (state.namespace) this.registry.unregisterNamespace(state.namespace);
 			};
 			const timeout = config.startupTimeoutMs ?? 15_000;
-			await client.connect(transport, { timeout, maxTotalTimeout: timeout });
-			state.tools = this.filterTools(await this.listTools(client, timeout), config);
+			const startupSignal = AbortSignal.any([callerSignal, AbortSignal.timeout(timeout)]);
+			await client.connect(transport, { timeout, maxTotalTimeout: timeout, signal: startupSignal });
+			state.tools = this.filterTools(await this.listTools(client, timeout, startupSignal), config);
 			state.status = "ready";
 			state.error = undefined;
 			this.installTools(serverName, state);
@@ -366,7 +543,7 @@ export class RiemannMcpManager {
 	}
 
 	promptInventory(capabilities: ReadonlySet<string>): string {
-		if (!hasCapability(capabilities, "mcp.activate", "mcp")) return "";
+		if (!hasCapability(capabilities, "mcp.open", "mcp")) return "";
 		return Object.entries(this.configs)
 			.filter(
 				([name, config]) =>
@@ -384,18 +561,83 @@ export class RiemannMcpManager {
 	definitions(): FunctionDefinition[] {
 		return [
 			{
-				name: "activate",
+				abiVersion: 2,
+				name: "open",
 				namespace: "mcp",
-				description:
-					"Activate one MCP server and install its tools in a Python namespace derived from the configured server name.",
-				promptSnippet: "Lazily activate a server and install its functions.",
-				parameters: [{ name: "name", description: "Configured server name", type: "str", required: true }],
-				returns: "Python namespace",
-				capability: "mcp.activate",
-				handler: async (args, signal) => {
-					if (typeof args.name !== "string" || args.name.length === 0)
-						throw new RiemannHostError("invalid_arguments", "name must be a non-empty string");
-					return this.activate(args.name, signal);
+				description: "Open one configured MCP server and install its tools in a Python namespace.",
+				inputSchema: Type.Object(
+					{ name: Type.String({ minLength: 1, description: "Configured server name" }) },
+					{ additionalProperties: false },
+				),
+				outputSchema: FunctionBundleSchema,
+				pythonReturnType: "McpNamespace",
+				errors: [
+					{ code: "not_found", description: "The configured server does not exist", retryable: false },
+					{ code: "mcp_error", description: "The MCP server failed to start", retryable: true },
+				],
+				effects: [{ kind: "connect", resource: "configured MCP server" }],
+				idempotency: "idempotent",
+				cancellation: { supported: true, description: "Cancels waiting for server startup" },
+				visibility: "public",
+				prompt: {
+					inventory: "Open a configured MCP server and install its tools.",
+					example: 'server = await mcp.open(name="ida")',
+				},
+				capability: "mcp.open",
+				handler: (args, signal) => this.open(args.name as string, signal),
+			},
+			{
+				abiVersion: 2,
+				name: "status",
+				namespace: "mcp",
+				description: "Return lifecycle state for an opened MCP namespace.",
+				inputSchema: Type.Object({ server_name: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+				outputSchema: McpServerStatusSchema,
+				pythonReturnType: "McpServerStatus",
+				errors: [{ code: "not_found", description: "The server is unavailable.", retryable: false }],
+				effects: [{ kind: "read", resource: "MCP server state" }],
+				idempotency: "idempotent",
+				cancellation: { supported: false, description: "Not cancellable." },
+				visibility: "handle-method",
+				prompt: { inventory: "Inspect MCP lifecycle state.", example: "await server.status()" },
+				capability: "mcp.open",
+				handler: async (args) => this.serverStatus(args.server_name as string),
+			},
+			{
+				abiVersion: 2,
+				name: "refresh",
+				namespace: "mcp",
+				description: "Reconnect an MCP server and replace its namespace tools.",
+				inputSchema: Type.Object({ server_name: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+				outputSchema: FunctionBundleSchema,
+				pythonReturnType: "McpNamespace",
+				errors: [{ code: "mcp_error", description: "The server failed to reconnect.", retryable: true }],
+				effects: [{ kind: "connect", resource: "configured MCP server" }],
+				idempotency: "non-idempotent",
+				cancellation: { supported: true, description: "Cancels waiting for reconnection." },
+				visibility: "handle-method",
+				prompt: { inventory: "Refresh MCP tools.", example: "await server.refresh()" },
+				capability: "mcp.open",
+				handler: (args, signal) => this.refresh(args.server_name as string, signal),
+			},
+			{
+				abiVersion: 2,
+				name: "close",
+				namespace: "mcp",
+				description: "Close one MCP server and remove its tools.",
+				inputSchema: Type.Object({ server_name: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+				outputSchema: Type.Null(),
+				pythonReturnType: "None",
+				errors: [{ code: "not_found", description: "The server is unavailable.", retryable: false }],
+				effects: [{ kind: "disconnect", resource: "configured MCP server" }],
+				idempotency: "idempotent",
+				cancellation: { supported: false, description: "Close runs to settlement." },
+				visibility: "handle-method",
+				prompt: { inventory: "Close an MCP namespace.", example: "await server.close()" },
+				capability: "mcp.open",
+				handler: async (args) => {
+					await this.closeServer(args.server_name as string);
+					return null;
 				},
 			},
 		];

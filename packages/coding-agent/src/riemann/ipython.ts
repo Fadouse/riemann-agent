@@ -1,22 +1,28 @@
 import { type Static, Type } from "typebox";
+import type { KernelExecuteStatus } from "./kernel/types.ts";
 
-export const IPYTHON_TOOL_DESCRIPTION =
-	"Execute Python in a persistent IPython environment. The operation namespaces listed in the system prompt are preinstalled globals; calls can be assigned and composed with top-level await. Variables persist across executions.";
+export const IPYTHON_TOOL_DESCRIPTION = "Execute code in the persistent Riemann IPython runtime.";
 
-export const IPYTHON_TOOL_PROMPT_SNIPPET = "Run persistent Python for state and operation orchestration";
+export const IPYTHON_TOOL_PROMPT_SNIPPET = "Run persistent Python";
 
 export const IPythonSchema = Type.Object(
 	{
-		code: Type.String({
-			description:
-				"Python code to execute. Every operation namespace call is async and must be awaited. Assign large results and display only the needed slice.",
-		}),
+		code: Type.String({ description: "Python code to execute" }),
 		timeout: Type.Optional(
-			Type.Integer({ minimum: 1, maximum: 86_400, description: "Cell timeout in seconds. Default 300." }),
+			Type.Integer({ minimum: 1, maximum: 86_400, default: 300, description: "Cell timeout in seconds" }),
 		),
 	},
 	{ additionalProperties: false },
 );
+
+export const IPYTHON_TOOL_METADATA = {
+	name: "ipython",
+	label: "IPython",
+	description: IPYTHON_TOOL_DESCRIPTION,
+	promptSnippet: IPYTHON_TOOL_PROMPT_SNIPPET,
+	parameters: IPythonSchema,
+	executionMode: "sequential",
+} as const;
 
 export type IPythonInput = Static<typeof IPythonSchema>;
 
@@ -75,7 +81,7 @@ export interface IPythonPatchActivity extends IPythonActivityBase {
 export type IPythonActivity = IPythonShellActivity | IPythonAgentActivity | IPythonFileActivity | IPythonPatchActivity;
 
 export interface IPythonToolDetails {
-	status: "running" | "ok" | "error" | "aborted";
+	status: "running" | KernelExecuteStatus;
 	durationMs?: number;
 	errorName?: string;
 	executionCount?: number;

@@ -1,19 +1,25 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
+import { chmod, type FileHandle, mkdir, open, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { glob } from "glob";
 import lockfile from "proper-lockfile";
+import { Type } from "typebox";
+import { graphemeSafePrefix } from "../../utils/text.ts";
 import { assertReadable, assertWritable, type FileAccessPolicy, isInside } from "../access-policy.ts";
 import { RiemannHostError } from "../errors.ts";
-import { imageReadNote, type StoredModelImage, storeModelImage } from "../images.ts";
-import { type JsonValue, type KernelHostResult, kernelHostResult } from "../kernel/types.ts";
+import { type StoredModelImage, storeModelImage } from "../images.ts";
+import type { JsonValue } from "../kernel/types.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
 import type { RiemannStore } from "../state/store.ts";
 import type { FunctionDefinition } from "./registry.ts";
 
+const MAX_READ_BYTES = 32 * 1024 * 1024;
+const MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_SEARCH_LINE_CHARS = 4_000;
+
 interface SnapshotReference {
-	$riemann: "text_snapshot_ref" | "image_snapshot_ref";
+	$riemann: "text_snapshot_ref.v1" | "image_snapshot_ref.v1";
 	capability: string;
 }
 
@@ -23,6 +29,103 @@ interface TextEdit {
 	end: number;
 	text: string;
 }
+
+const artifactSchema = Type.Object(
+	{
+		$riemann: Type.Literal("artifact.v1"),
+		handle: Type.String(),
+		mime_type: Type.String(),
+		size: Type.Integer({ minimum: 0 }),
+		name: Type.Union([Type.String(), Type.Null()]),
+	},
+	{ additionalProperties: false, $id: "Artifact" },
+);
+
+const textSnapshotSchema = Type.Object(
+	{
+		kind: Type.Literal("text"),
+		$riemann: Type.Literal("text_snapshot.v1"),
+		path: Type.String(),
+		text: Type.String(),
+		encoding: Type.Literal("utf-8"),
+		_capability: Type.String(),
+	},
+	{ additionalProperties: false, $id: "TextSnapshot" },
+);
+
+const imageSnapshotSchema = Type.Object(
+	{
+		kind: Type.Literal("image"),
+		$riemann: Type.Literal("image_snapshot.v1"),
+		path: Type.String(),
+		artifact: artifactSchema,
+		mime_type: Type.String(),
+		source_size: Type.Integer({ minimum: 0 }),
+		_capability: Type.String(),
+		width: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+		height: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+	},
+	{ additionalProperties: false, $id: "ImageSnapshot" },
+);
+
+const fileSnapshotSchema = Type.Union([textSnapshotSchema, imageSnapshotSchema], { $id: "FileSnapshot" });
+
+const textSnapshotReferenceSchema = Type.Object(
+	{
+		$riemann: Type.Literal("text_snapshot_ref.v1"),
+		capability: Type.String({ minLength: 1 }),
+	},
+	{ additionalProperties: false },
+);
+
+const fileSnapshotReferenceSchema = Type.Union([
+	textSnapshotReferenceSchema,
+	Type.Object(
+		{
+			$riemann: Type.Literal("image_snapshot_ref.v1"),
+			capability: Type.String({ minLength: 1 }),
+		},
+		{ additionalProperties: false },
+	),
+]);
+
+const editOperationSchema = Type.Union([
+	Type.Object(
+		{
+			kind: Type.Literal("replace"),
+			start: Type.Integer({ minimum: 0 }),
+			end: Type.Integer({ minimum: 0 }),
+			text: Type.String(),
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			kind: Type.Literal("insert"),
+			at: Type.Integer({ minimum: 0 }),
+			text: Type.String(),
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			kind: Type.Literal("delete"),
+			start: Type.Integer({ minimum: 0 }),
+			end: Type.Integer({ minimum: 0 }),
+		},
+		{ additionalProperties: false },
+	),
+]);
+
+const removedFileSchema = Type.Object(
+	{ $riemann: Type.Literal("removed_file.v1"), path: Type.String(), removed: Type.Literal(true) },
+	{ additionalProperties: false, $id: "RemovedFile" },
+);
+
+const noCancellation = {
+	supported: false,
+	description: "Filesystem operations do not observe cancellation after they start.",
+} as const;
 
 function hashText(text: string): string {
 	return createHash("sha256").update(text).digest("hex");
@@ -41,16 +144,31 @@ function requiredString(args: Record<string, JsonValue>, name: string): string {
 
 function optionalBoolean(args: Record<string, JsonValue>, name: string, fallback: boolean): boolean {
 	const value = args[name];
-	if (value === undefined || value === null) return fallback;
+	if (value === undefined) return fallback;
 	if (typeof value !== "boolean") throw new RiemannHostError("invalid_arguments", `${name} must be a boolean`);
 	return value;
 }
 
-function optionalInteger(args: Record<string, JsonValue>, name: string, fallback: number): number {
+function optionalInteger(
+	args: Record<string, JsonValue>,
+	name: string,
+	fallback: number,
+	minimum: number,
+	maximum: number,
+): number {
 	const value = args[name];
-	if (value === undefined || value === null) return fallback;
-	if (typeof value !== "number" || !Number.isInteger(value))
-		throw new RiemannHostError("invalid_arguments", `${name} must be an integer`);
+	if (value === undefined) return fallback;
+	if (typeof value !== "number" || !Number.isInteger(value) || value < minimum || value > maximum) {
+		throw new RiemannHostError("invalid_arguments", `${name} must be an integer from ${minimum} to ${maximum}`);
+	}
+	return value;
+}
+
+function optionalString(args: Record<string, JsonValue>, name: string, fallback: string): string {
+	const value = args[name];
+	if (value === undefined) return fallback;
+	if (typeof value !== "string" || value.length === 0)
+		throw new RiemannHostError("invalid_arguments", `${name} must be a non-empty string`);
 	return value;
 }
 
@@ -72,6 +190,14 @@ async function syncDirectory(path: string): Promise<void> {
 		}
 	} catch {
 		// Directory fsync is unavailable on some supported platforms.
+	}
+}
+
+function assertSafeRegex(pattern: string): void {
+	if (pattern.length > 256)
+		throw new RiemannHostError("invalid_arguments", "regular expression exceeds 256 characters");
+	if (/\\[1-9]|\(\?[=!<]|\([^)]*(?:[+*]|\{\d+,?\d*\})[^)]*\)(?:[+*]|\{)/.test(pattern)) {
+		throw new RiemannHostError("invalid_arguments", "regular expression uses unsupported backtracking constructs");
 	}
 }
 
@@ -103,6 +229,57 @@ export class FileFunctions {
 		return canonical;
 	}
 
+	private async openedPath(file: FileHandle, fallback: string): Promise<string> {
+		const descriptorPath = process.platform === "linux" ? `/proc/self/fd/${file.fd}` : `/dev/fd/${file.fd}`;
+		try {
+			return await realpath(descriptorPath);
+		} catch {
+			const [opened, currentPath, canonical] = await Promise.all([file.stat(), stat(fallback), realpath(fallback)]);
+			if (opened.dev !== currentPath.dev || opened.ino !== currentPath.ino) {
+				throw new RiemannHostError("conflict", `Path changed while opening: ${fallback}`);
+			}
+			return canonical;
+		}
+	}
+
+	private async readBounded(file: FileHandle, maximumBytes: number): Promise<Buffer> {
+		const info = await file.stat();
+		if (!info.isFile()) throw new RiemannHostError("unsupported_media_type", "Path is not a regular file");
+		if (info.size > maximumBytes) {
+			throw new RiemannHostError("response_too_large", `File exceeds ${maximumBytes} bytes`);
+		}
+		const chunks: Buffer[] = [];
+		let total = 0;
+		while (total <= maximumBytes) {
+			const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maximumBytes + 1 - total));
+			const { bytesRead } = await file.read(chunk, 0, chunk.length, null);
+			if (bytesRead === 0) break;
+			chunks.push(chunk.subarray(0, bytesRead));
+			total += bytesRead;
+		}
+		if (total > maximumBytes) throw new RiemannHostError("response_too_large", `File exceeds ${maximumBytes} bytes`);
+		return Buffer.concat(chunks, total);
+	}
+
+	private async openReadable(input: string): Promise<{ path: string; file: FileHandle }> {
+		const candidate = await this.resolveExisting(input);
+		let file: FileHandle;
+		try {
+			file = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+		} catch (error) {
+			if (isNoEntity(error)) throw new RiemannHostError("not_found", `Path does not exist: ${input}`);
+			throw error;
+		}
+		try {
+			const path = await this.openedPath(file, candidate);
+			assertReadable(this.policy, path, input);
+			return { path, file };
+		} catch (error) {
+			await file.close().catch(() => undefined);
+			throw error;
+		}
+	}
+
 	/** Resolves the destination of a new writable path, creating missing parent directories. */
 	private async resolveNew(input: string): Promise<string> {
 		const candidate = resolve(this.policy.cwd, input);
@@ -129,10 +306,10 @@ export class FileFunctions {
 	private createSnapshot(path: string, text: string): JsonValue {
 		const capability = randomBytes(32).toString("base64url");
 		this.store.putFileCapability({ runId: this.runId, token: capability, path, contentHash: hashText(text) });
-		return { $riemann: "text_snapshot", path, text, encoding: "utf-8", _capability: capability };
+		return { kind: "text", $riemann: "text_snapshot.v1", path, text, encoding: "utf-8", _capability: capability };
 	}
 
-	private createImageSnapshot(path: string, sourceBytes: Uint8Array, image: StoredModelImage): KernelHostResult {
+	private createImageSnapshot(path: string, sourceBytes: Uint8Array, image: StoredModelImage): JsonValue {
 		const capability = randomBytes(32).toString("base64url");
 		this.store.putFileCapability({
 			runId: this.runId,
@@ -140,20 +317,20 @@ export class FileFunctions {
 			path,
 			contentHash: hashBytes(sourceBytes),
 		});
-		const note = imageReadNote(image.reference.mimeType, image.hints);
-		return kernelHostResult(
-			{
-				$riemann: "image_snapshot",
-				path,
-				artifact: image.artifact,
-				mime_type: image.reference.mimeType,
-				source_size: sourceBytes.byteLength,
-				_capability: capability,
-				width: null,
-				height: null,
-			},
-			[{ type: "text", text: note }, image.reference],
-		);
+		if (typeof image.artifact !== "object" || image.artifact === null || Array.isArray(image.artifact)) {
+			throw new RiemannHostError("artifact_error", "Image artifact metadata is invalid");
+		}
+		return {
+			kind: "image",
+			$riemann: "image_snapshot.v1",
+			path,
+			artifact: { ...image.artifact, $riemann: "artifact.v1" },
+			mime_type: image.reference.mimeType,
+			source_size: sourceBytes.byteLength,
+			_capability: capability,
+			width: null,
+			height: null,
+		};
 	}
 
 	private resolveSnapshot(value: JsonValue | undefined): {
@@ -167,7 +344,7 @@ export class FileFunctions {
 		}
 		const reference = value as Partial<SnapshotReference>;
 		if (
-			(reference.$riemann !== "text_snapshot_ref" && reference.$riemann !== "image_snapshot_ref") ||
+			(reference.$riemann !== "text_snapshot_ref.v1" && reference.$riemann !== "image_snapshot_ref.v1") ||
 			typeof reference.capability !== "string"
 		) {
 			throw new RiemannHostError("invalid_arguments", "snapshot capability is invalid");
@@ -180,7 +357,7 @@ export class FileFunctions {
 		return {
 			...capability,
 			capability: reference.capability,
-			kind: reference.$riemann === "text_snapshot_ref" ? "text" : "image",
+			kind: reference.$riemann === "text_snapshot_ref.v1" ? "text" : "image",
 		};
 	}
 
@@ -218,11 +395,23 @@ export class FileFunctions {
 			edits.push({ kind, start, end, text: replacement });
 		}
 		edits.sort((left, right) => right.start - left.start || right.end - left.end);
-		for (let index = 1; index < edits.length; index += 1) {
-			const previous = edits[index - 1];
-			const current = edits[index];
-			if (previous && current && current.end > previous.start)
-				throw new RiemannHostError("invalid_arguments", "operations overlap");
+		for (let leftIndex = 0; leftIndex < edits.length; leftIndex += 1) {
+			const left = edits[leftIndex];
+			if (!left) continue;
+			for (let rightIndex = leftIndex + 1; rightIndex < edits.length; rightIndex += 1) {
+				const right = edits[rightIndex];
+				if (!right) continue;
+				if (left.kind === "insert" && right.kind === "insert" && left.start === right.start) {
+					throw new RiemannHostError("invalid_arguments", "multiple inserts at the same offset are not allowed");
+				}
+				const leftContainsRight = left.start < right.start && right.start < left.end;
+				const rightContainsLeft = right.start < left.start && left.start < right.end;
+				const rangesOverlap =
+					left.start < left.end && right.start < right.end && left.start < right.end && right.start < left.end;
+				if (leftContainsRight || rightContainsLeft || rangesOverlap) {
+					throw new RiemannHostError("invalid_arguments", "operations overlap");
+				}
+			}
 		}
 		return edits;
 	}
@@ -254,11 +443,14 @@ export class FileFunctions {
 		});
 	}
 
-	/** Validates one glob result and returns its display path, or undefined when filtered out. */
+	private displayPath(path: string): string {
+		return isInside(this.policy.cwd, path) ? globPath(relative(this.policy.cwd, path)) : globPath(path);
+	}
+
+	/** Validates one glob result and returns its canonical display path, or undefined when filtered out. */
 	private async visiblePath(match: string): Promise<string | undefined> {
 		try {
-			const path = await this.resolveExisting(match);
-			return isInside(this.policy.cwd, path) ? globPath(relative(this.policy.cwd, path)) : globPath(path);
+			return this.displayPath(await this.resolveExisting(match));
 		} catch {
 			// Glob patterns may match unreadable paths or symlink escapes.
 			return undefined;
@@ -269,24 +461,53 @@ export class FileFunctions {
 		const pathDescription = "File path; relative paths resolve from the current working directory";
 		return [
 			{
+				abiVersion: 2,
 				name: "read",
 				namespace: "fs",
 				description:
-					"Read a UTF-8 text file or supported image. Text returns TextSnapshot; images return ImageSnapshot.",
-				promptSnippet: "Read a UTF-8 file or image for inspection and safe snapshot-based operations.",
-				parameters: [{ name: "path", description: pathDescription, type: "str", required: true }],
-				returns: "TextSnapshot | ImageSnapshot",
-				examples: [
-					"snap = await fs.read(path='src/main.ts')",
-					"image = await fs.read(path='/abs/path/screenshot.png')",
+					"Read a UTF-8 text file or supported image. Returns a discriminated FileSnapshot containing text or image metadata.",
+				inputSchema: Type.Object(
+					{ path: Type.String({ minLength: 1, description: pathDescription }) },
+					{ additionalProperties: false },
+				),
+				outputSchema: fileSnapshotSchema,
+				pythonReturnType: "FileSnapshot",
+				errors: [
+					{ code: "invalid_arguments", description: "The path is empty or invalid.", retryable: false },
+					{ code: "not_found", description: "The path does not exist.", retryable: false },
+					{
+						code: "permission_denied",
+						description: "The path is outside readable policy roots.",
+						retryable: false,
+					},
+					{ code: "response_too_large", description: "The file exceeds the read limit.", retryable: false },
+					{
+						code: "unsupported_media_type",
+						description: "The file is neither valid UTF-8 text nor a supported image.",
+						retryable: false,
+					},
 				],
+				effects: [{ kind: "read", resource: "filesystem" }],
+				idempotency: "idempotent",
+				cancellation: noCancellation,
+				visibility: "public",
+				prompt: {
+					inventory: "Read a UTF-8 file or image for inspection and safe snapshot-based operations.",
+					example: 'snap = await fs.read(path="src/main.ts")',
+					guidelines: [
+						"Files: prefer fs.search / fs.glob / fs.edit over shell grep / find / sed; snapshot edits detect concurrent modification that exit codes cannot.",
+					],
+				},
 				capability: "fs.read",
-				promptGuidelines: [
-					"Files: prefer fs.search / fs.glob / fs.edit over shell grep / find / sed; snapshot edits detect concurrent modification that exit codes cannot.",
-				],
 				handler: async (args) => {
-					const path = await this.resolveExisting(requiredString(args, "path"));
-					const bytes = await readFile(path);
+					const opened = await this.openReadable(requiredString(args, "path"));
+					const path = opened.path;
+					let bytes: Buffer;
+					try {
+						bytes = await this.readBounded(opened.file, MAX_READ_BYTES);
+					} finally {
+						await opened.file.close();
+					}
 					const detectedImage =
 						bytes.byteLength === 0
 							? undefined
@@ -305,7 +526,7 @@ export class FileFunctions {
 					}
 					let text: string;
 					try {
-						text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+						text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
 					} catch {
 						throw new RiemannHostError(
 							"unsupported_media_type",
@@ -316,24 +537,40 @@ export class FileFunctions {
 				},
 			},
 			{
+				abiVersion: 2,
 				name: "glob",
 				namespace: "fs",
-				description: "List readable files matching one or more glob patterns without reading their contents.",
-				promptSnippet: "Find files without reading them.",
-				parameters: [
-					{ name: "pattern", description: "Glob pattern", type: "str", required: true },
-					{ name: "include_hidden", description: "Include dotfiles", type: "bool | None", required: false },
-					{ name: "limit", description: "Maximum paths", type: "int | None", required: false },
+				description: "List readable files matching a glob pattern without reading their contents.",
+				inputSchema: Type.Object(
+					{
+						pattern: Type.String({ minLength: 1, description: "Glob pattern" }),
+						include_hidden: Type.Optional(Type.Boolean({ default: false, description: "Include dotfiles" })),
+						limit: Type.Optional(
+							Type.Integer({ minimum: 1, maximum: 5_000, default: 200, description: "Maximum paths" }),
+						),
+					},
+					{ additionalProperties: false },
+				),
+				outputSchema: Type.Array(Type.String()),
+				pythonReturnType: "list[str]",
+				errors: [
+					{ code: "invalid_arguments", description: "The pattern or options are invalid.", retryable: false },
 				],
-				returns: "list[str]",
-				examples: ["await fs.glob(pattern='src/**/*.ts', limit=200)"],
+				effects: [{ kind: "read", resource: "filesystem-metadata" }],
+				idempotency: "idempotent",
+				cancellation: noCancellation,
+				visibility: "public",
+				prompt: {
+					inventory: "Find readable files without reading their contents.",
+					example: 'await fs.glob(pattern="src/**/*.ts", limit=200)',
+				},
 				capability: "fs.read",
 				handler: async (args) => {
 					const matches = await this.globMatches(
 						requiredString(args, "pattern"),
 						optionalBoolean(args, "include_hidden", false),
 					);
-					const limit = Math.max(1, Math.min(optionalInteger(args, "limit", 200), 5_000));
+					const limit = optionalInteger(args, "limit", 200, 1, 5_000);
 					const visible: string[] = [];
 					for (const match of matches.sort()) {
 						if (visible.length >= limit) break;
@@ -344,95 +581,166 @@ export class FileFunctions {
 				},
 			},
 			{
+				abiVersion: 2,
 				name: "search",
 				namespace: "fs",
-				description: "Search readable UTF-8 files and return matching paths, line numbers, and lines.",
-				promptSnippet: "Search file text with paths and line numbers.",
-				parameters: [
+				description: "Search readable UTF-8 files and return canonical paths, line numbers, and matching lines.",
+				inputSchema: Type.Object(
 					{
-						name: "query",
-						description: "Literal text or JavaScript regular expression",
-						type: "str",
-						required: true,
+						query: Type.String({ minLength: 1, description: "Literal text or JavaScript regular expression" }),
+						glob: Type.Optional(Type.String({ minLength: 1, default: "**/*", description: "File glob" })),
+						mode: Type.Optional(
+							Type.Union([Type.Literal("literal"), Type.Literal("regex")], {
+								default: "literal",
+								description: "Literal or regular-expression matching",
+							}),
+						),
+						case_sensitive: Type.Optional(
+							Type.Boolean({ default: true, description: "Use case-sensitive matching" }),
+						),
+						limit: Type.Optional(
+							Type.Integer({ minimum: 1, maximum: 2_000, default: 100, description: "Maximum matches" }),
+						),
 					},
-					{ name: "glob", description: "File glob", type: "str | None", required: false },
+					{ additionalProperties: false },
+				),
+				outputSchema: Type.Array(
+					Type.Object(
+						{
+							path: Type.String(),
+							line: Type.Integer({ minimum: 1 }),
+							text: Type.String(),
+							truncated: Type.Boolean(),
+						},
+						{ additionalProperties: false },
+					),
+				),
+				pythonReturnType: "list[SearchMatch]",
+				errors: [
 					{
-						name: "regex",
-						description: "Treat query as a regular expression",
-						type: "bool | None",
-						required: false,
+						code: "invalid_arguments",
+						description: "The query, regular expression, or options are invalid.",
+						retryable: false,
 					},
-					{
-						name: "case_sensitive",
-						description: "Use case-sensitive matching",
-						type: "bool | None",
-						required: false,
-					},
-					{ name: "limit", description: "Maximum matches", type: "int | None", required: false },
 				],
-				returns: "list[dict]",
+				effects: [{ kind: "read", resource: "filesystem" }],
+				idempotency: "idempotent",
+				cancellation: noCancellation,
+				visibility: "public",
+				prompt: {
+					inventory: "Search file text with canonical paths and line numbers.",
+					example: 'await fs.search(query="needle", glob="src/**/*.ts")',
+				},
 				capability: "fs.read",
 				handler: async (args) => {
 					const query = requiredString(args, "query");
 					const caseSensitive = optionalBoolean(args, "case_sensitive", true);
-					const matcher = optionalBoolean(args, "regex", false)
-						? new RegExp(query, caseSensitive ? "g" : "gi")
-						: undefined;
+					let matcher: RegExp | undefined;
+					if (optionalString(args, "mode", "literal") === "regex") {
+						assertSafeRegex(query);
+						try {
+							matcher = new RegExp(query, caseSensitive ? "g" : "gi");
+						} catch {
+							throw new RiemannHostError(
+								"invalid_arguments",
+								"query must be a valid JavaScript regular expression",
+							);
+						}
+					}
 					const needle = caseSensitive ? query : query.toLowerCase();
-					const files = await this.globMatches(typeof args.glob === "string" ? args.glob : "**/*", false);
-					const limit = Math.max(1, Math.min(optionalInteger(args, "limit", 100), 2_000));
+					const files = await this.globMatches(optionalString(args, "glob", "**/*"), false);
+					const limit = optionalInteger(args, "limit", 100, 1, 2_000);
 					const hits: JsonValue[] = [];
 					for (const file of files.sort()) {
 						if (hits.length >= limit) break;
 						let data: Buffer;
+						let displayPath: string;
 						try {
-							const path = await this.resolveExisting(file);
-							data = await readFile(path);
+							const opened = await this.openReadable(file);
+							try {
+								displayPath = this.displayPath(opened.path);
+								data = await this.readBounded(opened.file, MAX_SEARCH_FILE_BYTES);
+							} finally {
+								await opened.file.close();
+							}
 						} catch {
 							// Glob results can be unreadable or escape through a symlink.
 							continue;
 						}
 						if (data.includes(0)) continue;
-						const lines = data.toString("utf8").split(/\r?\n/);
+						let text: string;
+						try {
+							text = new TextDecoder("utf-8", { fatal: true }).decode(data);
+						} catch {
+							continue;
+						}
+						const lines = text.split(/\r?\n/);
 						for (let index = 0; index < lines.length && hits.length < limit; index += 1) {
 							const line = lines[index] ?? "";
+							const searchableLine = matcher ? graphemeSafePrefix(line, MAX_SEARCH_LINE_CHARS) : line;
 							if (matcher) matcher.lastIndex = 0;
 							const matched = matcher
-								? matcher.test(line)
+								? matcher.test(searchableLine)
 								: (caseSensitive ? line : line.toLowerCase()).includes(needle);
-							if (matched) hits.push({ path: file, line: index + 1, text: line });
+							if (matched) {
+								hits.push({
+									path: displayPath,
+									line: index + 1,
+									text: graphemeSafePrefix(line, MAX_SEARCH_LINE_CHARS),
+									truncated: line.length > MAX_SEARCH_LINE_CHARS,
+								});
+							}
 						}
 					}
 					return hits;
 				},
 			},
 			{
+				abiVersion: 2,
 				name: "edit",
 				namespace: "fs",
 				description:
-					"Apply non-overlapping character-offset operations to a TextSnapshot. Fails if the file changed since it was read.",
-				promptSnippet: "Apply non-overlapping edits; fail if the file changed after reading.",
-				parameters: [
+					"Apply non-overlapping, end-exclusive Unicode code-point edits to a TextSnapshot. Fails if the file changed since it was read.",
+				inputSchema: Type.Object(
 					{
-						name: "snapshot",
-						description: "TextSnapshot from fs.read or fs.edit",
-						type: "TextSnapshot",
-						required: true,
+						snapshot: textSnapshotReferenceSchema,
+						operations: Type.Array(editOperationSchema, {
+							minItems: 1,
+							description: "Replace, insert, or delete operations against the snapshot text",
+						}),
 					},
+					{ additionalProperties: false },
+				),
+				outputSchema: textSnapshotSchema,
+				pythonReturnType: "TextSnapshot",
+				errors: [
 					{
-						name: "operations",
-						description:
-							"replace/delete {start,end,...} or insert {at,text} operations against the snapshot text",
-						type: "list[dict]",
-						required: true,
+						code: "invalid_arguments",
+						description: "The snapshot or edit operations are invalid or overlap.",
+						retryable: false,
 					},
+					{ code: "not_found", description: "The snapshot capability or file does not exist.", retryable: false },
+					{
+						code: "permission_denied",
+						description: "The file is outside writable policy roots.",
+						retryable: false,
+					},
+					{ code: "conflict", description: "The file changed after the snapshot was created.", retryable: true },
 				],
-				returns: "TextSnapshot",
-				examples: [
-					"snap = await fs.edit(snapshot=snap, operations=[{'kind':'replace','start':10,'end':13,'text':'new'}])",
+				effects: [
+					{ kind: "read", resource: "filesystem" },
+					{ kind: "write", resource: "filesystem" },
 				],
+				idempotency: "conditional",
+				cancellation: noCancellation,
+				visibility: "public",
+				prompt: {
+					inventory: "Apply Unicode code-point edits; fail if the file changed after reading.",
+					example:
+						'await fs.edit(snapshot=snap, operations=[{"kind":"replace","start":10,"end":13,"text":"new"}])',
+					guidelines: ["Read before editing; pass the returned TextSnapshot to fs.edit or fs.remove."],
+				},
 				capability: "fs.write",
-				promptGuidelines: ["Read before editing; pass the returned TextSnapshot to fs.edit or fs.remove."],
 				handler: async (args) => {
 					const snapshot = this.resolveSnapshot(args.snapshot);
 					if (snapshot.kind !== "text") {
@@ -440,21 +748,28 @@ export class FileFunctions {
 					}
 					const release = await lockfile.lock(snapshot.path, { realpath: false, stale: 30_000, retries: 8 });
 					try {
-						const current = await readFile(snapshot.path, "utf8");
-						const currentHash = hashText(current);
-						if (currentHash !== snapshot.contentHash) {
+						let currentBytes: Buffer;
+						try {
+							if ((await realpath(snapshot.path)) !== snapshot.path) throw new Error("path changed");
+							currentBytes = await readFile(snapshot.path);
+						} catch {
+							throw new RiemannHostError("conflict", `File path changed since snapshot: ${snapshot.path}`);
+						}
+						if (hashBytes(currentBytes) !== snapshot.contentHash) {
 							throw new RiemannHostError("conflict", `File changed since snapshot: ${snapshot.path}`, {
 								path: snapshot.path,
 							});
 						}
-						const edits = this.parseEdits(args.operations, current.length);
+						const current = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(currentBytes);
+						const codePoints = Array.from(current);
+						const edits = this.parseEdits(args.operations, codePoints.length);
 						const fragments: string[] = [];
-						let unchangedEnd = current.length;
+						let unchangedEnd = codePoints.length;
 						for (const edit of edits) {
-							fragments.push(current.slice(edit.end, unchangedEnd), edit.text);
+							fragments.push(codePoints.slice(edit.end, unchangedEnd).join(""), edit.text);
 							unchangedEnd = edit.start;
 						}
-						fragments.push(current.slice(0, unchangedEnd));
+						fragments.push(codePoints.slice(0, unchangedEnd).join(""));
 						const next = fragments.reverse().join("");
 						const info = await stat(snapshot.path);
 						await this.writeAtomically(snapshot.path, next, info.mode);
@@ -465,15 +780,36 @@ export class FileFunctions {
 				},
 			},
 			{
+				abiVersion: 2,
 				name: "create",
 				namespace: "fs",
 				description: "Create a new UTF-8 file atomically. Refuses to overwrite an existing path.",
-				promptSnippet: "Create a new UTF-8 file atomically; never overwrite.",
-				parameters: [
-					{ name: "path", description: pathDescription, type: "str", required: true },
-					{ name: "text", description: "Complete file content", type: "str", required: true },
+				inputSchema: Type.Object(
+					{
+						path: Type.String({ minLength: 1, description: pathDescription }),
+						text: Type.String({ description: "Complete file content" }),
+					},
+					{ additionalProperties: false },
+				),
+				outputSchema: textSnapshotSchema,
+				pythonReturnType: "TextSnapshot",
+				errors: [
+					{ code: "invalid_arguments", description: "The path or text is invalid.", retryable: false },
+					{
+						code: "permission_denied",
+						description: "The path is outside writable policy roots.",
+						retryable: false,
+					},
+					{ code: "conflict", description: "The destination already exists.", retryable: false },
 				],
-				returns: "TextSnapshot",
+				effects: [{ kind: "write", resource: "filesystem" }],
+				idempotency: "non-idempotent",
+				cancellation: noCancellation,
+				visibility: "public",
+				prompt: {
+					inventory: "Create a new UTF-8 file atomically; never overwrite.",
+					example: 'await fs.create(path="src/new.ts", text="export {};\\n")',
+				},
 				capability: "fs.write",
 				handler: async (args) => {
 					const inputPath = requiredString(args, "path");
@@ -495,36 +831,62 @@ export class FileFunctions {
 					}
 					await file.close();
 					await syncDirectory(dirname(path));
-					return this.createSnapshot(path, text);
+					const canonical = await realpath(path);
+					return this.createSnapshot(canonical, text);
 				},
 			},
 			{
+				abiVersion: 2,
 				name: "remove",
 				namespace: "fs",
 				description:
 					"Delete the file represented by a TextSnapshot or ImageSnapshot. Fails if it changed after the snapshot.",
-				promptSnippet: "Delete an unchanged snapshotted file.",
-				parameters: [
+				inputSchema: Type.Object({ snapshot: fileSnapshotReferenceSchema }, { additionalProperties: false }),
+				outputSchema: removedFileSchema,
+				pythonReturnType: "RemovedFile",
+				errors: [
+					{ code: "invalid_arguments", description: "The snapshot reference is invalid.", retryable: false },
+					{ code: "not_found", description: "The snapshot capability or file does not exist.", retryable: false },
 					{
-						name: "snapshot",
-						description: "TextSnapshot or ImageSnapshot to delete",
-						type: "TextSnapshot | ImageSnapshot",
-						required: true,
+						code: "permission_denied",
+						description: "The file is outside writable policy roots.",
+						retryable: false,
 					},
+					{ code: "conflict", description: "The file changed after the snapshot was created.", retryable: true },
 				],
-				returns: "dict",
+				effects: [
+					{ kind: "read", resource: "filesystem" },
+					{ kind: "delete", resource: "filesystem" },
+				],
+				idempotency: "conditional",
+				cancellation: noCancellation,
+				visibility: "public",
+				prompt: {
+					inventory: "Delete an unchanged snapshotted file.",
+					example: "await fs.remove(snapshot=snap)",
+					guidelines: ["Read before editing; pass the returned TextSnapshot to fs.edit or fs.remove."],
+				},
 				capability: "fs.write",
-				promptGuidelines: ["Read before editing; pass the returned TextSnapshot to fs.edit or fs.remove."],
 				handler: async (args) => {
 					const snapshot = this.resolveSnapshot(args.snapshot);
 					const release = await lockfile.lock(snapshot.path, { realpath: false, stale: 30_000, retries: 8 });
 					try {
-						const current = await readFile(snapshot.path);
+						let current: Buffer;
+						try {
+							if ((await realpath(snapshot.path)) !== snapshot.path) throw new Error("path changed");
+							current = await readFile(snapshot.path);
+						} catch {
+							throw new RiemannHostError("conflict", `File path changed since snapshot: ${snapshot.path}`);
+						}
 						if (hashBytes(current) !== snapshot.contentHash)
 							throw new RiemannHostError("conflict", `File changed since snapshot: ${snapshot.path}`);
-						await unlink(snapshot.path);
+						await unlink(snapshot.path).catch((error: NodeJS.ErrnoException) => {
+							if (error.code === "ENOENT")
+								throw new RiemannHostError("conflict", `File path changed since snapshot: ${snapshot.path}`);
+							throw error;
+						});
 						await syncDirectory(dirname(snapshot.path));
-						return { path: snapshot.path, removed: true };
+						return { $riemann: "removed_file.v1", path: snapshot.path, removed: true };
 					} finally {
 						await release();
 					}

@@ -4,6 +4,52 @@ import type { JsonValue, JupyterHeader, JupyterMessage } from "./types.ts";
 const DELIMITER = Buffer.from("<IDS|MSG>");
 const EMPTY_OBJECT = Buffer.from("{}");
 
+const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+
+type JsonContainer = Record<string, unknown> | unknown[];
+
+function jsonPath(parent: string, key: string | number): string {
+	return typeof key === "number" ? `${parent}[${key}]` : `${parent}[${JSON.stringify(key)}]`;
+}
+
+function validateJsonValue(value: unknown, path: string, active: Set<JsonContainer>): void {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return;
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new TypeError(`Cannot encode non-finite float at ${path}: ${String(value)}`);
+		if (Number.isInteger(value) && Math.abs(value) > MAX_SAFE_INTEGER) {
+			throw new TypeError(`Cannot encode unsafe integer at ${path}: ${String(value)}`);
+		}
+		return;
+	}
+	if (typeof value !== "object") {
+		throw new TypeError(`Cannot encode ${typeof value} as JSON at ${path}`);
+	}
+	const container = value as JsonContainer;
+	if (active.has(container)) throw new TypeError(`Cannot encode cyclic JSON value at ${path}`);
+	active.add(container);
+	try {
+		if (Array.isArray(container)) {
+			for (let index = 0; index < container.length; index += 1) {
+				validateJsonValue(container[index], jsonPath(path, index), active);
+			}
+			return;
+		}
+		for (const key of Reflect.ownKeys(container)) {
+			if (typeof key !== "string") {
+				throw new TypeError(`Cannot encode non-string dict key at ${path}: ${String(key)}`);
+			}
+			validateJsonValue(container[key], jsonPath(path, key), active);
+		}
+	} finally {
+		active.delete(container);
+	}
+}
+
+function jsonFrame(value: unknown, path: string): Buffer {
+	validateJsonValue(value, path, new Set());
+	return Buffer.from(JSON.stringify(value));
+}
+
 function parseHeader(value: unknown): JupyterHeader | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	const header = value as Partial<JupyterHeader>;
@@ -31,6 +77,7 @@ function parseJsonRecord(frame: Buffer): Record<string, JsonValue> | undefined {
 	try {
 		const value: unknown = JSON.parse(frame.toString("utf8"));
 		if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+		validateJsonValue(value, "frame", new Set());
 		return value as Record<string, JsonValue>;
 	} catch {
 		return undefined;
@@ -69,10 +116,10 @@ export function encodeJupyterMessage(options: {
 		version: "5.3",
 	};
 	const signed = [
-		Buffer.from(JSON.stringify(header)),
-		options.parentHeader ? Buffer.from(JSON.stringify(options.parentHeader)) : EMPTY_OBJECT,
-		options.metadata ? Buffer.from(JSON.stringify(options.metadata)) : EMPTY_OBJECT,
-		options.content ? Buffer.from(JSON.stringify(options.content)) : EMPTY_OBJECT,
+		jsonFrame(header, "header"),
+		options.parentHeader ? jsonFrame(options.parentHeader, "parent_header") : EMPTY_OBJECT,
+		options.metadata ? jsonFrame(options.metadata, "metadata") : EMPTY_OBJECT,
+		options.content ? jsonFrame(options.content, "content") : EMPTY_OBJECT,
 	];
 	const frames = [
 		...(options.identities ?? []),

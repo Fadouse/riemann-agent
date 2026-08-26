@@ -42,10 +42,6 @@ function numberValue(value: JsonValue | undefined): number | undefined {
 	return typeof value === "number" ? value : undefined;
 }
 
-function booleanValue(value: JsonValue | undefined): boolean | undefined {
-	return typeof value === "boolean" ? value : undefined;
-}
-
 function lineCount(text: string): number {
 	if (!text) return 0;
 	const lines = text.split(/\r?\n/);
@@ -112,7 +108,7 @@ export class RiemannActivityTracker {
 	async observe(event: KernelHostRequestEvent): Promise<IPythonActivity[] | undefined> {
 		switch (event.phase) {
 			case "start": {
-				const tracked = await this.start(event.requestId, event.request.type, event.request.args);
+				const tracked = await this.start(event.requestId, event.request.operation, event.request.arguments);
 				if (!tracked) return undefined;
 				this.tracked.set(event.requestId, tracked);
 				return this.snapshot();
@@ -122,10 +118,12 @@ export class RiemannActivityTracker {
 				if (!tracked || tracked.activity.kind !== "shell") return undefined;
 				const update = objectValue(event.update);
 				if (!update) return undefined;
+				const kind = stringValue(update.kind);
+				const value = `${stringValue(update.value) ?? ""}${update.truncated === true ? "\n[stream update truncated]\n" : ""}`;
 				tracked.activity = {
 					...tracked.activity,
-					stdout: appendStream(tracked.activity.stdout, stringValue(update.stdout_delta)),
-					stderr: appendStream(tracked.activity.stderr, stringValue(update.stderr_delta)),
+					stdout: kind === "stdout" ? appendStream(tracked.activity.stdout, value) : tracked.activity.stdout,
+					stderr: kind === "stderr" ? appendStream(tracked.activity.stderr, value) : tracked.activity.stderr,
 				};
 				return this.snapshot();
 			}
@@ -236,8 +234,14 @@ export class RiemannActivityTracker {
 		if (!error && activity.kind === "shell") {
 			const value = objectValue(result);
 			const exitCode = value?.exit_code === null ? null : numberValue(value?.exit_code);
-			const timedOut = booleanValue(value?.timed_out) ?? false;
-			const failed = timedOut || (exitCode !== undefined && exitCode !== null && exitCode !== 0);
+			const termination = stringValue(value?.termination);
+			const timedOut = termination === "timeout";
+			const cancelled = termination === "cancelled";
+			const failed =
+				timedOut ||
+				cancelled ||
+				termination === "signal" ||
+				(exitCode !== undefined && exitCode !== null && exitCode !== 0);
 			activity = {
 				...activity,
 				status: failed ? "error" : "ok",
@@ -245,7 +249,7 @@ export class RiemannActivityTracker {
 				stderr: stringValue(value?.stderr) ?? activity.stderr,
 				exitCode,
 				timedOut,
-				...(failed ? { error: timedOut ? "Timed out" : `Exit ${exitCode}` } : {}),
+				...(failed ? { error: timedOut ? "Timed out" : cancelled ? "Cancelled" : `Exit ${exitCode}` } : {}),
 			};
 		} else if (!error && activity.kind === "agent") {
 			const info = agentInfo(result);
@@ -255,7 +259,7 @@ export class RiemannActivityTracker {
 				...activity,
 				...(stringValue(info?.id) ? { agentId: stringValue(info?.id) } : {}),
 				...(stringValue(info?.name) ? { name: stringValue(info?.name) } : {}),
-				...(agentStatus ? { agentStatus } : activity.operation === "spawn" ? { agentStatus: "running" } : {}),
+				...(agentStatus ? { agentStatus } : activity.operation === "start" ? { agentStatus: "running" } : {}),
 				...(agentOutcome === "error" ? { status: "error", error: "Agent failed" } : {}),
 			};
 		} else if (!error && activity.kind === "patch") {

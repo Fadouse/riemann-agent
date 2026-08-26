@@ -60,6 +60,7 @@ class FakeChildSession implements ChildAgentSession {
 	readonly model: Model<any> | undefined;
 	readonly sessionManager: Pick<SessionManager, "getBranch">;
 	isStreaming = true;
+	steerFailure: Error | undefined;
 	readonly steering: string[] = [];
 	readonly prompts: string[] = [];
 	private aborted = false;
@@ -82,6 +83,7 @@ class FakeChildSession implements ChildAgentSession {
 	}
 
 	async steer(text: string): Promise<void> {
+		if (this.steerFailure) throw this.steerFailure;
 		this.steering.push(text);
 	}
 
@@ -297,41 +299,36 @@ describe("Riemann reusable Agent slots", () => {
 			const definitions = supervisor.definitions(mainId);
 			expect(definitions.map((definition) => definition.name)).toEqual([
 				"list",
-				"run",
-				"spawn",
+				"start",
 				"info",
 				"wait",
-				"send",
+				"steer",
 				"stop",
 				"release",
 			]);
 			expect(
-				definitions
-					.filter((definition) => definition.installInPythonNamespace !== false)
-					.map((definition) => definition.name),
-			).toEqual(["list", "run", "spawn"]);
+				definitions.filter((definition) => definition.visibility === "public").map((definition) => definition.name),
+			).toEqual(["list", "start"]);
 			expect(
 				definitions
-					.filter((definition) => definition.includeInSystemPrompt !== false)
+					.filter((definition) => definition.visibility === "handle-method")
 					.map((definition) => definition.name),
-			).toEqual(["list", "run", "spawn"]);
-			expect(functionByName(definitions, "spawn").parameters.map((parameter) => parameter.name)).toEqual([
-				"task",
-				"name",
-				"profile",
-			]);
-			expect(functionByName(definitions, "run").parameters.map((parameter) => parameter.name)).toEqual([
-				"task",
-				"name",
-				"profile",
-				"timeout",
-			]);
-			expect(
-				functionByName(definitions, "spawn").parameters.find((parameter) => parameter.name === "profile")
-					?.description,
-			).toBe('Exact configured policy key: "isolated", "privileged"');
+			).toEqual(["info", "wait", "steer", "stop", "release"]);
+			const startDefinition = functionByName(definitions, "start");
+			expect(startDefinition.abiVersion).toBe(2);
+			expect(Object.keys(startDefinition.inputSchema.properties)).toEqual(["task", "name", "profile", "reuse"]);
+			expect(startDefinition.inputSchema).toMatchObject({ additionalProperties: false });
+			expect(startDefinition.pythonReturnType).toBe("AgentTurnHandle");
+			expect(startDefinition.outputSchema).toMatchObject({
+				type: "object",
+				additionalProperties: false,
+				properties: { $riemann: { const: "agent_turn_handle.v1" }, status: { anyOf: expect.any(Array) } },
+			});
+			expect(startDefinition.inputSchema.properties.profile).toMatchObject({
+				anyOf: [{ description: 'Exact configured policy key: "isolated", "privileged"' }, { type: "null" }],
+			});
 			await expect(
-				supervisor.spawn(mainId, { task: "invalid profile", name: "invalid-profile", profile: "explore" }),
+				supervisor.start(mainId, { task: "invalid profile", name: "invalid-profile", profile: "explore" }),
 			).rejects.toMatchObject({
 				code: "not_found",
 				message:
@@ -340,12 +337,16 @@ describe("Riemann reusable Agent slots", () => {
 			expect(store.listAgents(harness.runId).filter((agent) => agent.parentId !== null)).toHaveLength(0);
 
 			const firstHandle = objectValue(
-				await supervisor.spawn(mainId, { task: "Produce a bounded result", name: "reviewer" }),
+				await supervisor.start(mainId, { task: "Produce a bounded result", name: "reviewer" }),
 			);
 			const childId = firstHandle.id;
-			if (typeof childId !== "string") throw new Error("Spawn did not return an Agent id");
+			if (typeof childId !== "string") throw new Error("Start did not return an Agent id");
 			const firstTurnId = firstHandle.turn_id;
-			if (typeof firstTurnId !== "string") throw new Error("Spawn did not return a Turn id");
+			if (typeof firstTurnId !== "string") throw new Error("Start did not return a Turn id");
+			expect(firstHandle).toMatchObject({
+				$riemann: "agent_turn_handle.v1",
+				status: "running",
+			});
 			expect(supervisor.definitions(childId)).toEqual([]);
 			await waitFor(() => supervisor.listSubagentsForUi().find((agent) => agent.id === childId)?.live === true);
 			expect(store.getAgent(childId)).toMatchObject({
@@ -390,9 +391,20 @@ describe("Riemann reusable Agent slots", () => {
 			expect(store.listPendingAgentEvents(mainId)).toHaveLength(0);
 			await waitFor(() => supervisor.listSubagentsForUi().find((agent) => agent.id === childId)?.live === false);
 			expect(supervisor.listSubagentsForUi().find((agent) => agent.id === childId)?.messages).not.toHaveLength(0);
+			await expect(
+				supervisor.start(mainId, { task: "accidental collision", name: "reviewer", reuse: "never" }),
+			).rejects.toMatchObject({ code: "conflict" });
+			await expect(
+				supervisor.start(mainId, {
+					task: "incompatible reuse",
+					name: "reviewer",
+					profile: "privileged",
+					reuse: "exact",
+				}),
+			).rejects.toMatchObject({ code: "conflict" });
 
 			const reusedHandle = objectValue(
-				await supervisor.spawn(mainId, { task: "Review the regression test", name: "reviewer" }),
+				await supervisor.start(mainId, { task: "Review the regression test", name: "reviewer", reuse: "exact" }),
 			);
 			expect(reusedHandle.id).toBe(childId);
 			expect(reusedHandle.turn_id).not.toBe(firstTurnId);
@@ -402,7 +414,7 @@ describe("Riemann reusable Agent slots", () => {
 			sessions.get(childId)?.at(-1)?.finish();
 			await waitFor(() => store.getAgent(childId)?.status === "idle");
 
-			await supervisor.steerSubagentFromUi(childId, "Inspect the final diff");
+			await supervisor.start(mainId, { task: "Inspect the final diff", name: "reviewer", reuse: "exact" });
 			await waitFor(() => store.getAgent(childId)?.status === "running");
 			expect(store.listAgents(harness.runId).filter((agent) => agent.parentId !== null)).toHaveLength(1);
 			expect(resumeFlags.get(childId)).toEqual([false, true, true]);
@@ -411,7 +423,7 @@ describe("Riemann reusable Agent slots", () => {
 			expect(store.getAgent(childId)).toMatchObject({ status: "stopped", lastOutcome: "cancelled" });
 
 			await expect(
-				supervisor.spawn(childId, { task: "Attempt recursive delegation", name: "nested" }),
+				supervisor.start(childId, { task: "Attempt recursive delegation", name: "nested" }),
 			).rejects.toMatchObject({ code: "limit_exceeded" });
 		} finally {
 			await supervisor.close();
@@ -424,7 +436,7 @@ describe("Riemann reusable Agent slots", () => {
 		const harness = await createHarness({}, undefined, undefined, { createSession: () => session });
 		const { supervisor, store, mainId } = harness;
 		try {
-			const handle = objectValue(await supervisor.spawn(mainId, { task: "stream a response", name: "worker" }));
+			const handle = objectValue(await supervisor.start(mainId, { task: "stream a response", name: "worker" }));
 			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
 			await waitFor(() => supervisor.listSubagentsForUi().find((agent) => agent.id === handle.id)?.live === true);
 			expect(session.statsReads).toBe(1);
@@ -453,19 +465,15 @@ describe("Riemann reusable Agent slots", () => {
 		const { supervisor, store, mainId, sessions } = harness;
 		try {
 			const definitions = supervisor.definitions(mainId);
-			expect(functionByName(definitions, "run").parameters.map((parameter) => parameter.name)).toEqual([
+			expect(Object.keys(functionByName(definitions, "start").inputSchema.properties)).toEqual([
 				"task",
 				"name",
-				"timeout",
-			]);
-			expect(functionByName(definitions, "spawn").parameters.map((parameter) => parameter.name)).toEqual([
-				"task",
-				"name",
+				"reuse",
 			]);
 			expect(supervisor.profileInventory(mainId)).toBe("");
 
 			await expect(
-				supervisor.spawn(mainId, { task: "invalid profile", name: "invalid-profile", profile: "explore" }),
+				supervisor.start(mainId, { task: "invalid profile", name: "invalid-profile", profile: "explore" }),
 			).rejects.toMatchObject({
 				code: "not_found",
 				message:
@@ -474,9 +482,9 @@ describe("Riemann reusable Agent slots", () => {
 			expect(store.listAgents(harness.runId).filter((agent) => agent.parentId !== null)).toHaveLength(0);
 
 			const handle = objectValue(
-				await supervisor.spawn(mainId, { task: "Inspect the repository", name: "project-inspector" }),
+				await supervisor.start(mainId, { task: "Inspect the repository", name: "project-inspector" }),
 			);
-			if (typeof handle.id !== "string") throw new Error("Spawn did not return an Agent id");
+			if (typeof handle.id !== "string") throw new Error("Start did not return an Agent id");
 			const childId = handle.id;
 			await waitFor(() => store.getAgent(childId)?.status === "running");
 			sessions.get(childId)?.at(-1)?.finish();
@@ -492,12 +500,28 @@ describe("Riemann reusable Agent slots", () => {
 		const { supervisor, store, mainId, sessions, deliveries } = harness;
 		const definitions = supervisor.definitions(mainId);
 		const waitDefinition = functionByName(definitions, "wait");
-		const sendDefinition = functionByName(definitions, "send");
+		const steerDefinition = functionByName(definitions, "steer");
 		const stopDefinition = functionByName(definitions, "stop");
 		try {
-			const first = objectValue(await supervisor.spawn(mainId, { task: "first turn", name: "worker" }));
+			const first = objectValue(await supervisor.start(mainId, { task: "first turn", name: "worker" }));
 			if (typeof first.id !== "string" || typeof first.turn_id !== "string") throw new Error("Missing first handle");
 			await waitFor(() => store.getAgent(first.id as string)?.status === "running");
+			await expect(
+				supervisor.start(mainId, { task: "cannot start over active", name: "worker", reuse: "exact" }),
+			).rejects.toMatchObject({ code: "conflict" });
+			expect(
+				objectValue(
+					await steerDefinition.handler(
+						{ agent_id: first.id, turn_id: first.turn_id, message: "inspect the edge case" },
+						new AbortController().signal,
+					),
+				),
+			).toMatchObject({
+				$riemann: "agent_turn_handle.v1",
+				turn_id: first.turn_id,
+				status: "running",
+			});
+			expect(sessions.get(first.id)?.at(-1)?.steering).toHaveLength(1);
 			const firstWait = waitDefinition.handler(
 				{ agent_id: first.id, turn_id: first.turn_id },
 				new AbortController().signal,
@@ -505,7 +529,7 @@ describe("Riemann reusable Agent slots", () => {
 			sessions.get(first.id)?.at(-1)?.finish();
 			const firstResult = objectValue(await firstWait);
 			expect(firstResult).toMatchObject({
-				$riemann: "agent_result",
+				$riemann: "agent_result.v1",
 				id: first.id,
 				turn_id: first.turn_id,
 				status: "idle",
@@ -514,8 +538,16 @@ describe("Riemann reusable Agent slots", () => {
 			});
 			expect(store.listPendingAgentEvents(mainId)).toHaveLength(0);
 			expect(deliveries).toHaveLength(0);
+			await expect(
+				steerDefinition.handler(
+					{ agent_id: first.id, turn_id: first.turn_id, message: "settled steering" },
+					new AbortController().signal,
+				),
+			).rejects.toMatchObject({ code: "conflict" });
 
-			const second = objectValue(await supervisor.spawn(mainId, { task: "second turn", name: "worker" }));
+			const second = objectValue(
+				await supervisor.start(mainId, { task: "second turn", name: "worker", reuse: "exact" }),
+			);
 			if (typeof second.turn_id !== "string") throw new Error("Missing second Turn id");
 			expect(second.turn_id).not.toBe(first.turn_id);
 			expect(
@@ -527,7 +559,7 @@ describe("Riemann reusable Agent slots", () => {
 				).turn_id,
 			).toBe(first.turn_id);
 			await expect(
-				sendDefinition.handler(
+				steerDefinition.handler(
 					{ agent_id: first.id, turn_id: first.turn_id, message: "stale steering" },
 					new AbortController().signal,
 				),
@@ -547,7 +579,7 @@ describe("Riemann reusable Agent slots", () => {
 				),
 			);
 			expect(stopped).toMatchObject({
-				$riemann: "agent_result",
+				$riemann: "agent_result.v1",
 				turn_id: second.turn_id,
 				status: "stopped",
 				outcome: "cancelled",
@@ -564,7 +596,7 @@ describe("Riemann reusable Agent slots", () => {
 		const harness = await createHarness();
 		const { supervisor, store, mainId, sessions, deliveries } = harness;
 		try {
-			const handle = objectValue(await supervisor.spawn(mainId, { task: "background turn", name: "worker" }));
+			const handle = objectValue(await supervisor.start(mainId, { task: "background turn", name: "worker" }));
 			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
 			await waitFor(() => store.getAgent(handle.id as string)?.status === "running");
 			sessions.get(handle.id)?.at(-1)?.finish();
@@ -577,52 +609,51 @@ describe("Riemann reusable Agent slots", () => {
 		}
 	});
 
-	test("runs synchronously and stops the owned Turn when its caller aborts or times out", async () => {
+	test("starts independently and interrupting a wait does not stop the Turn", async () => {
 		const harness = await createHarness();
 		const { supervisor, store, mainId, sessions, deliveries } = harness;
-		const runDefinition = functionByName(supervisor.definitions(mainId), "run");
+		const definitions = supervisor.definitions(mainId);
+		const startDefinition = functionByName(definitions, "start");
+		const waitDefinition = functionByName(definitions, "wait");
 		try {
-			const completed = runDefinition.handler(
-				{ task: "synchronous turn", name: "sync-worker" },
-				new AbortController().signal,
+			const startSignal = new AbortController();
+			startSignal.abort(new Error("cell already interrupted"));
+			const handle = objectValue(
+				await startDefinition.handler(
+					{ task: "independent turn", name: "worker", reuse: "never" },
+					startSignal.signal,
+				),
 			);
-			await waitFor(() => store.listAgents(harness.runId).some((agent) => agent.name === "sync-worker"));
-			const syncAgent = store.listAgents(harness.runId).find((agent) => agent.name === "sync-worker");
-			if (!syncAgent) throw new Error("Missing synchronous Agent");
-			await waitFor(() => store.getAgent(syncAgent.id)?.status === "running");
-			sessions.get(syncAgent.id)?.at(-1)?.finish();
-			expect(objectValue(await completed)).toMatchObject({
-				$riemann: "agent_result",
-				id: syncAgent.id,
-				status: "idle",
-				outcome: "ok",
-				output: "child completed: synchronous turn",
+			if (typeof handle.id !== "string" || typeof handle.turn_id !== "string") {
+				throw new Error("Missing Agent Turn handle");
+			}
+			expect(handle).toMatchObject({
+				$riemann: "agent_turn_handle.v1",
+				status: "running",
 			});
 
-			const abortedController = new AbortController();
-			const aborted = runDefinition.handler(
-				{ task: "abort this turn", name: "abort-worker" },
-				abortedController.signal,
+			const waitController = new AbortController();
+			const interrupted = waitDefinition.handler(
+				{ agent_id: handle.id, turn_id: handle.turn_id },
+				waitController.signal,
 			);
-			await waitFor(
-				() => store.listAgents(harness.runId).find((agent) => agent.name === "abort-worker")?.status === "running",
-			);
-			abortedController.abort(new Error("caller interrupted"));
-			await expect(aborted).rejects.toMatchObject({ code: "aborted" });
-			await waitFor(
-				() => store.listAgents(harness.runId).find((agent) => agent.name === "abort-worker")?.status === "stopped",
-			);
+			waitController.abort(new Error("interrupt only the wait"));
+			await expect(interrupted).rejects.toMatchObject({ code: "cancelled" });
+			expect(store.getAgent(handle.id)?.status).toBe("running");
 
-			await expect(
-				runDefinition.handler(
-					{ task: "time out this turn", name: "timeout-worker", timeout: 0.01 },
-					new AbortController().signal,
-				),
-			).rejects.toMatchObject({ code: "timeout" });
-			await waitFor(
-				() =>
-					store.listAgents(harness.runId).find((agent) => agent.name === "timeout-worker")?.status === "stopped",
+			const completed = waitDefinition.handler(
+				{ agent_id: handle.id, turn_id: handle.turn_id },
+				new AbortController().signal,
 			);
+			sessions.get(handle.id)?.at(-1)?.finish();
+			expect(objectValue(await completed)).toMatchObject({
+				$riemann: "agent_result.v1",
+				id: handle.id,
+				turn_id: handle.turn_id,
+				status: "idle",
+				outcome: "ok",
+				output: "child completed: independent turn",
+			});
 			expect(store.listPendingAgentEvents(mainId)).toHaveLength(0);
 			expect(deliveries).toHaveLength(0);
 		} finally {
@@ -630,7 +661,6 @@ describe("Riemann reusable Agent slots", () => {
 			store.close();
 		}
 	});
-
 	test("uses the configured default child model without requiring a profile", async () => {
 		const childModel = getModel("openai", "gpt-4o");
 		if (!childModel) throw new Error("Configured test model is unavailable");
@@ -646,8 +676,8 @@ describe("Riemann reusable Agent slots", () => {
 		);
 		const { supervisor, store, mainId, sessions, modelIds } = harness;
 		try {
-			const handle = objectValue(await supervisor.spawn(mainId, { task: "Use the default model", name: "worker" }));
-			if (typeof handle.id !== "string") throw new Error("Spawn did not return an Agent id");
+			const handle = objectValue(await supervisor.start(mainId, { task: "Use the default model", name: "worker" }));
+			if (typeof handle.id !== "string") throw new Error("Start did not return an Agent id");
 			const childId = handle.id;
 			await waitFor(() => modelIds.length === 1);
 			expect(modelIds).toEqual([`${childModel.provider}/${childModel.id}`]);
@@ -686,9 +716,9 @@ describe("Riemann reusable Agent slots", () => {
 		);
 		try {
 			const handle = objectValue(
-				await supervisor.spawn(mainId, { task: "Complete the child turn", name: "worker" }),
+				await supervisor.start(mainId, { task: "Complete the child turn", name: "worker" }),
 			);
-			if (typeof handle.id !== "string") throw new Error("Spawn did not return an Agent id");
+			if (typeof handle.id !== "string") throw new Error("Start did not return an Agent id");
 			const childId = handle.id;
 			await waitFor(() => store.getAgent(childId)?.status === "idle", 10_000);
 			expect(store.getAgent(childId)).toMatchObject({
@@ -735,7 +765,7 @@ describe("Riemann reusable Agent slots", () => {
 			JSON.stringify({ [faux.provider.id]: { type: "api_key", key: "faux-key" } }),
 		);
 		try {
-			const handle = objectValue(await supervisor.spawn(mainId, { task: "Complete", name: "snapshot-worker" }));
+			const handle = objectValue(await supervisor.start(mainId, { task: "Complete", name: "snapshot-worker" }));
 			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
 			await waitFor(() => store.getAgent(handle.id as string)?.status === "idle", 10_000);
 			expect(warnings).toContainEqual(
@@ -781,7 +811,7 @@ describe("Riemann reusable Agent slots", () => {
 		);
 		const { supervisor, store, mainId, sessions, agentDir } = harness;
 		try {
-			const handle = objectValue(await supervisor.spawn(mainId, { task: "Wait", name: "live-worker" }));
+			const handle = objectValue(await supervisor.start(mainId, { task: "Wait", name: "live-worker" }));
 			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
 			await waitFor(() => supervisor.listSubagentsForUi().some((agent) => agent.id === handle.id && agent.live));
 
@@ -829,7 +859,7 @@ describe("Riemann reusable Agent slots", () => {
 		await mkdir(join(root, ".riemann"), { recursive: true });
 		await writeFile(join(root, ".riemann", "config.yaml"), "version: 1\ncompaction:\n  strategy: default\n");
 		try {
-			const handle = objectValue(await supervisor.spawn(mainId, { task: "Wait", name: "project-worker" }));
+			const handle = objectValue(await supervisor.start(mainId, { task: "Wait", name: "project-worker" }));
 			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
 			await waitFor(() => supervisor.listSubagentsForUi().some((agent) => agent.id === handle.id && agent.live));
 
@@ -847,28 +877,37 @@ describe("Riemann reusable Agent slots", () => {
 	test("enforces the global slot cap across idle and stopped Agents until the user releases one", async () => {
 		const harness = await createHarness({ maxAgents: 2, maxConcurrentAgents: 1 });
 		const { supervisor, store, mainId, sessions } = harness;
+		const steerDefinition = functionByName(supervisor.definitions(mainId), "steer");
 		try {
-			const first = objectValue(await supervisor.spawn(mainId, { task: "first", name: "first" }));
-			const second = objectValue(await supervisor.spawn(mainId, { task: "second", name: "second" }));
+			const first = objectValue(await supervisor.start(mainId, { task: "first", name: "first" }));
+			const second = objectValue(await supervisor.start(mainId, { task: "second", name: "second" }));
 			if (typeof first.id !== "string" || typeof second.id !== "string") throw new Error("Missing Agent ids");
 			const firstId = first.id;
 			const secondId = second.id;
 			await waitFor(() => store.getAgent(firstId)?.status === "running");
 			expect(store.getAgent(secondId)?.status).toBe("queued");
-			await expect(supervisor.spawn(mainId, { task: "third", name: "third" })).rejects.toMatchObject({
+			expect(second).toMatchObject({ $riemann: "agent_turn_handle.v1", status: "queued" });
+			await expect(
+				steerDefinition.handler(
+					{ agent_id: secondId, turn_id: second.turn_id, message: "queued steering" },
+					new AbortController().signal,
+				),
+			).rejects.toMatchObject({ code: "conflict" });
+			expect(store.listInbox(secondId)).toHaveLength(0);
+			await expect(supervisor.start(mainId, { task: "third", name: "third" })).rejects.toMatchObject({
 				code: "limit_exceeded",
 			});
 
 			await supervisor.stopSubagentFromUi(secondId);
 			expect(store.getAgent(secondId)?.status).toBe("stopped");
-			await expect(supervisor.spawn(mainId, { task: "third", name: "third" })).rejects.toMatchObject({
+			await expect(supervisor.start(mainId, { task: "third", name: "third" })).rejects.toMatchObject({
 				code: "limit_exceeded",
 			});
 
 			await supervisor.releaseSubagentFromUi(secondId);
 			expect(store.getAgent(secondId)?.releasedAt).not.toBeNull();
 			expect(supervisor.listSubagentsForUi().some((agent) => agent.id === secondId)).toBe(false);
-			const replacement = objectValue(await supervisor.spawn(mainId, { task: "replacement", name: "second" }));
+			const replacement = objectValue(await supervisor.start(mainId, { task: "replacement", name: "second" }));
 			if (typeof replacement.id !== "string") throw new Error("Missing replacement Agent id");
 			expect(replacement.id).not.toBe(secondId);
 			expect(store.listAgents(harness.runId).filter((agent) => agent.parentId !== null)).toHaveLength(2);
@@ -889,7 +928,7 @@ describe("Riemann reusable Agent slots", () => {
 		});
 		const { supervisor, store, mainId, sessions } = harness;
 		try {
-			const handle = objectValue(await supervisor.spawn(mainId, { task: "complete once", name: "worker" }));
+			const handle = objectValue(await supervisor.start(mainId, { task: "complete once", name: "worker" }));
 			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
 			const childId = handle.id;
 			await waitFor(() => store.getAgent(childId)?.status === "running");
@@ -1152,7 +1191,7 @@ describe("Riemann reusable Agent slots", () => {
 		});
 		try {
 			const handle = objectValue(
-				await supervisor.spawn(main.id, { task: "work independently", name: "worker", profile: "isolated" }),
+				await supervisor.start(main.id, { task: "work independently", name: "worker", profile: "isolated" }),
 			);
 			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
 			const childId = handle.id;
@@ -1178,4 +1217,30 @@ describe("Riemann reusable Agent slots", () => {
 			store.close();
 		}
 	}, 30_000);
+	test("failed exact-Turn steering cannot become a later Turn", async () => {
+		const harness = await createHarness();
+		const { supervisor, store, mainId, sessions } = harness;
+		const steerDefinition = functionByName(supervisor.definitions(mainId), "steer");
+		try {
+			const handle = objectValue(await supervisor.start(mainId, { task: "active turn", name: "steer-race" }));
+			if (typeof handle.id !== "string" || typeof handle.turn_id !== "string") throw new Error("Missing handle");
+			await waitFor(() => store.getAgent(handle.id as string)?.status === "running");
+			const session = sessions.get(handle.id)?.at(-1);
+			if (!session) throw new Error("Missing child session");
+			session.steerFailure = new Error("stream settled concurrently");
+			await expect(
+				steerDefinition.handler(
+					{ agent_id: handle.id, turn_id: handle.turn_id, message: "must not become a task" },
+					new AbortController().signal,
+				),
+			).rejects.toThrow("stream settled concurrently");
+			expect(store.listInbox(handle.id, { unreadOnly: true })).toEqual([]);
+			session.finish();
+			await waitFor(() => store.getAgent(handle.id as string)?.status === "idle");
+			expect(store.listAgentTurns(handle.id)).toHaveLength(1);
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
 });

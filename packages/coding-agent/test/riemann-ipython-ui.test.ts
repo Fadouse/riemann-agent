@@ -130,7 +130,7 @@ describe("Riemann IPython transcript", () => {
 
 		component.update({
 			code: "await asyncio.sleep(60)",
-			details: { status: "aborted" },
+			details: { status: "cancelled" },
 			isPartial: false,
 			executionStarted: true,
 			argsComplete: true,

@@ -70,6 +70,7 @@ describe("Riemann kernel system sandbox", () => {
 			expect(command.args).not.toContain("--unshare-all");
 			expect(command.args).toContain("--new-session");
 			expect(command.args).toContain("--unshare-pid");
+			expect(command.args).toContain("--unshare-net");
 			expect(command.transport).toBe("ipc");
 			expect(command.args).toEqual(expect.arrayContaining(["--dev-bind", "/dev", "/dev"]));
 			expect(command.args).toEqual(expect.arrayContaining(["--bind", "/", "/"]));
@@ -140,6 +141,11 @@ describe("Riemann kernel system sandbox", () => {
 		expect(macOSSandboxProfile({ ...config, networkAllowed: true, platform: "darwin" })).toContain(
 			"(allow network*)",
 		);
+		const linuxAllowed = sandboxedKernelCommand(
+			{ ...config, networkAllowed: true, platform: "linux", bubblewrapPath: "/usr/bin/bwrap" },
+			[],
+		);
+		expect(linuxAllowed.args).not.toContain("--unshare-net");
 	});
 
 	test("preserves host and terminal environment while keeping Jupyter state private", async () => {

@@ -4,7 +4,7 @@ import { copyFile, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { Dealer, Subscriber } from "zeromq";
+import { Dealer, Subscriber } from "zeromq";
 import { signalProcessGroup, spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { policyAllowsRead, policyAllowsWrite } from "../access-policy.ts";
 import { sandboxedKernelCommand } from "./sandbox.ts";
@@ -16,6 +16,7 @@ import type {
 	KernelError,
 	KernelExecuteOptions,
 	KernelExecuteResult,
+	KernelExecuteStatus,
 	KernelHostRequest,
 	KernelHostRequestError,
 	KernelHostRequestEvent,
@@ -23,7 +24,7 @@ import type {
 	KernelModelContent,
 	KernelRestoreResult,
 } from "./types.ts";
-import { isKernelHostResult } from "./types.ts";
+import { isKernelHostResult, RIEMANN_BRIDGE_ABI_VERSION } from "./types.ts";
 import { decodeJupyterMessage, encodeJupyterMessage } from "./wire.ts";
 
 const CONNECTION_WAIT_MS = 50;
@@ -42,7 +43,7 @@ interface ActiveExecution {
 	result?: KernelDisplay;
 	error?: KernelError;
 	executionCount?: number;
-	status: "ok" | "error" | "aborted";
+	status: KernelExecuteStatus;
 	idle: boolean;
 	replied: boolean;
 	settled: boolean;
@@ -53,6 +54,7 @@ interface ActiveExecution {
 	nextHostSequence: number;
 	hostModelContent: Array<{ sequence: number; content: KernelModelContent[] }>;
 	hostNotificationQueue: Promise<void>;
+	richOutputTruncated: boolean;
 }
 
 function endpoint(info: JupyterConnectionInfo, port: number): string {
@@ -307,10 +309,9 @@ export class IPythonKernelManager {
 		}
 		if (!this.connection) throw new Error("Timed out waiting for IPython connection ports");
 
-		const { Dealer: DealerSocket, Subscriber: SubscriberSocket } = await import("zeromq");
-		this.shell = new DealerSocket({ routingId: `riemann-shell-${this.session}` });
-		this.control = new DealerSocket({ routingId: `riemann-control-${this.session}` });
-		this.iopub = new SubscriberSocket();
+		this.shell = new Dealer({ routingId: `riemann-shell-${this.session}` });
+		this.control = new Dealer({ routingId: `riemann-control-${this.session}` });
+		this.iopub = new Subscriber();
 		this.iopub.subscribe();
 		this.shell.connect(endpoint(this.connection, this.connection.shell_port));
 		this.control.connect(endpoint(this.connection, this.connection.control_port));
@@ -388,17 +389,25 @@ export class IPythonKernelManager {
 				break;
 			}
 			case "display_data": {
-				const display = parseDisplay(message);
-				if (display) execution.displays.push(display);
+				const display = this.boundedDisplay(message);
+				if (!display) break;
+				if (execution.displays.length < 32) execution.displays.push(display);
+				else if (!execution.richOutputTruncated) {
+					execution.richOutputTruncated = true;
+					execution.displays.push({
+						data: { "text/plain": "[additional rich output omitted by Riemann Agent]" },
+						metadata: {},
+					});
+				}
 				break;
 			}
 			case "execute_result": {
-				execution.result = parseDisplay(message);
+				execution.result = this.boundedDisplay(message);
 				execution.executionCount = numberField(message.content.execution_count);
 				break;
 			}
 			case "error":
-				if (execution.status !== "aborted") {
+				if (execution.status !== "cancelled" && execution.status !== "timeout") {
 					execution.error = parseError(message);
 					execution.status = "error";
 				}
@@ -406,11 +415,15 @@ export class IPythonKernelManager {
 			case "execute_reply":
 				execution.replied = true;
 				execution.executionCount ??= numberField(message.content.execution_count);
-				if (message.content.status === "error" && execution.status !== "aborted") {
+				if (
+					message.content.status === "error" &&
+					execution.status !== "cancelled" &&
+					execution.status !== "timeout"
+				) {
 					execution.status = "error";
 					execution.error ??= parseError(message);
-				} else if (message.content.status === "aborted") {
-					execution.status = "aborted";
+				} else if (message.content.status === "aborted" && execution.status === "ok") {
+					execution.status = "cancelled";
 				}
 				this.settleIfComplete(execution);
 				break;
@@ -421,6 +434,25 @@ export class IPythonKernelManager {
 				}
 				break;
 		}
+	}
+
+	private boundedDisplay(message: JupyterMessage): KernelDisplay | undefined {
+		const display = parseDisplay(message);
+		if (!display) return undefined;
+		const cap = Math.max(1, this.options.maxOutputChars ?? 100_000);
+		const encoded = JSON.stringify(display.data);
+		if (encoded.length <= cap) return display;
+		const text = display.data["text/plain"];
+		if (typeof text === "string") {
+			return {
+				data: { "text/plain": `${text.slice(0, cap)}\n[rich output truncated by Riemann Agent]` },
+				metadata: display.metadata,
+			};
+		}
+		return {
+			data: { "text/plain": `[rich output omitted by Riemann Agent; ${encoded.length} encoded characters]` },
+			metadata: {},
+		};
 	}
 
 	private capOutput(value: string, addition: string): { value: string; truncated: boolean } {
@@ -476,11 +508,93 @@ export class IPythonKernelManager {
 
 	private async handleHostRequest(_channel: "shell" | "control" | "iopub", message: JupyterMessage): Promise<void> {
 		const commId = stringField(message.content.comm_id);
+		if (!commId) return;
 		const data = message.content.data;
-		if (!commId || typeof data !== "object" || data === null || Array.isArray(data)) return;
-		const type = stringField(data.type);
-		const args = data.args;
-		if (!type || typeof args !== "object" || args === null || Array.isArray(args)) return;
+		const dataRecord = typeof data === "object" && data !== null && !Array.isArray(data) ? data : undefined;
+		const suppliedRequestId = dataRecord ? stringField(dataRecord.request_id) : undefined;
+		const suppliedOperation = dataRecord ? stringField(dataRecord.operation) : undefined;
+		const requestId = suppliedRequestId ?? commId;
+		const operation = suppliedOperation ?? "<unknown>";
+		const sendReply = async (reply: Record<string, JsonValue>): Promise<void> => {
+			const socket = this.control ?? this.shell;
+			if (!socket || !this.connection || this.closed) return;
+			let response: ReturnType<typeof encodeJupyterMessage>;
+			try {
+				response = encodeJupyterMessage({
+					type: "comm_msg",
+					content: { comm_id: commId, data: reply },
+					parentHeader: message.header,
+					session: this.session,
+					username: this.options.sessionId,
+					key: this.connection.key,
+				});
+			} catch (error) {
+				const protocolReply: Record<string, JsonValue> = {
+					abi_version: RIEMANN_BRIDGE_ABI_VERSION,
+					request_id: requestId,
+					operation,
+					status: "error",
+					error: {
+						code: "bridge_protocol_error",
+						message: `Host produced a value that cannot be encoded: ${errorMessage(error)}`,
+						operation,
+						request_id: requestId,
+						retryable: false,
+					},
+				};
+				response = encodeJupyterMessage({
+					type: "comm_msg",
+					content: { comm_id: commId, data: protocolReply },
+					parentHeader: message.header,
+					session: this.session,
+					username: this.options.sessionId,
+					key: this.connection.key,
+				});
+			}
+			await socket.send(response.frames);
+		};
+		const protocolError = async (messageText: string): Promise<void> => {
+			await sendReply({
+				abi_version: RIEMANN_BRIDGE_ABI_VERSION,
+				request_id: requestId,
+				operation,
+				status: "error",
+				error: {
+					code: "bridge_protocol_error",
+					message: messageText,
+					operation,
+					request_id: requestId,
+					retryable: false,
+				},
+			});
+		};
+		if (!dataRecord) {
+			await protocolError("Host bridge request data must be an object");
+			return;
+		}
+		const requestFields = new Set(["abi_version", "request_id", "operation", "arguments"]);
+		if (Object.keys(dataRecord).some((key) => !requestFields.has(key))) {
+			await protocolError("Host bridge request contains an unknown field");
+			return;
+		}
+		if (dataRecord.abi_version !== RIEMANN_BRIDGE_ABI_VERSION) {
+			await protocolError("Unsupported host bridge ABI version");
+			return;
+		}
+		if (!suppliedRequestId) {
+			await protocolError("Host bridge request_id must be a non-empty string");
+			return;
+		}
+		if (!suppliedOperation) {
+			await protocolError("Host bridge operation must be a non-empty string");
+			return;
+		}
+		const argumentsValue = dataRecord.arguments;
+		if (typeof argumentsValue !== "object" || argumentsValue === null || Array.isArray(argumentsValue)) {
+			await protocolError("Host bridge arguments must be an object");
+			return;
+		}
+
 		const execution = this.execution;
 		const sequence = execution?.nextHostSequence ?? 0;
 		if (execution) execution.nextHostSequence += 1;
@@ -490,28 +604,49 @@ export class IPythonKernelManager {
 		} else {
 			execution.hostControllers.add(controller);
 		}
-		const request: KernelHostRequest = { type, args, cellId: stringField(message.parentHeader.msg_id) };
+		const request: KernelHostRequest = {
+			abiVersion: RIEMANN_BRIDGE_ABI_VERSION,
+			requestId,
+			operation,
+			arguments: argumentsValue,
+			cellId: stringField(message.parentHeader.msg_id),
+		};
 		const startedAt = Date.now();
 		let reply: Record<string, JsonValue>;
 		if (controller.signal.aborted || !execution) {
 			reply = {
+				abi_version: RIEMANN_BRIDGE_ABI_VERSION,
+				request_id: requestId,
+				operation,
 				status: "error",
-				error: { code: "aborted", message: "The originating IPython cell is no longer active" },
+				error: {
+					code: "cancelled",
+					message: "The originating IPython cell is no longer active",
+					operation,
+					request_id: requestId,
+					retryable: false,
+				},
 			};
 		} else {
-			await this.notifyHostRequest(execution, { phase: "start", requestId: commId, request, startedAt });
+			await this.notifyHostRequest(execution, { phase: "start", requestId, request, startedAt });
 			try {
 				const result = await this.options.hostRequest(request, controller.signal, (update) => {
-					void this.notifyHostRequest(execution, { phase: "update", requestId: commId, request, update });
+					void this.notifyHostRequest(execution, { phase: "update", requestId, request, update });
 				});
 				const value = isKernelHostResult(result) ? result.value : result;
 				if (isKernelHostResult(result) && result.modelContent.length > 0) {
 					execution.hostModelContent.push({ sequence, content: result.modelContent });
 				}
-				reply = { status: "ok", value };
+				reply = {
+					abi_version: RIEMANN_BRIDGE_ABI_VERSION,
+					request_id: requestId,
+					operation,
+					status: "ok",
+					value,
+				};
 				await this.notifyHostRequest(execution, {
 					phase: "end",
-					requestId: commId,
+					requestId,
 					request,
 					durationMs: Date.now() - startedAt,
 					result: value,
@@ -523,21 +658,35 @@ export class IPythonKernelManager {
 					code:
 						error instanceof Error && "code" in error
 							? String((error as { code?: unknown }).code)
-							: "runtime_error",
+							: controller.signal.aborted
+								? "cancelled"
+								: "runtime_error",
 					message: error instanceof Error ? error.message : String(error),
+					operation,
+					requestId,
+					retryable:
+						error instanceof Error && "retryable" in error
+							? (error as { retryable?: unknown }).retryable === true
+							: false,
 					...(details === undefined ? {} : { details }),
 				};
 				reply = {
+					abi_version: RIEMANN_BRIDGE_ABI_VERSION,
+					request_id: requestId,
+					operation,
 					status: "error",
 					error: {
 						code: requestError.code,
 						message: requestError.message,
+						operation,
+						request_id: requestId,
+						retryable: requestError.retryable,
 						...(requestError.details === undefined ? {} : { details: requestError.details }),
 					},
 				};
 				await this.notifyHostRequest(execution, {
 					phase: "end",
-					requestId: commId,
+					requestId,
 					request,
 					durationMs: Date.now() - startedAt,
 					error: requestError,
@@ -546,17 +695,7 @@ export class IPythonKernelManager {
 				execution.hostControllers.delete(controller);
 			}
 		}
-		const socket = this.control ?? this.shell;
-		if (!socket || !this.connection || this.closed) return;
-		const response = encodeJupyterMessage({
-			type: "comm_msg",
-			content: { comm_id: commId, data: reply },
-			parentHeader: message.header,
-			session: this.session,
-			username: this.options.sessionId,
-			key: this.connection.key,
-		});
-		await socket.send(response.frames);
+		await sendReply(reply);
 	}
 
 	async execute(code: string, options: KernelExecuteOptions = {}): Promise<KernelExecuteResult> {
@@ -600,6 +739,7 @@ export class IPythonKernelManager {
 			nextHostSequence: 0,
 			hostModelContent: [],
 			hostNotificationQueue: Promise.resolve(),
+			richOutputTruncated: false,
 		};
 		this.execution = execution;
 		try {
@@ -608,7 +748,11 @@ export class IPythonKernelManager {
 			this.failActive(error instanceof Error ? error : new Error(String(error)));
 		}
 		if (options.signal && !execution.settled) {
-			const onAbort = () => void this.interrupt().catch(() => undefined);
+			const onAbort = () => {
+				const reason = options.signal?.reason;
+				execution.status = reason instanceof Error && reason.name === "TimeoutError" ? "timeout" : "cancelled";
+				void this.interrupt().catch(() => undefined);
+			};
 			options.signal.addEventListener("abort", onAbort, { once: true });
 			execution.abort = () => options.signal?.removeEventListener("abort", onAbort);
 			if (options.signal.aborted) onAbort();
@@ -619,7 +763,7 @@ export class IPythonKernelManager {
 	async interrupt(): Promise<void> {
 		const execution = this.execution;
 		if (!execution) return;
-		execution.status = "aborted";
+		if (execution.status === "ok") execution.status = "cancelled";
 		this.abortHostRequests(execution, new Error("IPython cell interrupted"));
 		if (this.control && this.connection) {
 			const request = encodeJupyterMessage({
@@ -647,7 +791,7 @@ export class IPythonKernelManager {
 	private failActive(error: Error): void {
 		const execution = this.execution;
 		if (!execution || execution.settled) return;
-		if (execution.status !== "aborted") {
+		if (execution.status !== "cancelled" && execution.status !== "timeout") {
 			execution.error = { ename: error.name, evalue: error.message, traceback: [] };
 			execution.status = "error";
 		}
@@ -728,12 +872,12 @@ export class IPythonKernelManager {
 		const escapedPath = JSON.stringify(kernelPath);
 		const result = await this.execute(
 			`import dill as _riemann_dill, json as _riemann_json, pathlib as _riemann_pathlib\n_riemann_restore = {"restored": [], "skipped": []}\n_riemann_snapshot_path = _riemann_pathlib.Path(${escapedPath})\nif _riemann_snapshot_path.exists():\n    try:\n        with _riemann_snapshot_path.open("rb") as _riemann_file:\n            _riemann_values = _riemann_dill.load(_riemann_file)\n        for _riemann_name, _riemann_value in _riemann_values.items():\n            globals()[_riemann_name] = _riemann_value\n            _riemann_restore["restored"].append(_riemann_name)\n    except Exception as _riemann_error:\n        _riemann_restore["error"] = f"{type(_riemann_error).__name__}: {_riemann_error}"\nprint("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps(_riemann_restore, sort_keys=True))`,
-			{ internal: true },
+			{ internal: true, signal: AbortSignal.timeout(30_000) },
 		);
 		this.options.onRestore?.(this.parseSnapshotResult(result));
 	}
 
-	async snapshot(): Promise<KernelRestoreResult> {
+	async snapshot(signal: AbortSignal = AbortSignal.timeout(30_000)): Promise<KernelRestoreResult> {
 		const kernelPath = this.kernelSnapshotPath();
 		if (!kernelPath) return { restored: [], skipped: [], error: "Snapshots are disabled" };
 		if (!this.kernelReady || this.process?.exitCode !== null)
@@ -772,7 +916,7 @@ try:
 finally:
     if _riemann_os.path.exists(_riemann_tmp): _riemann_os.unlink(_riemann_tmp)
 print("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps({"restored": sorted(_riemann_values), "skipped": _riemann_skipped}, sort_keys=True))`;
-		const result = await this.execute(code, { internal: true });
+		const result = await this.execute(code, { internal: true, signal });
 		if (result.status !== "ok") return { restored: [], skipped: [], error: result.error?.evalue ?? result.stderr };
 		const parsed = this.parseSnapshotResult(result);
 		try {

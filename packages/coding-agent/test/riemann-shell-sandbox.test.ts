@@ -77,7 +77,9 @@ describe("Riemann shell argument validation", () => {
 		const { definition, store } = await shellDefinition(workspace, root, [workspace], []);
 		const signal = new AbortController().signal;
 		try {
-			await expect(definition.handler({}, signal)).rejects.toMatchObject({ code: "invalid_arguments" });
+			await expect(definition.handler({}, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+			});
 			await expect(definition.handler({ script: "" }, signal)).rejects.toMatchObject({
 				code: "invalid_arguments",
 			});
@@ -92,6 +94,41 @@ describe("Riemann shell argument validation", () => {
 			});
 			await expect(definition.handler({ script: "true", cwd: outside }, signal)).rejects.toMatchObject({
 				code: "permission_denied",
+			});
+		} finally {
+			store.close();
+		}
+	});
+
+	test("publishes the exact ABI v2 contract", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-contract-"));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		await mkdir(workspace);
+		const { definition, store } = await shellDefinition(workspace, root, [workspace], []);
+		try {
+			expect(definition).toMatchObject({
+				abiVersion: 2,
+				pythonReturnType: "ProcessResult",
+				idempotency: "non-idempotent",
+				visibility: "public",
+				inputSchema: { type: "object", additionalProperties: false },
+				outputSchema: { type: "object", additionalProperties: false },
+			});
+			expect(definition).not.toHaveProperty("parameters");
+			expect(definition).not.toHaveProperty("returns");
+			expect(definition.outputSchema).toMatchObject({
+				properties: {
+					$riemann: {},
+					exit_code: {},
+					stdout: {},
+					stderr: {},
+					duration_ms: {},
+					termination: {},
+					stdout_truncated: {},
+					stderr_truncated: {},
+					artifact: {},
+				},
 			});
 		} finally {
 			store.close();
@@ -122,11 +159,15 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 					new AbortController().signal,
 				),
 			);
-			expect(result).toMatchObject({
-				command: "riemann-command-that-does-not-exist",
+			expect(result).toEqual({
+				$riemann: "process_result.v1",
 				exit_code: 127,
 				stdout: "",
-				timed_out: false,
+				stderr: expect.stringContaining("command not found"),
+				duration_ms: expect.any(Number),
+				termination: "exited",
+				stdout_truncated: false,
+				stderr_truncated: false,
 				artifact: null,
 			});
 			expect(String(result.stderr)).toContain("command not found");
@@ -157,7 +198,11 @@ PROBE`;
 			);
 			expect(result.exit_code).toBe(0);
 			const output = JSON.parse(String(result.stdout).trim()) as Record<string, string | null>;
-			expect(output).toMatchObject({ inside: "inside", hostSecret: null, explicit: "visible" });
+			expect(output).toMatchObject({
+				inside: "inside",
+				hostSecret: null,
+				explicit: "visible",
+			});
 			expect(output.write).not.toBe("allowed");
 			expect(output.outside).not.toBe("allowed");
 			await expect(readFile(join(workspace, "write.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
@@ -228,7 +273,10 @@ PROBE`;
 				const result = record(
 					await definition.handler({ script: "pwd", timeout: 10 }, new AbortController().signal),
 				);
-				expect(result).toMatchObject({ exit_code: 0, stdout: `${workspace}\n` });
+				expect(result).toMatchObject({
+					exit_code: 0,
+					stdout: `${workspace}\n`,
+				});
 			} finally {
 				store.close();
 			}
@@ -249,7 +297,12 @@ PROBE`;
 		try {
 			const run = store.openRun("shell-nested-state", root);
 			const shell = new ShellFunctions(
-				fileAccessPolicy(root, { read: ["/"], readExclude: [agentDir], write: ["/"], writeExclude: [] }),
+				fileAccessPolicy(root, {
+					read: ["/"],
+					readExclude: [agentDir],
+					write: ["/"],
+					writeExclude: [],
+				}),
 				new ArtifactStore(store, run.id),
 				100_000,
 				false,
@@ -279,12 +332,18 @@ PROBE`;
 			const timeoutResult = record(
 				await definition.handler({ script: "sleep 30", timeout: 1 }, new AbortController().signal),
 			);
-			expect(timeoutResult).toMatchObject({ timed_out: true, exit_code: null });
+			expect(timeoutResult).toMatchObject({
+				termination: "timeout",
+				exit_code: null,
+			});
 
 			const controller = new AbortController();
 			setTimeout(() => controller.abort(), 300);
 			const abortedResult = record(await definition.handler({ script: "sleep 30", timeout: 30 }, controller.signal));
-			expect(abortedResult).toMatchObject({ timed_out: false, exit_code: null });
+			expect(abortedResult).toMatchObject({
+				termination: "cancelled",
+				exit_code: null,
+			});
 		} finally {
 			store.close();
 		}
@@ -323,7 +382,10 @@ setInterval(() => {}, 1000);
 				expect(daemonPid).toBeDefined();
 
 				const result = record(await execution);
-				expect(result).toMatchObject({ timed_out: true, exit_code: null });
+				expect(result).toMatchObject({
+					termination: "timeout",
+					exit_code: null,
+				});
 				for (let attempt = 0; attempt < 40 && processExists(daemonPid!); attempt++) await delay(25);
 				expect(processExists(daemonPid!)).toBe(false);
 			} finally {
@@ -358,6 +420,31 @@ PROBE`;
 		}
 	}, 30_000);
 
+	test("marks stream updates when the update window drops bytes", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-stream-limit-"));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		await mkdir(workspace);
+		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
+		try {
+			const updates: Array<Record<string, JsonValue>> = [];
+			const script = `${process.execPath} -e "process.stdout.write('x'.repeat(70000))"`;
+			const result = record(
+				await definition.handler({ script, timeout: 10 }, new AbortController().signal, (update) => {
+					updates.push(record(update));
+				}),
+			);
+			expect(result).toMatchObject({
+				stdout_truncated: false,
+				termination: "exited",
+			});
+			expect(String(result.stdout)).toHaveLength(70_000);
+			expect(updates.some((update) => update.kind === "stdout" && update.truncated === true)).toBe(true);
+		} finally {
+			store.close();
+		}
+	}, 30_000);
+
 	test("streams split UTF-8 sequences across timed updates and flushes incomplete EOF input", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-stream-unicode-"));
 		roots.push(root);
@@ -365,21 +452,35 @@ PROBE`;
 		await mkdir(workspace);
 		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
 		try {
-			const stdoutDeltas: string[] = [];
-			const stderrDeltas: string[] = [];
+			const updates: Array<Record<string, JsonValue>> = [];
 			const script = `${process.execPath} - <<'PROBE'
 const first=Buffer.from([0xf0,0x9f]);process.stdout.write(first);process.stderr.write(first);setTimeout(()=>process.stdout.write(Buffer.from([0x98,0x80])),150)
 PROBE`;
 			const result = record(
 				await definition.handler({ script, timeout: 10 }, new AbortController().signal, (update) => {
-					const value = record(update);
-					if (typeof value.stdout_delta === "string") stdoutDeltas.push(value.stdout_delta);
-					if (typeof value.stderr_delta === "string") stderrDeltas.push(value.stderr_delta);
+					updates.push(record(update));
 				}),
 			);
-			expect(result).toMatchObject({ exit_code: 0, stdout: "😀", stderr: "�" });
-			expect(stdoutDeltas.join("")).toBe("😀");
-			expect(stderrDeltas.join("")).toBe("�");
+			expect(result).toMatchObject({
+				exit_code: 0,
+				stdout: "😀",
+				stderr: "�",
+				termination: "exited",
+			});
+			expect(updates.map((update) => update.sequence)).toEqual(updates.map((_, index) => index));
+			expect(updates.every((update) => typeof update.truncated === "boolean")).toBe(true);
+			expect(
+				updates
+					.filter((update) => update.kind === "stdout")
+					.map((update) => update.value)
+					.join(""),
+			).toBe("😀");
+			expect(
+				updates
+					.filter((update) => update.kind === "stderr")
+					.map((update) => update.value)
+					.join(""),
+			).toBe("�");
 		} finally {
 			store.close();
 		}

@@ -2,12 +2,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, copyFile, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { RiemannHostError } from "../errors.ts";
 import type { JsonValue } from "../kernel/types.ts";
 import type { RiemannStore, StoredArtifact } from "./store.ts";
 
+const MAX_ARTIFACT_SLICE_BYTES = 1024 * 1024;
+
 function wireArtifact(artifact: StoredArtifact): JsonValue {
 	return {
-		$riemann: "artifact",
+		$riemann: "artifact.v1",
 		handle: artifact.handle,
 		mime_type: artifact.mimeType,
 		size: artifact.size,
@@ -73,8 +76,14 @@ export class ArtifactStore {
 				// Directory fsync is unavailable on some supported platforms.
 			}
 		}
+		const metadataHash = createHash("sha256")
+			.update(options.mimeType)
+			.update("\0")
+			.update(options.name ?? "")
+			.digest("hex")
+			.slice(0, 16);
 		const artifact: StoredArtifact = {
-			handle: `artifact://${this.runId}/${hash}`,
+			handle: `artifact://${this.runId}/${hash}-${metadataHash}`,
 			runId: this.runId,
 			hash,
 			mimeType: options.mimeType,
@@ -89,7 +98,8 @@ export class ArtifactStore {
 
 	getMetadata(handle: string): StoredArtifact {
 		const artifact = this.store.getArtifact(handle);
-		if (!artifact || artifact.runId !== this.runId) throw new Error(`Artifact not found: ${handle}`);
+		if (!artifact || artifact.runId !== this.runId)
+			throw new RiemannHostError("not_found", `Artifact not found: ${handle}`);
 		return artifact;
 	}
 
@@ -104,7 +114,14 @@ export class ArtifactStore {
 		try {
 			const fileSize = (await file.stat()).size;
 			const offset = Math.max(0, options.offset ?? 0);
-			const end = options.limit === undefined ? fileSize : Math.min(fileSize, offset + Math.max(0, options.limit));
+			const limit = options.limit ?? 65_536;
+			if (!Number.isInteger(limit) || limit < 1 || limit > MAX_ARTIFACT_SLICE_BYTES) {
+				throw new RiemannHostError(
+					"invalid_arguments",
+					`Artifact slice limit must be an integer from 1 to ${MAX_ARTIFACT_SLICE_BYTES}`,
+				);
+			}
+			const end = Math.min(fileSize, offset + Math.max(0, limit));
 			const readStart = Math.min(fileSize, Number.isNaN(offset) ? 0 : Math.trunc(offset));
 			const readEnd = Math.min(fileSize, Number.isNaN(end) ? 0 : Math.trunc(end));
 			const data = Buffer.allocUnsafe(Math.max(0, readEnd - readStart));
@@ -114,28 +131,46 @@ export class ArtifactStore {
 				if (result.bytesRead === 0) break;
 				bytesRead += result.bytesRead;
 			}
-			const slice = bytesRead === data.length ? data : data.subarray(0, bytesRead);
+			let slice = bytesRead === data.length ? data : data.subarray(0, bytesRead);
+			let actualStart = readStart;
+			let actualEnd = readStart + slice.byteLength;
 			if (
 				artifact.mimeType.startsWith("text/") ||
 				artifact.mimeType.includes("json") ||
 				artifact.mimeType.includes("xml")
 			) {
+				while (slice.length > 0 && (slice[0] ?? 0) >= 0x80 && (slice[0] ?? 0) < 0xc0) {
+					slice = slice.subarray(1);
+					actualStart += 1;
+				}
+				let content: string | undefined;
+				for (let trim = 0; trim <= Math.min(3, slice.length); trim += 1) {
+					try {
+						content = new TextDecoder("utf-8", { fatal: true }).decode(slice.subarray(0, slice.length - trim));
+						actualEnd -= trim;
+						break;
+					} catch {}
+				}
+				if (content === undefined)
+					throw new RiemannHostError("unsupported_media_type", "Artifact text is not valid UTF-8");
 				return {
 					handle,
 					mime_type: artifact.mimeType,
 					size: artifact.size,
-					offset,
-					content: slice.toString("utf8"),
-					truncated: end < fileSize,
+					offset: actualStart,
+					next_offset: actualEnd,
+					content,
+					truncated: actualEnd < fileSize,
 				};
 			}
 			return {
 				handle,
 				mime_type: artifact.mimeType,
 				size: artifact.size,
-				offset,
+				offset: actualStart,
+				next_offset: actualEnd,
 				base64: slice.toString("base64"),
-				truncated: end < fileSize,
+				truncated: actualEnd < fileSize,
 			};
 		} finally {
 			await file.close();

@@ -25,7 +25,10 @@ describe("grapheme-safe text limits", () => {
 	});
 
 	test("does not split emoji in tool output truncation", () => {
-		expect(truncateLine("a😀b", 2)).toEqual({ text: "a... [truncated]", wasTruncated: true });
+		expect(truncateLine("a😀b", 2)).toEqual({
+			text: "a... [truncated]",
+			wasTruncated: true,
+		});
 		expect(truncateTail("👩‍💻", { maxBytes: 8 })).toMatchObject({
 			content: "",
 			lastLinePartial: true,
@@ -45,7 +48,13 @@ describe("Riemann web decoding", () => {
 		const store = new RiemannStore(join(root, "agent"));
 		try {
 			const run = store.openRun("web-unicode", root);
-			const web = new WebFunctions(undefined, new ArtifactStore(store, run.id), 10_000);
+			const web = new WebFunctions(
+				undefined,
+				new ArtifactStore(store, run.id),
+				10_000,
+				async () => ["93.184.216.34"],
+				(input, init) => globalThis.fetch(input, init),
+			);
 			const definition = web.definitions().find((item) => item.name === "fetch");
 			if (!definition) throw new Error("web.fetch is unavailable");
 			const fetchMock = vi
@@ -57,7 +66,9 @@ describe("Riemann web decoding", () => {
 				)
 				.mockResolvedValueOnce(
 					new Response(Buffer.from("snowman: ☃", "utf8"), {
-						headers: { "content-type": "text/plain; charset=not-a-real-charset" },
+						headers: {
+							"content-type": "text/plain; charset=not-a-real-charset",
+						},
 					}),
 				);
 			vi.stubGlobal("fetch", fetchMock);
@@ -70,8 +81,14 @@ describe("Riemann web decoding", () => {
 				{ url: "https://example.test/fallback" },
 				new AbortController().signal,
 			);
-			expect(windowsResult).toMatchObject({ text: expect.stringContaining("café") });
-			expect(fallbackResult).toMatchObject({ text: expect.stringContaining("snowman: ☃") });
+			expect(windowsResult).toMatchObject({ text: "café", trust: "untrusted" });
+			expect(fallbackResult).toMatchObject({
+				text: "snowman: ☃",
+				trust: "untrusted",
+			});
+			expect(windowsResult).not.toMatchObject({
+				text: expect.stringContaining("Untrusted external web content"),
+			});
 		} finally {
 			store.close();
 		}

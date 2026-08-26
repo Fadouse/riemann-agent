@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Value } from "typebox/value";
 import { afterEach, describe, expect, test } from "vitest";
 import { FULL_FILESYSTEM, fileAccessPolicy, resolveFilesystemSnapshot } from "../src/riemann/access-policy.ts";
 import { FileFunctions } from "../src/riemann/functions/fs.ts";
@@ -44,7 +45,7 @@ describe("Riemann fs capabilities", () => {
 			expect(await readFile(join(root, "src", "value.txt"), "utf8")).toBe("alpha beta\n");
 			const capability = created._capability;
 			expect(typeof capability).toBe("string");
-			const reference: JsonValue = { $riemann: "text_snapshot_ref", capability: capability as string };
+			const reference: JsonValue = { $riemann: "text_snapshot_ref.v1", capability: capability as string };
 			const edited = objectValue(
 				await edit.handler(
 					{
@@ -54,21 +55,20 @@ describe("Riemann fs capabilities", () => {
 							{ kind: "replace", start: 6, end: 10, text: "gamma" },
 							{ kind: "insert", at: 10, text: "!" },
 							{ kind: "delete", start: 10, end: 11 },
-							{ kind: "insert", at: 0, text: ">" },
 						],
 					},
 					signal,
 				),
 			);
-			expect(edited.text).toBe(">[alpha gamma!");
-			expect(await readFile(join(root, "src", "value.txt"), "utf8")).toBe(">[alpha gamma!");
+			expect(edited.text).toBe("[alpha gamma!");
+			expect(await readFile(join(root, "src", "value.txt"), "utf8")).toBe("[alpha gamma!");
 
 			const current = objectValue(await read.handler({ path: "src/value.txt" }, signal));
 			await writeFile(join(root, "src", "value.txt"), "concurrent change\n", "utf8");
 			await expect(
 				edit.handler(
 					{
-						snapshot: { $riemann: "text_snapshot_ref", capability: current._capability as string },
+						snapshot: { $riemann: "text_snapshot_ref.v1", capability: current._capability as string },
 						operations: [{ kind: "delete", start: 0, end: 5 }],
 					},
 					signal,
@@ -108,7 +108,7 @@ describe("Riemann fs capabilities", () => {
 			);
 			expect(await readFile(join(outside, "new.txt"), "utf8")).toBe("written\n");
 			await remove.handler(
-				{ snapshot: { $riemann: "text_snapshot_ref", capability: created._capability as string } },
+				{ snapshot: { $riemann: "text_snapshot_ref.v1", capability: created._capability as string } },
 				signal,
 			);
 			await expect(readFile(join(outside, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -158,6 +158,8 @@ describe("Riemann fs capabilities", () => {
 		await writeFile(join(root, "public.txt"), "public\n");
 		const store = new RiemannStore(join(root, ".agent"));
 		const run = store.openRun("fs-exclude", root);
+		await mkdir(privateDir, { recursive: true });
+		await mkdir(join(root, "frozen"));
 		const policy = fileAccessPolicy(root, {
 			read: ["/"],
 			readExclude: [privateDir],
@@ -175,9 +177,7 @@ describe("Riemann fs capabilities", () => {
 		if (!read || !create || !glob) throw new Error("fs definitions are incomplete");
 		const signal = new AbortController().signal;
 		try {
-			await mkdir(privateDir, { recursive: true });
 			await writeFile(join(privateDir, "key.txt"), "private\n");
-			await mkdir(join(root, "frozen"));
 			await expect(read.handler({ path: join(privateDir, "key.txt") }, signal)).rejects.toMatchObject({
 				code: "permission_denied",
 			});
@@ -242,7 +242,7 @@ describe("Riemann fs capabilities", () => {
 		if (!search) throw new Error("fs.search is unavailable");
 		try {
 			const result = await search.handler({ query: "find-me" }, new AbortController().signal);
-			expect(result).toEqual([{ path: "inside.txt", line: 1, text: "find-me inside" }]);
+			expect(result).toEqual([{ path: "inside.txt", line: 1, text: "find-me inside", truncated: false }]);
 			const scoped = await search.handler({ query: "find-me", glob: "secret.txt" }, new AbortController().signal);
 			expect(scoped).toEqual([]);
 		} finally {
@@ -314,23 +314,21 @@ describe("Riemann fs capabilities", () => {
 		await writeFile(join(root, "pixel.png"), imageBytes);
 		try {
 			const result = await read.handler({ path: "pixel.png" }, new AbortController().signal);
-			expect(isKernelHostResult(result)).toBe(true);
-			if (!isKernelHostResult(result)) throw new Error("Expected image model content");
+			expect(isKernelHostResult(result)).toBe(false);
 			const snapshot = objectValue(result);
+			expect(Value.Check(read.outputSchema, snapshot)).toBe(true);
 			expect(snapshot).toMatchObject({
-				$riemann: "image_snapshot",
+				$riemann: "image_snapshot.v1",
 				path: join(root, "pixel.png"),
 				mime_type: "image/png",
 				source_size: imageBytes.byteLength,
 			});
-			expect(result.modelContent[0]).toMatchObject({ type: "text", text: expect.stringContaining("Read image") });
-			expect(result.modelContent[1]).toMatchObject({ type: "image_ref", mimeType: "image/png" });
-			const reference = result.modelContent[1];
-			if (reference?.type !== "image_ref") throw new Error("Expected image reference");
-			expect((await artifacts.readBuffer(reference.artifactHandle)).byteLength).toBeGreaterThan(0);
+			const artifact = objectValue(snapshot.artifact as JsonValue);
+			expect(artifact.$riemann).toBe("artifact.v1");
+			expect((await artifacts.readBuffer(String(artifact.handle))).byteLength).toBeGreaterThan(0);
 
 			await remove.handler(
-				{ snapshot: { $riemann: "image_snapshot_ref", capability: snapshot._capability as string } },
+				{ snapshot: { $riemann: "image_snapshot_ref.v1", capability: snapshot._capability as string } },
 				new AbortController().signal,
 			);
 			await expect(readFile(join(root, "pixel.png"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -356,6 +354,175 @@ describe("Riemann fs capabilities", () => {
 			await expect(read.handler({ path: "data.bin" }, new AbortController().signal)).rejects.toMatchObject({
 				code: "unsupported_media_type",
 			});
+		} finally {
+			store.close();
+		}
+	});
+
+	test("publishes six strict ABI v2 filesystem definitions", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-fs-abi-"));
+		roots.push(root);
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("fs-abi", root);
+		try {
+			const definitions = new FileFunctions(
+				fullPolicy(root),
+				run.id,
+				store,
+				new ArtifactStore(store, run.id),
+			).definitions();
+			expect(definitions.map((definition) => definition.name)).toEqual([
+				"read",
+				"glob",
+				"search",
+				"edit",
+				"create",
+				"remove",
+			]);
+			for (const definition of definitions) {
+				expect(definition.abiVersion).toBe(2);
+				expect(definition.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
+				expect(definition.outputSchema).toBeDefined();
+				expect(definition.pythonReturnType).toEqual(expect.any(String));
+				expect(definition.errors).toEqual(expect.any(Array));
+				expect(definition.effects).toEqual(expect.any(Array));
+				expect(definition.cancellation).toMatchObject({ supported: false });
+				expect(definition.visibility).toBe("public");
+				expect(definition.prompt).toMatchObject({ inventory: expect.any(String), example: expect.any(String) });
+				expect(definition).not.toHaveProperty("parameters");
+				expect(definition).not.toHaveProperty("returns");
+			}
+			const read = definitions.find((definition) => definition.name === "read");
+			const remove = definitions.find((definition) => definition.name === "remove");
+			expect(read?.outputSchema).toMatchObject({ $id: "FileSnapshot" });
+			expect(JSON.stringify(read?.outputSchema)).toContain('"kind"');
+			expect(remove?.outputSchema).toMatchObject({ $id: "RemovedFile" });
+			expect(remove?.pythonReturnType).toBe("RemovedFile");
+		} finally {
+			store.close();
+		}
+	});
+
+	test("preserves BOM hashes and applies end-exclusive Unicode code-point edits", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-fs-unicode-"));
+		roots.push(root);
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("fs-unicode", root);
+		const definitions = new Map(
+			new FileFunctions(fullPolicy(root), run.id, store, new ArtifactStore(store, run.id))
+				.definitions()
+				.map((definition) => [definition.name, definition]),
+		);
+		const read = definitions.get("read");
+		const edit = definitions.get("edit");
+		const remove = definitions.get("remove");
+		if (!read || !edit || !remove) throw new Error("fs definitions are incomplete");
+		const signal = new AbortController().signal;
+		await writeFile(join(root, "unicode.txt"), "\ufeffA😀𐐷Z", "utf8");
+		try {
+			const snapshot = objectValue(await read.handler({ path: "unicode.txt" }, signal));
+			expect(Value.Check(read.outputSchema, snapshot)).toBe(true);
+			expect(snapshot).toMatchObject({ kind: "text", text: "\ufeffA😀𐐷Z" });
+			const reference: JsonValue = {
+				$riemann: "text_snapshot_ref.v1",
+				capability: snapshot._capability as string,
+			};
+			await expect(
+				edit.handler(
+					{
+						snapshot: reference,
+						operations: [
+							{ kind: "insert", at: 2, text: "left" },
+							{ kind: "insert", at: 2, text: "right" },
+						],
+					},
+					signal,
+				),
+			).rejects.toMatchObject({ code: "invalid_arguments" });
+			expect(await readFile(join(root, "unicode.txt"), "utf8")).toBe("\ufeffA😀𐐷Z");
+
+			const edited = objectValue(
+				await edit.handler(
+					{ snapshot: reference, operations: [{ kind: "replace", start: 2, end: 4, text: "X" }] },
+					signal,
+				),
+			);
+			expect(edited).toMatchObject({ kind: "text", text: "\ufeffAXZ" });
+			expect(await readFile(join(root, "unicode.txt"), "utf8")).toBe("\ufeffAXZ");
+			const removed = await remove.handler(
+				{
+					snapshot: {
+						$riemann: "text_snapshot_ref.v1",
+						capability: edited._capability as string,
+					},
+				},
+				signal,
+			);
+			expect(Value.Check(remove.outputSchema, removed)).toBe(true);
+			expect(removed).toEqual({ $riemann: "removed_file.v1", path: join(root, "unicode.txt"), removed: true });
+		} finally {
+			store.close();
+		}
+	});
+
+	test("normalizes invalid regexes, rejects loose options, and skips invalid UTF-8 during search", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-fs-search-validation-"));
+		roots.push(root);
+		await writeFile(join(root, "valid.txt"), "find valid\n");
+		await writeFile(join(root, "invalid.txt"), Buffer.from([0x66, 0x69, 0x6e, 0x64, 0x80]));
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("fs-search-validation", root);
+		const definitions = new Map(
+			new FileFunctions(fullPolicy(root), run.id, store, new ArtifactStore(store, run.id))
+				.definitions()
+				.map((definition) => [definition.name, definition]),
+		);
+		const glob = definitions.get("glob");
+		const search = definitions.get("search");
+		if (!glob || !search) throw new Error("fs definitions are incomplete");
+		const signal = new AbortController().signal;
+		try {
+			await expect(search.handler({ query: "[", mode: "regex" }, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+				message: "query must be a valid JavaScript regular expression",
+			});
+			await expect(search.handler({ query: "(a+)+$", mode: "regex" }, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+				message: "regular expression uses unsupported backtracking constructs",
+			});
+			await expect(search.handler({ query: "find", glob: 42 }, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+			});
+			await expect(glob.handler({ pattern: "**/*", include_hidden: null }, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+			});
+			await expect(glob.handler({ pattern: "**/*", limit: 0 }, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+			});
+			expect(await search.handler({ query: "find" }, signal)).toEqual([
+				{ path: "valid.txt", line: 1, text: "find valid", truncated: false },
+			]);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("search reports canonical paths for symlink matches", async () => {
+		if (process.platform === "win32") return;
+		const root = await mkdtemp(join(tmpdir(), "riemann-fs-search-canonical-"));
+		roots.push(root);
+		await writeFile(join(root, "target.txt"), "canonical hit\n");
+		await symlink(join(root, "target.txt"), join(root, "alias.txt"));
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("fs-search-canonical", root);
+		const search = new FileFunctions(fullPolicy(root), run.id, store, new ArtifactStore(store, run.id))
+			.definitions()
+			.find((definition) => definition.name === "search");
+		if (!search) throw new Error("fs.search is unavailable");
+		try {
+			expect(await search.handler({ query: "canonical", glob: "alias.txt" }, new AbortController().signal)).toEqual([
+				{ path: "target.txt", line: 1, text: "canonical hit", truncated: false },
+			]);
 		} finally {
 			store.close();
 		}

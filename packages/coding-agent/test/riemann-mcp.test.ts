@@ -2,8 +2,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import type { RiemannHostError } from "../src/riemann/errors.ts";
 import { FunctionRegistry } from "../src/riemann/functions/registry.ts";
-import { isKernelHostResult, type JsonValue, type KernelHostResult } from "../src/riemann/kernel/types.ts";
+import {
+	isKernelHostResult,
+	type JsonValue,
+	type KernelHostRequest,
+	type KernelHostResult,
+} from "../src/riemann/kernel/types.ts";
 import { RiemannMcpManager } from "../src/riemann/mcp/manager.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
@@ -24,163 +30,191 @@ afterEach(async () => {
 	await rm(root, { recursive: true, force: true });
 });
 
-function objectValue(value: JsonValue | KernelHostResult): Record<string, JsonValue> {
-	const wireValue = isKernelHostResult(value) ? value.value : value;
-	if (typeof wireValue !== "object" || wireValue === null || Array.isArray(wireValue))
+function objectValue(value: JsonValue | KernelHostResult | undefined): Record<string, JsonValue> {
+	const wireValue = value && isKernelHostResult(value) ? value.value : value;
+	if (typeof wireValue !== "object" || wireValue === null || Array.isArray(wireValue)) {
 		throw new Error("Expected object result");
+	}
 	return wireValue;
 }
 
-describe("Riemann MCP bridge", () => {
-	test("activates a server lazily and installs callable Python-safe functions", async () => {
+function mcpJson(value: JsonValue | undefined): JsonValue {
+	const wrapper = objectValue(value);
+	expect(wrapper.$riemann).toBe("mcp_json.v1");
+	return wrapper.value ?? null;
+}
+
+function request(operation: string, arguments_: Record<string, JsonValue>): KernelHostRequest {
+	return { abiVersion: 2, requestId: `test-${operation}`, operation, arguments: arguments_ };
+}
+
+function fixtureConfig() {
+	return {
+		command: process.execPath,
+		args: [join(import.meta.dirname, "fixtures", "riemann-mcp-server.mjs")],
+		startupTimeoutMs: 10_000,
+		toolTimeoutMs: 10_000,
+	};
+}
+
+describe("Riemann MCP ABI v2 bridge", () => {
+	test("opens a server lazily and installs one-input-schema functions with stable results", async () => {
 		const registry = new FunctionRegistry();
+		const capabilities = new Set(["mcp.*"]);
 		const manager = new RiemannMcpManager(
-			{
-				fixture: {
-					command: process.execPath,
-					args: [join(import.meta.dirname, "fixtures", "riemann-mcp-server.mjs")],
-					startupTimeoutMs: 10_000,
-					toolTimeoutMs: 10_000,
-				},
-			},
+			{ fixture: fixtureConfig() },
 			import.meta.dirname,
 			registry,
 			artifacts,
+			capabilities,
 		);
 		for (const definition of manager.definitions()) registry.register(definition);
-		expect(manager.definitions().map((definition) => definition.name)).toEqual(["activate"]);
-		const capabilities = new Set(["mcp.*"]);
+		expect(manager.definitions().map((definition) => definition.name)).toEqual([
+			"open",
+			"status",
+			"refresh",
+			"close",
+		]);
 		const signal = new AbortController().signal;
 		try {
-			const activated = objectValue(
-				await registry.dispatch({ type: "mcp.activate", args: { name: "fixture" } }, capabilities, signal),
+			const opened = objectValue(
+				await registry.dispatch(request("mcp.open", { name: "fixture" }), capabilities, signal),
 			);
-			expect(activated.$riemann).toBe("function_bundle");
-			expect(activated.namespace).toBe("fixture");
-			expect(registry.get("fixture.sum_values")).toBeDefined();
-			expect(registry.search("sum values", 8, capabilities)).toEqual([
-				{
-					name: "fixture.sum_values",
-					description: "Add two numbers. [MCP fixture/sum-values]",
-					returns: "MCP tool result",
-				},
-			]);
-			expect(registry.describe("fixture.sum_values", capabilities)).toMatchObject({
+			expect(opened.$riemann).toBe("function_bundle.v1");
+			expect(opened.namespace).toBe("fixture");
+			expect(opened.server_name).toBe("fixture");
+			expect(registry.get("fixture.close")).toBeUndefined();
+			expect(registry.list(capabilities).some((definition) => definition.name.startsWith("tool_close_"))).toBe(true);
+			expect(registry.list(capabilities).some((definition) => definition.name.startsWith("tool_private_"))).toBe(
+				true,
+			);
+			expect(manager.serverStatus("fixture")).toMatchObject({ status: "ready", tool_count: 6 });
+			const sum = registry.describe("fixture.sum_values", capabilities);
+			expect(sum).toMatchObject({
 				name: "fixture.sum_values",
+				pythonReturnType: "McpResult",
+				inputSchema: {
+					type: "object",
+					required: ["input"],
+					properties: { input: expect.objectContaining({ type: "object" }) },
+					additionalProperties: false,
+				},
 			});
 
 			const result = objectValue(
 				await registry.dispatch(
-					{ type: "fixture.sum_values", args: { left: 19, right: 23 } },
+					request("fixture.sum_values", { input: { left: 19, right: 23 } }),
 					capabilities,
 					signal,
 				),
 			);
-			const structured = objectValue(result.structuredContent ?? null);
-			expect(structured.total).toBe(42);
+			expect(result.$riemann).toBe("mcp_result.v1");
+			expect(objectValue(mcpJson(result.structured_content)).total).toBe(42);
 
-			const imageResult = await registry.dispatch({ type: "fixture.show_pixel", args: {} }, capabilities, signal);
-			expect(isKernelHostResult(imageResult)).toBe(true);
-			if (!isKernelHostResult(imageResult)) throw new Error("Expected MCP image model content");
-			const imageWire = objectValue(imageResult);
-			expect(JSON.stringify(imageWire)).not.toContain("iVBORw0KGgo");
-			expect(imageWire.content).toEqual([
-				expect.objectContaining({ type: "image", mimeType: "image/png", artifact: expect.any(Object) }),
-			]);
-			const imageReference = imageResult.modelContent.find((content) => content.type === "image_ref");
-			if (!imageReference || imageReference.type !== "image_ref") throw new Error("Expected MCP image reference");
-			expect((await artifacts.readBuffer(imageReference.artifactHandle)).byteLength).toBeGreaterThan(0);
+			await expect(
+				registry.dispatch(request("fixture.fail", { input: {} }), capabilities, signal),
+			).rejects.toMatchObject({
+				code: "mcp_tool_error",
+				details: expect.objectContaining({ $riemann: "mcp_result.v1" }),
+			});
 
-			const resourceResult = await registry.dispatch(
-				{ type: "fixture.show_resource_pixel", args: {} },
-				capabilities,
-				signal,
+			const imageWire = objectValue(
+				await registry.dispatch(request("fixture.show_pixel", { input: {} }), capabilities, signal),
 			);
-			expect(isKernelHostResult(resourceResult)).toBe(true);
-			if (!isKernelHostResult(resourceResult)) throw new Error("Expected MCP resource image model content");
-			const resourceWire = objectValue(resourceResult);
+			expect(JSON.stringify(imageWire)).not.toContain("iVBORw0KGgo");
+			const imageContent = Array.isArray(imageWire.content) ? mcpJson(imageWire.content[0]) : null;
+			expect(imageContent).toEqual(
+				expect.objectContaining({ type: "image", mimeType: "image/png", artifact: expect.any(Object) }),
+			);
+			const imageArtifact = objectValue(Array.isArray(imageWire.artifacts) ? imageWire.artifacts[0] : undefined);
+			expect(typeof imageArtifact.handle).toBe("string");
+			expect((await artifacts.readBuffer(String(imageArtifact.handle))).byteLength).toBeGreaterThan(0);
+
+			const resourceWire = objectValue(
+				await registry.dispatch(request("fixture.show_resource_pixel", { input: {} }), capabilities, signal),
+			);
 			expect(JSON.stringify(resourceWire)).not.toContain("iVBORw0KGgo");
-			expect(resourceWire.content).toEqual([
-				{
-					type: "resource",
-					resource: expect.objectContaining({
-						uri: "fixture://pixel.png",
-						mimeType: "image/png",
-						_meta: { fixture: true },
-						artifact: expect.any(Object),
-					}),
-				},
-			]);
-			expect(resourceResult.modelContent).toEqual([
-				expect.objectContaining({ type: "text", text: expect.stringContaining("MCP image resource") }),
-				expect.objectContaining({ type: "image_ref", mimeType: "image/png" }),
-			]);
+			const resourceContent = Array.isArray(resourceWire.content) ? mcpJson(resourceWire.content[0]) : null;
+			expect(resourceContent).toEqual({
+				type: "resource",
+				resource: expect.objectContaining({
+					uri: "fixture://pixel.png",
+					mimeType: "image/png",
+					_meta: { fixture: true },
+					artifact: expect.any(Object),
+				}),
+			});
 		} finally {
 			await manager.close();
 		}
 	}, 30_000);
 
-	test("exposes available server names and descriptions by default with explicit opt-out", async () => {
+	test("uses the same capability boundary for inventory and connection", async () => {
 		const registry = new FunctionRegistry();
 		const manager = new RiemannMcpManager(
 			{
-				public_docs: {
-					description: "Search approved internal product documentation.",
-					command: "private-docs-command",
-					env: { PRIVATE_TOKEN: "secret" },
-				},
-				hidden_docs: {
-					description: "Hidden documentation.",
-					command: "hidden-command",
-					exposeToModel: false,
-				},
+				public_docs: { description: "Search approved internal product documentation.", command: "private" },
+				hidden_docs: { description: "Hidden documentation.", command: "hidden", exposeToModel: false },
 			},
 			import.meta.dirname,
 			registry,
 			artifacts,
+			new Set(["mcp.open", "mcp.public_docs"]),
 		);
 		try {
-			expect(manager.promptInventory(new Set(["mcp.*"]))).toBe(
-				'- "public_docs": Search approved internal product documentation.',
-			);
-			expect(manager.promptInventory(new Set(["mcp.activate", "mcp.hidden_docs"]))).toBe("");
-			const exposed = manager.promptInventory(new Set(["mcp.activate", "mcp.public_docs"]));
-			expect(exposed).toContain("public_docs");
-			expect(exposed).not.toContain("private-docs-command");
-			expect(exposed).not.toContain("PRIVATE_TOKEN");
-			expect(exposed).not.toContain("secret");
-			expect(exposed).not.toContain("hidden_docs");
+			expect(manager.promptInventory(new Set(["mcp.open", "mcp.public_docs"]))).toContain("public_docs");
+			expect(manager.promptInventory(new Set(["mcp.open", "mcp.hidden_docs"]))).toBe("");
+			await expect(manager.open("hidden_docs", new AbortController().signal)).rejects.toMatchObject({
+				code: "permission_denied",
+			} satisfies Partial<RiemannHostError>);
 		} finally {
 			await manager.close();
 		}
 	});
 
-	test("keeps colliding Python-safe server names isolated", async () => {
-		const registry = new FunctionRegistry();
-		const server = {
-			command: process.execPath,
-			args: [join(import.meta.dirname, "fixtures", "riemann-mcp-server.mjs")],
-			startupTimeoutMs: 10_000,
-		};
-		const manager = new RiemannMcpManager(
-			{ "fixture-a": server, fixture_a: server },
+	test("maps colliding server names deterministically independent of config order", async () => {
+		const firstRegistry = new FunctionRegistry();
+		const secondRegistry = new FunctionRegistry();
+		const capabilities = new Set(["mcp.*"]);
+		const first = new RiemannMcpManager(
+			{
+				"fixture-a": fixtureConfig(),
+				fixture_a: fixtureConfig(),
+				shell: fixtureConfig(),
+				Artifact: fixtureConfig(),
+				mcp_shell_ce635c4e: fixtureConfig(),
+			},
 			import.meta.dirname,
-			registry,
+			firstRegistry,
 			artifacts,
+			capabilities,
 		);
-		const reservedManager = new RiemannMcpManager({ shell: server }, import.meta.dirname, registry, artifacts);
+		const second = new RiemannMcpManager(
+			{
+				mcp_shell_ce635c4e: fixtureConfig(),
+				Artifact: fixtureConfig(),
+				shell: fixtureConfig(),
+				fixture_a: fixtureConfig(),
+				"fixture-a": fixtureConfig(),
+			},
+			import.meta.dirname,
+			secondRegistry,
+			artifacts,
+			capabilities,
+		);
 		const signal = new AbortController().signal;
 		try {
-			const first = objectValue(await manager.activate("fixture-a", signal));
-			const second = objectValue(await manager.activate("fixture_a", signal));
-			expect(first.namespace).not.toBe(second.namespace);
-			expect(registry.get(`${String(first.namespace)}.sum_values`)).toBeDefined();
-			expect(registry.get(`${String(second.namespace)}.sum_values`)).toBeDefined();
-			const reserved = objectValue(await reservedManager.activate("shell", signal));
-			expect(reserved.namespace).toBe("mcp_shell");
+			for (const name of ["fixture-a", "fixture_a", "shell", "Artifact", "mcp_shell_ce635c4e"]) {
+				const left = objectValue(await first.open(name, signal));
+				const right = objectValue(await second.open(name, signal));
+				expect(left.namespace).toBe(right.namespace);
+				if (name === "Artifact") expect(left.namespace).not.toBe("Artifact");
+				if (name === "shell") expect(left.namespace).not.toBe("mcp_shell_ce635c4e");
+				expect(typeof left.namespace).toBe("string");
+			}
 		} finally {
-			await manager.close();
-			await reservedManager.close();
+			await first.close();
+			await second.close();
 		}
 	}, 30_000);
 });

@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { access, mkdir, readFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import type { AgentSessionEventListener, SessionStats } from "../../core/agent-session.ts";
 import { AuthStorage } from "../../core/auth-storage.ts";
 import type { CompactionPreparation, CompactionResult } from "../../core/compaction/index.ts";
@@ -273,12 +274,16 @@ function optionalTimeout(args: Record<string, JsonValue>, name = "timeout"): num
 	return value;
 }
 
-function handleWire(agent: StoredAgent, turnId: string): JsonValue {
+function turnHandleWire(agent: StoredAgent, turnId: string): JsonValue {
+	if (agent.activeTurnId !== turnId || (agent.status !== "queued" && agent.status !== "running")) {
+		throw new RiemannHostError("conflict", `Agent Turn is no longer active: ${agent.name}/${turnId}`);
+	}
 	return {
-		$riemann: "agent_handle",
+		$riemann: "agent_turn_handle.v1",
 		id: agent.id,
 		name: agent.name,
 		turn_id: turnId,
+		status: agent.status,
 	};
 }
 
@@ -509,7 +514,7 @@ export class AgentSupervisor {
 	async steerSubagentFromUi(agentId: string, message: string): Promise<void> {
 		const agent = this.ownedChild(this.options.rootAgent.id, agentId);
 		if (!agent.lastTurnId) throw new RiemannHostError("not_found", `Agent ${agent.name} has no Turn`);
-		await this.sendMessage(this.options.rootAgent.id, agent.id, agent.lastTurnId, message);
+		await this.steerMessage(this.options.rootAgent.id, agent.id, agent.lastTurnId, message);
 	}
 
 	async stopSubagentFromUi(agentId: string): Promise<void> {
@@ -580,7 +585,7 @@ export class AgentSupervisor {
 			? currentAssistantText(liveSession?.state.messages ?? [], liveSession?.state.streamingMessage)
 			: (turn.result ?? "");
 		return {
-			$riemann: "agent_info",
+			$riemann: "agent_info.v1",
 			id: agent.id,
 			name: agent.name,
 			turn_id: turn.id,
@@ -604,7 +609,7 @@ export class AgentSupervisor {
 			throw new RiemannHostError("conflict", `Agent Turn has not settled: ${agent.name}/${turn.id}`);
 		}
 		return {
-			$riemann: "agent_result",
+			$riemann: "agent_result.v1",
 			id: agent.id,
 			name: agent.name,
 			turn_id: turn.id,
@@ -1278,7 +1283,7 @@ export class AgentSupervisor {
 			this.live.has(agent.id) ||
 			this.queue.some((item) => item.agentId === agent.id)
 		) {
-			throw new RiemannHostError("conflict", `Agent ${agent.name} is already running; use send() to steer it`);
+			throw new RiemannHostError("conflict", `Agent ${agent.name} already has an active Turn`);
 		}
 		const model = this.modelForAgent(agent);
 		const runtime = this.subagentUi.get(agent.id) ?? {
@@ -1304,7 +1309,6 @@ export class AgentSupervisor {
 	private async startAgent(
 		callerId: string,
 		args: Record<string, JsonValue>,
-		deliveryMode: AgentDeliveryMode,
 	): Promise<{ agent: StoredAgent; turn: StoredAgentTurn }> {
 		const caller = this.findAgent(callerId);
 		if (caller.depth >= 1) {
@@ -1313,31 +1317,20 @@ export class AgentSupervisor {
 		const task = requiredString(args, "task");
 		const profileName = optionalString(args, "profile");
 		const requestedProfile = this.resolveProfile(caller, profileName);
-		const name = optionalString(args, "name") ?? `agent-${randomUUID().slice(0, 8)}`;
+		const requestedName = optionalString(args, "name");
+		const reuse = args.reuse ?? "never";
+		if (reuse !== "never" && reuse !== "exact") {
+			throw new RiemannHostError("invalid_arguments", "reuse must be never or exact");
+		}
+		if (reuse === "exact" && requestedName === undefined) {
+			throw new RiemannHostError("invalid_arguments", "name is required when reuse is exact");
+		}
+		const name = requestedName ?? `agent-${randomUUID().slice(0, 8)}`;
 		if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) {
 			throw new RiemannHostError(
 				"invalid_arguments",
 				"name must use 1-64 letters, digits, dots, dashes, or underscores",
 			);
-		}
-		const existing = this.options.store.listAgents(this.options.runId).find((agent) => agent.name === name);
-		if (existing) {
-			if (existing.parentId !== caller.id) {
-				throw new RiemannHostError("conflict", `Agent name already exists in this run: ${name}`);
-			}
-			if (profileName && existing.modelRole !== profileName) {
-				throw new RiemannHostError(
-					"conflict",
-					`Agent ${name} uses profile ${existing.modelRole}; reuse cannot change its profile`,
-				);
-			}
-			if (existing.activeTurnId !== null || existing.status === "queued" || existing.status === "running") {
-				throw new RiemannHostError("conflict", `Agent ${name} is already running; use send() to steer it`);
-			}
-			const profile =
-				existing.modelRole === "inherit" ? undefined : this.options.config.profiles[existing.modelRole];
-			const prompt = await this.initialAgentPrompt(profile, task);
-			return this.queueExistingAgent(existing, task, prompt, deliveryMode);
 		}
 
 		const workspaceMode = requestedProfile?.workspace ?? this.options.config.agentDefaults.workspace;
@@ -1357,6 +1350,48 @@ export class AgentSupervisor {
 			}
 			return snapshot;
 		};
+		const capabilities = this.resolveCapabilities(
+			caller,
+			requestedProfile?.capabilities
+				? canonicalCapabilities(requestedProfile.capabilities)
+				: this.defaultCapabilities(caller),
+		);
+		const model = this.resolveModel(requestedProfile);
+		const existing = this.options.store.listAgents(this.options.runId).find((agent) => agent.name === name);
+		if (existing) {
+			if (existing.parentId !== caller.id) {
+				throw new RiemannHostError("conflict", `Agent name already exists in this run: ${name}`);
+			}
+			if (reuse !== "exact") {
+				throw new RiemannHostError(
+					"conflict",
+					`Agent name already exists: ${name}; set reuse to exact only for a compatible settled identity`,
+				);
+			}
+			const expectedFilesystem = childFilesystem(
+				existing.workspace,
+				workspaceMode,
+				workspaceMode === "worktree" ? [existing.workspace] : [],
+			);
+			const compatible =
+				existing.modelRole === (profileName ?? "inherit") &&
+				existing.workspaceMode === workspaceMode &&
+				(workspaceMode === "worktree" || existing.workspace === caller.workspace) &&
+				JSON.stringify(existing.filesystem) === JSON.stringify(expectedFilesystem) &&
+				JSON.stringify(existing.capabilities) === JSON.stringify(capabilities);
+			if (!compatible) {
+				throw new RiemannHostError(
+					"conflict",
+					`Agent ${name} is not exactly compatible with the requested profile and policy`,
+				);
+			}
+			if (existing.activeTurnId !== null || existing.status === "queued" || existing.status === "running") {
+				throw new RiemannHostError("conflict", `Agent ${name} already has an active Turn`);
+			}
+			const prompt = await this.initialAgentPrompt(requestedProfile, task);
+			return this.queueExistingAgent(existing, task, prompt, "notify");
+		}
+
 		// Worktree children resolve their default write root against their own
 		// workspace, so the pre-worktree check grants the caller workspace just
 		// like the host-provisioned worktree root is granted after creation.
@@ -1365,13 +1400,6 @@ export class AgentSupervisor {
 			workspaceMode,
 			workspaceMode === "worktree" ? [caller.workspace] : [],
 		);
-		const capabilities = this.resolveCapabilities(
-			caller,
-			requestedProfile?.capabilities
-				? canonicalCapabilities(requestedProfile.capabilities)
-				: this.defaultCapabilities(caller),
-		);
-		const model = this.resolveModel(requestedProfile);
 		const prompt = await this.initialAgentPrompt(requestedProfile, task);
 		const reserved = this.options.store.reserveAgentSlot(
 			{
@@ -1402,7 +1430,7 @@ export class AgentSupervisor {
 			agentId: reserved.agent.id,
 			task,
 			prompt,
-			deliveryMode,
+			deliveryMode: "notify",
 		});
 		let agent = started.agent;
 		this.subagentUi.set(agent.id, { task, turnCount: 0, toolUses: 0, tokens: 0 });
@@ -1430,9 +1458,11 @@ export class AgentSupervisor {
 		return { agent, turn: started.turn };
 	}
 
-	async spawn(callerId: string, args: Record<string, JsonValue>): Promise<JsonValue> {
-		const started = await this.startAgent(callerId, args, "notify");
-		return handleWire(started.agent, started.turn.id);
+	async start(callerId: string, args: Record<string, JsonValue>): Promise<JsonValue> {
+		const started = await this.startAgent(callerId, args);
+		const current = this.options.store.getAgent(started.agent.id);
+		if (!current) throw new RiemannHostError("not_found", `Agent not found: ${started.agent.id}`);
+		return turnHandleWire(current, started.turn.id);
 	}
 
 	private async waitForTurn(
@@ -1465,7 +1495,9 @@ export class AgentSupervisor {
 				};
 				const onAbort = () =>
 					settle(() =>
-						reject(new RiemannHostError("aborted", "Agent wait was interrupted by the originating IPython cell")),
+						reject(
+							new RiemannHostError("cancelled", "Agent wait was interrupted by the originating IPython cell"),
+						),
 					);
 				this.events.on(`turn:${turnId}`, onTurn);
 				signal.addEventListener("abort", onAbort, { once: true });
@@ -1498,52 +1530,39 @@ export class AgentSupervisor {
 		return this.agentResultWire(settled.agent, settled.turn);
 	}
 
-	async run(callerId: string, args: Record<string, JsonValue>, signal: AbortSignal): Promise<JsonValue> {
-		const timeout = optionalTimeout(args);
-		const started = await this.startAgent(callerId, args, "return");
-		try {
-			const settled = await this.waitForTurn(callerId, started.agent.id, started.turn.id, signal, timeout);
-			return this.agentResultWire(settled.agent, settled.turn);
-		} catch (error) {
-			if (error instanceof RiemannHostError && (error.code === "aborted" || error.code === "timeout")) {
-				this.requestStop(callerId, started.agent.id, started.turn.id);
-			}
-			throw error;
-		}
-	}
-
-	async sendMessage(
+	async steerMessage(
 		callerId: string,
 		recipientSelector: string,
 		expectedTurnId: string,
 		body: string,
-	): Promise<{ agent: StoredAgent; turn: StoredAgentTurn }> {
-		const recipient = this.ownedChild(callerId, recipientSelector);
-		if (recipient.lastTurnId !== expectedTurnId) {
+	): Promise<JsonValue> {
+		const { agent, turn } = this.ownedTurn(callerId, recipientSelector, expectedTurnId);
+		const live = this.live.get(agent.id);
+		if (
+			agent.activeTurnId !== turn.id ||
+			agent.status !== "running" ||
+			live?.turnId !== turn.id ||
+			!live.session?.isStreaming
+		) {
 			throw new RiemannHostError(
 				"conflict",
-				`Agent ${recipient.name} advanced from Turn ${expectedTurnId} to ${recipient.lastTurnId ?? "none"}`,
+				`Agent Turn is not the exact active streaming Turn: ${agent.name}/${turn.id}`,
 			);
 		}
-		const currentTurn = this.latestTurn(recipient);
 		const message = this.options.store.sendMessage({
 			runId: this.options.runId,
 			senderId: callerId,
-			recipientId: recipient.id,
+			recipientId: agent.id,
 			body,
 		});
-		const live = this.live.get(recipient.id);
-		if (recipient.status === "running" || recipient.status === "queued") {
-			if (recipient.status === "running" && live?.turnId === currentTurn.id && live.session?.isStreaming) {
-				await live.session.steer(`[Agent message ${message.id}]\n${message.body}`);
-				this.options.store.markMessageDelivered(message.id);
-			}
-			this.notifyTurn(recipient.id, currentTurn.id);
-			return { agent: recipient, turn: currentTurn };
+		try {
+			await live.session.steer(`[Agent message ${message.id}]\n${message.body}`);
+		} finally {
+			// A failed exact-Turn steer must never be consumed as a later Turn task.
+			this.options.store.markMessageDelivered(message.id);
 		}
-		const started = await this.queueExistingAgent(recipient, body, "", "notify");
-		this.notifyTurn(recipient.id, started.turn.id);
-		return started;
+		this.notifyTurn(agent.id, turn.id);
+		return turnHandleWire(agent, turn.id);
 	}
 
 	private requestStop(callerId: string, agentId: string, turnId: string): void {
@@ -1619,28 +1638,136 @@ export class AgentSupervisor {
 		const caller = this.findAgent(callerId);
 		if (caller.depth >= 1) return [];
 		const profileNames = this.availableProfileEntries(caller).map(([name]) => name);
-		const profileParameters: FunctionDefinition["parameters"] =
-			profileNames.length === 0
-				? []
-				: [
-						{
-							name: "profile",
-							description: `Exact configured policy key: ${profileNames
-								.map((name) => JSON.stringify(name))
-								.join(", ")}`,
-							type: "str | None",
-							required: false,
-						},
-					];
+		const noCancellation = {
+			supported: false,
+			description: "The operation does not observe cancellation.",
+		} as const;
+		const waitCancellation = {
+			supported: true,
+			description: "Cancelling the originating cell interrupts only this wait; the Agent Turn continues.",
+		} as const;
+		const stopCancellation = {
+			supported: true,
+			description: "Cancelling the originating cell interrupts the settlement wait after stop is requested.",
+		} as const;
+		const agentStatusSchema = Type.Union([
+			Type.Literal("queued"),
+			Type.Literal("running"),
+			Type.Literal("idle"),
+			Type.Literal("stopped"),
+		]);
+		const outcomeSchema = Type.Union([Type.Literal("ok"), Type.Literal("error"), Type.Literal("cancelled")]);
+		const turnHandleSchema = Type.Object(
+			{
+				$riemann: Type.Literal("agent_turn_handle.v1"),
+				id: Type.String(),
+				name: Type.String(),
+				turn_id: Type.String(),
+				status: Type.Union([Type.Literal("queued"), Type.Literal("running")]),
+			},
+			{ additionalProperties: false },
+		);
+		const agentInfoSchema = Type.Object(
+			{
+				$riemann: Type.Literal("agent_info.v1"),
+				id: Type.String(),
+				name: Type.String(),
+				turn_id: Type.String(),
+				status: agentStatusSchema,
+				parent_id: Type.Union([Type.String(), Type.Null()]),
+				task: Type.String(),
+				profile: Type.Union([Type.String(), Type.Null()]),
+				model: Type.String(),
+				workspace: Type.String(),
+				active_turn_id: Type.Union([Type.String(), Type.Null()]),
+				last_turn_id: Type.String(),
+				last_outcome: Type.Union([outcomeSchema, Type.Null()]),
+				output_preview: Type.Union([Type.String(), Type.Null()]),
+				created_at: Type.String(),
+				updated_at: Type.String(),
+			},
+			{ additionalProperties: false },
+		);
+		const agentResultSchema = Type.Object(
+			{
+				$riemann: Type.Literal("agent_result.v1"),
+				id: Type.String(),
+				name: Type.String(),
+				turn_id: Type.String(),
+				status: Type.Union([Type.Literal("idle"), Type.Literal("stopped")]),
+				outcome: outcomeSchema,
+				output: Type.String(),
+				error: Type.Union([Type.String(), Type.Null()]),
+				transcript_handle: Type.String(),
+				patch_handle: Type.Union([Type.String(), Type.Null()]),
+				started_at: Type.String(),
+				completed_at: Type.String(),
+			},
+			{ additionalProperties: false },
+		);
+		const exactTurnInput = {
+			agent_id: Type.String({ minLength: 1, description: "Owned child identity id" }),
+			turn_id: Type.String({ minLength: 1, description: "Exact Agent Turn id" }),
+		};
+		const timeoutSchema = Type.Optional(
+			Type.Union([
+				Type.Number({ exclusiveMinimum: 0, maximum: 86_400, description: "Timeout in seconds" }),
+				Type.Null(),
+			]),
+		);
+		const startProperties = {
+			task: Type.String({ minLength: 1, description: "Complete, self-contained task" }),
+			name: Type.Optional(
+				Type.Union([
+					Type.String({
+						minLength: 1,
+						maxLength: 64,
+						pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+						description: "Stable child identity name",
+					}),
+					Type.Null(),
+				]),
+			),
+			...(profileNames.length > 0
+				? {
+						profile: Type.Optional(
+							Type.Union([
+								Type.String({
+									enum: profileNames,
+									description: `Exact configured policy key: ${profileNames
+										.map((name) => JSON.stringify(name))
+										.join(", ")}`,
+								}),
+								Type.Null(),
+							]),
+						),
+					}
+				: {}),
+			reuse: Type.Optional(
+				Type.Union([Type.Literal("never"), Type.Literal("exact")], {
+					default: "never",
+					description: "never rejects name collisions; exact reuses only a compatible settled named identity",
+				}),
+			),
+		};
 		return [
 			{
+				abiVersion: 2,
 				name: "list",
 				namespace: "agents",
 				description: "List this Agent's reusable child identities, current activity, and latest outcomes.",
-				promptSnippet:
-					"List reusable child Agents. AgentInfo items are handles; inspect `name`, `status`, `task`, `last_outcome`, and `output_preview`, then use `await info.wait()` for the full `AgentResult.output`.",
-				parameters: [],
-				returns: "list[AgentInfo]",
+				inputSchema: Type.Object({}, { additionalProperties: false }),
+				outputSchema: Type.Array(agentInfoSchema),
+				pythonReturnType: "list[AgentInfo]",
+				errors: [],
+				effects: [{ kind: "read", resource: "agent-state" }],
+				idempotency: "idempotent",
+				cancellation: noCancellation,
+				visibility: "public",
+				prompt: {
+					inventory: "List reusable child Agents and their latest Turn state.",
+					example: "await agents.list()",
+				},
 				capability: "agents.list",
 				handler: async () =>
 					this.options.store
@@ -1649,119 +1776,180 @@ export class AgentSupervisor {
 						.map((agent) => this.agentInfoWire(agent)),
 			},
 			{
-				name: "run",
+				abiVersion: 2,
+				name: "start",
 				namespace: "agents",
 				description:
-					"Run a child Agent with structured cancellation and return its settled result in the current IPython cell.",
-				promptSnippet:
-					profileNames.length > 0
-						? "Run or reuse a child Agent synchronously with an optional exact configured profile and return its final result."
-						: "Run or reuse a child Agent synchronously and return its final result.",
-				parameters: [
-					{ name: "task", description: "Complete, self-contained task", type: "str", required: true },
-					{ name: "name", description: "Stable reusable name", type: "str | None", required: false },
-					...profileParameters,
+					"Start a child Agent Turn in the background, creating a new identity or exactly reusing a compatible settled named identity.",
+				inputSchema: Type.Object(startProperties, { additionalProperties: false }),
+				outputSchema: turnHandleSchema,
+				pythonReturnType: "AgentTurnHandle",
+				errors: [
 					{
-						name: "timeout",
-						description: "Total queue and execution timeout in seconds",
-						type: "float | None",
-						required: false,
+						code: "invalid_arguments",
+						description: "The task, name, profile, or reuse mode is invalid.",
+						retryable: false,
 					},
+					{ code: "not_found", description: "The requested profile or model is unavailable.", retryable: false },
+					{ code: "not_configured", description: "No child model is configured.", retryable: false },
+					{
+						code: "conflict",
+						description: "The name or exact reuse request conflicts with current Agent state.",
+						retryable: true,
+					},
+					{
+						code: "permission_denied",
+						description: "The requested child policy exceeds the parent policy.",
+						retryable: false,
+					},
+					{ code: "limit_exceeded", description: "No child identity slot is available.", retryable: true },
+					{ code: "workspace_error", description: "An isolated worktree could not be prepared.", retryable: true },
 				],
-				returns: "AgentResult",
-				capability: "agents.spawn",
-				promptGuidelines: [
-					"Agents: `await agents.run(...)` when the result is needed before continuing; `await agents.spawn(...)` for independent background work, composed with `asyncio.gather`.",
-					"Collect every expected result before synthesizing; `handle.wait()` returns `AgentResult.output` and suppresses the background completion reminder. handle.info/send/stop/release manage one live Turn; reuse stable names or release settled handles, slots are bounded.",
+				effects: [
+					{ kind: "write", resource: "agent-state" },
+					{ kind: "execute", resource: "child-agent-turn" },
 				],
-				handler: (args, signal) => this.run(callerId, args, signal),
+				idempotency: "non-idempotent",
+				cancellation: noCancellation,
+				visibility: "public",
+				prompt: {
+					inventory: "Start a queued or running background child Agent Turn and return its exact handle.",
+					example: 'handle = await agents.start(task="Inspect the parser", name="parser-review", reuse="never")',
+					guidelines: [
+						"Agents: use `await agents.start(...)` for background work and compose independent starts with `asyncio.gather`; await every expected handle result before synthesizing.",
+						'Use `reuse="never"` for a new identity or `reuse="exact"` with a stable name for a compatible settled identity. `handle.wait()` returns the exact Turn result; `handle.steer()` only applies while that Turn is actively streaming.',
+					],
+				},
+				capability: "agents.start",
+				handler: (args) => this.start(callerId, args),
 			},
 			{
-				name: "spawn",
-				namespace: "agents",
-				description:
-					"Start a background child Agent in a reusable slot. Await admission to receive its handle; unclaimed completion sends only a minimal reminder.",
-				promptSnippet:
-					profileNames.length > 0
-						? "Await a background child Agent admission by task, stable name, and optional exact configured profile."
-						: "Await a background child Agent admission by task and stable name.",
-				parameters: [
-					{ name: "task", description: "Complete, self-contained task", type: "str", required: true },
-					{ name: "name", description: "Stable reusable name", type: "str | None", required: false },
-					...profileParameters,
-				],
-				returns: "AgentHandle",
-				capability: "agents.spawn",
-				handler: (args) => this.spawn(callerId, args),
-			},
-			{
+				abiVersion: 2,
 				name: "info",
 				namespace: "agents",
-				description: "Internal AgentHandle operation: refresh the child identity and latest Turn state.",
-				parameters: [{ name: "agent_id", description: "Owned child id", type: "str", required: true }],
-				returns: "AgentInfo",
+				description: "Refresh the child identity and latest Turn state.",
+				inputSchema: Type.Object(
+					{ agent_id: Type.String({ minLength: 1, description: "Owned child identity id" }) },
+					{ additionalProperties: false },
+				),
+				outputSchema: agentInfoSchema,
+				pythonReturnType: "AgentInfo",
+				errors: [
+					{ code: "not_found", description: "The child identity does not exist.", retryable: false },
+					{
+						code: "permission_denied",
+						description: "The child is not directly owned by the caller.",
+						retryable: false,
+					},
+				],
+				effects: [{ kind: "read", resource: "agent-state" }],
+				idempotency: "idempotent",
+				cancellation: noCancellation,
+				visibility: "handle-method",
+				prompt: { inventory: "Refresh this child identity.", example: "await handle.info()" },
 				capability: "agents.manage",
-				includeInSystemPrompt: false,
-				installInPythonNamespace: false,
 				handler: async (args) => this.agentInfoWire(this.ownedChild(callerId, requiredString(args, "agent_id"))),
 			},
 			{
+				abiVersion: 2,
 				name: "wait",
 				namespace: "agents",
-				description: "Internal AgentHandle operation: wait for and claim one exact child Turn result.",
-				parameters: [
-					{ name: "agent_id", description: "Owned child id", type: "str", required: true },
-					{ name: "turn_id", description: "Exact admitted Turn id", type: "str", required: true },
-					{ name: "timeout", description: "Wait timeout in seconds", type: "float | None", required: false },
+				description: "Wait for and claim one exact child Agent Turn result.",
+				inputSchema: Type.Object({ ...exactTurnInput, timeout: timeoutSchema }, { additionalProperties: false }),
+				outputSchema: agentResultSchema,
+				pythonReturnType: "AgentResult",
+				errors: [
+					{ code: "not_found", description: "The child identity or exact Turn does not exist.", retryable: false },
+					{
+						code: "permission_denied",
+						description: "The child is not directly owned by the caller.",
+						retryable: false,
+					},
+					{ code: "timeout", description: "The Turn did not settle before the timeout.", retryable: true },
+					{ code: "cancelled", description: "The originating cell was interrupted.", retryable: true },
 				],
-				returns: "AgentResult",
+				effects: [
+					{ kind: "read", resource: "agent-state" },
+					{ kind: "write", resource: "agent-result-delivery" },
+				],
+				idempotency: "idempotent",
+				cancellation: waitCancellation,
+				visibility: "handle-method",
+				prompt: { inventory: "Wait for this exact Agent Turn.", example: "await handle.wait(timeout=60)" },
 				capability: "agents.manage",
-				includeInSystemPrompt: false,
-				installInPythonNamespace: false,
 				handler: (args, signal) => this.wait(callerId, args, signal),
 			},
 			{
-				name: "send",
+				abiVersion: 2,
+				name: "steer",
 				namespace: "agents",
-				description:
-					"Internal AgentHandle operation: steer the exact active Turn or start the next persisted Turn.",
-				parameters: [
-					{ name: "agent_id", description: "Owned child id", type: "str", required: true },
-					{ name: "turn_id", description: "Expected latest Turn id", type: "str", required: true },
-					{ name: "message", description: "Steering message or next task", type: "str", required: true },
+				description: "Steer only this exact active streaming Agent Turn; otherwise fail with conflict.",
+				inputSchema: Type.Object(
+					{
+						...exactTurnInput,
+						message: Type.String({ minLength: 1, description: "Steering instruction" }),
+					},
+					{ additionalProperties: false },
+				),
+				outputSchema: turnHandleSchema,
+				pythonReturnType: "AgentTurnHandle",
+				errors: [
+					{ code: "not_found", description: "The child identity or exact Turn does not exist.", retryable: false },
+					{
+						code: "permission_denied",
+						description: "The child is not directly owned by the caller.",
+						retryable: false,
+					},
+					{ code: "conflict", description: "The exact Turn is not actively streaming.", retryable: true },
 				],
-				returns: "AgentHandle",
+				effects: [
+					{ kind: "write", resource: "agent-inbox" },
+					{ kind: "execute", resource: "active-agent-turn" },
+				],
+				idempotency: "non-idempotent",
+				cancellation: noCancellation,
+				visibility: "handle-method",
+				prompt: {
+					inventory: "Steer this exact active streaming Turn.",
+					example: 'await handle.steer(message="Check the edge case")',
+				},
 				capability: "agents.manage",
-				includeInSystemPrompt: false,
-				installInPythonNamespace: false,
-				handler: async (args) => {
-					const started = await this.sendMessage(
+				handler: (args) =>
+					this.steerMessage(
 						callerId,
 						requiredString(args, "agent_id"),
 						requiredString(args, "turn_id"),
 						requiredString(args, "message"),
-					);
-					return handleWire(started.agent, started.turn.id);
-				},
+					),
 			},
 			{
+				abiVersion: 2,
 				name: "stop",
 				namespace: "agents",
-				description: "Internal AgentHandle operation: stop and settle one exact Turn while retaining its identity.",
-				parameters: [
-					{ name: "agent_id", description: "Owned child id", type: "str", required: true },
-					{ name: "turn_id", description: "Exact admitted Turn id", type: "str", required: true },
+				description: "Stop and settle one exact Agent Turn while retaining its identity.",
+				inputSchema: Type.Object({ ...exactTurnInput, timeout: timeoutSchema }, { additionalProperties: false }),
+				outputSchema: agentResultSchema,
+				pythonReturnType: "AgentResult",
+				errors: [
+					{ code: "not_found", description: "The child identity or exact Turn does not exist.", retryable: false },
 					{
-						name: "timeout",
-						description: "Cancellation settlement timeout in seconds",
-						type: "float | None",
-						required: false,
+						code: "permission_denied",
+						description: "The child is not directly owned by the caller.",
+						retryable: false,
 					},
+					{ code: "conflict", description: "The identity has advanced to another Turn.", retryable: false },
+					{ code: "timeout", description: "The stopped Turn did not settle before the timeout.", retryable: true },
+					{ code: "cancelled", description: "The settlement wait was interrupted.", retryable: true },
 				],
-				returns: "AgentResult",
+				effects: [
+					{ kind: "write", resource: "agent-state" },
+					{ kind: "execute", resource: "active-agent-turn" },
+				],
+				idempotency: "idempotent",
+				cancellation: stopCancellation,
+				visibility: "handle-method",
+				prompt: { inventory: "Stop and settle this exact Turn.", example: "await handle.stop(timeout=30)" },
 				capability: "agents.manage",
-				includeInSystemPrompt: false,
-				installInPythonNamespace: false,
 				handler: (args, signal) =>
 					this.stopTurn(
 						callerId,
@@ -1772,17 +1960,36 @@ export class AgentSupervisor {
 					),
 			},
 			{
+				abiVersion: 2,
 				name: "release",
 				namespace: "agents",
-				description: "Internal AgentHandle operation: release a settled identity and free its run slot.",
-				parameters: [
-					{ name: "agent_id", description: "Owned child id", type: "str", required: true },
-					{ name: "turn_id", description: "Expected latest Turn id", type: "str", required: true },
+				description: "Release a settled child identity and free its run slot.",
+				inputSchema: Type.Object(exactTurnInput, { additionalProperties: false }),
+				outputSchema: Type.Null(),
+				pythonReturnType: "None",
+				errors: [
+					{ code: "not_found", description: "The child identity does not exist.", retryable: false },
+					{
+						code: "permission_denied",
+						description: "The child is not directly owned by the caller.",
+						retryable: false,
+					},
+					{
+						code: "conflict",
+						description: "The identity is active or has advanced to another Turn.",
+						retryable: true,
+					},
+					{ code: "workspace_error", description: "The isolated worktree could not be removed.", retryable: true },
 				],
-				returns: "None",
+				effects: [
+					{ kind: "write", resource: "agent-state" },
+					{ kind: "delete", resource: "agent-workspace" },
+				],
+				idempotency: "non-idempotent",
+				cancellation: noCancellation,
+				visibility: "handle-method",
+				prompt: { inventory: "Release this settled child identity.", example: "await handle.release()" },
 				capability: "agents.manage",
-				includeInSystemPrompt: false,
-				installInPythonNamespace: false,
 				handler: async (args) => {
 					await this.releaseAgent(callerId, requiredString(args, "agent_id"), requiredString(args, "turn_id"));
 					return null;

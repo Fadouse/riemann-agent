@@ -139,6 +139,7 @@ function linuxCommand(config: SandboxedLaunchConfig, pythonArgs: string[]): Sand
 	const unrestricted = unrestrictedRead(policy) && unrestrictedWrite(policy);
 	const rootReadable = coveredBy("/", policy.readRoots);
 	const args = ["--die-with-parent", "--new-session", "--unshare-pid"];
+	if (config.networkAllowed !== true) args.push("--unshare-net");
 	if (unrestricted) {
 		args.push("--bind", "/", "/");
 	} else if (rootReadable) {

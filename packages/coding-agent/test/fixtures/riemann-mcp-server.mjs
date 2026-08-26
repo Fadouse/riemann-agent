@@ -18,6 +18,30 @@ server.registerTool(
 );
 
 server.registerTool(
+	"close",
+	{ description: "Tool name colliding with namespace lifecycle.", inputSchema: {} },
+	async () => ({ content: [{ type: "text", text: "tool close" }] }),
+);
+
+server.registerTool(
+	"_private",
+	{ description: "Tool name colliding with namespace internals.", inputSchema: {} },
+	async () => ({ content: [{ type: "text", text: "private" }] }),
+);
+
+server.registerTool(
+	"fail",
+	{
+		description: "Return an MCP tool error.",
+		inputSchema: {},
+	},
+	async () => ({
+		isError: true,
+		content: [{ type: "text", text: "fixture failure" }],
+	}),
+);
+
+server.registerTool(
 	"show-pixel",
 	{
 		description: "Return a one-pixel PNG.",

@@ -105,8 +105,7 @@ describe("Riemann session extension", () => {
 				isProjectTrusted: () => true,
 			} as unknown as ExtensionContext);
 			const systemPrompt = runtime.systemPrompt("main");
-			expect(systemPrompt).toContain("`await agents.spawn(task, name=None) -> AgentHandle`");
-			expect(systemPrompt).toContain("`await agents.run(task, name=None, timeout=None) -> AgentResult`");
+			expect(systemPrompt).toContain('`await agents.start(task=..., name=None, reuse="never") -> AgentTurnHandle`');
 			expect(systemPrompt).not.toContain("profile=None");
 			expect(systemPrompt).not.toContain("## Agent profiles");
 			expect(systemPrompt).not.toContain("No Agent policy profiles");
@@ -200,9 +199,7 @@ describe("Riemann session extension", () => {
 			riemannExtension(api as never);
 			expect(registered.map((tool) => tool.name)).toEqual(["ipython"]);
 			expect(registeredCommands).toEqual(["agents"]);
-			expect(registered[0]?.description).toBe(
-				"Execute Python in a persistent IPython environment. The operation namespaces listed in the system prompt are preinstalled globals; calls can be assigned and composed with top-level await. Variables persist across executions.",
-			);
+			expect(registered[0]?.description).toBe("Execute code in the persistent Riemann IPython runtime.");
 			expect(JSON.stringify(registered[0]?.parameters)).not.toContain("IPython");
 			expect(JSON.stringify(registered[0]?.parameters)).not.toContain("asyncio.gather");
 			expect(sessionStart).toBeDefined();
@@ -222,32 +219,30 @@ describe("Riemann session extension", () => {
 			expect(systemPrompt).toMatch(/- Kernel: \S+/);
 			expect(systemPrompt).toMatch(/- Architecture: \S+/);
 			expect(systemPrompt).not.toContain("- Shell:");
-			expect(systemPrompt).toContain("`ipython` is a persistent Python kernel");
+			expect(systemPrompt).toContain("`ipython` is persistent");
 			expect(systemPrompt).toContain("## Tool discipline");
 			expect(systemPrompt).toContain("## Verification");
-			expect(systemPrompt).toContain("reproduce first, fix, then confirm");
-			expect(systemPrompt).toContain("## Available operations");
-			expect(systemPrompt).toContain("`await fs.read(path) -> TextSnapshot | ImageSnapshot`");
+			expect(systemPrompt).toContain("Reproduce bugs before fixing");
+			expect(systemPrompt).toContain("## Operations");
+			const operationInventory = systemPrompt.split("## Operations\n\n")[1]?.split("\n\nUse `catalog.describe")[0];
+			expect(operationInventory?.length).toBeLessThanOrEqual(1_600);
+			expect(systemPrompt).toContain("`await fs.read(path=...) -> FileSnapshot`");
 			expect(systemPrompt).toContain("`await shell.run(");
 			expect(systemPrompt).not.toContain("shell.exec");
 			expect(systemPrompt).not.toContain("artifacts.get");
+			expect(systemPrompt).toContain("`await artifacts.open(handle=...) -> Artifact`");
 			expect(systemPrompt).not.toContain("artifacts.view");
 			expect(systemPrompt).not.toContain("artifacts.materialize");
 			expect(systemPrompt).not.toContain("catalog.namespaces");
 			expect(systemPrompt).not.toContain("state.checkpoint");
-			expect(systemPrompt).toContain("`await state.status() -> dict`");
-			expect(systemPrompt).toContain("`await agents.spawn(task, name=None, profile=None) -> AgentHandle`");
+			expect(systemPrompt).toContain("`await state.status() -> RuntimeStatusV1`");
 			expect(systemPrompt).toContain(
-				"`await agents.run(task, name=None, profile=None, timeout=None) -> AgentResult`",
+				'`await agents.start(task=..., name=None, profile=None, reuse="never") -> AgentTurnHandle`',
 			);
-			expect(systemPrompt).toContain(
-				"`handle.wait()` returns `AgentResult.output` and suppresses the background completion reminder",
-			);
+			expect(systemPrompt).toContain("`handle.wait()` returns the exact Turn result");
 			expect(systemPrompt).toContain("`await agents.list() -> list[AgentInfo]`");
-			expect(systemPrompt).toContain(
-				"AgentInfo items are handles; inspect `name`, `status`, `task`, `last_outcome`, and `output_preview`, then use `await info.wait()` for the full `AgentResult.output`.",
-			);
-			expect(systemPrompt).toContain("Agents: `await agents.run(...)` when the result is needed before continuing");
+
+			expect(systemPrompt).toContain("Agents: use `await agents.start(...)`");
 			expect(systemPrompt).not.toContain("`agents.wait(");
 			expect(systemPrompt).not.toContain("`agents.result(");
 			expect(systemPrompt).not.toContain("`agents.inbox(");
@@ -274,12 +269,14 @@ describe("Riemann session extension", () => {
 					code: [
 						"assert not hasattr(mcp, 'list')",
 						"assert not hasattr(agents, 'wait')",
-						"assert 'artifacts' not in globals(), sorted(name for name in globals() if not name.startswith('_'))",
+						"assert hasattr(artifacts, 'open')",
 						"assert not hasattr(catalog, 'namespaces')",
 						"assert not hasattr(state, 'checkpoint')",
 						"assert hasattr(catalog, 'search')",
 						"assert hasattr(state, 'status')",
-						"assert hasattr(agents, 'run')",
+						"runtime_status = await state.status()",
+						"assert runtime_status['abi_version'] == 1 and runtime_status['agent_slots']['used'] == 0, runtime_status",
+						"assert hasattr(agents, 'start')",
 						"assert not hasattr(agents, 'result')",
 						"assert not hasattr(agents, 'inbox')",
 						"assert not hasattr(agents, 'park')",
@@ -290,20 +287,26 @@ describe("Riemann session extension", () => {
 						"snap = await fs.edit(snapshot=snap, operations=[{'kind':'replace','start':0,'end':6,'text':'after'}])",
 						"image = await fs.read(path='pixel.png')",
 						"assert isinstance(image, ImageSnapshot), image",
+						"reopened = await artifacts.open(handle=image.artifact.handle)",
+						"assert isinstance(reopened, Artifact) and reopened.handle == image.artifact.handle, reopened",
 						"viewed = await image.artifact.view()",
 						"assert isinstance(viewed, ImageSnapshot), viewed",
 						`display({"image/png": "${pixelBase64}"}, raw=True)`,
 						"process = await shell.run(script=\"printf 'streamed\\n' | tail -1\")",
 						"assert process.exit_code == 0 and process.stdout.strip() == 'streamed', process",
-						"public_docs = await mcp.activate(name='public_docs')",
+						"public_docs = await mcp.open(name='public_docs')",
+						"mcp_status = await public_docs.status()",
+						"assert mcp_status.status == 'ready' and mcp_status.tool_count == 6, mcp_status",
 						"matches = await catalog.search(query='sum values')",
 						"assert matches[0]['name'] == 'public_docs.sum_values', matches",
 						"contract = await catalog.describe(name=matches[0]['name'])",
 						"assert contract['name'] == 'public_docs.sum_values', contract",
-						"mcp_result = await public_docs.sum_values(left=19, right=23)",
-						"assert mcp_result['structuredContent']['total'] == 42, mcp_result",
-						"mcp_image = await public_docs.show_pixel()",
-						"assert mcp_image['content'][0]['artifact'].mime_type == 'image/png', mcp_image",
+						"mcp_result = await public_docs.sum_values(input={'left': 19, 'right': 23})",
+						"assert mcp_result.structured_content['total'] == 42, mcp_result",
+						"mcp_image = await public_docs.show_pixel(input={})",
+						"assert mcp_image.artifacts[0].mime_type == 'image/png', mcp_image",
+						"await public_docs.close()",
+						"assert not hasattr(public_docs, 'sum_values')",
 						"durable_value = 42",
 						"durable_value",
 					].join("\n"),
@@ -328,7 +331,7 @@ describe("Riemann session extension", () => {
 			expect(modelVisibleText).not.toContain("[stderr]");
 			expect(modelVisibleText).not.toContain("DeprecationWarning");
 			const modelVisibleImages = executed.content.filter((item) => item.type === "image");
-			expect(modelVisibleImages).toHaveLength(4);
+			expect(modelVisibleImages).toHaveLength(2);
 			expect(modelVisibleImages.every((item) => item.mimeType === "image/png")).toBe(true);
 			expect(executed.details).toMatchObject({
 				media: expect.arrayContaining([
