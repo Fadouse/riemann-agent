@@ -327,7 +327,7 @@ export class RiemannRuntime {
 		const jsonObjectSchema = Type.Object({}, { additionalProperties: true });
 		const artifactSchema = Type.Object(
 			{
-				$riemann: Type.Literal("artifact.v1"),
+				$riemann: Type.Literal("artifact"),
 				handle: Type.String(),
 				mime_type: Type.String(),
 				size: Type.Integer({ minimum: 0 }),
@@ -355,7 +355,6 @@ export class RiemannRuntime {
 		);
 		return [
 			{
-				abiVersion: 2,
 				name: "search",
 				namespace: "catalog",
 				description: "Search registered functions by capability, task, namespace, or input description.",
@@ -400,7 +399,6 @@ export class RiemannRuntime {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "describe",
 				namespace: "catalog",
 				description:
@@ -411,7 +409,6 @@ export class RiemannRuntime {
 				),
 				outputSchema: Type.Object(
 					{
-						abiVersion: Type.Literal(2),
 						name: Type.String(),
 						description: Type.String(),
 						inputSchema: jsonObjectSchema,
@@ -431,7 +428,7 @@ export class RiemannRuntime {
 					},
 					{ additionalProperties: false },
 				),
-				pythonReturnType: "OperationSpecV2",
+				pythonReturnType: "OperationSpec",
 				errors: [
 					{ code: "not_found", description: "The function is hidden, unavailable, or unknown.", retryable: false },
 				],
@@ -450,7 +447,6 @@ export class RiemannRuntime {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "open",
 				namespace: "artifacts",
 				description:
@@ -476,7 +472,7 @@ export class RiemannRuntime {
 					}
 					const artifact = this.shared.artifacts.getMetadata(args.handle);
 					return {
-						$riemann: "artifact.v1",
+						$riemann: "artifact",
 						handle: artifact.handle,
 						mime_type: artifact.mimeType,
 						size: artifact.size,
@@ -485,7 +481,6 @@ export class RiemannRuntime {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "get",
 				namespace: "artifacts",
 				description: "Read a byte or text slice from a durable artifact handle.",
@@ -526,7 +521,6 @@ export class RiemannRuntime {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "view",
 				namespace: "artifacts",
 				description: "Load an image artifact into the current model context.",
@@ -536,7 +530,7 @@ export class RiemannRuntime {
 				),
 				outputSchema: Type.Object(
 					{
-						$riemann: Type.Literal("image_snapshot.v1"),
+						$riemann: Type.Literal("image_snapshot"),
 						kind: Type.Literal("image"),
 						path: Type.Null(),
 						artifact: artifactSchema,
@@ -580,7 +574,7 @@ export class RiemannRuntime {
 					});
 					return kernelHostResult(
 						{
-							$riemann: "image_snapshot.v1",
+							$riemann: "image_snapshot",
 							kind: "image",
 							path: null,
 							artifact: image.artifact,
@@ -595,7 +589,6 @@ export class RiemannRuntime {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "materialize",
 				namespace: "artifacts",
 				description: "Copy a durable artifact into the current workspace atomically.",
@@ -636,14 +629,12 @@ export class RiemannRuntime {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "status",
 				namespace: "state",
 				description: "Return durable run, agent, workspace, and configuration metadata.",
 				inputSchema: Type.Object({}, { additionalProperties: false }),
 				outputSchema: Type.Object(
 					{
-						abi_version: Type.Literal(1),
 						observed_at: Type.String(),
 						run_id: Type.String(),
 						session_id: Type.String(),
@@ -722,7 +713,7 @@ export class RiemannRuntime {
 					},
 					{ additionalProperties: false },
 				),
-				pythonReturnType: "RuntimeStatusV1",
+				pythonReturnType: "RuntimeStatus",
 				errors: [],
 				effects: [
 					{ kind: "read", resource: "run-state" },
@@ -740,7 +731,6 @@ export class RiemannRuntime {
 						.listAgents(this.shared.run.id)
 						.filter((agent) => agent.parentId !== null);
 					return {
-						abi_version: 1,
 						observed_at: new Date().toISOString(),
 						run_id: this.shared.run.id,
 						session_id: this.shared.run.sessionId,
@@ -815,8 +805,10 @@ export class RiemannRuntime {
 	}
 
 	private operationGuidelines(): string {
-		const guidelines = this.registry.promptGuidelines(this.capabilities);
-		if (guidelines.length === 0) return "";
+		const guidelines = [
+			'Use `await catalog.describe(name="...")` when an exact contract is needed.',
+			...this.registry.promptGuidelines(this.capabilities),
+		];
 		return `## Python operation discipline\n\n${guidelines.map((guideline) => `- ${guideline}`).join("\n")}`;
 	}
 
@@ -839,7 +831,6 @@ export class RiemannRuntime {
 		const agents = this.shared.store.listAgents(this.shared.run.id);
 		const pendingEvents = this.shared.store.listPendingAgentEvents(this.agent.id);
 		return {
-			version: 1,
 			run: {
 				id: this.shared.run.id,
 				session_id: this.shared.run.sessionId,
@@ -938,9 +929,9 @@ export class RiemannRuntime {
 		const values = {
 			environment: formatEnvironmentContext(this.agent.workspace),
 			pythonNamespaceInventory: this.pythonNamespaceInventory(),
-			agentProfiles: this.agentProfiles(),
-			operationGuidelines: this.operationGuidelines(),
-			exposedMcpServers: this.exposedMcpServers(),
+			runtimeSections: [this.operationGuidelines(), this.agentProfiles(), this.exposedMcpServers()]
+				.filter(Boolean)
+				.join("\n\n"),
 		};
 		if (kind === "main") return renderRiemannPrompt("system/main.md", values);
 		const context = JSON.stringify(

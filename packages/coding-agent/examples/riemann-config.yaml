@@ -1,5 +1,3 @@
-version: 1
-
 compaction:
   # automatic uses OpenAI cloud compaction for OpenAI Codex models and default
   # semantic checkpoints for every other provider. Explicit default, openai,

@@ -53,10 +53,9 @@ Large-result artifacts, kernel snapshots, and isolated worktrees belonging to cl
 
 Global configuration: `~/.riemann/agent/config.yaml`. Trusted project configuration: `<workspace>/.riemann/config.yaml`; project values may lower the global slot cap and override trusted settings. Copy `examples/riemann-config.yaml` as a starting point.
 
-The settings panel exposes the two routine Agent choices: reusable run slots and the default child model. The equivalent version-one YAML is:
+The settings panel exposes the two routine Agent choices: reusable run slots and the default child model. The equivalent configuration YAML is:
 
 ```yaml
-version: 1
 agents:
   maxAgents: 4 # Main Agent excluded; 0 disables delegation
   main:
@@ -147,7 +146,7 @@ display(sync_result.output)
 
 Without a profile, `agents.start()` uses `agents.defaults`. Select a configured profile for a different model, workspace topology, permissions, prompt, or capability set; model calls cannot supply filesystem paths or elevate a child beyond its parent. Capability overrides accept exact operations such as `web.search` and namespace shorthand such as `web`, which is normalized to `web.*`. Configured profile names and descriptions are listed directly in the system prompt.
 
-Operation arguments are keyword-only and validated against the same ABI v2 schema used by `catalog.describe()`. Generated Python signatures reject unknown keyword arguments locally with `TypeError`; host-dispatched schema violations fail with `invalid_arguments`. Domain results are versioned and discriminated, while mutation receipts use exact named schemas. `fs.search()` selects `mode="literal"` or `mode="regex"`. `fs.edit()` offsets are zero-based Unicode code-point indices with an exclusive end, and multiple inserts at the same offset are rejected. Image reads return metadata without attaching pixels; call `await image.view()` or `await image.artifact.view()` explicitly when visual context is required.
+Operation arguments are keyword-only and validated against the same exact schema used by `catalog.describe()`. Generated Python signatures reject unknown keyword arguments locally with `TypeError`; host-dispatched schema violations fail with `invalid_arguments`. The operation inventory shows each return record's fields inline, while mutation receipts use exact named schemas. `fs.search()` selects `mode="literal"` or `mode="regex"`. `fs.edit()` offsets are zero-based Unicode code-point indices with an exclusive end, and multiple inserts at the same offset are rejected. Image reads return metadata without attaching pixels; call `await image.view()` or `await image.artifact.view()` explicitly when visual context is required.
 
 Large values should remain in variables or artifacts; display only the slice needed for the next decision. A cancelled cell can have completed an external side effect, so inspect durable state before retrying.
 

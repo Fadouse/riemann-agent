@@ -16,9 +16,10 @@
 - Renamed the `fs.search` file-filter argument `pattern` to `glob`, removing the `query`/`pattern` ambiguity.
 - Filesystem policies now require every configured root and exclusion to exist, require write roots to be covered by read roots, and treat `readExclude` as denying both reads and writes.
 - Omitted Riemann `compaction.strategy` now resolves automatically: OpenAI Codex models use cloud compaction and all other providers use the semantic default strategy; set `default` explicitly to force semantic compaction on Codex.
-- Replaced the Riemann Python operation bridge with strict ABI v2 schemas, keyword-only calls, versioned result tags, normalized errors, and a single `agents.start()`/`mcp.open()` lifecycle surface; removed `agents.run()`, `agents.spawn()`, `AgentHandle.send()`, and `mcp.activate()`.
-- Replaced `fs.search(regex=...)` with `fs.search(mode="literal" | "regex")`, defined edit offsets as Unicode code points, and changed Shell, Web, Artifact, and MCP result records to their exact ABI v2 shapes.
+- Replaced the Riemann Python operation bridge with strict lockstep schemas, keyword-only calls, discriminated result tags, normalized errors, and a single `agents.start()`/`mcp.open()` lifecycle surface; removed `agents.run()`, `agents.spawn()`, `AgentHandle.send()`, and `mcp.activate()`.
+- Replaced `fs.search(regex=...)` with `fs.search(mode="literal" | "regex")`, defined edit offsets as Unicode code points, and changed Shell, Web, Artifact, and MCP result records to exact named shapes.
 - Replaced the separate `shell.network` capability with `agents.main/defaults/profiles.network: allow | deny | inherit`; the effective policy now controls both IPython and `shell.run`, while Web and MCP host operations remain unaffected.
+- Removed embedded Riemann config, bridge, result-tag, compaction-state, and managed-Python layout version markers; these lockstep contracts now reject stale shapes without compatibility aliases.
 
 ### Added
 
@@ -28,11 +29,11 @@
 - Added direct-session image attachments across clipboard input with highlighted attachment markers, remote sessions, compaction, and explicit Riemann artifact image views.
 - Added live Riemann compaction strategy switching with complete Automatic, Default, OpenAI Codex, and Snapshot settings choices.
 - Added non-blocking compaction warnings for encrypted OpenAI context transitions, Snapshot models without image input, and incompatible OpenAI Codex model or OAuth selections.
-- Added schema-derived operation discovery, bounded Python result representations, explicit image viewing, Unicode-safe snapshot editing, and structured artifact recovery metadata.
+- Added schema-derived operation discovery with inline return fields, bounded Python result representations, explicit image viewing, Unicode-safe snapshot editing, and structured artifact recovery metadata.
 
 ### Changed
 
-- Restructured and budgeted the Riemann main, child, operation, and compaction prompts around one runtime contract and catalog-backed ABI discovery.
+- Restructured the Riemann main, child, operation, and compaction prompts around one runtime contract and catalog-backed schema discovery.
 - Changed Riemann shell execution to resolve bash through pi's shared shell configuration (`bash -c`, legacy WSL stdin transport) instead of `$SHELL -lc`/`cmd /d /s /c`.
 - Changed child delegation to one `agents.start()` operation returning durable `AgentTurnHandle` values with deterministic `info()`, `wait()`, `steer()`, `stop()`, and `release()` lifecycle controls.
 - Changed Linux Riemann isolation to preserve workspace/state paths and host devices while one inheritable Agent network policy consistently controls both persistent IPython and `shell.run`; PID namespaces still provide deterministic descendant cleanup.
@@ -48,7 +49,6 @@
 - Fixed models treating `fs`, `shell`, `web`, Agent, catalog, state, and MCP namespace calls as parallel native tools by declaring `ipython` as the sole callable tool across its schema, main/child prompts, operation headings, and MCP guidance.
 - Fixed managed Python startup on NixOS by resolving the host C++ runtime for ZeroMQ wheels while preserving existing library-path entries.
 - Fixed active IPython cells remaining uninterruptible behind non-cooperative host requests, including managed-Python startup on NixOS hosts.
-- Kept the strict Riemann configuration schema at `version: 1`; settings writes and examples no longer force an unrelated version-two migration.
 - Fixed async Agent calls being presented as synchronous expressions, and replaced delayed result-bearing completion injection with immediate minimal steering reminders.
 - Fixed sandboxed command lookup to honor call-level `PATH`, resolve Nix profile symlinks canonically, and return a structured exit-127 result for missing executables.
 - Fixed opaque `AgentInfo` field guidance and Agent completion presentation; the prompt exposes flat Turn fields, asynchronous completions emit immediate compact transcript lines, and the Subagent-only Fleet shows the latest Agent output.

@@ -3,8 +3,6 @@ import type { FileAccessPolicy } from "../access-policy.ts";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-export const RIEMANN_BRIDGE_ABI_VERSION = 2 as const;
-
 export const KERNEL_HOST_RESULT = Symbol("riemann.kernel-host-result");
 
 export type KernelImageReference = {
@@ -90,7 +88,6 @@ export interface KernelExecuteResult {
 }
 
 export interface KernelHostRequest {
-	abiVersion: typeof RIEMANN_BRIDGE_ABI_VERSION;
 	requestId: string;
 	operation: string;
 	arguments: Record<string, JsonValue>;

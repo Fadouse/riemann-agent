@@ -108,7 +108,6 @@ describe("Riemann shell argument validation", () => {
 		const { definition, store } = await shellDefinition(workspace, root, [workspace], []);
 		try {
 			expect(definition).toMatchObject({
-				abiVersion: 2,
 				pythonReturnType: "ProcessResult",
 				idempotency: "non-idempotent",
 				visibility: "public",
@@ -160,7 +159,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 				),
 			);
 			expect(result).toEqual({
-				$riemann: "process_result.v1",
+				$riemann: "process_result",
 				exit_code: 127,
 				stdout: "",
 				stderr: expect.stringContaining("command not found"),

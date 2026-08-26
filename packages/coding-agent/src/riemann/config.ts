@@ -70,7 +70,6 @@ const McpServerSchema = Type.Object(
 );
 const ConfigSchema = Type.Object(
 	{
-		version: Type.Literal(1),
 		compaction: Type.Optional(
 			Type.Object({ strategy: Type.Optional(CompactionStrategySchema) }, { additionalProperties: false }),
 		),
@@ -405,7 +404,7 @@ export function updateGlobalRiemannSetting(agentDir: string, path: RiemannSettin
 				},
 			});
 			try {
-				const existing = (await parseConfigFileNow(configPath)) ?? { version: 1 };
+				const existing = (await parseConfigFileNow(configPath)) ?? {};
 				const previousStrategy = existing.compaction?.strategy ?? "automatic";
 				const next = structuredClone(existing) as Record<string, unknown>;
 				setNestedValue(next, settingPathSegments(path), value);

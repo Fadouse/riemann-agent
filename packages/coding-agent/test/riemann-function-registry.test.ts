@@ -7,12 +7,11 @@ import { type JsonValue, type KernelHostRequest, kernelHostResult } from "../src
 const NEVER_ABORTED = new AbortController().signal;
 
 function request(operation: string, arguments_: Record<string, JsonValue> = {}): KernelHostRequest {
-	return { abiVersion: 2, requestId: `test-${operation}`, operation, arguments: arguments_ };
+	return { requestId: `test-${operation}`, operation, arguments: arguments_ };
 }
 
 function readDefinition(handler: FunctionDefinition["handler"] = async () => "contents"): FunctionDefinition {
 	return {
-		abiVersion: 2,
 		name: "read",
 		namespace: "fs",
 		description: "Read a file.",
@@ -41,7 +40,6 @@ function readDefinition(handler: FunctionDefinition["handler"] = async () => "co
 
 function editDefinition(): FunctionDefinition {
 	return {
-		abiVersion: 2,
 		name: "edit",
 		namespace: "fs",
 		description: "Edit a file snapshot.",
@@ -75,7 +73,6 @@ function registerFixtureFunctions(registry: FunctionRegistry): void {
 	registry.register(readDefinition());
 	registry.register(editDefinition());
 	registry.register({
-		abiVersion: 2,
 		name: "get",
 		namespace: "artifacts",
 		description: "Read an artifact.",
@@ -102,7 +99,7 @@ async function expectHostError(promise: Promise<unknown>, code: string): Promise
 	}
 }
 
-describe("Riemann ABI v2 function registry", () => {
+describe("Riemann function registry", () => {
 	test("rejects Python keywords in namespaces, names, and parameters", () => {
 		const keywordName = { ...readDefinition(), name: "class" };
 		expect(() => new FunctionRegistry().register(keywordName)).toThrow("Invalid Python function name");
@@ -156,12 +153,11 @@ describe("Riemann ABI v2 function registry", () => {
 		expect(() => registry.search("fs", 0)).toThrow("limit must be an integer from 1 to 50");
 	});
 
-	test("describe returns exact ABI metadata, schemas, and defaults", () => {
+	test("describe returns exact metadata, schemas, and defaults", () => {
 		const registry = new FunctionRegistry();
 		registry.register(readDefinition());
 
 		expect(registry.describe("fs.read", new Set(["fs.read"]))).toEqual({
-			abiVersion: 2,
 			name: "fs.read",
 			description: "Read a file.",
 			inputSchema: {

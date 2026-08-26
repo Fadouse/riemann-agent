@@ -196,7 +196,7 @@ export async function createRiemannCompaction(options: {
 		firstKeptEntryId: preparation.firstKeptEntryId,
 		tokensBefore: preparation.tokensBefore,
 		usage,
-		details: { version: 1, strategy: "default", kind, fileOperations: operations },
+		details: { strategy: "default", kind, fileOperations: operations },
 	};
 }
 
@@ -259,7 +259,6 @@ export async function createRiemannSnapshotCompaction(options: {
 		firstKeptEntryId: result.firstKeptEntryId,
 		tokensBefore: result.tokensBefore,
 		details: {
-			version: 1,
 			strategy: "snapshot",
 			fileOperations: result.details,
 			frames: archive?.frames.length ?? 0,

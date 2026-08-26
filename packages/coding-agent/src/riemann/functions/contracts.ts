@@ -29,7 +29,6 @@ export interface FunctionPromptSpecification {
 }
 
 export interface FunctionDefinition {
-	abiVersion: 2;
 	name: string;
 	namespace: string;
 	description: string;

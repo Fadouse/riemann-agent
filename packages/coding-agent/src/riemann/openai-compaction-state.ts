@@ -2,11 +2,8 @@ import type { ProviderPayload } from "@earendil-works/pi-ai";
 import type { OpenAICodexCompactionResult } from "@earendil-works/pi-ai/api/openai-codex-responses";
 
 export const OPENAI_COMPACTION_PRESERVE_KEY = "openaiRemoteCompaction";
-export const OPENAI_COMPACTION_FORMAT = "responses-compaction-v2";
 
 export interface PreservedOpenAICompaction {
-	version: 1;
-	format: typeof OPENAI_COMPACTION_FORMAT;
 	compactionItem: OpenAICodexCompactionResult["compactionItem"];
 	replacementHistory: Array<Record<string, unknown>>;
 	responseId?: string;
@@ -53,9 +50,9 @@ export function getPreservedOpenAICompaction(
 ): PreservedOpenAICompaction | undefined {
 	const candidate = preserveData?.[OPENAI_COMPACTION_PRESERVE_KEY];
 	if (!isRecord(candidate)) return undefined;
+	const allowedFields = new Set(["compactionItem", "replacementHistory", "responseId"]);
 	if (
-		candidate.version !== 1 ||
-		candidate.format !== OPENAI_COMPACTION_FORMAT ||
+		Object.keys(candidate).some((field) => !allowedFields.has(field)) ||
 		!isCompactionItem(candidate.compactionItem) ||
 		!isReplacementHistory(candidate.replacementHistory, candidate.compactionItem) ||
 		(candidate.responseId !== undefined && typeof candidate.responseId !== "string")

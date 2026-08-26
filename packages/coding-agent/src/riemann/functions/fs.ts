@@ -19,7 +19,7 @@ const MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_SEARCH_LINE_CHARS = 4_000;
 
 interface SnapshotReference {
-	$riemann: "text_snapshot_ref.v1" | "image_snapshot_ref.v1";
+	$riemann: "text_snapshot_ref" | "image_snapshot_ref";
 	capability: string;
 }
 
@@ -32,7 +32,7 @@ interface TextEdit {
 
 const artifactSchema = Type.Object(
 	{
-		$riemann: Type.Literal("artifact.v1"),
+		$riemann: Type.Literal("artifact"),
 		handle: Type.String(),
 		mime_type: Type.String(),
 		size: Type.Integer({ minimum: 0 }),
@@ -44,7 +44,7 @@ const artifactSchema = Type.Object(
 const textSnapshotSchema = Type.Object(
 	{
 		kind: Type.Literal("text"),
-		$riemann: Type.Literal("text_snapshot.v1"),
+		$riemann: Type.Literal("text_snapshot"),
 		path: Type.String(),
 		text: Type.String(),
 		encoding: Type.Literal("utf-8"),
@@ -56,7 +56,7 @@ const textSnapshotSchema = Type.Object(
 const imageSnapshotSchema = Type.Object(
 	{
 		kind: Type.Literal("image"),
-		$riemann: Type.Literal("image_snapshot.v1"),
+		$riemann: Type.Literal("image_snapshot"),
 		path: Type.String(),
 		artifact: artifactSchema,
 		mime_type: Type.String(),
@@ -72,7 +72,7 @@ const fileSnapshotSchema = Type.Union([textSnapshotSchema, imageSnapshotSchema],
 
 const textSnapshotReferenceSchema = Type.Object(
 	{
-		$riemann: Type.Literal("text_snapshot_ref.v1"),
+		$riemann: Type.Literal("text_snapshot_ref"),
 		capability: Type.String({ minLength: 1 }),
 	},
 	{ additionalProperties: false },
@@ -82,7 +82,7 @@ const fileSnapshotReferenceSchema = Type.Union([
 	textSnapshotReferenceSchema,
 	Type.Object(
 		{
-			$riemann: Type.Literal("image_snapshot_ref.v1"),
+			$riemann: Type.Literal("image_snapshot_ref"),
 			capability: Type.String({ minLength: 1 }),
 		},
 		{ additionalProperties: false },
@@ -118,7 +118,7 @@ const editOperationSchema = Type.Union([
 ]);
 
 const removedFileSchema = Type.Object(
-	{ $riemann: Type.Literal("removed_file.v1"), path: Type.String(), removed: Type.Literal(true) },
+	{ $riemann: Type.Literal("removed_file"), path: Type.String(), removed: Type.Literal(true) },
 	{ additionalProperties: false, $id: "RemovedFile" },
 );
 
@@ -306,7 +306,7 @@ export class FileFunctions {
 	private createSnapshot(path: string, text: string): JsonValue {
 		const capability = randomBytes(32).toString("base64url");
 		this.store.putFileCapability({ runId: this.runId, token: capability, path, contentHash: hashText(text) });
-		return { kind: "text", $riemann: "text_snapshot.v1", path, text, encoding: "utf-8", _capability: capability };
+		return { kind: "text", $riemann: "text_snapshot", path, text, encoding: "utf-8", _capability: capability };
 	}
 
 	private createImageSnapshot(path: string, sourceBytes: Uint8Array, image: StoredModelImage): JsonValue {
@@ -322,9 +322,9 @@ export class FileFunctions {
 		}
 		return {
 			kind: "image",
-			$riemann: "image_snapshot.v1",
+			$riemann: "image_snapshot",
 			path,
-			artifact: { ...image.artifact, $riemann: "artifact.v1" },
+			artifact: { ...image.artifact, $riemann: "artifact" },
 			mime_type: image.reference.mimeType,
 			source_size: sourceBytes.byteLength,
 			_capability: capability,
@@ -344,7 +344,7 @@ export class FileFunctions {
 		}
 		const reference = value as Partial<SnapshotReference>;
 		if (
-			(reference.$riemann !== "text_snapshot_ref.v1" && reference.$riemann !== "image_snapshot_ref.v1") ||
+			(reference.$riemann !== "text_snapshot_ref" && reference.$riemann !== "image_snapshot_ref") ||
 			typeof reference.capability !== "string"
 		) {
 			throw new RiemannHostError("invalid_arguments", "snapshot capability is invalid");
@@ -357,7 +357,7 @@ export class FileFunctions {
 		return {
 			...capability,
 			capability: reference.capability,
-			kind: reference.$riemann === "text_snapshot_ref.v1" ? "text" : "image",
+			kind: reference.$riemann === "text_snapshot_ref" ? "text" : "image",
 		};
 	}
 
@@ -461,7 +461,6 @@ export class FileFunctions {
 		const pathDescription = "File path; relative paths resolve from the current working directory";
 		return [
 			{
-				abiVersion: 2,
 				name: "read",
 				namespace: "fs",
 				description:
@@ -537,7 +536,6 @@ export class FileFunctions {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "glob",
 				namespace: "fs",
 				description: "List readable files matching a glob pattern without reading their contents.",
@@ -581,7 +579,6 @@ export class FileFunctions {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "search",
 				namespace: "fs",
 				description: "Search readable UTF-8 files and return canonical paths, line numbers, and matching lines.",
@@ -696,7 +693,6 @@ export class FileFunctions {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "edit",
 				namespace: "fs",
 				description:
@@ -780,7 +776,6 @@ export class FileFunctions {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "create",
 				namespace: "fs",
 				description: "Create a new UTF-8 file atomically. Refuses to overwrite an existing path.",
@@ -836,7 +831,6 @@ export class FileFunctions {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "remove",
 				namespace: "fs",
 				description:
@@ -886,7 +880,7 @@ export class FileFunctions {
 							throw error;
 						});
 						await syncDirectory(dirname(snapshot.path));
-						return { $riemann: "removed_file.v1", path: snapshot.path, removed: true };
+						return { $riemann: "removed_file", path: snapshot.path, removed: true };
 					} finally {
 						await release();
 					}

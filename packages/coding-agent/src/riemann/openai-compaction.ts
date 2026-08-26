@@ -9,7 +9,6 @@ import { convertToLlm } from "../core/messages.ts";
 import type { JsonValue } from "./kernel/types.ts";
 import {
 	getPreservedOpenAICompaction,
-	OPENAI_COMPACTION_FORMAT,
 	OPENAI_COMPACTION_PRESERVE_KEY,
 	type PreservedOpenAICompaction,
 } from "./openai-compaction-state.ts";
@@ -101,8 +100,6 @@ export async function createRiemannOpenAICompaction(options: {
 	const summary = compactionSummary(options.durableState);
 	const history = replacementHistory(remote.compactionItem, summary);
 	const preserved: PreservedOpenAICompaction = {
-		version: 1,
-		format: OPENAI_COMPACTION_FORMAT,
 		compactionItem: remote.compactionItem,
 		replacementHistory: history,
 		...(remote.responseId ? { responseId: remote.responseId } : {}),
@@ -113,9 +110,7 @@ export async function createRiemannOpenAICompaction(options: {
 		tokensBefore: options.preparation.tokensBefore,
 		usage: remote.usage,
 		details: {
-			version: 1,
 			strategy: "openai",
-			format: preserved.format,
 			responseId: preserved.responseId,
 		},
 		preserveData: {

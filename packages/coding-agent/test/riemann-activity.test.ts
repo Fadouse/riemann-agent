@@ -12,7 +12,7 @@ afterEach(async () => {
 });
 
 function request(type: string, args: KernelHostRequest["arguments"]): KernelHostRequest {
-	return { abiVersion: 2, requestId: `request-${type}`, operation: type, arguments: args, cellId: "cell-1" };
+	return { requestId: `request-${type}`, operation: type, arguments: args, cellId: "cell-1" };
 }
 
 async function observe(tracker: RiemannActivityTracker, event: KernelHostRequestEvent) {
@@ -47,7 +47,7 @@ describe("Riemann IPython activity tracking", () => {
 			request: shellRequest,
 			durationMs: 40,
 			result: {
-				$riemann: "process_result.v1",
+				$riemann: "process_result",
 				exit_code: 0,
 				stdout: "Tests 12 passed\n",
 				stderr: "",
@@ -70,7 +70,7 @@ describe("Riemann IPython activity tracking", () => {
 			capability === "file-capability" ? path : undefined,
 		);
 		const editRequest = request("fs.edit", {
-			snapshot: { $riemann: "text_snapshot_ref.v1", capability: "file-capability" },
+			snapshot: { $riemann: "text_snapshot_ref", capability: "file-capability" },
 			operations: [{ kind: "replace", start: 14, end: 15, text: "2" }],
 		});
 		await observe(tracker, { phase: "start", requestId: "edit-1", request: editRequest, startedAt: 1 });
@@ -80,7 +80,7 @@ describe("Riemann IPython activity tracking", () => {
 			request: editRequest,
 			durationMs: 10,
 			result: {
-				$riemann: "text_snapshot.v1",
+				$riemann: "text_snapshot",
 				kind: "text",
 				path,
 				text: "const value = 2;\n",
@@ -114,7 +114,7 @@ describe("Riemann IPython activity tracking", () => {
 			request: spawnRequest,
 			durationMs: 8,
 			result: {
-				$riemann: "agent_turn_handle.v1",
+				$riemann: "agent_turn_handle",
 				id: "child-1",
 				name: "Reviewer",
 				turn_id: "turn-1",

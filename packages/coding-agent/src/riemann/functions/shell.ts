@@ -28,7 +28,7 @@ interface PendingStreamUpdate {
 
 const ArtifactSchema = Type.Object(
 	{
-		$riemann: Type.Literal("artifact.v1"),
+		$riemann: Type.Literal("artifact"),
 		handle: Type.String(),
 		mime_type: Type.String(),
 		size: Type.Integer({ minimum: 0 }),
@@ -39,7 +39,7 @@ const ArtifactSchema = Type.Object(
 
 const ProcessResultSchema = Type.Object(
 	{
-		$riemann: Type.Literal("process_result.v1"),
+		$riemann: Type.Literal("process_result"),
 		exit_code: Type.Union([Type.Integer(), Type.Null()]),
 		stdout: Type.String(),
 		stderr: Type.String(),
@@ -143,7 +143,7 @@ export class ShellFunctions {
 		);
 		if (!executable) {
 			return {
-				$riemann: "process_result.v1",
+				$riemann: "process_result",
 				exit_code: 127,
 				stdout: "",
 				stderr: `${command.executable}: command not found\n`,
@@ -297,7 +297,7 @@ export class ShellFunctions {
 				: `${graphemeSafePrefix(text, this.previewChars)}\n${PREVIEW_TRUNCATION_MARKER}`;
 		const termination: ProcessTermination = requestedTermination ?? (child.signalCode === null ? "exited" : "signal");
 		return {
-			$riemann: "process_result.v1",
+			$riemann: "process_result",
 			exit_code: exitCode,
 			stdout: preview(stdoutText),
 			stderr: preview(stderrText),
@@ -314,7 +314,6 @@ export class ShellFunctions {
 			"Working directory; relative paths resolve from the current working directory and absolute host paths are allowed";
 		return [
 			{
-				abiVersion: 2,
 				name: "run",
 				namespace: "shell",
 				description: "Run a shell script and return a structured ProcessResult.",

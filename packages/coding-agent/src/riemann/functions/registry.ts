@@ -1,4 +1,4 @@
-import type { TSchema } from "typebox";
+import { IsArray, IsObject, IsUnion, type TSchema } from "typebox";
 import { Value } from "typebox/value";
 import { RiemannHostError } from "../errors.ts";
 import { isKernelHostResult, type JsonValue, type KernelHostRequest, type KernelHostResult } from "../kernel/types.ts";
@@ -129,12 +129,47 @@ function promptArgument(name: string, schema: TSchema, required: boolean): strin
 	return required ? `${name}=...` : `${name}=None`;
 }
 
+const PYTHON_RETURN_METHODS = new Map<string, readonly string[]>([
+	["TextSnapshot", ["lines(start=1, end=None)"]],
+	["ImageSnapshot", ["view()"]],
+	["Artifact", ["read(offset=0, limit=None)", "materialize(path=...)", "view()"]],
+	["AgentTurnHandle", ["info()", "wait(timeout=None)", "steer(message=...)", "stop(timeout=None)", "release()"]],
+	["AgentInfo", ["info()", "wait(timeout=None)", "steer(message=...)", "stop(timeout=None)", "release()"]],
+	["AgentResult", ["info()", "wait(timeout=None)", "steer(message=...)", "stop(timeout=None)", "release()"]],
+	["McpNamespace", ["status()", "refresh()", "close()"]],
+]);
+
+function visibleOutputFields(schema: TSchema): string[] {
+	if (IsObject(schema)) {
+		return Object.keys(schema.properties).filter((name) => !name.startsWith("$") && !name.startsWith("_"));
+	}
+	if (IsArray(schema)) return visibleOutputFields(schema.items);
+	if (IsUnion(schema)) return [...new Set(schema.anyOf.flatMap(visibleOutputFields))];
+	return [];
+}
+
+function formatNamedReturnShape(returnType: string, schema: TSchema): string {
+	const fields = returnType === "McpNamespace" ? [] : visibleOutputFields(schema);
+	const methods = PYTHON_RETURN_METHODS.get(returnType) ?? [];
+	const details = [fields.join(", "), methods.join(", ")].filter(Boolean).join("; ");
+	return details ? `${returnType}(${details})` : returnType;
+}
+
+function formatPythonReturnShape(returnType: string, schema: TSchema): string {
+	const listMatch = /^list\[(.+)]$/.exec(returnType);
+	if (listMatch && IsArray(schema)) return `list[${formatNamedReturnShape(listMatch[1], schema.items)}]`;
+	return formatNamedReturnShape(returnType, schema);
+}
+
 function promptInventoryItem(definition: FunctionDefinition): string {
 	const required = new Set(definition.inputSchema.required ?? []);
 	const argumentsText = Object.entries(definition.inputSchema.properties)
 		.map(([name, schema]) => promptArgument(name, schema, required.has(name)))
 		.join(", ");
-	return `\`${definition.name}(${argumentsText}) -> ${definition.pythonReturnType}\``;
+	return `\`${definition.name}(${argumentsText}) -> ${formatPythonReturnShape(
+		definition.pythonReturnType,
+		definition.outputSchema,
+	)}\``;
 }
 
 export class FunctionRegistry {
@@ -146,7 +181,6 @@ export class FunctionRegistry {
 		}
 		const qualifiedName = `${definition.namespace}.${definition.name}`;
 		if (this.definitions.has(qualifiedName)) throw new Error(`Function is already registered: ${qualifiedName}`);
-		if (definition.abiVersion !== 2) throw new Error(`Unsupported ABI version for ${qualifiedName}`);
 		if (
 			definition.inputSchema.type !== "object" ||
 			!("additionalProperties" in definition.inputSchema) ||
@@ -228,7 +262,6 @@ export class FunctionRegistry {
 			throw new RiemannHostError("not_found", `Function not found: ${name}`);
 		}
 		return {
-			abiVersion: definition.abiVersion,
 			name,
 			description: definition.description,
 			inputSchema: metadataValue(definition.inputSchema),

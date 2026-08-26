@@ -96,7 +96,6 @@ describe("Riemann session extension", () => {
 		await writeFile(
 			join(agentDir, "config.yaml"),
 			[
-				"version: 1",
 				"agents:",
 				"  profiles:",
 				"    researcher:",
@@ -197,7 +196,7 @@ describe("Riemann session extension", () => {
 						"assert hasattr(catalog, 'search')",
 						"assert hasattr(state, 'status')",
 						"runtime_status = await state.status()",
-						"assert runtime_status['abi_version'] == 1 and runtime_status['agent_slots']['used'] == 0, runtime_status",
+						"assert runtime_status['agent_slots']['used'] == 0, runtime_status",
 						"assert runtime_status['network'] == {'configured': 'inherit', 'effective': 'deny', 'source': 'builtin'}, runtime_status",
 						"assert hasattr(agents, 'start')",
 						"assert not hasattr(agents, 'result')",

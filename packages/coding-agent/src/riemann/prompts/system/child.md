@@ -22,14 +22,8 @@ You are a child Agent in a Riemann run.
 
 Emit model tool calls only with the name `ipython`. The entries below are Python APIs inside its persistent `code` field, never tool-call names. For example, use `ipython` with code `result = await web.search(query="latest news")`.
 
-## Python API inside `ipython.code`
+## Python API
 
 {{pythonNamespaceInventory}}
 
-Use `await catalog.describe(name="...")` when an exact contract is needed.
-
-{{agentProfiles}}
-
-{{operationGuidelines}}
-
-{{exposedMcpServers}}
+{{runtimeSections}}

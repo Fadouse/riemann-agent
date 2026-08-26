@@ -40,12 +40,12 @@ function objectValue(value: JsonValue | KernelHostResult | undefined): Record<st
 
 function mcpJson(value: JsonValue | undefined): JsonValue {
 	const wrapper = objectValue(value);
-	expect(wrapper.$riemann).toBe("mcp_json.v1");
+	expect(wrapper.$riemann).toBe("mcp_json");
 	return wrapper.value ?? null;
 }
 
 function request(operation: string, arguments_: Record<string, JsonValue>): KernelHostRequest {
-	return { abiVersion: 2, requestId: `test-${operation}`, operation, arguments: arguments_ };
+	return { requestId: `test-${operation}`, operation, arguments: arguments_ };
 }
 
 function fixtureConfig() {
@@ -80,7 +80,7 @@ describe("Riemann MCP ABI v2 bridge", () => {
 			const opened = objectValue(
 				await registry.dispatch(request("mcp.open", { name: "fixture" }), capabilities, signal),
 			);
-			expect(opened.$riemann).toBe("function_bundle.v1");
+			expect(opened.$riemann).toBe("function_bundle");
 			expect(opened.namespace).toBe("fixture");
 			expect(opened.server_name).toBe("fixture");
 			expect(registry.get("fixture.close")).toBeUndefined();
@@ -108,14 +108,14 @@ describe("Riemann MCP ABI v2 bridge", () => {
 					signal,
 				),
 			);
-			expect(result.$riemann).toBe("mcp_result.v1");
+			expect(result.$riemann).toBe("mcp_result");
 			expect(objectValue(mcpJson(result.structured_content)).total).toBe(42);
 
 			await expect(
 				registry.dispatch(request("fixture.fail", { input: {} }), capabilities, signal),
 			).rejects.toMatchObject({
 				code: "mcp_tool_error",
-				details: expect.objectContaining({ $riemann: "mcp_result.v1" }),
+				details: expect.objectContaining({ $riemann: "mcp_result" }),
 			});
 
 			const imageWire = objectValue(

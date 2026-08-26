@@ -48,11 +48,11 @@ describe("Riemann context compaction", () => {
 				model,
 				modelRegistry: { complete } as unknown as ExtensionContext["modelRegistry"],
 			},
-			durableState: { version: 1, agents: [{ id: "child-1", status: "running" }] },
+			durableState: { agents: [{ id: "child-1", status: "running" }] },
 		});
 
 		expect(result.summary).toContain("## Objective\nPreserve the task");
-		expect(result.summary).toContain('<riemann_state>\n{"version":1,"agents":[{"id":"child-1","status":"running"}]}');
+		expect(result.summary).toContain('<riemann_state>\n{"agents":[{"id":"child-1","status":"running"}]}');
 		expect(result.firstKeptEntryId).toBe("kept-entry");
 		const call = completeCalls[0];
 		if (!call) throw new Error("Compaction model was not called");
@@ -86,7 +86,7 @@ describe("Riemann context compaction", () => {
 				model,
 				modelRegistry: { complete } as unknown as ExtensionContext["modelRegistry"],
 			},
-			durableState: { version: 1 },
+			durableState: {},
 		};
 
 		await createRiemannCompaction({ ...common, includeImages: true });
@@ -127,7 +127,7 @@ describe("Riemann context compaction", () => {
 				model,
 				modelRegistry: { complete } as unknown as ExtensionContext["modelRegistry"],
 			},
-			durableState: { version: 1, agents: [] },
+			durableState: { agents: [] },
 		});
 
 		expect(kinds).toEqual(["initial", "prefix"]);
@@ -153,7 +153,7 @@ describe("Riemann context compaction", () => {
 			preparation,
 			signal: new AbortController().signal,
 			context: { model },
-			durableState: { version: 1, agents: [] },
+			durableState: { agents: [] },
 		});
 		const archive = getPreservedArchive(result.preserveData);
 		expect(archive).toBeDefined();
@@ -182,7 +182,7 @@ describe("Riemann context compaction", () => {
 		);
 	});
 
-	test("uses one Codex compact request and persists unbound V1 history", async () => {
+	test("uses one Codex compact request and persists unbound remote history", async () => {
 		const model = getModel("openai-codex", "gpt-5.5");
 		if (!model || model.api !== "openai-codex-responses") {
 			throw new Error("Built-in OpenAI Codex test model is unavailable");
@@ -229,14 +229,12 @@ describe("Riemann context compaction", () => {
 				getSystemPrompt: () => "Riemann system",
 				thinkingLevel: "low",
 			},
-			durableState: { version: 1, agents: [] },
+			durableState: { agents: [] },
 			sessionId: "session-1",
 		}).finally(() => vi.unstubAllGlobals());
 
 		expect(result.details).toEqual({
-			version: 1,
 			strategy: "openai",
-			format: "responses-compaction-v2",
 			responseId: "resp_1",
 		});
 		expect(result.summary).toContain("OpenAI Codex cloud compaction is active");
@@ -245,7 +243,6 @@ describe("Riemann context compaction", () => {
 		expect(getPreservedArchive(result.preserveData)).toBeUndefined();
 		const remote = getPreservedOpenAICompaction(result.preserveData);
 		expect(remote).toMatchObject({
-			version: 1,
 			compactionItem: { type: "compaction", id: "cmp_1", encrypted_content: "opaque" },
 			responseId: "resp_1",
 		});
@@ -311,7 +308,7 @@ describe("Riemann context compaction", () => {
 				customInstructions: "preserve errors",
 				signal: new AbortController().signal,
 				context,
-				durableState: { version: 1 },
+				durableState: {},
 				sessionId: "session-1",
 			}),
 		).rejects.toThrow('strategy "openai" does not support custom instructions');
@@ -327,7 +324,7 @@ describe("Riemann context compaction", () => {
 				preparation,
 				signal: new AbortController().signal,
 				context: noOAuthContext,
-				durableState: { version: 1 },
+				durableState: {},
 				sessionId: "session-1",
 			}),
 		).rejects.toThrow("requires OpenAI Codex subscription OAuth");
@@ -348,7 +345,7 @@ describe("Riemann context compaction", () => {
 						getApiKeyAndHeaders: async () => ({ ok: true, apiKey: `aaa.${tokenPayload}.bbb` }),
 					} as unknown as ExtensionContext["modelRegistry"],
 				},
-				durableState: { version: 1 },
+				durableState: {},
 				sessionId: "session-1",
 			}),
 		)

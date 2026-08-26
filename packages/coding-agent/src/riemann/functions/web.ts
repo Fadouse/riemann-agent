@@ -44,7 +44,7 @@ const ISO_TIMESTAMP_PATTERN =
 
 const ArtifactSchema = Type.Object(
 	{
-		$riemann: Type.Literal("artifact.v1"),
+		$riemann: Type.Literal("artifact"),
 		handle: Type.String(),
 		mime_type: Type.String(),
 		size: Type.Integer({ minimum: 0 }),
@@ -55,7 +55,7 @@ const ArtifactSchema = Type.Object(
 
 const SearchHitSchema = Type.Object(
 	{
-		$riemann: Type.Literal("search_hit.v1"),
+		$riemann: Type.Literal("search_hit"),
 		title: Type.String(),
 		url: Type.String(),
 		snippet: Type.String(),
@@ -66,7 +66,7 @@ const SearchHitSchema = Type.Object(
 
 const DocumentSchema = Type.Object(
 	{
-		$riemann: Type.Literal("document.v1"),
+		$riemann: Type.Literal("document"),
 		url: Type.String(),
 		title: Type.Union([Type.String(), Type.Null()]),
 		text: Type.String(),
@@ -354,7 +354,6 @@ export class WebFunctions {
 	definitions(): FunctionDefinition[] {
 		return [
 			{
-				abiVersion: 2,
 				name: "search",
 				namespace: "web",
 				description:
@@ -494,7 +493,7 @@ export class WebFunctions {
 						throw new RiemannHostError("provider_error", "Exa response has an invalid result shape");
 					const result = parsed as ExaResponse;
 					return result.results.slice(0, limit).map((item) => ({
-						$riemann: "search_hit.v1",
+						$riemann: "search_hit",
 						title: item.title ?? item.url,
 						url: normalizeProviderUrl(item.url),
 						snippet: graphemeSafePrefix(item.highlights?.join("\n\n") || item.text || "", 1_200),
@@ -503,7 +502,6 @@ export class WebFunctions {
 				},
 			},
 			{
-				abiVersion: 2,
 				name: "fetch",
 				namespace: "web",
 				description:
@@ -609,7 +607,7 @@ export class WebFunctions {
 							mimeType: contentType,
 						});
 						return {
-							$riemann: "document.v1",
+							$riemann: "document",
 							url: finalUrl,
 							title: null,
 							text: "",
@@ -629,7 +627,7 @@ export class WebFunctions {
 								})
 							: null;
 					return {
-						$riemann: "document.v1",
+						$riemann: "document",
 						url: finalUrl,
 						title: extracted.title,
 						text:

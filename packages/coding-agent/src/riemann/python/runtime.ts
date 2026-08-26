@@ -7,14 +7,12 @@ import { getPackageDir, isBunBinary } from "../../config.ts";
 import { spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { getRiemannAgentDir } from "../config.ts";
 
-const RUNTIME_LAYOUT_VERSION = 1;
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
 const PROBE_TIMEOUT_MS = 10_000;
 const CXX_RUNTIME_LIBRARY = "libstdc++.so.6";
 let runtimePromise: Promise<ManagedPythonRuntime> | undefined;
 
 interface RuntimeMarker {
-	layoutVersion: number;
 	requirementsSha256: string;
 }
 
@@ -59,10 +57,8 @@ async function readMarker(path: string): Promise<RuntimeMarker | undefined> {
 		const value: unknown = JSON.parse(await readFile(path, "utf8"));
 		if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 		const marker = value as Partial<RuntimeMarker>;
-		if (marker.layoutVersion !== RUNTIME_LAYOUT_VERSION || typeof marker.requirementsSha256 !== "string") {
-			return undefined;
-		}
-		return { layoutVersion: marker.layoutVersion, requirementsSha256: marker.requirementsSha256 };
+		if (Object.keys(value).length !== 1 || typeof marker.requirementsSha256 !== "string") return undefined;
+		return { requirementsSha256: marker.requirementsSha256 };
 	} catch {
 		return undefined;
 	}
@@ -234,7 +230,7 @@ async function managedPythonEnvironment(python: string): Promise<Record<string, 
 async function ensureRuntimePath(): Promise<string> {
 	const agentDir = getRiemannAgentDir();
 	const runtimeRoot = join(agentDir, "runtime");
-	const runtimeDir = join(runtimeRoot, `python-v${RUNTIME_LAYOUT_VERSION}`);
+	const runtimeDir = join(runtimeRoot, "python");
 	const markerPath = join(runtimeDir, "riemann-runtime.json");
 	const requirements = requirementsPath();
 	const requirementsSha256 = createHash("sha256")
@@ -251,12 +247,12 @@ async function ensureRuntimePath(): Promise<string> {
 		if (lockedCurrent?.requirementsSha256 === requirementsSha256 && existsSync(pythonIn(runtimeDir))) {
 			return pythonIn(runtimeDir);
 		}
-		const stagingDir = join(runtimeRoot, `.python-v${RUNTIME_LAYOUT_VERSION}-${process.pid}-${randomUUID()}.tmp`);
+		const stagingDir = join(runtimeRoot, `.python-${process.pid}-${randomUUID()}.tmp`);
 		try {
 			await provisionRuntime(stagingDir, requirements);
 			await writeFile(
 				join(stagingDir, "riemann-runtime.json"),
-				`${JSON.stringify({ layoutVersion: RUNTIME_LAYOUT_VERSION, requirementsSha256 }, null, 2)}\n`,
+				`${JSON.stringify({ requirementsSha256 }, null, 2)}\n`,
 				{ mode: 0o600 },
 			);
 			await rm(runtimeDir, { recursive: true, force: true });

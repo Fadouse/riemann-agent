@@ -7,7 +7,7 @@ import {
 	detectCompactionWarnings,
 	latestActiveCompactionHasOpenAIContext,
 } from "../src/riemann/compaction-warning.ts";
-import { OPENAI_COMPACTION_FORMAT, OPENAI_COMPACTION_PRESERVE_KEY } from "../src/riemann/openai-compaction-state.ts";
+import { OPENAI_COMPACTION_PRESERVE_KEY } from "../src/riemann/openai-compaction-state.ts";
 
 function warningCodes(
 	effectiveStrategy: EffectiveCompactionStrategy,
@@ -43,8 +43,6 @@ function entry(id: string, value: Pick<SessionEntry, "type"> & Partial<SessionEn
 
 const validRemoteState = {
 	[OPENAI_COMPACTION_PRESERVE_KEY]: {
-		version: 1,
-		format: OPENAI_COMPACTION_FORMAT,
 		compactionItem: { type: "compaction", encrypted_content: "encrypted" },
 		replacementHistory: [
 			{ type: "compaction", encrypted_content: "encrypted" },
@@ -169,7 +167,7 @@ describe("latest active OpenAI compaction state", () => {
 				summary: "latest",
 				firstKeptEntryId: "first",
 				tokensBefore: 2,
-				preserveData: { [OPENAI_COMPACTION_PRESERVE_KEY]: { version: 1 } },
+				preserveData: { [OPENAI_COMPACTION_PRESERVE_KEY]: { unexpected: true } },
 			}),
 		];
 		expect(latestActiveCompactionHasOpenAIContext(branch)).toBe(false);

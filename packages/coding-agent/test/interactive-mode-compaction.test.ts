@@ -55,8 +55,6 @@ describe("InteractiveMode compaction strategy warnings", () => {
 			tokensBefore: 100,
 			preserveData: {
 				openaiRemoteCompaction: {
-					version: 1,
-					format: "responses-compaction-v2",
 					compactionItem: { type: "compaction", encrypted_content: "encrypted" },
 					replacementHistory: [
 						{ type: "compaction", encrypted_content: "encrypted" },
@@ -127,8 +125,6 @@ describe("InteractiveMode compaction strategy warnings", () => {
 						tokensBefore: 100,
 						preserveData: {
 							openaiRemoteCompaction: {
-								version: 1,
-								format: "responses-compaction-v2",
 								compactionItem: { type: "compaction", encrypted_content: "encrypted" },
 								replacementHistory: [
 									{ type: "compaction", encrypted_content: "encrypted" },

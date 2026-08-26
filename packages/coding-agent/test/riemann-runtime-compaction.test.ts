@@ -30,7 +30,7 @@ function preparation(): CompactionPreparation {
 
 async function writeStrategy(path: string, strategy: "automatic" | "default" | "openai" | "snapshot") {
 	await mkdir(join(path, ".."), { recursive: true });
-	await writeFile(path, `version: 1\ncompaction:\n  strategy: ${strategy}\n`);
+	await writeFile(path, `compaction:\n  strategy: ${strategy}\n`);
 }
 
 function durableCompaction(summary: string): unknown {

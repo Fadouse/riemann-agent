@@ -14,7 +14,6 @@ import { createRiemannCompaction, createRiemannSnapshotCompaction } from "../src
 import { createRiemannOpenAICompaction } from "../src/riemann/openai-compaction.ts";
 import {
 	getPreservedOpenAICompaction,
-	OPENAI_COMPACTION_FORMAT,
 	OPENAI_COMPACTION_PRESERVE_KEY,
 } from "../src/riemann/openai-compaction-state.ts";
 import { archiveSourceText, getPreservedArchive, PRESERVE_KEY } from "../src/riemann/snapshot-compaction.ts";
@@ -67,8 +66,6 @@ function openAIPreparation(options?: { marker?: string; opaque?: string }): Comp
 		previousSummary: marker,
 		previousPreserveData: {
 			[OPENAI_COMPACTION_PRESERVE_KEY]: {
-				version: 1,
-				format: OPENAI_COMPACTION_FORMAT,
 				compactionItem,
 				replacementHistory: [
 					compactionItem,
@@ -145,7 +142,7 @@ describe("Riemann compaction strategy continuity", () => {
 				preparation,
 				signal: new AbortController().signal,
 				context,
-				durableState: { version: 1 },
+				durableState: {},
 				sessionId: "session-1",
 			});
 			expect(fetchMock).toHaveBeenCalledOnce();
@@ -170,7 +167,7 @@ describe("Riemann compaction strategy continuity", () => {
 			includeImages: true,
 			signal: new AbortController().signal,
 			context: { model, modelRegistry: { complete } as unknown as ExtensionContext["modelRegistry"] },
-			durableState: { version: 1 },
+			durableState: {},
 		});
 
 		expect(complete).toHaveBeenCalledOnce();
@@ -178,7 +175,7 @@ describe("Riemann compaction strategy continuity", () => {
 		expect(request).not.toContain("snapshot-to-default-plaintext");
 	});
 
-	test("replays the V1 opaque item in one compact request without provider or model binding", async () => {
+	test("replays the opaque item in one compact request without provider or model binding", async () => {
 		const fetchMock = vi.fn(
 			async (_input: string | URL | Request, _init?: RequestInit) => new Response(codexSse(), { status: 200 }),
 		);
@@ -188,7 +185,7 @@ describe("Riemann compaction strategy continuity", () => {
 			preparation: openAIPreparation({ marker: "host-only-marker", opaque: "unbound-encrypted" }),
 			signal: new AbortController().signal,
 			context,
-			durableState: { version: 1 },
+			durableState: {},
 			sessionId: "session-1",
 		});
 
@@ -199,7 +196,6 @@ describe("Riemann compaction strategy continuity", () => {
 		expect(context.modelRegistry.complete).not.toHaveBeenCalled();
 		const preserved = getPreservedOpenAICompaction(result.preserveData);
 		expect(preserved).toMatchObject({
-			version: 1,
 			compactionItem: { encrypted_content: "new-encrypted-context" },
 		});
 		expect(preserved).not.toHaveProperty("provider");
@@ -220,7 +216,7 @@ describe("Riemann compaction strategy continuity", () => {
 			preparation: openAIPreparation({ marker: "existing textual marker", opaque: "replayed-opaque" }),
 			signal: new AbortController().signal,
 			context,
-			durableState: { version: 1 },
+			durableState: {},
 			sessionId: "session-1",
 		});
 
@@ -231,9 +227,7 @@ describe("Riemann compaction strategy continuity", () => {
 		expect(body).not.toContain("unavailable");
 		expect(context.modelRegistry.complete).not.toHaveBeenCalled();
 		expect(result.details).toEqual({
-			version: 1,
 			strategy: "openai",
-			format: "responses-compaction-v2",
 			responseId: "resp_new",
 		});
 		expect(result.details).not.toHaveProperty("priorEncryptedContext");
@@ -255,7 +249,7 @@ describe("Riemann compaction strategy continuity", () => {
 			includeImages: true,
 			signal: new AbortController().signal,
 			context: { model, modelRegistry: { complete } as unknown as ExtensionContext["modelRegistry"] },
-			durableState: { version: 1 },
+			durableState: {},
 		});
 
 		expect(complete).toHaveBeenCalledOnce();
@@ -272,7 +266,7 @@ describe("Riemann compaction strategy continuity", () => {
 			preparation: openAIPreparation({ marker: "existing snapshot marker", opaque: "snapshot-opaque" }),
 			signal: new AbortController().signal,
 			context: { model },
-			durableState: { version: 1 },
+			durableState: {},
 		});
 		const archive = getPreservedArchive(result.preserveData);
 		if (!archive) throw new Error("Snapshot archive is unavailable");
@@ -295,13 +289,13 @@ describe("Riemann compaction strategy continuity", () => {
 				includeImages: true,
 				signal: new AbortController().signal,
 				context: { model, modelRegistry: { complete } as unknown as ExtensionContext["modelRegistry"] },
-				durableState: { version: 1 },
+				durableState: {},
 			}),
 		).rejects.toThrow("Riemann compaction failed: generation hit the token cap and the summary is incomplete");
 		expect(complete).toHaveBeenCalledOnce();
 	});
 
-	test("V1 OpenAI preserve data survives JSONL persistence without a portable fallback", async () => {
+	test("OpenAI preserve data survives JSONL persistence without a portable fallback", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "pi-openai-compaction-"));
 		try {
 			const preserveData = openAIPreparation({ marker: "persisted host marker" }).previousPreserveData;
@@ -313,7 +307,7 @@ describe("Riemann compaction strategy continuity", () => {
 			const file = session.getSessionFile();
 			if (!file) throw new Error("Persisted session file is unavailable");
 			const jsonl = await readFile(file, "utf8");
-			expect(jsonl).toContain('"openaiRemoteCompaction":{"version":1');
+			expect(jsonl).toContain('"openaiRemoteCompaction":{"compactionItem":');
 			expect(jsonl).not.toContain("portableFallback");
 
 			const restored = SessionManager.open(file);

@@ -316,14 +316,13 @@ describe("Riemann reusable Agent slots", () => {
 					.map((definition) => definition.name),
 			).toEqual(["info", "wait", "steer", "stop", "release"]);
 			const startDefinition = functionByName(definitions, "start");
-			expect(startDefinition.abiVersion).toBe(2);
 			expect(Object.keys(startDefinition.inputSchema.properties)).toEqual(["task", "name", "profile", "reuse"]);
 			expect(startDefinition.inputSchema).toMatchObject({ additionalProperties: false });
 			expect(startDefinition.pythonReturnType).toBe("AgentTurnHandle");
 			expect(startDefinition.outputSchema).toMatchObject({
 				type: "object",
 				additionalProperties: false,
-				properties: { $riemann: { const: "agent_turn_handle.v1" }, status: { anyOf: expect.any(Array) } },
+				properties: { $riemann: { const: "agent_turn_handle" }, status: { anyOf: expect.any(Array) } },
 			});
 			expect(startDefinition.inputSchema.properties.profile).toMatchObject({
 				anyOf: [{ description: 'Exact configured policy key: "isolated", "privileged"' }, { type: "null" }],
@@ -345,7 +344,7 @@ describe("Riemann reusable Agent slots", () => {
 			const firstTurnId = firstHandle.turn_id;
 			if (typeof firstTurnId !== "string") throw new Error("Start did not return a Turn id");
 			expect(firstHandle).toMatchObject({
-				$riemann: "agent_turn_handle.v1",
+				$riemann: "agent_turn_handle",
 				status: "running",
 			});
 			expect(supervisor.definitions(childId)).toEqual([]);
@@ -518,7 +517,7 @@ describe("Riemann reusable Agent slots", () => {
 					),
 				),
 			).toMatchObject({
-				$riemann: "agent_turn_handle.v1",
+				$riemann: "agent_turn_handle",
 				turn_id: first.turn_id,
 				status: "running",
 			});
@@ -530,7 +529,7 @@ describe("Riemann reusable Agent slots", () => {
 			sessions.get(first.id)?.at(-1)?.finish();
 			const firstResult = objectValue(await firstWait);
 			expect(firstResult).toMatchObject({
-				$riemann: "agent_result.v1",
+				$riemann: "agent_result",
 				id: first.id,
 				turn_id: first.turn_id,
 				status: "idle",
@@ -580,7 +579,7 @@ describe("Riemann reusable Agent slots", () => {
 				),
 			);
 			expect(stopped).toMatchObject({
-				$riemann: "agent_result.v1",
+				$riemann: "agent_result",
 				turn_id: second.turn_id,
 				status: "stopped",
 				outcome: "cancelled",
@@ -629,7 +628,7 @@ describe("Riemann reusable Agent slots", () => {
 				throw new Error("Missing Agent Turn handle");
 			}
 			expect(handle).toMatchObject({
-				$riemann: "agent_turn_handle.v1",
+				$riemann: "agent_turn_handle",
 				status: "running",
 			});
 
@@ -648,7 +647,7 @@ describe("Riemann reusable Agent slots", () => {
 			);
 			sessions.get(handle.id)?.at(-1)?.finish();
 			expect(objectValue(await completed)).toMatchObject({
-				$riemann: "agent_result.v1",
+				$riemann: "agent_result",
 				id: handle.id,
 				turn_id: handle.turn_id,
 				status: "idle",
@@ -761,7 +760,7 @@ describe("Riemann reusable Agent slots", () => {
 		});
 		const { supervisor, store, mainId, agentDir } = harness;
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(join(agentDir, "config.yaml"), "version: 1\ncompaction:\n  strategy: snapshot\n");
+		await writeFile(join(agentDir, "config.yaml"), "compaction:\n  strategy: snapshot\n");
 		await writeFile(
 			join(agentDir, "auth.json"),
 			JSON.stringify({ [faux.provider.id]: { type: "api_key", key: "faux-key" } }),
@@ -867,7 +866,7 @@ describe("Riemann reusable Agent slots", () => {
 		);
 		const { supervisor, store, mainId, sessions, agentDir, root } = harness;
 		await mkdir(join(root, ".riemann"), { recursive: true });
-		await writeFile(join(root, ".riemann", "config.yaml"), "version: 1\ncompaction:\n  strategy: default\n");
+		await writeFile(join(root, ".riemann", "config.yaml"), "compaction:\n  strategy: default\n");
 		try {
 			const handle = objectValue(await supervisor.start(mainId, { task: "Wait", name: "project-worker" }));
 			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
@@ -896,7 +895,7 @@ describe("Riemann reusable Agent slots", () => {
 			const secondId = second.id;
 			await waitFor(() => store.getAgent(firstId)?.status === "running");
 			expect(store.getAgent(secondId)?.status).toBe("queued");
-			expect(second).toMatchObject({ $riemann: "agent_turn_handle.v1", status: "queued" });
+			expect(second).toMatchObject({ $riemann: "agent_turn_handle", status: "queued" });
 			await expect(
 				steerDefinition.handler(
 					{ agent_id: secondId, turn_id: second.turn_id, message: "queued steering" },

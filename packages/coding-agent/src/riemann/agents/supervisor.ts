@@ -279,7 +279,7 @@ function turnHandleWire(agent: StoredAgent, turnId: string): JsonValue {
 		throw new RiemannHostError("conflict", `Agent Turn is no longer active: ${agent.name}/${turnId}`);
 	}
 	return {
-		$riemann: "agent_turn_handle.v1",
+		$riemann: "agent_turn_handle",
 		id: agent.id,
 		name: agent.name,
 		turn_id: turnId,
@@ -585,7 +585,7 @@ export class AgentSupervisor {
 			? currentAssistantText(liveSession?.state.messages ?? [], liveSession?.state.streamingMessage)
 			: (turn.result ?? "");
 		return {
-			$riemann: "agent_info.v1",
+			$riemann: "agent_info",
 			id: agent.id,
 			name: agent.name,
 			turn_id: turn.id,
@@ -610,7 +610,7 @@ export class AgentSupervisor {
 			throw new RiemannHostError("conflict", `Agent Turn has not settled: ${agent.name}/${turn.id}`);
 		}
 		return {
-			$riemann: "agent_result.v1",
+			$riemann: "agent_result",
 			id: agent.id,
 			name: agent.name,
 			turn_id: turn.id,
@@ -1670,7 +1670,7 @@ export class AgentSupervisor {
 		const outcomeSchema = Type.Union([Type.Literal("ok"), Type.Literal("error"), Type.Literal("cancelled")]);
 		const turnHandleSchema = Type.Object(
 			{
-				$riemann: Type.Literal("agent_turn_handle.v1"),
+				$riemann: Type.Literal("agent_turn_handle"),
 				id: Type.String(),
 				name: Type.String(),
 				turn_id: Type.String(),
@@ -1680,7 +1680,7 @@ export class AgentSupervisor {
 		);
 		const agentInfoSchema = Type.Object(
 			{
-				$riemann: Type.Literal("agent_info.v1"),
+				$riemann: Type.Literal("agent_info"),
 				id: Type.String(),
 				name: Type.String(),
 				turn_id: Type.String(),
@@ -1702,7 +1702,7 @@ export class AgentSupervisor {
 		);
 		const agentResultSchema = Type.Object(
 			{
-				$riemann: Type.Literal("agent_result.v1"),
+				$riemann: Type.Literal("agent_result"),
 				id: Type.String(),
 				name: Type.String(),
 				turn_id: Type.String(),
@@ -1764,7 +1764,6 @@ export class AgentSupervisor {
 		};
 		return [
 			{
-				abiVersion: 2,
 				name: "list",
 				namespace: "agents",
 				description: "List this Agent's reusable child identities, current activity, and latest outcomes.",
@@ -1788,7 +1787,6 @@ export class AgentSupervisor {
 						.map((agent) => this.agentInfoWire(agent)),
 			},
 			{
-				abiVersion: 2,
 				name: "start",
 				namespace: "agents",
 				description:
@@ -1836,7 +1834,6 @@ export class AgentSupervisor {
 				handler: (args) => this.start(callerId, args),
 			},
 			{
-				abiVersion: 2,
 				name: "info",
 				namespace: "agents",
 				description: "Refresh the child identity and latest Turn state.",
@@ -1863,7 +1860,6 @@ export class AgentSupervisor {
 				handler: async (args) => this.agentInfoWire(this.ownedChild(callerId, requiredString(args, "agent_id"))),
 			},
 			{
-				abiVersion: 2,
 				name: "wait",
 				namespace: "agents",
 				description: "Wait for and claim one exact child Agent Turn result.",
@@ -1892,7 +1888,6 @@ export class AgentSupervisor {
 				handler: (args, signal) => this.wait(callerId, args, signal),
 			},
 			{
-				abiVersion: 2,
 				name: "steer",
 				namespace: "agents",
 				description: "Steer only this exact active streaming Agent Turn; otherwise fail with conflict.",
@@ -1935,7 +1930,6 @@ export class AgentSupervisor {
 					),
 			},
 			{
-				abiVersion: 2,
 				name: "stop",
 				namespace: "agents",
 				description: "Stop and settle one exact Agent Turn while retaining its identity.",
@@ -1972,7 +1966,6 @@ export class AgentSupervisor {
 					),
 			},
 			{
-				abiVersion: 2,
 				name: "release",
 				namespace: "agents",
 				description: "Release a settled child identity and free its run slot.",

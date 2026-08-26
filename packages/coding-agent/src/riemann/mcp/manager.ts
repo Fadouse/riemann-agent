@@ -106,7 +106,7 @@ const PYTHON_KEYWORDS = new Set([
 
 const McpResultSchema = Type.Object(
 	{
-		$riemann: Type.Literal("mcp_result.v1"),
+		$riemann: Type.Literal("mcp_result"),
 		content: Type.Array(Type.Any()),
 		structured_content: Type.Any(),
 		metadata: Type.Any(),
@@ -117,7 +117,7 @@ const McpResultSchema = Type.Object(
 );
 const FunctionBundleSchema = Type.Object(
 	{
-		$riemann: Type.Literal("function_bundle.v1"),
+		$riemann: Type.Literal("function_bundle"),
 		namespace: Type.String(),
 		server_name: Type.String(),
 		specifications: Type.Array(Type.Any()),
@@ -127,7 +127,7 @@ const FunctionBundleSchema = Type.Object(
 
 const McpServerStatusSchema = Type.Object(
 	{
-		$riemann: Type.Literal("mcp_server_status.v1"),
+		$riemann: Type.Literal("mcp_server_status"),
 		name: Type.String(),
 		namespace: Type.String(),
 		status: Type.Union([
@@ -343,9 +343,9 @@ export class RiemannMcpManager {
 		const extensions = Object.fromEntries(
 			Object.entries(raw).filter(([key]) => !["content", "structuredContent", "_meta", "isError"].includes(key)),
 		);
-		const opaqueMcpJson = (value: JsonValue): JsonValue => ({ $riemann: "mcp_json.v1", value });
+		const opaqueMcpJson = (value: JsonValue): JsonValue => ({ $riemann: "mcp_json", value });
 		const normalized: JsonValue = {
-			$riemann: "mcp_result.v1",
+			$riemann: "mcp_result",
 			content: content.map(opaqueMcpJson),
 			structured_content: opaqueMcpJson(raw.structuredContent ?? null),
 			metadata: opaqueMcpJson(raw._meta ?? null),
@@ -374,7 +374,6 @@ export class RiemannMcpManager {
 			asJson(tool.inputSchema) as Record<string, JsonValue>,
 		);
 		return {
-			abiVersion: 2,
 			name,
 			namespace,
 			description: `${tool.description || tool.title || tool.name} [MCP ${serverName}/${tool.name}]`,
@@ -439,7 +438,7 @@ export class RiemannMcpManager {
 
 	private functionBundle(serverName: string, state: McpServerState): JsonValue {
 		return asJson({
-			$riemann: "function_bundle.v1",
+			$riemann: "function_bundle",
 			namespace: state.namespace ?? "",
 			server_name: serverName,
 			specifications: this.registry.pythonSpecifications(state.namespace),
@@ -460,7 +459,7 @@ export class RiemannMcpManager {
 	serverStatus(serverName: string): JsonValue {
 		const state = this.requireServer(serverName);
 		return {
-			$riemann: "mcp_server_status.v1",
+			$riemann: "mcp_server_status",
 			name: serverName,
 			namespace: state.namespace ?? "",
 			status: state.status,
@@ -561,7 +560,6 @@ export class RiemannMcpManager {
 	definitions(): FunctionDefinition[] {
 		return [
 			{
-				abiVersion: 2,
 				name: "open",
 				namespace: "mcp",
 				description: "Open one configured MCP server and install its tools in a Python namespace.",
@@ -587,7 +585,6 @@ export class RiemannMcpManager {
 				handler: (args, signal) => this.open(args.name as string, signal),
 			},
 			{
-				abiVersion: 2,
 				name: "status",
 				namespace: "mcp",
 				description: "Return lifecycle state for an opened MCP namespace.",
@@ -604,7 +601,6 @@ export class RiemannMcpManager {
 				handler: async (args) => this.serverStatus(args.server_name as string),
 			},
 			{
-				abiVersion: 2,
 				name: "refresh",
 				namespace: "mcp",
 				description: "Reconnect an MCP server and replace its namespace tools.",
@@ -621,7 +617,6 @@ export class RiemannMcpManager {
 				handler: (args, signal) => this.refresh(args.server_name as string, signal),
 			},
 			{
-				abiVersion: 2,
 				name: "close",
 				namespace: "mcp",
 				description: "Close one MCP server and remove its tools.",

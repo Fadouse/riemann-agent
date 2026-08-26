@@ -21,7 +21,6 @@ class _RiemannMissing:
 
 
 _RIEMANN_MISSING = _RiemannMissing()
-_RIEMANN_BRIDGE_ABI_VERSION = 2
 _RIEMANN_MAX_SAFE_INTEGER = (1 << 53) - 1
 
 
@@ -380,18 +379,18 @@ _ERROR_TYPES = {
 }
 
 _DOMAIN_TYPES = {
-    "artifact.v1": Artifact,
-    "text_snapshot.v1": TextSnapshot,
-    "image_snapshot.v1": ImageSnapshot,
-    "process_result.v1": ProcessResult,
-    "search_hit.v1": SearchHit,
-    "document.v1": Document,
-    "removed_file.v1": RemovedFile,
-    "mcp_result.v1": McpResult,
-    "mcp_server_status.v1": McpServerStatus,
-    "agent_turn_handle.v1": AgentTurnHandle,
-    "agent_info.v1": AgentInfo,
-    "agent_result.v1": AgentResult,
+    "artifact": Artifact,
+    "text_snapshot": TextSnapshot,
+    "image_snapshot": ImageSnapshot,
+    "process_result": ProcessResult,
+    "search_hit": SearchHit,
+    "document": Document,
+    "removed_file": RemovedFile,
+    "mcp_result": McpResult,
+    "mcp_server_status": McpServerStatus,
+    "agent_turn_handle": AgentTurnHandle,
+    "agent_info": AgentInfo,
+    "agent_result": AgentResult,
 }
 _RIEMANN_PROTECTED = {
     "RiemannError",
@@ -428,15 +427,15 @@ def _to_wire(value, *, _seen=None, _path="$"):
     if _seen is None:
         _seen = set()
     if isinstance(value, TextSnapshot):
-        return {"$riemann": "text_snapshot_ref.v1", "capability": value._capability}
+        return {"$riemann": "text_snapshot_ref", "capability": value._capability}
     if isinstance(value, ImageSnapshot):
         if value._capability is None:
             raise TypeError("ImageSnapshot is not backed by a file capability")
-        return {"$riemann": "image_snapshot_ref.v1", "capability": value._capability}
+        return {"$riemann": "image_snapshot_ref", "capability": value._capability}
     if isinstance(value, Artifact):
-        return {"$riemann": "artifact_ref.v1", "handle": value.handle}
+        return {"$riemann": "artifact_ref", "handle": value.handle}
     if isinstance(value, AgentTurnHandle):
-        return {"$riemann": "agent_turn_ref.v1", "id": value.id, "turn_id": value.turn_id}
+        return {"$riemann": "agent_turn_ref", "id": value.id, "turn_id": value.turn_id}
     if isinstance(value, _Path):
         return str(value)
     if value is None or isinstance(value, (bool, str)):
@@ -493,9 +492,9 @@ def _from_wire(value):
     if any(not isinstance(key, str) for key in value):
         raise RiemannError("Host returned a dict with a non-string key", code="bridge_protocol_error")
     type_name = value.get("$riemann")
-    if type_name == "mcp_json.v1":
+    if type_name == "mcp_json":
         return value.get("value")
-    if type_name == "function_bundle.v1":
+    if type_name == "function_bundle":
         specifications = value.get("specifications")
         namespace_name = value.get("namespace")
         server_name = value.get("server_name")
@@ -526,6 +525,8 @@ def _from_wire(value):
         cls = _DOMAIN_TYPES[type_name]
         kwargs = {key: _from_wire(item) for key, item in value.items() if key != "$riemann"}
         return cls(**kwargs)
+    if isinstance(type_name, str):
+        raise RiemannError(f"Host returned an unknown Riemann discriminator: {type_name}", code="bridge_protocol_error")
     return {key: _from_wire(item) for key, item in value.items()}
 
 
@@ -576,14 +577,12 @@ async def _riemann_call(operation: str, arguments: dict):
                 reply = content.get("data")
                 if not isinstance(reply, dict):
                     raise protocol_error("Host returned an invalid reply")
-                if reply.get("abi_version") != _RIEMANN_BRIDGE_ABI_VERSION:
-                    raise protocol_error("Host returned an unsupported bridge ABI version")
                 if reply.get("request_id") != request_id:
                     raise protocol_error("Host returned a reply for a different request_id")
                 if reply.get("operation") != operation:
                     raise protocol_error("Host returned a reply for a different operation")
                 status = reply.get("status")
-                common_fields = {"abi_version", "request_id", "operation", "status"}
+                common_fields = {"request_id", "operation", "status"}
                 if status == "ok":
                     if set(reply) != common_fields | {"value"}:
                         raise protocol_error("Host returned an invalid success reply shape")
@@ -644,7 +643,6 @@ async def _riemann_call(operation: str, arguments: dict):
         comm.on_close(on_close)
     comm.open(
         data={
-            "abi_version": _RIEMANN_BRIDGE_ABI_VERSION,
             "request_id": request_id,
             "operation": operation,
             "arguments": encoded_arguments,

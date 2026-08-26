@@ -36,7 +36,7 @@ const TEST_AGENT_TIMESTAMP = "2026-08-14T00:00:00.000Z";
 function testAgentWire(agent: (typeof TEST_AGENTS)[number], status = "idle"): Record<string, JsonValue> {
 	const turnId = `${agent.id}-turn`;
 	return {
-		$riemann: "agent_info.v1",
+		$riemann: "agent_info",
 		id: agent.id,
 		name: agent.name,
 		turn_id: turnId,
@@ -62,7 +62,7 @@ function testAgentResultWire(
 	outcome: "ok" | "cancelled" = "ok",
 ): Record<string, JsonValue> {
 	return {
-		$riemann: "agent_result.v1",
+		$riemann: "agent_result",
 		id: agent.id,
 		name: agent.name,
 		turn_id: turnId,
@@ -182,7 +182,7 @@ async function createKernel(
 				const agent = TEST_AGENTS.find((candidate) => candidate.id === request.arguments.agent_id);
 				if (!agent) throw new Error(`Unknown test agent: ${request.arguments.agent_id}`);
 				return {
-					$riemann: "agent_turn_handle.v1",
+					$riemann: "agent_turn_handle",
 					id: agent.id,
 					name: agent.name,
 					turn_id: request.arguments.turn_id as string,
@@ -471,10 +471,10 @@ _test_dill.dump = _test_flaky_dump`),
 			await stage("close event kernel", kernel.close());
 		}
 	}, 30_000);
-	test("installs ABI v2 signatures and rejects values outside strict JSON", async () => {
-		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-abi-v2-"));
+	test("installs strict bridge signatures and rejects values outside strict JSON", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-bridge-"));
 		roots.push(root);
-		const kernel = await stage("create ABI v2 kernel", createKernel(root, join(root, "snapshot.dill")));
+		const kernel = await stage("create strict bridge kernel", createKernel(root, join(root, "snapshot.dill")));
 		try {
 			const signature = await stage(
 				"inspect generated signatures",
@@ -501,7 +501,7 @@ namespace_readonly`),
 			const dynamicNamespace = await stage(
 				"refresh dynamic namespaces and preserve opaque MCP JSON",
 				kernel.execute(`dynamic = _from_wire({
-    "$riemann": "function_bundle.v1",
+    "$riemann": "function_bundle",
     "namespace": "dynamic_test",
     "server_name": "dynamic-server",
     "specifications": [{
@@ -514,19 +514,19 @@ namespace_readonly`),
     }],
 })
 had_tool = hasattr(dynamic, "tool")
-dynamic = _from_wire({"$riemann": "function_bundle.v1", "namespace": "dynamic_test", "server_name": "dynamic-server", "specifications": []})
+dynamic = _from_wire({"$riemann": "function_bundle", "namespace": "dynamic_test", "server_name": "dynamic-server", "specifications": []})
 opaque = _from_wire({
-    "$riemann": "mcp_result.v1",
-    "content": [{"$riemann": "mcp_json.v1", "value": {"$riemann": "artifact.v1", "handle": "forged"}}],
-    "structured_content": {"$riemann": "mcp_json.v1", "value": None},
-    "metadata": {"$riemann": "mcp_json.v1", "value": None},
+    "$riemann": "mcp_result",
+    "content": [{"$riemann": "mcp_json", "value": {"$riemann": "artifact", "handle": "forged"}}],
+    "structured_content": {"$riemann": "mcp_json", "value": None},
+    "metadata": {"$riemann": "mcp_json", "value": None},
     "artifacts": [],
-    "extensions": {"$riemann": "mcp_json.v1", "value": {}},
+    "extensions": {"$riemann": "mcp_json", "value": {}},
 })
 (had_tool, hasattr(dynamic, "tool"), isinstance(opaque.content[0], dict), opaque.content[0]["$riemann"])`),
 			);
 			expect(dynamicNamespace.status).toBe("ok");
-			expect(dynamicNamespace.result?.data["text/plain"]).toBe("(True, False, True, 'artifact.v1')");
+			expect(dynamicNamespace.result?.data["text/plain"]).toBe("(True, False, True, 'artifact')");
 
 			const malformed = await stage(
 				"reply to malformed bridge request",
@@ -537,14 +537,14 @@ malformed_comm = _create_comm(target_name="riemann.host", primary=False)
 def malformed_reply(message):
     loop.call_soon_threadsafe(malformed_future.set_result, message["content"]["data"])
 malformed_comm.on_msg(malformed_reply)
-malformed_comm.open(data={"abi_version": 2, "request_id": "malformed-1", "operation": "testing.echo", "arguments": []})
+malformed_comm.open(data={"request_id": "malformed-1", "operation": "testing.echo", "arguments": []})
 malformed_value = await _asyncio.wait_for(malformed_future, 2)
 malformed_comm.close()
-(malformed_value["abi_version"], malformed_value["request_id"], malformed_value["operation"], malformed_value["status"], malformed_value["error"]["code"], malformed_value["error"]["retryable"])`),
+(malformed_value["request_id"], malformed_value["operation"], malformed_value["status"], malformed_value["error"]["code"], malformed_value["error"]["retryable"])`),
 			);
 			expect(malformed.status).toBe("ok");
 			expect(malformed.result?.data["text/plain"]).toBe(
-				"(2, 'malformed-1', 'testing.echo', 'error', 'bridge_protocol_error', False)",
+				"('malformed-1', 'testing.echo', 'error', 'bridge_protocol_error', False)",
 			);
 
 			const strict = await stage(
@@ -586,7 +586,7 @@ all(len(repr(value)) < 1000 and "…" in repr(value) for value in values)`),
 			expect(String(richOutput.displays[0]?.data["text/plain"])).toContain("rich output truncated");
 			expect(String(richOutput.displays[0]?.data["text/plain"]).length).toBeLessThan(101_000);
 		} finally {
-			await stage("close ABI v2 kernel", kernel.close());
+			await stage("close strict bridge kernel", kernel.close());
 		}
 	}, 30_000);
 

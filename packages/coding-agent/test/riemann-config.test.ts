@@ -76,11 +76,11 @@ describe("Riemann configuration", () => {
 		await mkdir(agentDir, { recursive: true });
 		await writeFile(
 			join(agentDir, "config.yaml"),
-			"version: 1\nagents:\n  maxAgents: 8\n  defaults:\n    model: openai/global-agent\nweb:\n  searchBackend: disabled\n",
+			"agents:\n  maxAgents: 8\n  defaults:\n    model: openai/global-agent\nweb:\n  searchBackend: disabled\n",
 		);
 		await writeFile(
 			join(project, ".riemann", "config.yaml"),
-			'version: 1\nagents:\n  maxAgents: 12\n  main:\n    filesystem:\n      read: ["/"]\n      write: ["/tmp/riemann-bounded"]\n  defaults:\n    model: anthropic/project-agent\n    workspace: worktree\n    filesystem:\n      read: inherit\n      write: inherit\ncompaction:\n  strategy: openai\n',
+			'agents:\n  maxAgents: 12\n  main:\n    filesystem:\n      read: ["/"]\n      write: ["/tmp/riemann-bounded"]\n  defaults:\n    model: anthropic/project-agent\n    workspace: worktree\n    filesystem:\n      read: inherit\n      write: inherit\ncompaction:\n  strategy: openai\n',
 		);
 
 		const untrusted = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: false });
@@ -106,7 +106,7 @@ describe("Riemann configuration", () => {
 
 		await writeFile(
 			join(project, ".riemann", "config.yaml"),
-			'version: 1\nagents:\n  maxAgents: 2\n  main:\n    filesystem:\n      readExclude: ["~/.ssh"]\n  defaults:\n    model: anthropic/project-agent\n    workspace: worktree\n    filesystem:\n      write: ["/tmp/riemann-lowered"]\ncompaction:\n  strategy: openai\n',
+			'agents:\n  maxAgents: 2\n  main:\n    filesystem:\n      readExclude: ["~/.ssh"]\n  defaults:\n    model: anthropic/project-agent\n    workspace: worktree\n    filesystem:\n      write: ["/tmp/riemann-lowered"]\ncompaction:\n  strategy: openai\n',
 		);
 		const lowered = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: true });
 		expect(lowered.maxAgents).toBe(2);
@@ -142,10 +142,7 @@ describe("Riemann configuration", () => {
 		roots.push(root);
 		const agentDir = join(root, "agent");
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(
-			join(agentDir, "config.yaml"),
-			"version: 1\nmcp:\n  servers:\n    docs:\n      command: docs-server\n",
-		);
+		await writeFile(join(agentDir, "config.yaml"), "mcp:\n  servers:\n    docs:\n      command: docs-server\n");
 
 		await expect(loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false })).rejects.toThrow(
 			"model-visible MCP server docs requires a description",
@@ -159,7 +156,7 @@ describe("Riemann configuration", () => {
 		await mkdir(agentDir, { recursive: true });
 		await writeFile(
 			join(agentDir, "config.yaml"),
-			"version: 1\nmcp:\n  servers:\n    hidden:\n      exposeToModel: false\n      command: hidden-server\n    disabled:\n      enabled: false\n      command: disabled-server\n",
+			"mcp:\n  servers:\n    hidden:\n      exposeToModel: false\n      command: hidden-server\n    disabled:\n      enabled: false\n      command: disabled-server\n",
 		);
 
 		const config = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
@@ -173,7 +170,7 @@ describe("Riemann configuration", () => {
 		await mkdir(agentDir, { recursive: true });
 		await writeFile(
 			join(agentDir, "config.yaml"),
-			"version: 1\nmcp:\n  servers:\n    docs:\n      description: Documentation\n      command: docs-server\n",
+			"mcp:\n  servers:\n    docs:\n      description: Documentation\n      command: docs-server\n",
 		);
 
 		await updateGlobalRiemannSetting(agentDir, "agents.maxAgents", 8);
@@ -194,9 +191,9 @@ describe("Riemann configuration", () => {
 			(await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false })).agentDefaults.model,
 		).toBeUndefined();
 
-		await updateGlobalRiemannSetting(agentDir, "mcp.servers.docs.v2.enabled", false);
+		await updateGlobalRiemannSetting(agentDir, "mcp.servers.docs.internal.enabled", false);
 		const dotted = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
-		expect(dotted.mcpServers["docs.v2"]?.enabled).toBe(false);
+		expect(dotted.mcpServers["docs.internal"]?.enabled).toBe(false);
 	});
 
 	test("creates the version-one global config when it does not exist", async () => {
@@ -225,7 +222,7 @@ describe("Riemann configuration", () => {
 			network: "inherit",
 			filesystem: { read: "inherit", write: ["."] },
 		});
-		expect(await readFile(join(agentDir, "config.yaml"), "utf8")).toContain("version: 1");
+		expect(await readFile(join(agentDir, "config.yaml"), "utf8")).not.toContain("version:");
 	});
 
 	test("rejects the removed permissions field and accepts filesystem policies", async () => {
@@ -233,14 +230,14 @@ describe("Riemann configuration", () => {
 		roots.push(root);
 		const agentDir = join(root, "agent");
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(join(agentDir, "config.yaml"), "version: 1\nagents:\n  main:\n    permissions: host\n");
+		await writeFile(join(agentDir, "config.yaml"), "agents:\n  main:\n    permissions: host\n");
 		await expect(loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false })).rejects.toThrow(
 			"Invalid Riemann config",
 		);
 
 		await writeFile(
 			join(agentDir, "config.yaml"),
-			'version: 1\nagents:\n  main:\n    filesystem:\n      read: ["/"]\n      readExclude: ["~/.ssh"]\n      write: ["."]\n      writeExclude: []\n  defaults:\n    filesystem:\n      write: inherit\n',
+			'agents:\n  main:\n    filesystem:\n      read: ["/"]\n      readExclude: ["~/.ssh"]\n      write: ["."]\n      writeExclude: []\n  defaults:\n    filesystem:\n      write: inherit\n',
 		);
 		const config = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
 		expect(config.mainAgent.filesystem).toEqual({
@@ -318,7 +315,7 @@ describe("Riemann configuration", () => {
 		await mkdir(agentDir, { recursive: true });
 		await writeFile(
 			join(agentDir, "config.yaml"),
-			"version: 1\nlimits:\n  maxAgentsPerRun: 8\nagents:\n  profiles:\n    legacy:\n      maxDepth: 3\n      parkOnComplete: true\n",
+			"limits:\n  maxAgentsPerRun: 8\nagents:\n  profiles:\n    legacy:\n      maxDepth: 3\n      parkOnComplete: true\n",
 		);
 
 		await expect(loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false })).rejects.toThrow(
@@ -333,7 +330,6 @@ describe("Riemann configuration", () => {
 		await writeFile(
 			join(agentDir, "config.yaml"),
 			[
-				"version: 1",
 				"agents:",
 				"  main:",
 				"    network: allow",

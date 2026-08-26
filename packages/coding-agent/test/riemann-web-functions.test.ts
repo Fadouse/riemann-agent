@@ -45,7 +45,6 @@ describe("Riemann web ABI v2 contracts", () => {
 		try {
 			for (const definition of [search, fetchDefinition]) {
 				expect(definition).toMatchObject({
-					abiVersion: 2,
 					visibility: "public",
 					inputSchema: { type: "object", additionalProperties: false },
 				});
@@ -101,7 +100,7 @@ describe("Riemann web search", () => {
 			);
 			expect(result).toEqual([
 				{
-					$riemann: "search_hit.v1",
+					$riemann: "search_hit",
 					title: "https://example.com/article",
 					url: "https://example.com/article",
 					snippet: "first\n\nsecond",
@@ -182,7 +181,7 @@ describe("Riemann web fetch", () => {
 				new AbortController().signal,
 			);
 			expect(result).toEqual({
-				$riemann: "document.v1",
+				$riemann: "document",
 				url: "https://example.test/plain",
 				title: null,
 				text: "plain body",

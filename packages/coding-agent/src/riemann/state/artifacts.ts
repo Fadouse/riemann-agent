@@ -10,7 +10,7 @@ const MAX_ARTIFACT_SLICE_BYTES = 1024 * 1024;
 
 function wireArtifact(artifact: StoredArtifact): JsonValue {
 	return {
-		$riemann: "artifact.v1",
+		$riemann: "artifact",
 		handle: artifact.handle,
 		mime_type: artifact.mimeType,
 		size: artifact.size,

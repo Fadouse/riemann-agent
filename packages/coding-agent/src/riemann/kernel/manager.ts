@@ -24,7 +24,7 @@ import type {
 	KernelModelContent,
 	KernelRestoreResult,
 } from "./types.ts";
-import { isKernelHostResult, RIEMANN_BRIDGE_ABI_VERSION } from "./types.ts";
+import { isKernelHostResult } from "./types.ts";
 import { decodeJupyterMessage, encodeJupyterMessage } from "./wire.ts";
 
 const CONNECTION_WAIT_MS = 50;
@@ -531,7 +531,6 @@ export class IPythonKernelManager {
 				});
 			} catch (error) {
 				const protocolReply: Record<string, JsonValue> = {
-					abi_version: RIEMANN_BRIDGE_ABI_VERSION,
 					request_id: requestId,
 					operation,
 					status: "error",
@@ -556,7 +555,6 @@ export class IPythonKernelManager {
 		};
 		const protocolError = async (messageText: string): Promise<void> => {
 			await sendReply({
-				abi_version: RIEMANN_BRIDGE_ABI_VERSION,
 				request_id: requestId,
 				operation,
 				status: "error",
@@ -573,13 +571,9 @@ export class IPythonKernelManager {
 			await protocolError("Host bridge request data must be an object");
 			return;
 		}
-		const requestFields = new Set(["abi_version", "request_id", "operation", "arguments"]);
+		const requestFields = new Set(["request_id", "operation", "arguments"]);
 		if (Object.keys(dataRecord).some((key) => !requestFields.has(key))) {
 			await protocolError("Host bridge request contains an unknown field");
-			return;
-		}
-		if (dataRecord.abi_version !== RIEMANN_BRIDGE_ABI_VERSION) {
-			await protocolError("Unsupported host bridge ABI version");
 			return;
 		}
 		if (!suppliedRequestId) {
@@ -606,7 +600,6 @@ export class IPythonKernelManager {
 			execution.hostControllers.add(controller);
 		}
 		const request: KernelHostRequest = {
-			abiVersion: RIEMANN_BRIDGE_ABI_VERSION,
 			requestId,
 			operation,
 			arguments: argumentsValue,
@@ -616,7 +609,6 @@ export class IPythonKernelManager {
 		let reply: Record<string, JsonValue>;
 		if (controller.signal.aborted || !execution) {
 			reply = {
-				abi_version: RIEMANN_BRIDGE_ABI_VERSION,
 				request_id: requestId,
 				operation,
 				status: "error",
@@ -639,7 +631,6 @@ export class IPythonKernelManager {
 					execution.hostModelContent.push({ sequence, content: result.modelContent });
 				}
 				reply = {
-					abi_version: RIEMANN_BRIDGE_ABI_VERSION,
 					request_id: requestId,
 					operation,
 					status: "ok",
@@ -672,7 +663,6 @@ export class IPythonKernelManager {
 					...(details === undefined ? {} : { details }),
 				};
 				reply = {
-					abi_version: RIEMANN_BRIDGE_ABI_VERSION,
 					request_id: requestId,
 					operation,
 					status: "error",

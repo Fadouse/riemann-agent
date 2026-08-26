@@ -45,7 +45,7 @@ describe("Riemann fs capabilities", () => {
 			expect(await readFile(join(root, "src", "value.txt"), "utf8")).toBe("alpha beta\n");
 			const capability = created._capability;
 			expect(typeof capability).toBe("string");
-			const reference: JsonValue = { $riemann: "text_snapshot_ref.v1", capability: capability as string };
+			const reference: JsonValue = { $riemann: "text_snapshot_ref", capability: capability as string };
 			const edited = objectValue(
 				await edit.handler(
 					{
@@ -68,7 +68,7 @@ describe("Riemann fs capabilities", () => {
 			await expect(
 				edit.handler(
 					{
-						snapshot: { $riemann: "text_snapshot_ref.v1", capability: current._capability as string },
+						snapshot: { $riemann: "text_snapshot_ref", capability: current._capability as string },
 						operations: [{ kind: "delete", start: 0, end: 5 }],
 					},
 					signal,
@@ -108,7 +108,7 @@ describe("Riemann fs capabilities", () => {
 			);
 			expect(await readFile(join(outside, "new.txt"), "utf8")).toBe("written\n");
 			await remove.handler(
-				{ snapshot: { $riemann: "text_snapshot_ref.v1", capability: created._capability as string } },
+				{ snapshot: { $riemann: "text_snapshot_ref", capability: created._capability as string } },
 				signal,
 			);
 			await expect(readFile(join(outside, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -318,17 +318,17 @@ describe("Riemann fs capabilities", () => {
 			const snapshot = objectValue(result);
 			expect(Value.Check(read.outputSchema, snapshot)).toBe(true);
 			expect(snapshot).toMatchObject({
-				$riemann: "image_snapshot.v1",
+				$riemann: "image_snapshot",
 				path: join(root, "pixel.png"),
 				mime_type: "image/png",
 				source_size: imageBytes.byteLength,
 			});
 			const artifact = objectValue(snapshot.artifact as JsonValue);
-			expect(artifact.$riemann).toBe("artifact.v1");
+			expect(artifact.$riemann).toBe("artifact");
 			expect((await artifacts.readBuffer(String(artifact.handle))).byteLength).toBeGreaterThan(0);
 
 			await remove.handler(
-				{ snapshot: { $riemann: "image_snapshot_ref.v1", capability: snapshot._capability as string } },
+				{ snapshot: { $riemann: "image_snapshot_ref", capability: snapshot._capability as string } },
 				new AbortController().signal,
 			);
 			await expect(readFile(join(root, "pixel.png"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -380,7 +380,6 @@ describe("Riemann fs capabilities", () => {
 				"remove",
 			]);
 			for (const definition of definitions) {
-				expect(definition.abiVersion).toBe(2);
 				expect(definition.inputSchema).toMatchObject({ type: "object", additionalProperties: false });
 				expect(definition.outputSchema).toBeDefined();
 				expect(definition.pythonReturnType).toEqual(expect.any(String));
@@ -424,7 +423,7 @@ describe("Riemann fs capabilities", () => {
 			expect(Value.Check(read.outputSchema, snapshot)).toBe(true);
 			expect(snapshot).toMatchObject({ kind: "text", text: "\ufeffA😀𐐷Z" });
 			const reference: JsonValue = {
-				$riemann: "text_snapshot_ref.v1",
+				$riemann: "text_snapshot_ref",
 				capability: snapshot._capability as string,
 			};
 			await expect(
@@ -452,14 +451,14 @@ describe("Riemann fs capabilities", () => {
 			const removed = await remove.handler(
 				{
 					snapshot: {
-						$riemann: "text_snapshot_ref.v1",
+						$riemann: "text_snapshot_ref",
 						capability: edited._capability as string,
 					},
 				},
 				signal,
 			);
 			expect(Value.Check(remove.outputSchema, removed)).toBe(true);
-			expect(removed).toEqual({ $riemann: "removed_file.v1", path: join(root, "unicode.txt"), removed: true });
+			expect(removed).toEqual({ $riemann: "removed_file", path: join(root, "unicode.txt"), removed: true });
 		} finally {
 			store.close();
 		}

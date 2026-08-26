@@ -8,7 +8,7 @@ import type { ExtensionContext } from "../src/core/extensions/types.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";
 import riemannExtension from "../src/extensions/riemann/index.ts";
 import { type ChildRiemannRuntime, registerChildCompactionHooks } from "../src/riemann/agents/supervisor.ts";
-import { OPENAI_COMPACTION_FORMAT, OPENAI_COMPACTION_PRESERVE_KEY } from "../src/riemann/openai-compaction-state.ts";
+import { OPENAI_COMPACTION_PRESERVE_KEY } from "../src/riemann/openai-compaction-state.ts";
 import { RiemannRuntime } from "../src/riemann/runtime.ts";
 
 const roots: string[] = [];
@@ -32,8 +32,6 @@ const codexModel = {
 
 const preservedOpenAIContext = {
 	[OPENAI_COMPACTION_PRESERVE_KEY]: {
-		version: 1,
-		format: OPENAI_COMPACTION_FORMAT,
 		compactionItem: { type: "compaction", encrypted_content: "encrypted" },
 		replacementHistory: [
 			{ type: "compaction", encrypted_content: "encrypted" },
@@ -115,12 +113,12 @@ async function configRoot(strategy: "automatic" | "default" | "openai" | "snapsh
 	roots.push(root);
 	const agentDir = join(root, "agent-dir");
 	await mkdir(agentDir, { recursive: true });
-	await writeFile(join(agentDir, "config.yaml"), `version: 1\ncompaction:\n  strategy: ${strategy}\n`);
+	await writeFile(join(agentDir, "config.yaml"), `compaction:\n  strategy: ${strategy}\n`);
 	return { root, agentDir };
 }
 
 async function setStrategy(agentDir: string, strategy: "automatic" | "default" | "openai" | "snapshot") {
-	await writeFile(join(agentDir, "config.yaml"), `version: 1\ncompaction:\n  strategy: ${strategy}\n`);
+	await writeFile(join(agentDir, "config.yaml"), `compaction:\n  strategy: ${strategy}\n`);
 }
 
 afterEach(async () => {

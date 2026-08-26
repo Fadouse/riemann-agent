@@ -50,14 +50,14 @@ if (process.argv[2] === "venv") {
 
 		const [first, concurrent] = await Promise.all([ensureManagedPython(), ensureManagedPython()]);
 		expect(concurrent).toBe(first);
-		expect(first.python).toBe(join(agentDir, "runtime", "python-v1", "bin", "python"));
+		expect(first.python).toBe(join(agentDir, "runtime", "python", "bin", "python"));
 		const firstLog = await readFile(log, "utf8");
 		expect(firstLog.match(/^venv /gm)).toHaveLength(1);
 		expect(firstLog.match(/^pip install /gm)).toHaveLength(1);
 		const marker = JSON.parse(
-			await readFile(join(agentDir, "runtime", "python-v1", "riemann-runtime.json"), "utf8"),
-		) as { layoutVersion: number; requirementsSha256: string };
-		expect(marker.layoutVersion).toBe(1);
+			await readFile(join(agentDir, "runtime", "python", "riemann-runtime.json"), "utf8"),
+		) as { requirementsSha256: string };
+		expect(Object.keys(marker)).toEqual(["requirementsSha256"]);
 		expect(marker.requirementsSha256).toMatch(/^[a-f0-9]{64}$/);
 
 		resetManagedPythonCacheForTests();
@@ -106,7 +106,7 @@ if (process.argv[2] === "venv") {
 
 			const runtime = await ensureManagedPython();
 
-			expect(runtime.python).toBe(join(agentDir, "runtime", "python-v1", "bin", "python"));
+			expect(runtime.python).toBe(join(agentDir, "runtime", "python", "bin", "python"));
 			expect(runtime.environment).toEqual({
 				LD_LIBRARY_PATH: `${libraryDir}${delimiter}${existingLibraryDir}`,
 			});

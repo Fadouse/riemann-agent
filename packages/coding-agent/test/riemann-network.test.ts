@@ -22,8 +22,7 @@ async function executePolicy(policy: "allow" | "deny", port: number): Promise<st
 	await mkdir(agentDir, { recursive: true });
 	await writeFile(
 		join(agentDir, "config.yaml"),
-		`version: 1
-agents:
+		`agents:
   main:
     network: ${policy}
 `,
