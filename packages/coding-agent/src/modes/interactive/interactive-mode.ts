@@ -99,7 +99,14 @@ import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
-import { getRiemannAgentDir, loadRiemannConfig, updateGlobalRiemannSetting } from "../../riemann/config.ts";
+import { type ConfiguredCompactionStrategy, resolveCompactionStrategy } from "../../riemann/compaction-strategy.ts";
+import { detectCompactionWarnings, latestActiveCompactionHasOpenAIContext } from "../../riemann/compaction-warning.ts";
+import {
+	getRiemannAgentDir,
+	loadRiemannConfig,
+	type RiemannSettingPath,
+	updateGlobalRiemannSetting,
+} from "../../riemann/config.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardText } from "../../utils/clipboard.ts";
 import { readClipboardImage } from "../../utils/clipboard-image.ts";
@@ -246,6 +253,16 @@ function isDeadTerminalError(error: unknown): boolean {
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 	"Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in /settings.";
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
+
+export function formatRiemannSettingSaveStatus(path: RiemannSettingPath): string {
+	return path === "compaction.strategy"
+		? "Saved compaction.strategy; active for next compaction"
+		: `Saved ${path}; applies to new runs`;
+}
+
+function isConfiguredCompactionStrategy(value: unknown): value is ConfiguredCompactionStrategy {
+	return value === "automatic" || value === "default" || value === "openai" || value === "snapshot";
+}
 
 function isAnthropicSubscriptionAuthKey(apiKey: string | undefined): boolean {
 	return typeof apiKey === "string" && apiKey.startsWith("sk-ant-oat");
@@ -4585,6 +4602,41 @@ export class InteractiveMode {
 		void this.showUnifiedSettingsSelector();
 	}
 
+	private showRiemannSettingSaveNotifications(
+		path: RiemannSettingPath,
+		value: unknown,
+		state: { currentConfiguredCompactionStrategy: ConfiguredCompactionStrategy },
+	): void {
+		this.showStatus(formatRiemannSettingSaveStatus(path));
+		if (path !== "compaction.strategy" || !isConfiguredCompactionStrategy(value)) return;
+		const previousConfiguredStrategy = state.currentConfiguredCompactionStrategy;
+		state.currentConfiguredCompactionStrategy = value;
+		this.showCompactionStrategySaveWarnings(previousConfiguredStrategy, value);
+	}
+
+	private showCompactionStrategySaveWarnings(
+		previousConfiguredStrategy: ConfiguredCompactionStrategy,
+		nextConfiguredStrategy: ConfiguredCompactionStrategy,
+	): void {
+		const model = this.session.model;
+		const supportsOpenAICompaction = model?.provider === "openai-codex" && model.api === "openai-codex-responses";
+		const warnings = detectCompactionWarnings({
+			trigger: "strategy-change",
+			hasEncryptedOpenAIContext: latestActiveCompactionHasOpenAIContext(this.sessionManager.getBranch()),
+			previousEffectiveStrategy: resolveCompactionStrategy(previousConfiguredStrategy, model).effective,
+			effectiveStrategy: resolveCompactionStrategy(nextConfiguredStrategy, model).effective,
+			currentModel: {
+				supportsImageInput: model?.input.includes("image") ?? false,
+				supportsOpenAICompaction,
+				usingOAuth:
+					model !== undefined && supportsOpenAICompaction
+						? this.session.modelRuntime.isUsingOAuth(model.provider)
+						: false,
+			},
+		});
+		for (const warning of warnings) this.showWarning(warning.message);
+	}
+
 	private async showUnifiedSettingsSelector(): Promise<void> {
 		try {
 			const agentDir = getRiemannAgentDir();
@@ -4595,6 +4647,9 @@ export class InteractiveMode {
 			});
 			this.showSelector((done) => {
 				let selector: SettingsSelectorComponent | undefined;
+				const riemannSettingSaveState = {
+					currentConfiguredCompactionStrategy: riemann.compaction.strategy,
+				};
 				const defaultProvider = this.settingsManager.getDefaultProvider();
 				const defaultModelId = this.settingsManager.getDefaultModel();
 				const defaultModel = defaultProvider && defaultModelId ? `${defaultProvider}/${defaultModelId}` : "not set";
@@ -4825,7 +4880,7 @@ export class InteractiveMode {
 						},
 						onRiemannChange: async (path, value) => {
 							await updateGlobalRiemannSetting(agentDir, path, value);
-							this.showStatus(`Saved ${path}; applies to new runs`);
+							this.showRiemannSettingSaveNotifications(path, value, riemannSettingSaveState);
 						},
 						onError: (message) => this.showError(message),
 						onCancel: () => {

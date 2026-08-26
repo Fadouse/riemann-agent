@@ -84,16 +84,18 @@ Context compaction is selected in Riemann configuration:
 
 ```yaml
 compaction:
-  strategy: default # default | openai | snapshot
+  strategy: automatic # automatic | default | openai | snapshot
 ```
 
-`default` is used when the setting is omitted and creates a model-generated semantic checkpoint.
+`automatic` is used when the setting is omitted. It resolves to `openai` for an active `openai-codex` Responses model and to `default` for every other provider. The strategy is resolved from the model active when each compaction starts. Explicit `default`, `openai`, and `snapshot` values remain literal overrides.
 
-`openai` strictly uses Codex Responses V2 cloud compaction. It requires the active model to use the `openai-codex` ChatGPT Plus/Pro OAuth provider, sends the discarded context to `https://chatgpt.com/backend-api/codex/responses`, validates exactly one opaque encrypted compaction item, persists it unchanged, and replays it on later matching Codex requests. It does not create a local snapshot or semantic backup and never switches strategy after an auth, model, request, or protocol failure.
+`default` creates a model-generated semantic checkpoint. `openai` uses Codex Responses V2 cloud compaction and requires an active `openai-codex` OAuth model. It sends compacted context to `https://chatgpt.com/backend-api/codex/responses`, persists the returned opaque compaction item in session state, and includes that item in subsequent OpenAI Responses history.
 
 The Codex subscription endpoint is a private first-party ChatGPT backend, not the documented public OpenAI API contract. Data handling follows the active ChatGPT workspace policy. `openai` does not use an `OPENAI_API_KEY`; start Riemann, run `/login`, and select OpenAI Codex (ChatGPT Plus/Pro).
 
-Strategy selection is literal: `snapshot` requires an image-capable model and always uses OMP bitmap archives; `default` always uses Riemann's approved semantic compaction prompt. Custom `/compact <instructions>` is supported only by `default`. An incompatible strategy or failed compaction is reported as an error; Riemann does not hide a strategy switch in control flow.
+`snapshot` requires an image-capable model and stores OMP bitmap archives. All four strategies remain selectable in `/settings`, and a successful change applies to the next compaction in the current runtime. Custom `/compact <instructions>` requires an effective `default` strategy.
+
+Riemann displays non-blocking warnings when encrypted OpenAI context may be unavailable after a model or strategy change, when Snapshot is selected with a model that lacks image input, or when OpenAI compaction lacks a compatible Codex model or OAuth. Warnings do not change the selected model or strategy.
 
 ## Python operations
 
@@ -355,9 +357,9 @@ Use `/session` in interactive mode to see the current session ID before reusing 
 
 ### Compaction
 
-Long sessions can exhaust context windows. Configure exactly one `compaction.strategy`: `openai` for subscription-backed Codex cloud compaction, `snapshot` for OMP bitmap archives, or `default` for Riemann's model-generated semantic checkpoint. Strategies never fall through to one another.
+Long sessions can exhaust context windows. `compaction.strategy` defaults to `automatic`, which uses subscription-backed Codex cloud compaction for `openai-codex` models and Riemann's semantic `default` checkpoint otherwise. Explicit `default`, `openai`, and `snapshot` selections remain available.
 
-**Manual:** `/compact` uses the configured strategy. `/compact <custom instructions>` requires `strategy: default`; other strategies return an explicit error.
+**Manual:** `/compact` uses the strategy resolved when compaction starts. `/compact <custom instructions>` requires an effective `default` strategy; other strategies return an explicit error.
 
 **Automatic:** Enabled by default. Triggers on context overflow (recovers and retries) or when approaching the limit (proactive). Configure via `/settings` or `settings.json`.
 

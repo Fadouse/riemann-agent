@@ -16,7 +16,7 @@ import {
 	type ChildAgentSession,
 	type ChildRiemannRuntime,
 } from "../src/riemann/agents/supervisor.ts";
-import type { RiemannConfig } from "../src/riemann/config.ts";
+import { type RiemannConfig, updateGlobalRiemannSetting } from "../src/riemann/config.ts";
 import type { FunctionDefinition } from "../src/riemann/functions/registry.ts";
 import { IPythonSchema } from "../src/riemann/ipython.ts";
 import type { JsonValue } from "../src/riemann/kernel/types.ts";
@@ -57,6 +57,8 @@ async function git(cwd: string, args: string[]): Promise<string> {
 
 class FakeChildSession implements ChildAgentSession {
 	readonly state: { messages: unknown[] } = { messages: [] };
+	readonly model: Model<any> | undefined;
+	readonly sessionManager: Pick<SessionManager, "getBranch">;
 	isStreaming = true;
 	readonly steering: string[] = [];
 	readonly prompts: string[] = [];
@@ -65,6 +67,11 @@ class FakeChildSession implements ChildAgentSession {
 	private readonly completion = new Promise<void>((resolve) => {
 		this.resolveCompletion = resolve;
 	});
+
+	constructor(model: Model<any> | undefined = getModel("openai", "gpt-4o-mini")) {
+		this.model = model;
+		this.sessionManager = { getBranch: () => [] };
+	}
 
 	async prompt(text: string): Promise<void> {
 		this.prompts.push(text);
@@ -203,11 +210,17 @@ interface SupervisorHarnessOptions {
 	defaultSession?: boolean;
 	rootModel?: Model<any>;
 	modelRegistry?: ModelRegistry;
-	createSession?: () => FakeChildSession;
+	createSession?: (model: Model<any>) => FakeChildSession;
+	warningSink?: (message: string) => void | Promise<void>;
 }
 
 async function createHarness(
-	overrides: Partial<Pick<RiemannConfig, "maxAgents" | "maxConcurrentAgents" | "agentDefaults" | "profiles">> = {},
+	overrides: Partial<
+		Pick<
+			RiemannConfig,
+			"maxAgents" | "maxConcurrentAgents" | "agentDefaults" | "profiles" | "compaction" | "projectOverrides"
+		>
+	> = {},
 	deliver?: (delivery: AgentEventDelivery) => Promise<void>,
 	configuredChildModel?: Model<any>,
 	options: SupervisorHarnessOptions = {},
@@ -249,7 +262,7 @@ async function createHarness(
 			? {}
 			: {
 					createChildSession: async (agent, childModel, _runtime, resume) => {
-						const session = options.createSession?.() ?? new FakeChildSession();
+						const session = options.createSession?.(childModel) ?? new FakeChildSession(childModel);
 						sessions.set(agent.id, [...(sessions.get(agent.id) ?? []), session]);
 						resumeFlags.set(agent.id, [...(resumeFlags.get(agent.id) ?? []), resume]);
 						modelIds.push(`${childModel.provider}/${childModel.id}`);
@@ -260,6 +273,7 @@ async function createHarness(
 			deliveries.push(delivery);
 			await deliver?.(delivery);
 		},
+		warningSink: options.warningSink,
 	});
 	return {
 		root,
@@ -682,6 +696,148 @@ describe("Riemann reusable Agent slots", () => {
 				lastOutcome: "ok",
 				result: expect.stringContaining("child session ready"),
 			});
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("warns a new text-only child when snapshot compaction is configured", async () => {
+		const faux = fauxProvider({
+			provider: "faux-snapshot-child",
+			models: [{ id: "text-only", name: "Text-only child", reasoning: false, input: ["text"] }],
+		});
+		faux.setResponses([fauxAssistantMessage("child session ready")]);
+		const childModel = faux.getModel();
+		expect(childModel.input).not.toContain("image");
+		const warnings: string[] = [];
+		const modelRegistry = {
+			find: (provider: string, id: string) =>
+				provider === childModel.provider && id === childModel.id ? childModel : undefined,
+			getRegisteredProviderIds: () => [faux.provider.id],
+			getRegisteredNativeProvider: (provider: string) => (provider === faux.provider.id ? faux.provider : undefined),
+			getRegisteredProviderConfig: () => undefined,
+			isUsingOAuth: () => false,
+		} as unknown as ModelRegistry;
+		const harness = await createHarness({}, undefined, undefined, {
+			defaultSession: true,
+			rootModel: childModel,
+			modelRegistry,
+			warningSink: (message) => {
+				warnings.push(message);
+			},
+		});
+		const { supervisor, store, mainId, agentDir } = harness;
+		await mkdir(agentDir, { recursive: true });
+		await writeFile(join(agentDir, "config.yaml"), "version: 1\ncompaction:\n  strategy: snapshot\n");
+		await writeFile(
+			join(agentDir, "auth.json"),
+			JSON.stringify({ [faux.provider.id]: { type: "api_key", key: "faux-key" } }),
+		);
+		try {
+			const handle = objectValue(await supervisor.spawn(mainId, { task: "Complete", name: "snapshot-worker" }));
+			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
+			await waitFor(() => store.getAgent(handle.id as string)?.status === "idle", 10_000);
+			expect(warnings).toContainEqual(
+				expect.stringContaining("Snapshot compaction requires an image-capable model"),
+			);
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("warns incompatible live children after a global strategy write even when the root is compatible", async () => {
+		const rootModel = getModel("openai", "gpt-4o-mini");
+		if (!rootModel) throw new Error("Built-in root model is unavailable");
+		expect(rootModel.input).toContain("image");
+		const childModel = {
+			provider: "faux",
+			id: "text-only",
+			name: "Text only",
+			api: "faux:test",
+			input: ["text"],
+		} as Model<any>;
+		const warnings: string[] = [];
+		const modelRegistry = {
+			find: (provider: string, id: string) =>
+				provider === childModel.provider && id === childModel.id ? childModel : undefined,
+			isUsingOAuth: () => false,
+		} as unknown as ModelRegistry;
+		const harness = await createHarness(
+			{
+				compaction: { strategy: "automatic" },
+				agentDefaults: { workspace: "shared", model: `${childModel.provider}/${childModel.id}` },
+			},
+			undefined,
+			childModel,
+			{
+				rootModel,
+				modelRegistry,
+				warningSink: (message) => {
+					warnings.push(message);
+				},
+			},
+		);
+		const { supervisor, store, mainId, sessions, agentDir } = harness;
+		try {
+			const handle = objectValue(await supervisor.spawn(mainId, { task: "Wait", name: "live-worker" }));
+			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
+			await waitFor(() => supervisor.listSubagentsForUi().some((agent) => agent.id === handle.id && agent.live));
+
+			await updateGlobalRiemannSetting(agentDir, "compaction.strategy", "snapshot");
+
+			expect(warnings).toEqual([expect.stringContaining("Snapshot compaction requires an image-capable model")]);
+			sessions.get(handle.id)?.at(-1)?.finish();
+			await waitFor(() => store.getAgent(handle.id as string)?.status === "idle");
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("does not warn live children for a global strategy hidden by a project override", async () => {
+		const childModel = {
+			provider: "faux",
+			id: "text-only",
+			name: "Text only",
+			api: "faux:test",
+			input: ["text"],
+		} as Model<any>;
+		const warnings: string[] = [];
+		const modelRegistry = {
+			find: (provider: string, id: string) =>
+				provider === childModel.provider && id === childModel.id ? childModel : undefined,
+			isUsingOAuth: () => false,
+		} as unknown as ModelRegistry;
+		const harness = await createHarness(
+			{
+				compaction: { strategy: "default" },
+				projectOverrides: new Set(["compaction.strategy"]),
+				agentDefaults: { workspace: "shared", model: `${childModel.provider}/${childModel.id}` },
+			},
+			undefined,
+			childModel,
+			{
+				modelRegistry,
+				warningSink: (message) => {
+					warnings.push(message);
+				},
+			},
+		);
+		const { supervisor, store, mainId, sessions, agentDir, root } = harness;
+		await mkdir(join(root, ".riemann"), { recursive: true });
+		await writeFile(join(root, ".riemann", "config.yaml"), "version: 1\ncompaction:\n  strategy: default\n");
+		try {
+			const handle = objectValue(await supervisor.spawn(mainId, { task: "Wait", name: "project-worker" }));
+			if (typeof handle.id !== "string") throw new Error("Missing Agent id");
+			await waitFor(() => supervisor.listSubagentsForUi().some((agent) => agent.id === handle.id && agent.live));
+
+			await updateGlobalRiemannSetting(agentDir, "compaction.strategy", "snapshot");
+
+			expect(warnings).toEqual([]);
+			sessions.get(handle.id)?.at(-1)?.finish();
+			await waitFor(() => store.getAgent(handle.id as string)?.status === "idle");
 		} finally {
 			await supervisor.close();
 			store.close();

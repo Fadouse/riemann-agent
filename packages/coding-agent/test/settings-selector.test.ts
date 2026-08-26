@@ -8,6 +8,40 @@ import {
 } from "../src/modes/interactive/components/settings-selector.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
+function createCompactionSettingsConfig(
+	strategy: "automatic" | "default" | "openai" | "snapshot",
+	projectOverrides: ReadonlySet<"compaction.strategy"> = new Set(),
+): SettingsConfig {
+	return {
+		autoCompact: true,
+		warnings: {},
+		defaultModel: "not set",
+		availableDefaultModels: [],
+		availableThinkingLevels: [],
+		modelThinkingLevels: {},
+		availableThemes: [],
+		riemann: {
+			maxAgents: 8,
+			maxConcurrentAgents: 4,
+			limits: { maxCellOutputChars: 100_000, maxArtifactPreviewChars: 12_000 },
+			retention: {
+				maxAgeDays: 30,
+				maxArtifactBytes: 1_073_741_824,
+				maxSnapshotBytes: 536_870_912,
+				maxWorktreeBytes: 5_368_709_120,
+			},
+			compaction: { strategy },
+			mainAgent: {},
+			agentDefaults: { workspace: "shared" },
+			profiles: {},
+			mcpServers: {},
+			web: { searchBackend: "exa" },
+			files: [],
+			projectOverrides,
+		},
+	} as unknown as SettingsConfig;
+}
+
 describe("SettingsSelectorComponent", () => {
 	beforeAll(() => {
 		initTheme("dark");
@@ -155,5 +189,85 @@ describe("SettingsSelectorComponent", () => {
 			selector.handleInput("\x1b[C");
 		}
 		expect(selector.render(120).join("\n")).toContain("[ Interface ]");
+	});
+
+	it("shows and persists all configured compaction strategies", async () => {
+		const config = createCompactionSettingsConfig("automatic");
+		const onRiemannChange = vi.fn(async () => {});
+		const selector = new SettingsSelectorComponent(config, {
+			onCancel: vi.fn(),
+			onError: vi.fn(),
+			onRiemannChange,
+		} as unknown as SettingsCallbacks);
+		for (let index = 0; index < 3; index += 1) selector.handleInput("\x1b[C");
+		const list = selector.getSettingsList();
+		list.selectItem("compaction.strategy");
+
+		expect(selector.render(120).join("\n")).toContain("Automatic");
+		expect(selector.render(120).join("\n")).toContain("OpenAI Codex models");
+		expect(selector.render(120).join("\n")).toContain("advanced image archive");
+		for (const [label, literal] of [
+			["Default", "default"],
+			["OpenAI Codex", "openai"],
+			["Snapshot", "snapshot"],
+			["Automatic", "automatic"],
+		] as const) {
+			list.handleInput("\r");
+			expect(selector.render(120).join("\n")).toContain(label);
+			await vi.waitFor(() => expect(onRiemannChange).toHaveBeenLastCalledWith("compaction.strategy", literal));
+		}
+	});
+
+	it("commits successful Riemann saves and rolls failed saves back", async () => {
+		let rejectSave: ((error: Error) => void) | undefined;
+		const failedSave = new Promise<void>((_resolve, reject) => {
+			rejectSave = reject;
+		});
+		const onRiemannChange = vi
+			.fn<(path: string, value: unknown) => Promise<void>>()
+			.mockResolvedValueOnce()
+			.mockReturnValueOnce(failedSave);
+		const onError = vi.fn();
+		const selector = new SettingsSelectorComponent(createCompactionSettingsConfig("automatic"), {
+			onCancel: vi.fn(),
+			onError,
+			onRiemannChange,
+		} as unknown as SettingsCallbacks);
+		for (let index = 0; index < 3; index += 1) selector.handleInput("\x1b[C");
+		let list = selector.getSettingsList();
+		list.selectItem("compaction.strategy");
+
+		list.handleInput("\r");
+		await vi.waitFor(() => expect(onRiemannChange).toHaveBeenCalledWith("compaction.strategy", "default"));
+		selector.handleInput("\x1b[C");
+		selector.handleInput("\x1b[D");
+		list = selector.getSettingsList();
+		list.selectItem("compaction.strategy");
+		expect(selector.render(120).join("\n")).toContain("Default");
+
+		list.handleInput("\r");
+		expect(selector.render(120).join("\n")).toContain("OpenAI Codex");
+		rejectSave?.(new Error("disk full"));
+		await vi.waitFor(() => expect(onError).toHaveBeenCalledWith("disk full"));
+		expect(selector.render(120).join("\n")).toContain("Default");
+	});
+
+	it("keeps trusted project compaction overrides read-only", () => {
+		const onRiemannChange = vi.fn(async () => {});
+		const selector = new SettingsSelectorComponent(
+			createCompactionSettingsConfig("snapshot", new Set(["compaction.strategy"])),
+			{
+				onCancel: vi.fn(),
+				onError: vi.fn(),
+				onRiemannChange,
+			} as unknown as SettingsCallbacks,
+		);
+		for (let index = 0; index < 3; index += 1) selector.handleInput("\x1b[C");
+		const list = selector.getSettingsList();
+		list.selectItem("compaction.strategy");
+
+		expect(selector.render(120).join("\n")).toContain("Snapshot · project");
+		list.handleInput("\r");
+		expect(onRiemannChange).not.toHaveBeenCalled();
 	});
 });

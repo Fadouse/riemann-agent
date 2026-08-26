@@ -2,9 +2,161 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 import type { SessionEntry } from "../src/core/session-manager.ts";
-import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+import { formatRiemannSettingSaveStatus, InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
+
+test("reports when saved Riemann settings become active", () => {
+	expect(formatRiemannSettingSaveStatus("compaction.strategy")).toBe(
+		"Saved compaction.strategy; active for next compaction",
+	);
+	expect(formatRiemannSettingSaveStatus("agents.maxAgents")).toBe("Saved agents.maxAgents; applies to new runs");
+});
+
+describe("InteractiveMode compaction strategy warnings", () => {
+	test("tracks successful strategy saves and ignores other settings", () => {
+		type Strategy = "automatic" | "default" | "openai" | "snapshot";
+		const state: { currentConfiguredCompactionStrategy: Strategy } = {
+			currentConfiguredCompactionStrategy: "automatic",
+		};
+		const fakeThis = {
+			showStatus: vi.fn(),
+			showCompactionStrategySaveWarnings: vi.fn(),
+		};
+		const notify = Reflect.get(InteractiveMode.prototype, "showRiemannSettingSaveNotifications") as (
+			this: typeof fakeThis,
+			path: "agents.maxAgents" | "compaction.strategy",
+			value: unknown,
+			state: { currentConfiguredCompactionStrategy: Strategy },
+		) => void;
+
+		notify.call(fakeThis, "agents.maxAgents", 8, state);
+		notify.call(fakeThis, "compaction.strategy", "default", state);
+		notify.call(fakeThis, "compaction.strategy", "snapshot", state);
+
+		expect(fakeThis.showCompactionStrategySaveWarnings.mock.calls).toEqual([
+			["automatic", "default"],
+			["default", "snapshot"],
+		]);
+		expect(state.currentConfiguredCompactionStrategy).toBe("snapshot");
+		expect(fakeThis.showStatus).toHaveBeenCalledTimes(3);
+	});
+
+	test("shows every applicable warning from the current model and active branch", () => {
+		type WarningModel = { provider: string; api: string; input: ("text" | "image")[] };
+		const model: WarningModel = { provider: "anthropic", api: "anthropic-messages", input: ["text"] };
+		const encryptedCompaction: SessionEntry = {
+			type: "compaction",
+			id: "compaction",
+			parentId: null,
+			timestamp: "2026-08-26T00:00:00.000Z",
+			summary: "remote summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 100,
+			preserveData: {
+				openaiRemoteCompaction: {
+					version: 1,
+					format: "responses-compaction-v2",
+					compactionItem: { type: "compaction", encrypted_content: "encrypted" },
+					replacementHistory: [
+						{ type: "compaction", encrypted_content: "encrypted" },
+						{ type: "message", role: "user", content: [{ type: "input_text", text: "summary" }] },
+					],
+				},
+			},
+		};
+		const fakeThis = {
+			session: {
+				model,
+				modelRuntime: { isUsingOAuth: vi.fn(() => false) },
+			},
+			sessionManager: { getBranch: vi.fn(() => [encryptedCompaction]) },
+			showWarning: vi.fn(),
+		};
+		const showWarnings = Reflect.get(InteractiveMode.prototype, "showCompactionStrategySaveWarnings") as (
+			this: typeof fakeThis,
+			previous: "automatic" | "default" | "openai" | "snapshot",
+			next: "automatic" | "default" | "openai" | "snapshot",
+		) => void;
+
+		showWarnings.call(fakeThis, "openai", "snapshot");
+		expect(fakeThis.showWarning.mock.calls.map(([message]) => message)).toEqual([
+			expect.stringContaining("encrypted OpenAI compaction context"),
+			expect.stringContaining("requires an image-capable model"),
+		]);
+
+		fakeThis.showWarning.mockClear();
+		fakeThis.sessionManager.getBranch.mockReturnValue([]);
+		showWarnings.call(fakeThis, "default", "openai");
+		expect(fakeThis.showWarning).toHaveBeenCalledOnce();
+		expect(fakeThis.showWarning).toHaveBeenCalledWith(
+			expect.stringContaining("requires an active OpenAI Codex Responses model"),
+		);
+
+		fakeThis.showWarning.mockClear();
+		model.provider = "openai-codex";
+		model.api = "openai-codex-responses";
+		model.input = ["text", "image"];
+		showWarnings.call(fakeThis, "default", "openai");
+		expect(fakeThis.showWarning).toHaveBeenCalledOnce();
+		expect(fakeThis.showWarning).toHaveBeenCalledWith(
+			expect.stringContaining("requires OpenAI Codex subscription OAuth"),
+		);
+	});
+
+	test("compares effective strategies and reads OAuth without resolving auth", () => {
+		const isUsingOAuth = vi.fn(() => true);
+		const fakeThis = {
+			session: {
+				model: {
+					provider: "openai-codex",
+					api: "openai-codex-responses",
+					input: ["text", "image"] as ("text" | "image")[],
+				},
+				modelRuntime: { isUsingOAuth },
+			},
+			sessionManager: {
+				getBranch: () => [
+					{
+						type: "compaction" as const,
+						id: "compaction",
+						parentId: null,
+						timestamp: "2026-08-26T00:00:00.000Z",
+						summary: "remote summary",
+						firstKeptEntryId: "kept",
+						tokensBefore: 100,
+						preserveData: {
+							openaiRemoteCompaction: {
+								version: 1,
+								format: "responses-compaction-v2",
+								compactionItem: { type: "compaction", encrypted_content: "encrypted" },
+								replacementHistory: [
+									{ type: "compaction", encrypted_content: "encrypted" },
+									{
+										type: "message",
+										role: "user",
+										content: [{ type: "input_text", text: "summary" }],
+									},
+								],
+							},
+						},
+					},
+				],
+			},
+			showWarning: vi.fn(),
+		};
+		const showWarnings = Reflect.get(InteractiveMode.prototype, "showCompactionStrategySaveWarnings") as (
+			this: typeof fakeThis,
+			previous: "automatic" | "default" | "openai" | "snapshot",
+			next: "automatic" | "default" | "openai" | "snapshot",
+		) => void;
+
+		showWarnings.call(fakeThis, "automatic", "openai");
+
+		expect(fakeThis.showWarning).not.toHaveBeenCalled();
+		expect(isUsingOAuth).toHaveBeenCalledWith("openai-codex");
+	});
+});
 
 describe("InteractiveMode compaction events", () => {
 	test("uses the cache miss notice setting for compaction and branch summary costs", () => {

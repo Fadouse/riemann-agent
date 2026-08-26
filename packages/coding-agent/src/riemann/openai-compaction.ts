@@ -14,28 +14,22 @@ import {
 	type PreservedOpenAICompaction,
 } from "./openai-compaction-state.ts";
 
-function priorCompactionMessage(
-	preparation: CompactionPreparation,
-	provider: string,
-	model: string,
-): UserMessage | undefined {
+function priorCompactionMessage(preparation: CompactionPreparation): UserMessage | undefined {
 	const previous = getPreservedOpenAICompaction(preparation.previousPreserveData);
-	if (!previous || previous.provider !== provider || previous.model !== model) return undefined;
+	if (!previous) return undefined;
 	return {
 		role: "user",
 		content: "",
 		providerPayload: {
 			type: "openaiResponsesHistory",
-			provider: previous.provider,
 			items: [previous.compactionItem],
-			model: previous.model,
 		},
 		timestamp: 0,
 	};
 }
 
-function cloudContextMessages(preparation: CompactionPreparation, provider: string, model: string): Message[] {
-	const previous = priorCompactionMessage(preparation, provider, model);
+function cloudContextMessages(preparation: CompactionPreparation): Message[] {
+	const previous = priorCompactionMessage(preparation);
 	return [
 		...(previous ? [previous] : []),
 		...convertToLlm([...preparation.messagesToSummarize, ...preparation.turnPrefixMessages]),
@@ -92,7 +86,7 @@ export async function createRiemannOpenAICompaction(options: {
 		requestModel,
 		{
 			systemPrompt: options.context.getSystemPrompt(),
-			messages: cloudContextMessages(options.preparation, model.provider, model.id),
+			messages: cloudContextMessages(options.preparation),
 		},
 		{
 			apiKey: auth.apiKey,
@@ -108,8 +102,6 @@ export async function createRiemannOpenAICompaction(options: {
 	const history = replacementHistory(remote.compactionItem, summary);
 	const preserved: PreservedOpenAICompaction = {
 		version: 1,
-		provider: "openai-codex",
-		model: model.id,
 		format: OPENAI_COMPACTION_FORMAT,
 		compactionItem: remote.compactionItem,
 		replacementHistory: history,
@@ -123,8 +115,6 @@ export async function createRiemannOpenAICompaction(options: {
 		details: {
 			version: 1,
 			strategy: "openai",
-			provider: preserved.provider,
-			model: preserved.model,
 			format: preserved.format,
 			responseId: preserved.responseId,
 		},

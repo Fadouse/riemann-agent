@@ -1,10 +1,66 @@
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test } from "vitest";
 import { loadRiemannConfig, updateGlobalRiemannSetting } from "../src/riemann/config.ts";
 
 const roots: string[] = [];
+
+function startConfigUpdateProcess(
+	agentDir: string,
+	path: string,
+	value: unknown,
+): {
+	ready: Promise<void>;
+	start: () => void;
+	exited: Promise<{ code: number | null; stderr: string }>;
+} {
+	const configModuleUrl = pathToFileURL(resolve(__dirname, "../src/riemann/config.ts")).href;
+	const script = [
+		"const [moduleUrl, agentDir, path, serializedValue] = process.argv.slice(1);",
+		"const { updateGlobalRiemannSetting } = await import(moduleUrl);",
+		'process.stdout.write("ready\\n");',
+		'await new Promise((done) => process.stdin.once("data", done));',
+		"await updateGlobalRiemannSetting(agentDir, path, JSON.parse(serializedValue));",
+	].join("\n");
+	const child = spawn(
+		process.execPath,
+		["--input-type=module", "--eval", script, configModuleUrl, agentDir, path, JSON.stringify(value)],
+		{ stdio: ["pipe", "pipe", "pipe"] },
+	);
+	let stdout = "";
+	let stderr = "";
+	const ready = new Promise<void>((resolveReady, rejectReady) => {
+		let settled = false;
+		child.stdout.on("data", (chunk) => {
+			stdout += chunk.toString();
+			if (!settled && stdout.includes("ready\n")) {
+				settled = true;
+				resolveReady();
+			}
+		});
+		child.once("error", (error) => {
+			if (!settled) rejectReady(error);
+		});
+		child.once("exit", (code) => {
+			if (!settled) rejectReady(new Error(`Config update process exited with code ${code}: ${stderr}`));
+		});
+	});
+	child.stderr.on("data", (chunk) => {
+		stderr += chunk.toString();
+	});
+	const exited = new Promise<{ code: number | null; stderr: string }>((resolveExited) => {
+		child.once("error", (error) => resolveExited({ code: null, stderr: `${stderr}${error.message}` }));
+		child.once("close", (code) => resolveExited({ code, stderr }));
+	});
+	return {
+		ready,
+		start: () => child.stdin.end("start\n"),
+		exited,
+	};
+}
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -30,7 +86,7 @@ describe("Riemann configuration", () => {
 		const untrusted = await loadRiemannConfig({ cwd: project, agentDir, projectTrusted: false });
 		expect(untrusted.maxAgents).toBe(8);
 		expect(untrusted.maxConcurrentAgents).toBe(4);
-		expect(untrusted.compaction.strategy).toBe("default");
+		expect(untrusted.compaction.strategy).toBe("automatic");
 		expect(untrusted.mainAgent.filesystem).toBeUndefined();
 		expect(untrusted.files).toEqual([join(agentDir, "config.yaml")]);
 		expect(untrusted.agentDefaults.model).toBe("openai/global-agent");
@@ -192,6 +248,65 @@ describe("Riemann configuration", () => {
 			writeExclude: [],
 		});
 		expect(config.agentDefaults.filesystem).toEqual({ write: "inherit" });
+	});
+
+	test("supports all configured compaction strategies and defaults to automatic", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-config-strategies-"));
+		roots.push(root);
+		const agentDir = join(root, "agent");
+
+		const omitted = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
+		expect(omitted.compaction.strategy).toBe("automatic");
+		for (const strategy of ["automatic", "default", "openai", "snapshot"] as const) {
+			await updateGlobalRiemannSetting(agentDir, "compaction.strategy", strategy);
+			const config = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
+			expect(config.compaction.strategy).toBe(strategy);
+		}
+	});
+
+	test("serializes concurrent updates without losing settings", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-config-concurrent-"));
+		roots.push(root);
+		const agentDir = join(root, "agent");
+
+		const writes = [
+			updateGlobalRiemannSetting(agentDir, "agents.maxAgents", 7),
+			updateGlobalRiemannSetting(agentDir, "agents.defaults.model", "openai/worker"),
+			updateGlobalRiemannSetting(agentDir, "agents.defaults.workspace", "worktree"),
+			updateGlobalRiemannSetting(agentDir, "compaction.strategy", "snapshot"),
+			updateGlobalRiemannSetting(agentDir, "mcp.servers.docs.enabled", false),
+			updateGlobalRiemannSetting(agentDir, "mcp.servers.docs.enabledTools", ["search", "fetch"]),
+		];
+
+		const configWhileWritesArePending = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
+		await Promise.all(writes);
+		expect(configWhileWritesArePending).toMatchObject({
+			maxAgents: 7,
+			compaction: { strategy: "snapshot" },
+			agentDefaults: { model: "openai/worker", workspace: "worktree" },
+			mcpServers: { docs: { enabled: false, enabledTools: ["search", "fetch"] } },
+		});
+	});
+
+	test("preserves different settings updated by concurrent CLI processes", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-config-process-concurrent-"));
+		roots.push(root);
+		const agentDir = join(root, "agent");
+		const maxAgentsUpdate = startConfigUpdateProcess(agentDir, "agents.maxAgents", 8);
+		const modelUpdate = startConfigUpdateProcess(agentDir, "agents.defaults.model", "openai/worker");
+
+		await Promise.all([maxAgentsUpdate.ready, modelUpdate.ready]);
+		maxAgentsUpdate.start();
+		modelUpdate.start();
+		const results = await Promise.all([maxAgentsUpdate.exited, modelUpdate.exited]);
+		expect(results).toEqual([
+			{ code: 0, stderr: "" },
+			{ code: 0, stderr: "" },
+		]);
+
+		const config = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
+		expect(config.maxAgents).toBe(8);
+		expect(config.agentDefaults.model).toBe("openai/worker");
 	});
 
 	test("rejects removed limits and profile lifecycle settings", async () => {

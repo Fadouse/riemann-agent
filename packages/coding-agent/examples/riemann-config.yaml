@@ -1,9 +1,10 @@
 version: 1
 
 compaction:
-  # default uses semantic checkpoints; snapshot requires an image-capable model;
-  # openai requires OpenAI Codex OAuth. Riemann never switches implicitly.
-  strategy: default
+  # automatic uses OpenAI cloud compaction for OpenAI Codex models and default
+  # semantic checkpoints for every other provider. Explicit default, openai,
+  # and snapshot overrides remain available.
+  strategy: automatic
 
 agents:
   # Reusable child identities in one run. The Main Agent is not counted.

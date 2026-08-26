@@ -182,7 +182,7 @@ describe("Riemann context compaction", () => {
 		);
 	});
 
-	test("persists Codex subscription compaction and restores provider-native history", async () => {
+	test("uses one Codex compact request and persists unbound V1 history", async () => {
 		const model = getModel("openai-codex", "gpt-5.5");
 		if (!model || model.api !== "openai-codex-responses") {
 			throw new Error("Built-in OpenAI Codex test model is unavailable");
@@ -236,19 +236,22 @@ describe("Riemann context compaction", () => {
 		expect(result.details).toEqual({
 			version: 1,
 			strategy: "openai",
-			provider: "openai-codex",
-			model: "gpt-5.5",
 			format: "responses-compaction-v2",
 			responseId: "resp_1",
 		});
+		expect(result.summary).toContain("OpenAI Codex cloud compaction is active");
+		expect(result.summary).not.toContain("unavailable");
 		expect(result.summary).toContain("<riemann_state>");
 		expect(getPreservedArchive(result.preserveData)).toBeUndefined();
 		const remote = getPreservedOpenAICompaction(result.preserveData);
 		expect(remote).toMatchObject({
-			model: "gpt-5.5",
+			version: 1,
 			compactionItem: { type: "compaction", id: "cmp_1", encrypted_content: "opaque" },
 			responseId: "resp_1",
 		});
+		expect(remote).not.toHaveProperty("provider");
+		expect(remote).not.toHaveProperty("model");
+		expect(remote).not.toHaveProperty("portableFallback");
 
 		const session = SessionManager.inMemory();
 		session.appendMessage(userMessage("discarded"));
@@ -265,14 +268,16 @@ describe("Riemann context compaction", () => {
 		const context = convertToLlm(session.buildSessionContext().messages);
 		const compacted = context[0];
 		expect(compacted?.role).toBe("user");
-		expect(compacted?.role === "user" && compacted.providerPayload).toMatchObject({
+		const payload = compacted?.role === "user" ? compacted.providerPayload : undefined;
+		expect(payload).toMatchObject({
 			type: "openaiResponsesHistory",
-			provider: "openai-codex",
 			items: [
 				{ type: "compaction", encrypted_content: "opaque" },
 				{ type: "message", role: "user" },
 			],
 		});
+		expect(payload).not.toHaveProperty("provider");
+		expect(payload).not.toHaveProperty("model");
 		expect(context[1]).toMatchObject({ role: "user" });
 		expect(fetchMock).toHaveBeenCalledOnce();
 	});

@@ -7,7 +7,12 @@ import type { AgentSessionEventListener, SessionStats } from "../../core/agent-s
 import { AuthStorage } from "../../core/auth-storage.ts";
 import type { CompactionPreparation, CompactionResult } from "../../core/compaction/index.ts";
 import { execCommand } from "../../core/exec.ts";
-import { defineTool, type ExtensionContext, type ToolDefinition } from "../../core/extensions/types.ts";
+import {
+	defineTool,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ToolDefinition,
+} from "../../core/extensions/types.ts";
 import { ModelRuntime } from "../../core/model-runtime.ts";
 import { DefaultResourceLoader } from "../../core/resource-loader.ts";
 import { createAgentSession } from "../../core/sdk.ts";
@@ -15,11 +20,24 @@ import { findMostRecentSession, SessionManager, sessionEntryToContextMessages } 
 import { SettingsManager } from "../../core/settings-manager.ts";
 import { graphemeSafePrefix } from "../../utils/text.ts";
 import { isFilesystemSubset, resolveFilesystemSnapshot } from "../access-policy.ts";
-import type { AgentProfileConfig, RiemannConfig } from "../config.ts";
+import { resolveCompactionStrategy } from "../compaction-strategy.ts";
+import {
+	type CompactionWarningTrigger,
+	detectCompactionWarnings,
+	latestActiveCompactionHasOpenAIContext,
+} from "../compaction-warning.ts";
+import {
+	type AgentProfileConfig,
+	type CompactionStrategySettingCommit,
+	loadRiemannConfig,
+	type RiemannConfig,
+	subscribeCompactionStrategySettingCommits,
+} from "../config.ts";
 import { RiemannHostError } from "../errors.ts";
 import type { FunctionDefinition } from "../functions/registry.ts";
 import type { IPythonSchema, IPythonToolDetails } from "../ipython.ts";
 import type { JsonValue } from "../kernel/types.ts";
+import { getPreservedOpenAICompaction } from "../openai-compaction-state.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
 import type {
 	AgentDeliveryMethod,
@@ -48,6 +66,8 @@ export type ChildRuntimeFactory = (agent: StoredAgent) => Promise<ChildRiemannRu
 
 export interface ChildAgentSession {
 	readonly state: { messages: readonly unknown[]; streamingMessage?: unknown };
+	readonly model: Model<any> | undefined;
+	readonly sessionManager: Pick<SessionManager, "getBranch">;
 	readonly isStreaming: boolean;
 	prompt(text: string, options: { source: "rpc" }): Promise<void>;
 	steer(text: string): Promise<void>;
@@ -120,9 +140,106 @@ export interface AgentEventDelivery {
 	events: AgentCompletionNotice[];
 }
 
+export type CompactionWarningSink = (message: string) => void | Promise<void>;
+
 const DEFAULT_CHILD_CAPABILITIES = ["fs.read", "fs.write", "shell.run", "web.search", "web.fetch", "mcp.*"];
 const AGENT_OUTPUT_PREVIEW_CHARS = 160;
 const SUBAGENT_STATS_REFRESH_MS = 32;
+
+interface ChildCompactionWarningConfigLocation {
+	cwd: string;
+	agentDir: string;
+	projectTrusted: boolean;
+}
+
+interface ChildCompactionWarningEventInput {
+	trigger: CompactionWarningTrigger;
+	hasEncryptedOpenAIContext: boolean;
+	model: ExtensionContext["model"];
+	previousModel?: ExtensionContext["model"];
+}
+
+function childActiveBranchHasEncryptedOpenAIContext(ctx: ExtensionContext): boolean {
+	try {
+		return latestActiveCompactionHasOpenAIContext(ctx.sessionManager.getBranch());
+	} catch {
+		return false;
+	}
+}
+
+function childPreparationHasEncryptedOpenAIContext(preparation: {
+	previousPreserveData?: Record<string, unknown>;
+}): boolean {
+	try {
+		return getPreservedOpenAICompaction(preparation.previousPreserveData) !== undefined;
+	} catch {
+		return false;
+	}
+}
+
+async function warnForChildCompactionEvent(
+	ctx: ExtensionContext,
+	location: ChildCompactionWarningConfigLocation,
+	warningSink: CompactionWarningSink | undefined,
+	input: ChildCompactionWarningEventInput,
+): Promise<void> {
+	try {
+		const configured = (await loadRiemannConfig(location)).compaction.strategy;
+		const resolution = resolveCompactionStrategy(configured, input.model);
+		const supportsOpenAICompaction =
+			input.model?.provider === "openai-codex" && input.model.api === "openai-codex-responses";
+		const previousEffectiveStrategy =
+			input.trigger === "model-change"
+				? resolveCompactionStrategy(configured, input.previousModel).effective
+				: input.hasEncryptedOpenAIContext
+					? "openai"
+					: resolution.effective;
+		const warnings = detectCompactionWarnings({
+			trigger: input.trigger,
+			hasEncryptedOpenAIContext: input.hasEncryptedOpenAIContext,
+			previousEffectiveStrategy,
+			effectiveStrategy: resolution.effective,
+			currentModel: {
+				supportsImageInput: input.model?.input.includes("image") ?? false,
+				supportsOpenAICompaction,
+				...(input.model ? { usingOAuth: ctx.modelRegistry.isUsingOAuth(input.model) } : {}),
+			},
+		});
+		for (const warning of warnings) {
+			try {
+				const emitted = warningSink?.(warning.message);
+				if (emitted) void emitted.catch(() => undefined);
+			} catch {}
+		}
+	} catch {}
+}
+
+export function registerChildCompactionHooks(
+	pi: ExtensionAPI,
+	runtime: ChildRiemannRuntime,
+	location: ChildCompactionWarningConfigLocation,
+	warningSink?: CompactionWarningSink,
+): void {
+	pi.on("model_select", async (event, ctx) => {
+		if (event.source === "restore") return;
+		await warnForChildCompactionEvent(ctx, location, warningSink, {
+			trigger: "model-change",
+			hasEncryptedOpenAIContext: childActiveBranchHasEncryptedOpenAIContext(ctx),
+			model: event.model,
+			previousModel: event.previousModel,
+		});
+	});
+	pi.on("session_before_compact", async (event, ctx) => {
+		await warnForChildCompactionEvent(ctx, location, warningSink, {
+			trigger: "compaction-dispatch",
+			hasEncryptedOpenAIContext: childPreparationHasEncryptedOpenAIContext(event.preparation),
+			model: ctx.model,
+		});
+		return {
+			compaction: await runtime.compact(event.preparation, event.customInstructions, event.signal, ctx),
+		};
+	});
+}
 
 function canonicalCapabilities(values: readonly string[]): string[] {
 	return [
@@ -260,6 +377,7 @@ export interface AgentSupervisorOptions {
 	rootAgent: StoredAgent;
 	rootContext: Pick<ExtensionContext, "cwd" | "model" | "modelRegistry" | "thinkingLevel">;
 	agentDir: string;
+	projectTrusted?: boolean;
 	config: RiemannConfig;
 	createChildRuntime: ChildRuntimeFactory;
 	createChildSession?: (
@@ -269,6 +387,7 @@ export interface AgentSupervisorOptions {
 		resume: boolean,
 	) => Promise<ChildAgentSession>;
 	deliverAgentEvents?: (delivery: AgentEventDelivery) => Promise<void>;
+	warningSink?: CompactionWarningSink;
 }
 
 export class AgentSupervisor {
@@ -281,6 +400,7 @@ export class AgentSupervisor {
 	private readonly persistedMessages = new Map<string, readonly unknown[]>();
 	private readonly waiters = new Map<string, number>();
 	private readonly options: AgentSupervisorOptions;
+	private readonly unsubscribeCompactionStrategySettingCommits: () => void;
 	private running = 0;
 	private closed = false;
 	private deliveryInFlight: Promise<void> | undefined;
@@ -297,6 +417,45 @@ export class AgentSupervisor {
 			this.subagentUi.set(agent.id, { task: latestTurn?.task ?? agent.prompt, ...messageStats(messages) });
 		}
 		this.scheduleAgentEventDelivery();
+		this.unsubscribeCompactionStrategySettingCommits = subscribeCompactionStrategySettingCommits((commit) => {
+			this.warnLiveChildrenForCompactionStrategyCommit(commit);
+		});
+	}
+
+	private warnLiveChildrenForCompactionStrategyCommit(commit: CompactionStrategySettingCommit): void {
+		if (
+			this.closed ||
+			resolve(commit.agentDir) !== resolve(this.options.agentDir) ||
+			this.options.config.projectOverrides.has("compaction.strategy")
+		) {
+			return;
+		}
+		for (const live of this.live.values()) {
+			const session = live.session;
+			if (!session) continue;
+			try {
+				const model = session.model;
+				const supportsOpenAICompaction =
+					model?.provider === "openai-codex" && model.api === "openai-codex-responses";
+				const warnings = detectCompactionWarnings({
+					trigger: "strategy-change",
+					hasEncryptedOpenAIContext: latestActiveCompactionHasOpenAIContext(session.sessionManager.getBranch()),
+					previousEffectiveStrategy: resolveCompactionStrategy(commit.previousStrategy, model).effective,
+					effectiveStrategy: resolveCompactionStrategy(commit.committedStrategy, model).effective,
+					currentModel: {
+						supportsImageInput: model?.input.includes("image") ?? false,
+						supportsOpenAICompaction,
+						...(model ? { usingOAuth: this.options.rootContext.modelRegistry.isUsingOAuth(model) } : {}),
+					},
+				});
+				for (const warning of warnings) {
+					try {
+						const emitted = this.options.warningSink?.(warning.message);
+						if (emitted) void emitted.catch(() => undefined);
+					} catch {}
+				}
+			} catch {}
+		}
 	}
 
 	listSubagentsForUi(): SubagentUiSnapshot[] {
@@ -665,6 +824,39 @@ export class AgentSupervisor {
 		}
 	}
 
+	private async warnForStartedChild(session: ChildAgentSession): Promise<void> {
+		try {
+			const configured = (
+				await loadRiemannConfig({
+					cwd: this.options.rootContext.cwd,
+					agentDir: this.options.agentDir,
+					projectTrusted: this.options.projectTrusted ?? true,
+				})
+			).compaction.strategy;
+			const model = session.model;
+			const resolution = resolveCompactionStrategy(configured, model);
+			const hasEncryptedOpenAIContext = latestActiveCompactionHasOpenAIContext(session.sessionManager.getBranch());
+			const supportsOpenAICompaction = model?.provider === "openai-codex" && model.api === "openai-codex-responses";
+			const warnings = detectCompactionWarnings({
+				trigger: "session-resume",
+				hasEncryptedOpenAIContext,
+				previousEffectiveStrategy: hasEncryptedOpenAIContext ? "openai" : resolution.effective,
+				effectiveStrategy: resolution.effective,
+				currentModel: {
+					supportsImageInput: model?.input.includes("image") ?? false,
+					supportsOpenAICompaction,
+					...(model ? { usingOAuth: this.options.rootContext.modelRegistry.isUsingOAuth(model) } : {}),
+				},
+			});
+			for (const warning of warnings) {
+				try {
+					const emitted = this.options.warningSink?.(warning.message);
+					if (emitted) void emitted.catch(() => undefined);
+				} catch {}
+			}
+		} catch {}
+	}
+
 	private async createDefaultSession(
 		agent: StoredAgent,
 		model: Model<any>,
@@ -699,11 +891,17 @@ export class AgentSupervisor {
 				{
 					name: "Riemann child compaction",
 					hidden: true,
-					factory: (pi) => {
-						pi.on("session_before_compact", async (event, ctx) => ({
-							compaction: await runtime.compact(event.preparation, event.customInstructions, event.signal, ctx),
-						}));
-					},
+					factory: (pi) =>
+						registerChildCompactionHooks(
+							pi,
+							runtime,
+							{
+								cwd: this.options.rootContext.cwd,
+								agentDir: this.options.agentDir,
+								projectTrusted: this.options.projectTrusted ?? true,
+							},
+							this.options.warningSink,
+						),
 				},
 			],
 		});
@@ -723,7 +921,9 @@ export class AgentSupervisor {
 			resourceLoader,
 			sessionManager,
 			settingsManager,
+			sessionStartEvent: { type: "session_start", reason: resume ? "resume" : "new" },
 		});
+		await this.warnForStartedChild(created.session);
 		return created.session;
 	}
 
@@ -1594,6 +1794,7 @@ export class AgentSupervisor {
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
+		this.unsubscribeCompactionStrategySettingCommits();
 		for (const admission of this.queue.splice(0)) {
 			this.cancelled.add(admission.turnId);
 			const stopped = this.options.store.updateAgent(admission.agentId, {

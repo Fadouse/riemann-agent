@@ -1,11 +1,14 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import lockfile from "proper-lockfile";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type { FilesystemConfig } from "./access-policy.ts";
+import type { ConfiguredCompactionStrategy } from "./compaction-strategy.ts";
 
 const FilesystemFieldSchema = Type.Union([Type.Array(Type.String({ minLength: 1 })), Type.Literal("inherit")]);
 const FilesystemSchema = Type.Object(
@@ -27,9 +30,10 @@ const ThinkingLevelSchema = Type.Union([
 	Type.Literal("xhigh"),
 ]);
 const CompactionStrategySchema = Type.Union([
-	Type.Literal("snapshot"),
+	Type.Literal("automatic"),
 	Type.Literal("default"),
 	Type.Literal("openai"),
+	Type.Literal("snapshot"),
 ]);
 const AgentProfileSchema = Type.Object(
 	{
@@ -143,7 +147,7 @@ export interface RiemannConfig {
 		maxWorktreeBytes: number;
 	};
 	compaction: {
-		strategy: "snapshot" | "default" | "openai";
+		strategy: ConfiguredCompactionStrategy;
 	};
 	mainAgent: {
 		filesystem?: FilesystemConfig;
@@ -176,7 +180,7 @@ const DEFAULTS: Omit<RiemannConfig, "files"> = {
 		maxSnapshotBytes: 536_870_912,
 		maxWorktreeBytes: 5_368_709_120,
 	},
-	compaction: { strategy: "default" },
+	compaction: { strategy: "automatic" },
 	mainAgent: {},
 	agentDefaults: { workspace: "shared" },
 	profiles: {},
@@ -225,7 +229,46 @@ function configuredSettingPaths(config: RiemannConfigFile): Set<RiemannSettingPa
 	return paths;
 }
 
-async function parseConfigFile(path: string): Promise<RiemannConfigFile | undefined> {
+export interface CompactionStrategySettingCommit {
+	agentDir: string;
+	previousStrategy: ConfiguredCompactionStrategy;
+	committedStrategy: ConfiguredCompactionStrategy;
+}
+
+export type CompactionStrategySettingCommitListener = (commit: CompactionStrategySettingCommit) => void | Promise<void>;
+
+const compactionStrategySettingCommitListeners = new Set<CompactionStrategySettingCommitListener>();
+
+/** Subscribe to successful process-local compaction strategy writes. This does not observe external processes. */
+export function subscribeCompactionStrategySettingCommits(
+	listener: CompactionStrategySettingCommitListener,
+): () => void {
+	compactionStrategySettingCommitListeners.add(listener);
+	return () => compactionStrategySettingCommitListeners.delete(listener);
+}
+
+function notifyCompactionStrategySettingCommit(commit: CompactionStrategySettingCommit): void {
+	for (const listener of compactionStrategySettingCommitListeners) {
+		try {
+			const notified = listener(commit);
+			if (notified) void notified.catch(() => undefined);
+		} catch {}
+	}
+}
+
+const pendingConfigWrites = new Map<string, Promise<void>>();
+
+async function waitForPendingConfigWrites(path: string): Promise<void> {
+	const key = resolve(path);
+	while (true) {
+		const pending = pendingConfigWrites.get(key);
+		if (!pending) return;
+		await pending.catch(() => undefined);
+		if (pendingConfigWrites.get(key) === pending) return;
+	}
+}
+
+async function parseConfigFileNow(path: string): Promise<RiemannConfigFile | undefined> {
 	if (!existsSync(path)) return undefined;
 	let value: unknown;
 	try {
@@ -242,6 +285,11 @@ async function parseConfigFile(path: string): Promise<RiemannConfigFile | undefi
 	}
 	validateMcpDescriptions(value, path);
 	return value;
+}
+
+async function parseConfigFile(path: string): Promise<RiemannConfigFile | undefined> {
+	await waitForPendingConfigWrites(path);
+	return parseConfigFileNow(path);
 }
 
 export async function loadRiemannConfig(options: {
@@ -323,32 +371,65 @@ function setNestedValue(target: Record<string, unknown>, path: readonly string[]
 	else current[key] = value;
 }
 
-export async function updateGlobalRiemannSetting(
-	agentDir: string,
-	path: RiemannSettingPath,
-	value: unknown,
-): Promise<void> {
-	const configPath = join(agentDir, "config.yaml");
-	const existing = (await parseConfigFile(configPath)) ?? { version: 1 };
-	const next = structuredClone(existing) as Record<string, unknown>;
-	setNestedValue(next, settingPathSegments(path), value);
-	if (!Value.Check(ConfigSchema, next)) {
-		const errors = [...Value.Errors(ConfigSchema, next)]
-			.slice(0, 8)
-			.map((error) => `${error.instancePath || path}: ${error.message}`)
-			.join("; ");
-		throw new Error(`Invalid Riemann setting ${path}: ${errors}`);
-	}
-	validateMcpDescriptions(next as RiemannConfigFile, configPath);
-	await mkdir(agentDir, { recursive: true });
-	const temporaryPath = `${configPath}.${process.pid}.${Date.now()}.tmp`;
-	try {
-		await writeFile(temporaryPath, stringifyYaml(next), { encoding: "utf8", mode: 0o600 });
-		await rename(temporaryPath, configPath);
-	} catch (error) {
-		await rm(temporaryPath, { force: true });
-		throw error;
-	}
+export function updateGlobalRiemannSetting(agentDir: string, path: RiemannSettingPath, value: unknown): Promise<void> {
+	const configPath = resolve(agentDir, "config.yaml");
+	const preceding = pendingConfigWrites.get(configPath) ?? Promise.resolve();
+	const write = preceding
+		.catch(() => undefined)
+		.then(async () => {
+			await mkdir(dirname(configPath), { recursive: true });
+			let compactionStrategyCommit: CompactionStrategySettingCommit | undefined;
+			const release = await lockfile.lock(configPath, {
+				realpath: false,
+				retries: {
+					retries: 10,
+					factor: 1.5,
+					minTimeout: 10,
+					maxTimeout: 100,
+					maxRetryTime: 2_000,
+					randomize: true,
+				},
+			});
+			try {
+				const existing = (await parseConfigFileNow(configPath)) ?? { version: 1 };
+				const previousStrategy = existing.compaction?.strategy ?? "automatic";
+				const next = structuredClone(existing) as Record<string, unknown>;
+				setNestedValue(next, settingPathSegments(path), value);
+				if (!Value.Check(ConfigSchema, next)) {
+					const errors = [...Value.Errors(ConfigSchema, next)]
+						.slice(0, 8)
+						.map((error) => `${error.instancePath || path}: ${error.message}`)
+						.join("; ");
+					throw new Error(`Invalid Riemann setting ${path}: ${errors}`);
+				}
+				validateMcpDescriptions(next as RiemannConfigFile, configPath);
+				const temporaryPath = `${configPath}.${randomUUID()}.tmp`;
+				try {
+					await writeFile(temporaryPath, stringifyYaml(next), { encoding: "utf8", mode: 0o600 });
+					await rename(temporaryPath, configPath);
+					if (path === "compaction.strategy") {
+						const committed = next as RiemannConfigFile;
+						compactionStrategyCommit = {
+							agentDir: dirname(configPath),
+							previousStrategy,
+							committedStrategy: committed.compaction?.strategy ?? "automatic",
+						};
+					}
+				} catch (error) {
+					await rm(temporaryPath, { force: true });
+					throw error;
+				}
+			} finally {
+				await release();
+			}
+			if (compactionStrategyCommit) notifyCompactionStrategySettingCommit(compactionStrategyCommit);
+		});
+	pendingConfigWrites.set(configPath, write);
+	const clear = (): void => {
+		if (pendingConfigWrites.get(configPath) === write) pendingConfigWrites.delete(configPath);
+	};
+	write.then(clear, clear);
+	return write;
 }
 
 export function expandConfigSecret(value: string | undefined): string | undefined {

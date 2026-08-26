@@ -21,6 +21,10 @@ import type {
 	TuiMode,
 	WarningSettings,
 } from "../../../core/settings-manager.ts";
+import {
+	CONFIGURED_COMPACTION_STRATEGIES,
+	type ConfiguredCompactionStrategy,
+} from "../../../riemann/compaction-strategy.ts";
 import type { RiemannConfig, RiemannSettingPath } from "../../../riemann/config.ts";
 import { getSettingsListTheme, parseAutoThemeSetting, type TerminalTheme, theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
@@ -479,11 +483,31 @@ const GENERAL_SETTING_CATEGORIES: Record<Exclude<SettingsCategory, "Agents" | "M
 
 const AGENT_SLOT_CHOICES = [0, 1, 2, 4, 8, 16] as const;
 
+const COMPACTION_STRATEGY_LABELS = {
+	automatic: "Automatic",
+	default: "Default",
+	openai: "OpenAI Codex",
+	snapshot: "Snapshot",
+} satisfies Record<ConfiguredCompactionStrategy, string>;
+
+const COMPACTION_STRATEGY_BY_LABEL = new Map(
+	Object.entries(COMPACTION_STRATEGY_LABELS).map(([value, label]) => [label, value as ConfiguredCompactionStrategy]),
+);
+
+const COMPACTION_STRATEGY_CHOICES = CONFIGURED_COMPACTION_STRATEGIES.map(
+	(strategy) => COMPACTION_STRATEGY_LABELS[strategy],
+);
+
 function parseRiemannValue(path: string, display: string): unknown {
 	if (path.endsWith(".enabled") || path.endsWith(".exposeToModel")) return display === "true";
 	if (path === "agents.defaults.model") return display === "inherit" ? undefined : display;
 	if (path.endsWith("TimeoutMs") || path === "agents.maxAgents") return Number.parseInt(display, 10);
-	if (path === "compaction.strategy" || path === "agents.defaults.workspace") return display;
+	if (path === "compaction.strategy") {
+		const strategy = COMPACTION_STRATEGY_BY_LABEL.get(display);
+		if (!strategy) throw new Error(`Unknown compaction strategy: ${display}`);
+		return strategy;
+	}
+	if (path === "agents.defaults.workspace") return display;
 	return Number.parseFloat(display);
 }
 
@@ -517,15 +541,16 @@ function agentSettingItems(config: RiemannConfig, availableModels: readonly stri
 
 function contextSettingItems(config: RiemannConfig): SettingItem[] {
 	const project = config.projectOverrides.has("compaction.strategy");
+	const strategyLabel = COMPACTION_STRATEGY_LABELS[config.compaction.strategy];
 	return [
 		{
 			id: "compaction.strategy",
 			label: "Compaction strategy",
 			description: project
 				? "Read-only because the trusted project config overrides this value."
-				: "Context compaction implementation; applies to new runs.",
-			currentValue: project ? `${config.compaction.strategy} · project` : config.compaction.strategy,
-			values: project ? undefined : ["default", "snapshot", "openai"],
+				: "Automatic uses OpenAI Codex for compatible OpenAI Codex models and Default for all other providers. Snapshot is an advanced image archive for image-capable models. Active for the next compaction.",
+			currentValue: project ? `${strategyLabel} · project` : strategyLabel,
+			values: project ? undefined : COMPACTION_STRATEGY_CHOICES,
 		},
 	];
 }
@@ -624,6 +649,9 @@ export class SettingsSelectorComponent extends Container {
 	private readonly items: SettingItem[];
 	private readonly config: SettingsConfig;
 	private categoryIndex = 0;
+	private readonly committedRiemannValues = new Map<string, string>();
+	private readonly pendingRiemannValues = new Map<string, { version: number; value: string }>();
+	private nextRiemannSaveVersion = 0;
 
 	constructor(config: SettingsConfig, callbacks: SettingsCallbacks) {
 		super();
@@ -996,6 +1024,13 @@ export class SettingsSelectorComponent extends Container {
 		});
 
 		this.items = items;
+		for (const item of [
+			...contextSettingItems(config.riemann),
+			...agentSettingItems(config.riemann, config.availableAgentModels),
+			...mcpSettingItems(config.riemann),
+		]) {
+			this.committedRiemannValues.set(item.id, item.currentValue);
+		}
 
 		this.settingsList = new SettingsList(
 			items,
@@ -1110,14 +1145,15 @@ export class SettingsSelectorComponent extends Container {
 											.split(",")
 											.map((entry) => entry.trim())
 											.filter(Boolean);
-							void callbacks
-								.onRiemannChange(id as RiemannSettingPath, value)
-								.catch((error) => callbacks.onError(error instanceof Error ? error.message : String(error)));
+							this.saveRiemannSetting(id as RiemannSettingPath, newValue, value, callbacks);
 							break;
 						}
-						void callbacks
-							.onRiemannChange(id as RiemannSettingPath, parseRiemannValue(id, newValue))
-							.catch((error) => callbacks.onError(error instanceof Error ? error.message : String(error)));
+						this.saveRiemannSetting(
+							id as RiemannSettingPath,
+							newValue,
+							parseRiemannValue(id, newValue),
+							callbacks,
+						);
 				}
 			},
 			callbacks.onCancel,
@@ -1128,6 +1164,39 @@ export class SettingsSelectorComponent extends Container {
 		this.rebuild();
 	}
 
+	private saveRiemannSetting(
+		path: RiemannSettingPath,
+		displayValue: string,
+		value: unknown,
+		callbacks: SettingsCallbacks,
+	): void {
+		const version = ++this.nextRiemannSaveVersion;
+		this.pendingRiemannValues.set(path, { version, value: displayValue });
+		void callbacks.onRiemannChange(path, value).then(
+			() => {
+				this.committedRiemannValues.set(path, displayValue);
+				if (this.pendingRiemannValues.get(path)?.version === version) {
+					this.pendingRiemannValues.delete(path);
+				}
+			},
+			(error: unknown) => {
+				if (this.pendingRiemannValues.get(path)?.version === version) {
+					this.pendingRiemannValues.delete(path);
+					const committedValue = this.committedRiemannValues.get(path);
+					if (committedValue !== undefined) this.settingsList.updateValue(path, committedValue);
+				}
+				callbacks.onError(error instanceof Error ? error.message : String(error));
+			},
+		);
+	}
+
+	private withSavedRiemannValues(items: SettingItem[]): SettingItem[] {
+		return items.map((item) => {
+			const displayValue = this.pendingRiemannValues.get(item.id)?.value ?? this.committedRiemannValues.get(item.id);
+			return displayValue === undefined ? item : { ...item, currentValue: displayValue };
+		});
+	}
+
 	private currentCategory(): SettingsCategory {
 		return SETTINGS_CATEGORIES[this.categoryIndex];
 	}
@@ -1135,17 +1204,19 @@ export class SettingsSelectorComponent extends Container {
 	private applyCategory(): void {
 		const category = this.currentCategory();
 		if (category === "Agents") {
-			this.settingsList.setItems(agentSettingItems(this.config.riemann, this.config.availableAgentModels));
+			this.settingsList.setItems(
+				this.withSavedRiemannValues(agentSettingItems(this.config.riemann, this.config.availableAgentModels)),
+			);
 			return;
 		}
 		if (category === "MCP Servers") {
-			this.settingsList.setItems(mcpSettingItems(this.config.riemann));
+			this.settingsList.setItems(this.withSavedRiemannValues(mcpSettingItems(this.config.riemann)));
 			return;
 		}
 		if (category === "Context") {
 			this.settingsList.setItems([
 				...this.items.filter((item) => GENERAL_SETTING_CATEGORIES.Context.includes(item.id)),
-				...contextSettingItems(this.config.riemann),
+				...this.withSavedRiemannValues(contextSettingItems(this.config.riemann)),
 			]);
 			return;
 		}

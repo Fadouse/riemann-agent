@@ -1,12 +1,20 @@
 import { Text } from "@earendil-works/pi-tui";
 import type { BuildSystemPromptOptions, ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
 import type { AgentEventDelivery } from "../../riemann/agents/supervisor.ts";
+import { resolveCompactionStrategy } from "../../riemann/compaction-strategy.ts";
+import {
+	type CompactionWarningTrigger,
+	detectCompactionWarnings,
+	latestActiveCompactionHasOpenAIContext,
+} from "../../riemann/compaction-warning.ts";
+import { getRiemannAgentDir, loadRiemannConfig } from "../../riemann/config.ts";
 import {
 	IPYTHON_TOOL_DESCRIPTION,
 	IPYTHON_TOOL_PROMPT_SNIPPET,
 	IPythonSchema,
 	type IPythonToolDetails,
 } from "../../riemann/ipython.ts";
+import { getPreservedOpenAICompaction } from "../../riemann/openai-compaction-state.ts";
 import { RiemannRuntime } from "../../riemann/runtime.ts";
 import { installSubagentUi, type SubagentUiController } from "./subagent-ui.ts";
 
@@ -18,6 +26,78 @@ type AgentCompletionDisplay = Pick<AgentEventDelivery["events"][number], "name" 
 interface AgentEventReceipt {
 	eventIds: string[];
 	completions?: AgentCompletionDisplay[];
+}
+
+interface CompactionWarningEventInput {
+	trigger: CompactionWarningTrigger;
+	hasEncryptedOpenAIContext: boolean;
+	model: ExtensionContext["model"];
+	previousModel?: ExtensionContext["model"];
+}
+
+function notifyWarnings(
+	ctx: Pick<ExtensionContext, "ui">,
+	warnings: ReturnType<typeof detectCompactionWarnings>,
+): void {
+	for (const warning of warnings) {
+		try {
+			ctx.ui.notify(warning.message, "warning");
+		} catch {}
+	}
+}
+
+function activeBranchHasEncryptedOpenAIContext(ctx: ExtensionContext): boolean {
+	try {
+		return latestActiveCompactionHasOpenAIContext(ctx.sessionManager.getBranch());
+	} catch {
+		return false;
+	}
+}
+
+function preparationHasEncryptedOpenAIContext(preparation: {
+	previousPreserveData?: Record<string, unknown>;
+}): boolean {
+	try {
+		return getPreservedOpenAICompaction(preparation.previousPreserveData) !== undefined;
+	} catch {
+		return false;
+	}
+}
+
+/** Warning-only compatibility check. Failures must not affect the event being observed. */
+async function warnForCompactionEvent(ctx: ExtensionContext, input: CompactionWarningEventInput): Promise<void> {
+	try {
+		const configured = (
+			await loadRiemannConfig({
+				cwd: ctx.cwd,
+				agentDir: getRiemannAgentDir(),
+				projectTrusted: ctx.isProjectTrusted(),
+			})
+		).compaction.strategy;
+		const resolution = resolveCompactionStrategy(configured, input.model);
+		const supportsOpenAICompaction =
+			input.model?.provider === "openai-codex" && input.model.api === "openai-codex-responses";
+		const previousEffectiveStrategy =
+			input.trigger === "model-change"
+				? resolveCompactionStrategy(configured, input.previousModel).effective
+				: input.hasEncryptedOpenAIContext
+					? "openai"
+					: resolution.effective;
+		notifyWarnings(
+			ctx,
+			detectCompactionWarnings({
+				trigger: input.trigger,
+				hasEncryptedOpenAIContext: input.hasEncryptedOpenAIContext,
+				previousEffectiveStrategy,
+				effectiveStrategy: resolution.effective,
+				currentModel: {
+					supportsImageInput: input.model?.input.includes("image") ?? false,
+					supportsOpenAICompaction,
+					...(input.model ? { usingOAuth: ctx.modelRegistry.isUsingOAuth(input.model) } : {}),
+				},
+			}),
+		);
+	} catch {}
 }
 
 function persistedAgentEventIds(ctx: ExtensionContext): Set<string> {
@@ -167,6 +247,11 @@ const riemannExtension: ExtensionFactory = (pi) => {
 		}
 		runtime = await RiemannRuntime.createRoot(ctx, {
 			deliverAgentEvents: async (delivery) => deliverAgentEvents(pi, ctx, delivery),
+			warningSink: (message) => {
+				try {
+					ctx.ui.notify(message, "warning");
+				} catch {}
+			},
 		});
 		return runtime;
 	};
@@ -203,11 +288,28 @@ const riemannExtension: ExtensionFactory = (pi) => {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
+		if (event.reason !== "reload") {
+			await warnForCompactionEvent(ctx, {
+				trigger: "session-resume",
+				hasEncryptedOpenAIContext: activeBranchHasEncryptedOpenAIContext(ctx),
+				model: ctx.model,
+			});
+		}
 		const current = await getRuntime(ctx);
 		subagentUi?.dispose();
 		subagentUi = installSubagentUi(current, ctx);
 		pi.setActiveTools(["ipython"]);
+	});
+
+	pi.on("model_select", async (event, ctx) => {
+		if (event.source === "restore") return;
+		await warnForCompactionEvent(ctx, {
+			trigger: "model-change",
+			hasEncryptedOpenAIContext: activeBranchHasEncryptedOpenAIContext(ctx),
+			model: event.model,
+			previousModel: event.previousModel,
+		});
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -217,6 +319,11 @@ const riemannExtension: ExtensionFactory = (pi) => {
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
+		await warnForCompactionEvent(ctx, {
+			trigger: "compaction-dispatch",
+			hasEncryptedOpenAIContext: preparationHasEncryptedOpenAIContext(event.preparation),
+			model: ctx.model,
+		});
 		const current = await getRuntime(ctx);
 		return {
 			compaction: await current.compact(event.preparation, event.customInstructions, event.signal, ctx),

@@ -6,8 +6,6 @@ export const OPENAI_COMPACTION_FORMAT = "responses-compaction-v2";
 
 export interface PreservedOpenAICompaction {
 	version: 1;
-	provider: "openai-codex";
-	model: string;
 	format: typeof OPENAI_COMPACTION_FORMAT;
 	compactionItem: OpenAICodexCompactionResult["compactionItem"];
 	replacementHistory: Array<Record<string, unknown>>;
@@ -57,8 +55,6 @@ export function getPreservedOpenAICompaction(
 	if (!isRecord(candidate)) return undefined;
 	if (
 		candidate.version !== 1 ||
-		candidate.provider !== "openai-codex" ||
-		typeof candidate.model !== "string" ||
 		candidate.format !== OPENAI_COMPACTION_FORMAT ||
 		!isCompactionItem(candidate.compactionItem) ||
 		!isReplacementHistory(candidate.replacementHistory, candidate.compactionItem) ||
@@ -76,8 +72,6 @@ export function openAICompactionProviderPayload(
 	if (!remote) return undefined;
 	return {
 		type: "openaiResponsesHistory",
-		provider: remote.provider,
-		model: remote.model,
 		items: remote.replacementHistory,
 	};
 }

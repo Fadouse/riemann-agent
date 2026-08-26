@@ -15,6 +15,7 @@
 - Renamed `web.search` arguments `num_results`/`include_domains`/`start_published_date` to `limit`/`domains`/`since`, aligning the search `limit` vocabulary across `fs.glob`, `fs.search`, and `catalog.search`.
 - Renamed the `fs.search` file-filter argument `pattern` to `glob`, removing the `query`/`pattern` ambiguity.
 - Filesystem policies now require every configured root and exclusion to exist, require write roots to be covered by read roots, and treat `readExclude` as denying both reads and writes.
+- Omitted Riemann `compaction.strategy` now resolves automatically: OpenAI Codex models use cloud compaction and all other providers use the semantic default strategy; set `default` explicitly to force semantic compaction on Codex.
 
 ### Added
 
@@ -22,6 +23,8 @@
 - Added durable Agent completion delivery, standard transcript rendering, configurable Hub/viewer controls, and confirmed settled-slot release.
 - Added synchronous `agents.run()`, exact-Turn `AgentHandle.wait()`, cancellable settlement, and race-free suppression of duplicate background completion wakes.
 - Added direct-session image attachments across clipboard input with highlighted attachment markers, remote sessions, compaction, and Riemann workspace, artifact, IPython, and MCP results.
+- Added live Riemann compaction strategy switching with complete Automatic, Default, OpenAI Codex, and Snapshot settings choices.
+- Added non-blocking compaction warnings for encrypted OpenAI context transitions, Snapshot models without image input, and incompatible OpenAI Codex model or OAuth selections.
 
 ### Changed
 
@@ -34,6 +37,7 @@
 - Reduced startup and long-session overhead by coalescing model refreshes, gating Riemann migrations, using bounded artifact reads, and reusing session traversal results.
 - Reduced interactive streaming work by coalescing assistant, shell, and Subagent display updates and caching Mermaid transforms, footer totals, session search text, and fullscreen transcript search.
 - Reduced IPython checkpoint serialization to one common-path pass while retaining automatic snapshots and per-variable fallback diagnostics.
+- Changed OpenAI Codex cloud compaction to persist opaque context records without provider/model metadata.
 
 ### Fixed
 
@@ -50,6 +54,7 @@
 - Removed redundant Shell metadata and empty Agent-profile inventory from the Riemann system prompt.
 - Fixed Riemann and tool output decoding, grapheme-boundary previews, and trailing-newline expansion so Unicode streams render without mojibake or extra rows.
 - Fixed Bubblewrap launches to preserve host cwd, HOME, temporary and terminal environment values; validate same-path mount policies; keep private IPC writable through exclusions; and detach brokers from the terminal foreground group.
+- Fixed Riemann compaction configuration reloads, concurrent settings writes, async UI rollback, and truncated checkpoint rejection.
 
 ## [0.84.3] - 2026-08-24
 

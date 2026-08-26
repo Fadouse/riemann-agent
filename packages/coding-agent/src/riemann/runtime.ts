@@ -11,9 +11,11 @@ import {
 	type AgentEventDelivery,
 	AgentSupervisor,
 	type ChildRiemannRuntime,
+	type CompactionWarningSink,
 	type SubagentUiSnapshot,
 } from "./agents/supervisor.ts";
 import { createRiemannCompaction, createRiemannSnapshotCompaction } from "./compaction.ts";
+import { type CompactionStrategyResolution, resolveCompactionStrategy } from "./compaction-strategy.ts";
 import { expandConfigSecret, getRiemannAgentDir, loadRiemannConfig, type RiemannConfig } from "./config.ts";
 import { formatEnvironmentContext } from "./environment.ts";
 import { RiemannHostError } from "./errors.ts";
@@ -46,6 +48,11 @@ import { RiemannStore, type StoredAgent, type StoredRun } from "./state/store.ts
 
 interface SharedRun {
 	config: RiemannConfig;
+	configLoadOptions: {
+		cwd: string;
+		agentDir: string;
+		projectTrusted: boolean;
+	};
 
 	store: RiemannStore;
 	artifacts: ArtifactStore;
@@ -59,6 +66,11 @@ interface SharedRun {
 
 export interface RiemannRootOptions {
 	deliverAgentEvents?: (delivery: AgentEventDelivery) => Promise<void>;
+	warningSink?: CompactionWarningSink;
+}
+
+interface CompactionDispatch extends CompactionStrategyResolution {
+	reason: "configured" | "automatic-openai-codex" | "automatic-default";
 }
 
 function preludePath(): string {
@@ -167,7 +179,8 @@ export class RiemannRuntime {
 
 	static async createRoot(ctx: ExtensionContext, options: RiemannRootOptions = {}): Promise<RiemannRuntime> {
 		const agentDir = getRiemannAgentDir();
-		const config = await loadRiemannConfig({ cwd: ctx.cwd, agentDir, projectTrusted: ctx.isProjectTrusted() });
+		const configLoadOptions = { cwd: ctx.cwd, agentDir, projectTrusted: ctx.isProjectTrusted() };
+		const config = await loadRiemannConfig(configLoadOptions);
 		const store = new RiemannStore(agentDir);
 		const run = store.openRun(ctx.sessionManager.getSessionId(), ctx.cwd);
 		const retentionReport = await applyRetention(store, config.retention);
@@ -193,14 +206,27 @@ export class RiemannRuntime {
 			rootAgent,
 			rootContext,
 			agentDir,
+			projectTrusted: configLoadOptions.projectTrusted,
 			config,
 			deliverAgentEvents: options.deliverAgentEvents,
+			warningSink: options.warningSink,
 			createChildRuntime: async (agent) => {
 				const child = await RiemannRuntime.createChild(shared, agent);
 				return child.asChildRuntime();
 			},
 		});
-		shared = { config, store, artifacts, run, rootAgent, supervisor, agentDir, retentionReport, rootContext };
+		shared = {
+			config,
+			configLoadOptions,
+			store,
+			artifacts,
+			run,
+			rootAgent,
+			supervisor,
+			agentDir,
+			retentionReport,
+			rootContext,
+		};
 		return new RiemannRuntime(shared, rootAgent, true, await existingExaKey(config));
 	}
 
@@ -444,7 +470,7 @@ export class RiemannRuntime {
 		return inventory ? `## Configured MCP servers\n\n${inventory}` : "";
 	}
 
-	private durableState(): JsonValue {
+	private durableState(compaction: CompactionDispatch): JsonValue {
 		const agents = this.shared.store.listAgents(this.shared.run.id);
 		const pendingEvents = this.shared.store.listPendingAgentEvents(this.agent.id);
 		return {
@@ -472,7 +498,9 @@ export class RiemannRuntime {
 			})),
 			pending_agent_events: pendingEvents.map((event) => event.id),
 			compaction: {
-				strategy: this.shared.config.compaction.strategy,
+				configured: compaction.configured,
+				effective: compaction.effective,
+				reason: compaction.reason,
 			},
 			config_files: this.shared.config.files,
 		};
@@ -484,34 +512,61 @@ export class RiemannRuntime {
 		signal: AbortSignal,
 		context: Pick<ExtensionContext, "model" | "modelRegistry" | "getSystemPrompt" | "thinkingLevel">,
 	): Promise<CompactionResult> {
-		const durableState = this.durableState();
-		const strategy = this.shared.config.compaction.strategy;
-		if (strategy === "openai") {
-			return createRiemannOpenAICompaction({
+		const configured = (await loadRiemannConfig(this.shared.configLoadOptions)).compaction.strategy;
+		const dispatchContext = {
+			model: context.model,
+			modelRegistry: context.modelRegistry,
+			getSystemPrompt: context.getSystemPrompt,
+			thinkingLevel: context.thinkingLevel,
+		};
+		const resolution = resolveCompactionStrategy(configured, dispatchContext.model);
+		const dispatch: CompactionDispatch = {
+			...resolution,
+			reason:
+				configured !== "automatic"
+					? "configured"
+					: resolution.effective === "openai"
+						? "automatic-openai-codex"
+						: "automatic-default",
+		};
+		const durableState = this.durableState(dispatch);
+		let result: CompactionResult;
+		if (dispatch.effective === "openai") {
+			result = await createRiemannOpenAICompaction({
 				preparation,
 				customInstructions,
 				signal,
-				context,
+				context: dispatchContext,
 				durableState,
 				sessionId: this.shared.run.sessionId,
 			});
-		}
-		if (strategy === "snapshot") {
+		} else if (dispatch.effective === "snapshot") {
 			if (customInstructions !== undefined) {
 				throw new Error(
 					'compaction.strategy "snapshot" does not support custom instructions; configure strategy "default"',
 				);
 			}
-			return createRiemannSnapshotCompaction({ preparation, signal, context, durableState });
+			result = await createRiemannSnapshotCompaction({
+				preparation,
+				signal,
+				context: dispatchContext,
+				durableState,
+			});
+		} else {
+			result = await createRiemannCompaction({
+				preparation,
+				includeImages: this.root,
+				customInstructions,
+				signal,
+				context: dispatchContext,
+				durableState,
+			});
 		}
-		return createRiemannCompaction({
-			preparation,
-			includeImages: this.root,
-			customInstructions,
-			signal,
-			context,
-			durableState,
-		});
+		const resultDetails =
+			typeof result.details === "object" && result.details !== null && !Array.isArray(result.details)
+				? result.details
+				: {};
+		return { ...result, details: { ...resultDetails, ...dispatch } };
 	}
 
 	systemPrompt(kind: "main" | "child"): string {

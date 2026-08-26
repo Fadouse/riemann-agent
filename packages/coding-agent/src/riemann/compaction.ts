@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { contentText, type Message, type Usage } from "@earendil-works/pi-ai";
-import { type CompactionPreparation, type CompactionResult, estimateTokens } from "../core/compaction/index.ts";
+import {
+	type CompactionPreparation,
+	type CompactionResult,
+	estimateTokens,
+	getSummarizationFailure,
+} from "../core/compaction/index.ts";
 import { collectConversationImages, serializeConversation } from "../core/compaction/utils.ts";
 import type { ExtensionContext } from "../core/extensions/types.ts";
 import { convertToLlm } from "../core/messages.ts";
@@ -116,9 +121,11 @@ async function createSemanticSection(options: {
 			signal: options.signal,
 		},
 	);
-	if (response.stopReason === "error" || response.stopReason === "aborted") {
-		throw new Error(response.errorMessage || `Riemann compaction ${response.stopReason}`);
+	if (response.stopReason === "aborted") {
+		throw new Error(response.errorMessage || "Riemann compaction aborted");
 	}
+	const failure = getSummarizationFailure(response, "Riemann compaction");
+	if (failure) throw new Error(failure);
 	const text = contentText(response.content).trim();
 	if (!text) throw new Error("Riemann compaction returned an empty summary");
 	return { text, usage: response.usage };
