@@ -1,0 +1,27 @@
+name: nix-build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install official Nix 2.34.7
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            https://releases.nixos.org/nix/nix-2.34.7/install -o /tmp/install-nix
+          echo 'e9d447ce3d2ff62d7ff9cb6ef401de6fa8acb148839dd00f7271945d7b638b14  /tmp/install-nix' | sha256sum -c -
+          sh /tmp/install-nix --no-daemon --yes
+      - name: Build locally from pinned sources
+        shell: bash
+        run: |
+          . "$HOME/.nix-profile/etc/profile.d/nix.sh"
+          nix flake check --print-build-logs
