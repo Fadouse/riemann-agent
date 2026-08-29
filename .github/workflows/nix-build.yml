@@ -24,4 +24,4 @@ jobs:
         shell: bash
         run: |
           . "$HOME/.nix-profile/etc/profile.d/nix.sh"
-          nix flake check --print-build-logs
+          nix --extra-experimental-features 'nix-command flakes' flake check --print-build-logs
