@@ -59,7 +59,7 @@ describe("truncateToWidth", () => {
 
 	it("keeps a contiguous prefix instead of skipping a wide grapheme and resuming later", () => {
 		const truncated = truncateToWidth("🙂\t界 \x1b_abc\x07", 7, "…", true);
-		assert.strictEqual(truncated, "🙂\t\x1b[0m…\x1b[0m ");
+		assert.strictEqual(truncated, "🙂   \x1b[0m…\x1b[0m ");
 	});
 });
 

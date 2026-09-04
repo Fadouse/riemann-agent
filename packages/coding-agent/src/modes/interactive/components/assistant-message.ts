@@ -4,6 +4,7 @@ import {
 	Container,
 	Markdown,
 	type MarkdownTheme,
+	MouseRegion,
 	Spacer,
 	Text,
 	truncateToWidth,
@@ -105,6 +106,7 @@ export class AssistantMessageComponent extends Container {
 	private lastMessage?: AssistantMessage;
 	private hasToolCalls = false;
 	private isStreaming = false;
+	private thinkingVisibilityOverrides = new Map<number, boolean>();
 
 	constructor(
 		message?: AssistantMessage,
@@ -140,6 +142,7 @@ export class AssistantMessageComponent extends Container {
 
 	setHideThinkingBlock(hide: boolean): void {
 		this.hideThinkingBlock = hide;
+		this.thinkingVisibilityOverrides.clear();
 		if (this.lastMessage) {
 			this.updateContent(this.lastMessage);
 		}
@@ -188,6 +191,7 @@ export class AssistantMessageComponent extends Container {
 		}
 
 		// Render content in order
+		let thinkingRunIndex = 0;
 		for (let i = 0; i < message.content.length; i++) {
 			const content = message.content[i];
 			if (content.type === "text" && content.text.trim()) {
@@ -223,28 +227,45 @@ export class AssistantMessageComponent extends Container {
 					.some((c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()));
 
 				const combinedThinking = thinkingBlocks.join("\n\n");
-				if (this.hideThinkingBlock) {
-					this.contentContainer.addChild(
-						new CollapsedThinkingRow(thinkingRecap(combinedThinking, this.hiddenThinkingLabel), this.outputPad),
+				const runIndex = thinkingRunIndex++;
+				const visibilityOverride = this.thinkingVisibilityOverrides.get(runIndex);
+				const hidden = visibilityOverride ?? this.hideThinkingBlock;
+				let thinkingComponent: Component;
+				if (!hidden) {
+					thinkingComponent = new Markdown(
+						combinedThinking,
+						this.outputPad,
+						0,
+						getThinkingMarkdownTheme(this.markdownTheme),
+						{ color: (text: string) => theme.fg("thinkingText", text) },
+						{
+							transform: createMarkdownTransform(
+								"assistant-thinking",
+								this.isStreaming,
+								this.markdownTransformers,
+							),
+						},
+					);
+				} else if (visibilityOverride === true) {
+					thinkingComponent = new Text(
+						theme.italic(theme.fg("thinkingText", this.hiddenThinkingLabel)),
+						this.outputPad,
+						0,
 					);
 				} else {
-					this.contentContainer.addChild(
-						new Markdown(
-							combinedThinking,
-							this.outputPad,
-							0,
-							getThinkingMarkdownTheme(this.markdownTheme),
-							{ color: (text: string) => theme.fg("thinkingText", text) },
-							{
-								transform: createMarkdownTransform(
-									"assistant-thinking",
-									this.isStreaming,
-									this.markdownTransformers,
-								),
-							},
-						),
+					thinkingComponent = new CollapsedThinkingRow(
+						thinkingRecap(combinedThinking, this.hiddenThinkingLabel),
+						this.outputPad,
 					);
 				}
+				this.contentContainer.addChild(
+					new MouseRegion(thinkingComponent, (event) => {
+						if (event.type !== "click" || event.button !== "left") return undefined;
+						this.thinkingVisibilityOverrides.set(runIndex, !hidden);
+						if (this.lastMessage) this.updateContent(this.lastMessage);
+						return { handled: true };
+					}),
+				);
 				if (hasVisibleContentAfter) {
 					this.contentContainer.addChild(new Spacer(1));
 				}

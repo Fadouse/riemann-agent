@@ -40,6 +40,7 @@ describe("issue #2791 fs.watch error event crashes process", () => {
 
 	it("process should survive an error event on the theme FSWatcher", () => {
 		const themeModulePath = join(__dirname, "../../../src/modes/interactive/theme/theme.ts").replace(/\\/g, "/");
+		const sourceResolverPath = join(__dirname, "../../../src/experimental/source-resolver.ts");
 		const agentDir = join(tempRoot, "agent").replace(/\\/g, "/");
 
 		// Script that sets up the watcher and emits a synthetic error on it.
@@ -87,7 +88,7 @@ process.exit(0);
 		let stderr = "";
 		let exitCode: number;
 		try {
-			_stdout = execFileSync(process.execPath, [scriptPath], {
+			_stdout = execFileSync(process.execPath, ["--import", sourceResolverPath, scriptPath], {
 				timeout: 10000,
 				encoding: "utf-8",
 				env: { ...process.env, RIEMANN_CODING_AGENT_DIR: agentDir },

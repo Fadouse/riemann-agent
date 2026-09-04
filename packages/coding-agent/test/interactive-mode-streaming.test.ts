@@ -39,6 +39,7 @@ type StreamingContext = {
 	toolOutputExpanded: boolean;
 	chatContainer: Container;
 	getRegisteredToolDefinition(): undefined;
+	maybeShowAssistantDiagnostics(message: AssistantMessage): void;
 	maybeShowCacheMissNotice(message: AssistantMessage): void;
 	clearStatusIndicator(kind?: "working"): void;
 };
@@ -123,6 +124,7 @@ function createStreamingContext(transform?: (markdown: string) => string): {
 		toolOutputExpanded: false,
 		chatContainer,
 		getRegisteredToolDefinition: () => undefined,
+		maybeShowAssistantDiagnostics: vi.fn(),
 		maybeShowCacheMissNotice: vi.fn(),
 		clearStatusIndicator: vi.fn(),
 	};

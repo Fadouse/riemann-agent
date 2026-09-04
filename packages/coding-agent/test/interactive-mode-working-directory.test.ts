@@ -43,6 +43,7 @@ type ApplyRuntimeSettingsContext = {
 		getHttpIdleTimeoutMs: () => number;
 		getOutputPad: () => number;
 		getShowHardwareCursor: () => boolean;
+		getTerminalCapabilityOverrides: () => Record<string, never>;
 	};
 	statusContainer: { clear: () => void };
 	ui: WorkingDirectoryUi & {
@@ -116,6 +117,7 @@ describe("InteractiveMode working directory", () => {
 				getHttpIdleTimeoutMs: () => 30_000,
 				getOutputPad: () => 1,
 				getShowHardwareCursor: () => false,
+				getTerminalCapabilityOverrides: () => ({}),
 			},
 			statusContainer: { clear: vi.fn() },
 			ui: {

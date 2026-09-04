@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 
 interface CodingAgentPackageJson {
-	bin: { pi: string };
+	bin: { riemann: string };
 	main: string;
 	exports: {
 		".": { import: string; types: string };
@@ -16,11 +16,11 @@ const packageJson = JSON.parse(
 ) as CodingAgentPackageJson;
 
 describe("package distribution entrypoints", () => {
-	test("uses the bundle for executables and modular output for libraries", () => {
-		expect(packageJson.bin.pi).toBe("dist/bundle/cli.js");
+	test("uses Riemann executables and modular library output", () => {
+		expect(packageJson.bin.riemann).toBe("dist/cli.js");
 		expect(packageJson.main).toBe("./dist/index.js");
 		expect(packageJson.exports["."].import).toBe("./dist/index.js");
 		expect(packageJson.exports["./client"].import).toBe("./dist/client/index.js");
-		expect(packageJson.exports["./rpc-entry"].import).toBe("./dist/bundle/rpc-entry.js");
+		expect(packageJson.exports["./rpc-entry"].import).toBe("./dist/rpc-entry.js");
 	});
 });

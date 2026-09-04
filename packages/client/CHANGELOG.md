@@ -2,9 +2,7 @@
 
 ## [Unreleased]
 
-### Added
-
-- Added image attachments to `SessionLease.prompt()` and `SessionLease.steer()`.
+## [0.84.4] - 2026-08-28
 
 ## [0.84.3] - 2026-08-24
 

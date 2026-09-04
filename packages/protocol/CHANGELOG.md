@@ -2,9 +2,7 @@
 
 ## [Unreleased]
 
-### Breaking Changes
-
-- Bumped the remote session protocol to version 2 and added image attachments, including image detail hints, to prompt and steer commands.
+## [0.84.4] - 2026-08-28
 
 ## [0.84.3] - 2026-08-24
 
