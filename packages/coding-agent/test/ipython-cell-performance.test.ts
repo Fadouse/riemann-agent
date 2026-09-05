@@ -20,7 +20,7 @@ describe("IPython cell derived state", () => {
 		try {
 			component.update({ ...state, details: { status: "ok", durationMs: 2 } });
 			const lines = component.render(100);
-			expect(stripAnsi(lines.join("\n"))).toContain("↑ 20000 ↓ 100000 lines");
+			expect(stripAnsi(lines.join("\n"))).toContain("output");
 			expect(split.mock.contexts.some((text) => String(text).length > 100_000)).toBe(false);
 		} finally {
 			split.mockRestore();
@@ -42,7 +42,7 @@ describe("IPython cell derived state", () => {
 			{ code: "a\rb", content: [{ type: "text", text: "a\r\nb\r" }] },
 		];
 		for (const original of cases) {
-			const state = { ...original, details: { status: "ok" } };
+			const state = { ...original, details: { status: "ok" }, expanded: true };
 			const component = new IPythonCellComponent(state);
 			for (let iteration = 0; iteration < 2; iteration++) {
 				const input = state.code.split(/\r?\n/).filter((line) => line.trim()).length;
@@ -67,7 +67,8 @@ describe("IPython cell derived state", () => {
 		const content = new Array<{ type: string; text?: string }>(3);
 		content[2] = { type: "text", text: "one\ntwo" };
 		const component = new IPythonCellComponent({ code: "print(1)", content, details: { status: "ok" } });
-		expect(stripAnsi(component.render(100).join("\n"))).toContain("↑ 1 ↓ 2 lines");
+		expect(stripAnsi(component.render(100).join("\n"))).toContain("one");
+		expect(stripAnsi(component.render(100).join("\n"))).toContain("two");
 	});
 
 	test("drops hidden render caches and reconstructs complete activities when shown again", () => {

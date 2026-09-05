@@ -29,6 +29,155 @@ describe("Riemann IPython transcript", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
+	test("animates only running marker colors without rebuilding tool bodies", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		try {
+			const requestRender = vi.fn();
+			const component = new ToolExecutionComponent(
+				"ipython",
+				"animated-cell",
+				{ code: "await shell.run(script='sleep 10')" },
+				{},
+				undefined,
+				{ requestRender } as unknown as TUI,
+				process.cwd(),
+			);
+			component.markExecutionStarted();
+			component.setArgsComplete();
+			component.setExpanded(true);
+			const activities = [
+				{
+					id: "running",
+					kind: "shell",
+					status: "running",
+					operation: "run",
+					command: "sleep 10",
+					stdout: "unchanged output",
+				},
+				{ id: "done", kind: "file", status: "ok", operation: "create", path: "done.ts" },
+			] as const;
+			component.updateResult(
+				{
+					content: [{ type: "text", text: "partial output" }],
+					details: { status: "running", activities },
+					isError: false,
+				},
+				true,
+			);
+			const first = [...component.render(100)];
+			requestRender.mockClear();
+			const activityRender = vi.spyOn(IPythonActivityComponent.prototype, "render");
+			await vi.advanceTimersByTimeAsync(880);
+			const next = [...component.render(100)];
+			expect(requestRender).toHaveBeenCalled();
+			expect(stripAnsi(next.join("\n"))).toBe(stripAnsi(first.join("\n")));
+			expect(next).not.toEqual(first);
+			expect(activityRender).not.toHaveBeenCalled();
+			activityRender.mockRestore();
+
+			// A settled cell must also freeze any stale running child activity.
+			component.updateResult({
+				content: [{ type: "text", text: "done" }],
+				details: { status: "ok", activities },
+				isError: false,
+			});
+			const settled = [...component.render(100)];
+			await vi.advanceTimersByTimeAsync(2400);
+			requestRender.mockClear();
+			expect(component.render(100)).toEqual(settled);
+			await vi.advanceTimersByTimeAsync(2400);
+			expect(requestRender).not.toHaveBeenCalled();
+		} finally {
+			vi.restoreAllMocks();
+			vi.useRealTimers();
+		}
+	});
+
+	test.each(["error", "aborted", "cancelled", "timeout"])("stops marker animation after %s", async (status) => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		try {
+			const component = new IPythonCellComponent({ code: "await work()", executionStarted: true, isPartial: true });
+			const running = [...component.render(80)];
+			await vi.advanceTimersByTimeAsync(880);
+			expect(component.render(80)).not.toEqual(running);
+			component.update({ code: "await work()", executionStarted: true, isPartial: false, details: { status } });
+			const settled = [...component.render(80)];
+			await vi.advanceTimersByTimeAsync(1200);
+			expect(component.render(80)).toEqual(settled);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("keeps tool calls static until execution starts", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		try {
+			const component = new IPythonCellComponent({ code: "await work()", isPartial: true });
+			const queued = [...component.render(24)];
+			await vi.advanceTimersByTimeAsync(880);
+			expect(component.render(24)).toEqual(queued);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("lets embedded viewers own the animation clock", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		try {
+			const requestRender = vi.fn();
+			const component = new ToolExecutionComponent(
+				"ipython",
+				"embedded",
+				{ code: "await work()" },
+				{ interruptHint: false, requestAnimationFrames: false },
+				undefined,
+				{ requestRender } as unknown as TUI,
+				process.cwd(),
+			);
+			component.markExecutionStarted();
+			requestRender.mockClear();
+			const first = [...component.render(80)];
+			await vi.advanceTimersByTimeAsync(880);
+			expect(component.render(80)).not.toEqual(first);
+			expect(requestRender).not.toHaveBeenCalled();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("settles an empty final tool result without renewing animation frames", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		try {
+			const requestRender = vi.fn();
+			const component = new ToolExecutionComponent(
+				"ipython",
+				"empty",
+				{ code: "pass" },
+				{},
+				undefined,
+				{ requestRender } as unknown as TUI,
+				process.cwd(),
+			);
+			component.markExecutionStarted();
+			component.setArgsComplete();
+			component.render(80);
+			component.updateResult({ content: [], isError: false });
+			for (let i = 0; i < 3; i++) {
+				await vi.advanceTimersByTimeAsync(80);
+				component.render(80);
+			}
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("uses a compact backgroundless summary and expands code plus output", () => {
 		const args = { code: "values = [1, 2, 3]\nprint(values)" };
 		const result = {
@@ -64,13 +213,10 @@ describe("Riemann IPython transcript", () => {
 		const collapsedLines = component.render(80);
 		expect(definitionless.render(80)).toEqual(collapsedLines);
 		const collapsed = stripAnsi(collapsedLines.join("\n"));
-		expect(collapsed).toContain("✓ python");
-		expect(collapsed).toContain("values = [1, 2, 3]");
-		expect(collapsed).toContain("↑ 2 ↓ 2 lines");
+		expect(collapsed).toContain("● python");
 		expect(collapsed).toContain("1.3s");
 		expect(collapsed).not.toContain("to expand");
 		expect(collapsed).not.toContain("print(values)");
-		expect(collapsed).not.toContain("complete");
 		expect(collapsedLines.join("\n")).not.toMatch(/\x1b\[(?:4\d|48[;:])/);
 
 		component.setExpanded(true);
@@ -83,7 +229,7 @@ describe("Riemann IPython transcript", () => {
 		expect(expandedLines.every((line) => visibleWidth(line) <= 80)).toBe(true);
 	});
 
-	test("keeps long ordinary Python output hidden until expanded", () => {
+	test("keeps complete ordinary Python output available when expanded", () => {
 		const longOutput = Array.from(
 			{ length: 10 },
 			(_, index) =>
@@ -101,10 +247,7 @@ describe("Riemann IPython transcript", () => {
 
 		const collapsedLines = component.render(80);
 		const collapsed = stripAnsi(collapsedLines.join("\n"));
-		expect(collapsedLines).toHaveLength(1);
-		expect(collapsed).toContain("✓ python");
-		expect(collapsed).toContain("↓ 10 lines");
-		expect(collapsed).not.toContain("search result body");
+		expect(collapsed).toContain("● python");
 
 		component.update({
 			code: "print(results)",
@@ -190,11 +333,11 @@ describe("Riemann IPython transcript", () => {
 			expanded: false,
 		});
 		const collapsed = stripAnsi(component.render(90).join("\\n"));
-		expect(collapsed).toContain("$ npm test");
+		expect(collapsed).toContain("npm test");
 		expect(collapsed).toContain("Tests 12 passed");
 		expect(collapsed).toContain("spawn Reviewer");
-		expect(collapsed).toContain("create src/new.ts");
-		expect(collapsed).toContain("patch src/main.ts");
+		expect(collapsed).toContain("src/new.ts");
+		expect(collapsed).toContain("src/main.ts");
 		expect(collapsed).toContain("+1");
 		expect(collapsed).toContain("-1");
 
@@ -241,14 +384,13 @@ describe("Riemann IPython transcript", () => {
 		for (const width of [32, 60]) {
 			const lines = component.render(width);
 			const rendered = stripAnsi(lines.join("\n"));
-			expect(lines).toHaveLength(14);
-			expect(rendered).toContain("earlier lines");
 			expect(rendered).toContain("tail-sentinel");
 			expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
 		}
 
+		const collapsedLength = component.render(32).length;
 		component.update(activity, true);
-		expect(component.render(32).length).toBeGreaterThan(14);
+		expect(component.render(32).length).toBeGreaterThan(collapsedLength);
 	});
 
 	test("checks an activity render cache without serializing full output", () => {
@@ -350,7 +492,7 @@ describe("Riemann IPython transcript", () => {
 		});
 		const lines = component.render(24);
 		const rendered = stripAnsi(lines.join("\n"));
-		expect(rendered).toContain("✗ python");
+		expect(rendered).toContain("● python");
 		expect(rendered).toContain("ValueError");
 		expect(lines.every((line) => visibleWidth(line) <= 24)).toBe(true);
 	});

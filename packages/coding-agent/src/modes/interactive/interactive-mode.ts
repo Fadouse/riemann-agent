@@ -590,6 +590,7 @@ export class InteractiveMode {
 			autocompleteMaxVisible,
 			highlightImageMarker: (text) => theme.bold(theme.fg("accent", text)),
 			embedWorkingStatus: true,
+			showPrompt: true,
 		});
 		this.editor = this.defaultEditor;
 		this.editorContainer = new Container();
@@ -4457,9 +4458,13 @@ export class InteractiveMode {
 				const text = theme.fg("dim", `Follow-up: ${message}`);
 				this.pendingMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
-			const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
-			const hintText = theme.fg("dim", `↳ ${dequeueHint} to edit all queued messages`);
-			this.pendingMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
+			// Keep the main composer uncluttered.
+			// Replacement editors retain the existing queue-local hint.
+			if (this.editor !== this.defaultEditor) {
+				const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
+				const hintText = theme.fg("dim", `↳ ${dequeueHint} to edit all queued messages`);
+				this.pendingMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
+			}
 		}
 	}
 
@@ -4473,8 +4478,30 @@ export class InteractiveMode {
 			}
 			return 0;
 		}
-		const queuedText = allQueued.map((message) => message.text).join("\n\n");
-		const currentText = options?.currentText ?? this.editor.getText();
+		const queuedText = allQueued
+			.map((message) => {
+				let text = message.text;
+				if (message.images?.length) {
+					const markedImages = this.collectImagesFor(text) ?? [];
+					for (const image of message.images) {
+						const markedIndex = markedImages.findIndex(
+							(marked) => marked.data === image.data && marked.mimeType === image.mimeType,
+						);
+						if (markedIndex !== -1) {
+							// Each marker accounts for one attachment, even when image bytes are identical.
+							markedImages.splice(markedIndex, 1);
+							continue;
+						}
+						// Extension/API-queued images may not have a clipboard marker yet.
+						const id = this.nextImageMarkerId++;
+						this.pastedImages.set(id, image);
+						text = `${text} ${formatImageMarker(id)}`;
+					}
+				}
+				return text;
+			})
+			.join("\n\n");
+		const currentText = options?.currentText ?? this.editor.getExpandedText?.() ?? this.editor.getText();
 		const combinedText = [queuedText, currentText].filter((value) => value.trim()).join("\n\n");
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();

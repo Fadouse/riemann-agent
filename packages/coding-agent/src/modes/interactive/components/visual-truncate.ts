@@ -22,6 +22,7 @@ export interface VisualTruncateResult {
  * @param paddingX - Horizontal padding for Text component (default 0).
  *                   Use 0 when result will be placed in a Box (Box adds its own padding).
  *                   Use 1 when result will be placed in a plain Container.
+ * @param headVisualLines Optional number of leading rows to keep within the same budget.
  * @returns The truncated visual lines and count of skipped lines
  */
 export function truncateToVisualLines(
@@ -29,6 +30,7 @@ export function truncateToVisualLines(
 	maxVisualLines: number,
 	width: number,
 	paddingX: number = 0,
+	headVisualLines: number = 0,
 ): VisualTruncateResult {
 	if (!text) {
 		return { visualLines: [], skippedCount: 0 };
@@ -47,6 +49,9 @@ export function truncateToVisualLines(
 	const margin = " ".repeat(padding);
 	const contentWidth = Math.max(1, width - padding * 2);
 	const keep = Math.trunc(maxVisualLines);
+	const headCount = Math.min(keep, Math.max(0, Math.trunc(headVisualLines) || 0));
+	const tailCount = keep - headCount;
+	const head: string[] = [];
 	const tail: string[] = [];
 	let next = 0;
 	let count = 0;
@@ -55,13 +60,14 @@ export function truncateToVisualLines(
 	// of the full document. The source and expanded output remain unchanged.
 	for (const line of wrapTextWithAnsiIterator(text, contentWidth)) {
 		count++;
-		if (tail.length < keep) tail.push(line);
-		else {
+		if (head.length < headCount) head.push(line);
+		else if (tail.length < tailCount) tail.push(line);
+		else if (tailCount > 0) {
 			tail[next] = line;
-			next = (next + 1) % keep;
+			next = (next + 1) % tailCount;
 		}
 	}
-	const ordered = next === 0 ? tail : tail.slice(next).concat(tail.slice(0, next));
+	const ordered = head.concat(next === 0 ? tail : tail.slice(next).concat(tail.slice(0, next)));
 	const visualLines = ordered.map((line) => {
 		const padded = margin + line + margin;
 		return padded + " ".repeat(Math.max(0, width - visibleWidth(padded)));

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added optional editor content prefixes and placeholders with matching cursor, mouse, and completion geometry.
 - Added opt-in stable Markdown block reuse, complete wrapped-line iteration, and customizable undo snapshot cloning.
 
 ### Changed
@@ -15,6 +16,7 @@
 
 ### Fixed
 
+- Invalidated stale completions after editing and navigation, and preserved visual cursor columns across wide Unicode characters.
 - Fixed mouse hover changing selection and recentering autocomplete and settings lists, causing clicks to target a different item.
 
 - Fixed short width-cache keys retaining entire previous message strings and preserved surrogate pairs across terminal write chunks.

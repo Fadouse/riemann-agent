@@ -3,7 +3,6 @@ import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/p
 import type { AgentSession } from "../../../core/agent-session.ts";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
-import { addUsageToTotals, createUsageTotals } from "../../../core/usage-totals.ts";
 import { theme } from "../theme/theme.ts";
 
 /**
@@ -44,18 +43,14 @@ export function formatCwdForFooter(cwd: string, home: string | undefined): strin
 }
 
 /**
- * Footer component that shows pwd, token stats, and context usage.
- * Computes token/context stats from session, gets git branch and extension statuses from provider.
+ * Compact model/context footer. Detailed token, cache and cost statistics remain
+ * available through /session; branch and extension statuses come from the provider.
  */
 export class FooterComponent implements Component {
 	private autoCompactEnabled = true;
 	private session: AgentSession;
 	private footerData: ReadonlyFooterDataProvider;
-	private cachedUsageStats?: {
-		usageTotals: ReturnType<typeof createUsageTotals>;
-		latestCacheHitRate: number | undefined;
-		contextUsage: ReturnType<AgentSession["getContextUsage"]>;
-	};
+	private cachedContext?: { usage: ReturnType<AgentSession["getContextUsage"]> };
 
 	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
 		this.session = session;
@@ -64,193 +59,102 @@ export class FooterComponent implements Component {
 
 	setSession(session: AgentSession): void {
 		this.session = session;
-		this.cachedUsageStats = undefined;
+		this.invalidate();
 	}
 
 	setAutoCompactEnabled(enabled: boolean): void {
 		this.autoCompactEnabled = enabled;
 	}
 
-	/** Invalidate history-derived usage while branch data remains provider-cached. */
+	/** Invalidate history-derived context while branch data remains provider-cached. */
 	invalidate(): void {
-		this.cachedUsageStats = undefined;
+		this.cachedContext = undefined;
 	}
 
-	private getUsageStats(): NonNullable<FooterComponent["cachedUsageStats"]> {
-		if (this.cachedUsageStats) return this.cachedUsageStats;
-
-		const usageTotals = createUsageTotals();
-		let latestCacheHitRate: number | undefined;
-		for (const entry of this.session.sessionManager.getEntries()) {
-			if (entry.type === "message" && entry.message.role === "assistant") {
-				addUsageToTotals(usageTotals, entry.message.usage);
-				const latestPromptTokens =
-					entry.message.usage.input + entry.message.usage.cacheRead + entry.message.usage.cacheWrite;
-				latestCacheHitRate =
-					latestPromptTokens > 0 ? (entry.message.usage.cacheRead / latestPromptTokens) * 100 : undefined;
-			} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
-				addUsageToTotals(usageTotals, entry.message.usage);
-			} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
-				addUsageToTotals(usageTotals, entry.usage);
-			}
-		}
-
-		this.cachedUsageStats = {
-			usageTotals,
-			latestCacheHitRate,
-			contextUsage: this.session.getContextUsage(),
-		};
-		return this.cachedUsageStats;
-	}
-
-	/**
-	 * Clean up resources.
-	 * Git watcher cleanup now handled by provider.
-	 */
 	dispose(): void {
 		// Git watcher cleanup handled by provider
 	}
 
 	render(width: number): string[] {
 		const state = this.session.state;
+		// getContextUsage can traverse the active branch. Cache even an unknown result
+		// so spinner/editor repaints do not repeatedly walk session history.
+		this.cachedContext ??= { usage: this.session.getContextUsage() };
+		const contextUsage = this.cachedContext.usage;
+		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow;
+		const percent = contextUsage?.percent;
+		const contextText = `${percent == null ? "?" : `${percent.toFixed(1)}%`}/${contextWindow ? formatTokens(contextWindow) : "?"}`;
+		const context =
+			percent != null && percent > 90
+				? theme.fg("error", contextText)
+				: percent != null && percent > 70
+					? theme.fg("warning", contextText)
+					: contextText;
 
-		// Usage only changes when session events invalidate the footer. Cache the
-		// history scan so editor, spinner, branch, and overlay renders stay O(1).
-		const { usageTotals, latestCacheHitRate, contextUsage } = this.getUsageStats();
-		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
-		const contextPercentValue = contextUsage?.percent ?? 0;
-		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
+		const modelName = sanitizeStatusText(state.model?.id || "no-model");
+		const thinkingLevel = state.thinkingLevel || "off";
+		const thinking = state.model?.reasoning ? ` • ${thinkingLevel === "off" ? "thinking off" : thinkingLevel}` : "";
+		let right = `${modelName}${thinking} • ${context}`;
+		if (visibleWidth(right) > width) {
+			right = `${modelName} • ${context}`;
+		}
+		if (visibleWidth(right) > width) {
+			// Reserve context before truncating a long model name. At tiny widths only
+			// context fits; never let a long identifier push it completely offscreen.
+			const modelWidth = width - visibleWidth(context) - 3;
+			right =
+				modelWidth > 0
+					? `${truncateToWidth(modelName, modelWidth, "…")} • ${context}`
+					: truncateToWidth(context, width, "");
+		}
 
-		// Replace home directory with ~
-		let pwd = formatCwdForFooter(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
-
-		// Add git branch if available
+		const sessionName = sanitizeStatusText(this.session.sessionManager.getSessionName() ?? "");
+		let directory = sanitizeStatusText(
+			formatCwdForFooter(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE),
+		);
 		const branch = this.footerData.getGitBranch();
-		if (branch) {
-			pwd = `${pwd} (${branch})`;
+		if (branch) directory += ` (${sanitizeStatusText(branch)})`;
+		let left = sessionName ? `${directory} • ${sessionName}` : directory;
+		let separateSession = false;
+		if (visibleWidth(right) + 2 + visibleWidth(left) > width) {
+			// Directory is secondary. Keep a named session in the existing footer area
+			// with an explicit /session entry when it cannot share the primary row.
+			left = "";
+			separateSession = !!sessionName;
 		}
 
-		// Add session name if set
-		const sessionName = this.session.sessionManager.getSessionName();
-		if (sessionName) {
-			pwd = `${pwd} • ${sessionName}`;
-		}
-
-		// Build stats line
-		const statsParts = [];
-		if (usageTotals.input) statsParts.push(`↑${formatTokens(usageTotals.input)}`);
-		if (usageTotals.output) statsParts.push(`↓${formatTokens(usageTotals.output)}`);
-		if (usageTotals.cacheRead) statsParts.push(`R${formatTokens(usageTotals.cacheRead)}`);
-		if (usageTotals.cacheWrite) statsParts.push(`W${formatTokens(usageTotals.cacheWrite)}`);
-		if ((usageTotals.cacheRead > 0 || usageTotals.cacheWrite > 0) && latestCacheHitRate !== undefined) {
-			statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
-		}
-
-		// Kimi Coding is subscription-backed despite using API-key authentication.
-		const usingSubscription = state.model
-			? state.model.provider === "kimi-coding" || this.session.modelRuntime.isUsingSubscription(state.model.provider)
-			: false;
-		if (usageTotals.cost || usingSubscription) {
-			const costStr = `$${usageTotals.cost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`;
-			statsParts.push(costStr);
-		}
-
-		// Colorize context percentage based on usage
-		let contextPercentStr: string;
-		const autoIndicator = this.autoCompactEnabled ? " (auto)" : "";
-		const contextPercentDisplay =
-			contextPercent === "?"
-				? `?/${formatTokens(contextWindow)}${autoIndicator}`
-				: `${contextPercent}%/${formatTokens(contextWindow)}${autoIndicator}`;
-		if (contextPercentValue > 90) {
-			contextPercentStr = theme.fg("error", contextPercentDisplay);
-		} else if (contextPercentValue > 70) {
-			contextPercentStr = theme.fg("warning", contextPercentDisplay);
-		} else {
-			contextPercentStr = contextPercentDisplay;
-		}
-		statsParts.push(contextPercentStr);
-		if (areExperimentalFeaturesEnabled()) {
-			statsParts.push(`${theme.fg("dim", "•")} ${theme.bold(theme.fg("warning", "xp"))}`);
-		}
-
-		let statsLeft = statsParts.join(" ");
-
-		// Add model name on the right side, plus thinking level if model supports it
-		const modelName = state.model?.id || "no-model";
-
-		let statsLeftWidth = visibleWidth(statsLeft);
-
-		// If statsLeft is too wide, truncate it
-		if (statsLeftWidth > width) {
-			statsLeft = truncateToWidth(statsLeft, width, "...");
-			statsLeftWidth = visibleWidth(statsLeft);
-		}
-
-		// Calculate available space for padding (minimum 2 spaces between stats and model)
-		const minPadding = 2;
-
-		// Add thinking level indicator if model supports reasoning
-		let rightSideWithoutProvider = modelName;
-		if (state.model?.reasoning) {
-			const thinkingLevel = state.thinkingLevel || "off";
-			rightSideWithoutProvider =
-				thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
-		}
-
-		// Prepend the provider in parentheses if there are multiple providers and there's enough room
-		let rightSide = rightSideWithoutProvider;
 		if (this.footerData.getAvailableProviderCount() > 1 && state.model) {
-			rightSide = `(${state.model!.provider}) ${rightSideWithoutProvider}`;
-			if (statsLeftWidth + minPadding + visibleWidth(rightSide) > width) {
-				// Too wide, fall back
-				rightSide = rightSideWithoutProvider;
-			}
+			const provider = `(${sanitizeStatusText(state.model.provider)}) `;
+			if (visibleWidth(provider + right) + (left ? 2 + visibleWidth(left) : 0) <= width) right = provider + right;
+		}
+		const autoIndicator = this.autoCompactEnabled ? " (auto)" : " (manual)";
+		if (visibleWidth(right + autoIndicator) + (left ? 2 + visibleWidth(left) : 0) <= width) right += autoIndicator;
+		if (areExperimentalFeaturesEnabled()) {
+			const experimental = ` • ${theme.bold(theme.fg("warning", "xp"))}`;
+			if (visibleWidth(right + experimental) + (left ? 2 + visibleWidth(left) : 0) <= width) right += experimental;
 		}
 
-		const rightSideWidth = visibleWidth(rightSide);
-		const totalNeeded = statsLeftWidth + minPadding + rightSideWidth;
-
-		let statsLine: string;
-		if (totalNeeded <= width) {
-			// Both fit - add padding to right-align model
-			const padding = " ".repeat(width - statsLeftWidth - rightSideWidth);
-			statsLine = statsLeft + padding + rightSide;
-		} else {
-			// Need to truncate right side
-			const availableForRight = width - statsLeftWidth - minPadding;
-			if (availableForRight > 0) {
-				const truncatedRight = truncateToWidth(rightSide, availableForRight, "");
-				const truncatedRightWidth = visibleWidth(truncatedRight);
-				const padding = " ".repeat(Math.max(0, width - statsLeftWidth - truncatedRightWidth));
-				statsLine = statsLeft + padding + truncatedRight;
-			} else {
-				// Not enough space for right side at all
-				statsLine = statsLeft;
-			}
+		// Keep model/context at the right edge even when the directory cannot fit.
+		const padding = " ".repeat(width - visibleWidth(left) - visibleWidth(right));
+		const lines = [theme.fg("dim", left) + theme.fg("dim", padding + right)];
+		if (separateSession) {
+			const entry = " • /session";
+			const available = width - visibleWidth(entry);
+			const nameLine =
+				available > 0
+					? truncateToWidth(sessionName, available, "…") + entry
+					: truncateToWidth("/session", width, "");
+			lines.push(theme.fg("dim", nameLine));
 		}
 
-		// Apply dim to each part separately. statsLeft may contain color codes (for context %)
-		// that end with a reset, which would clear an outer dim wrapper. So we dim the parts
-		// before and after the colored section independently.
-		const dimStatsLeft = theme.fg("dim", statsLeft);
-		const remainder = statsLine.slice(statsLeft.length); // padding + rightSide
-		const dimRemainder = theme.fg("dim", remainder);
-
-		const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
-		const lines = [pwdLine, dimStatsLeft + dimRemainder];
-
-		// Add extension statuses on a single line, sorted by key alphabetically
+		// Preserve extension statuses on their own line, sorted by key alphabetically.
 		const extensionStatuses = this.footerData.getExtensionStatuses();
 		if (extensionStatuses.size > 0) {
 			const sortedStatuses = Array.from(extensionStatuses.entries())
 				.sort(([a], [b]) => a.localeCompare(b))
 				.map(([, text]) => sanitizeStatusText(text));
-			const statusLine = sortedStatuses.join(" ");
-			// Truncate to terminal width with dim ellipsis for consistency with footer style
-			lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+			lines.push(truncateToWidth(sortedStatuses.join(" "), width, theme.fg("dim", "...")));
 		}
-
 		return lines;
 	}
 }

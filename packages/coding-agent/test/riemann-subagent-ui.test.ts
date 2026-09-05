@@ -70,9 +70,9 @@ describe("Riemann Subagent UI", () => {
 		expect(rendered).toContain("select");
 		expect(rendered).toContain("● worker-6");
 		expect(rendered).toContain("○ worker-2");
-		expect(rendered).toContain("Task 6");
 		expect(rendered).toContain("↑ 2 more");
-		expect(rendered).toContain("12s · ↓ 13.1k tokens");
+		expect(rendered).toContain("12s");
+		expect(rendered).not.toContain("tokens");
 		expect(rendered).not.toContain("worker-0");
 		expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
 		expect(renderSubagentFleet([], theme)).toEqual([]);
@@ -132,12 +132,9 @@ describe("Riemann Subagent UI", () => {
 		const collapsedLines = viewer.render(100).map((line) => stripAnsi(line));
 		const collapsed = collapsedLines.join("\n");
 		expect(collapsed).toContain("Found two concrete defects.");
-		expect(collapsed).toContain("✓ python");
-		expect(collapsed).toContain("values = [1, 2, 3]");
-		expect(collapsed).toContain("↑ 2 ↓ 3 lines");
+		expect(collapsed).toContain("● python");
 		expect(collapsed).not.toContain('"code"');
 		expect(collapsed).not.toContain("print(values)");
-		expect(collapsed).not.toContain("complete");
 		expect(collapsed).not.toContain("[Assistant]");
 		expect(collapsed).not.toContain("private analysis");
 		expect(collapsedLines.length).toBeLessThan(20);
@@ -188,7 +185,7 @@ describe("Riemann Subagent UI", () => {
 
 		viewer.handleInput("\x1b[H");
 		const top = viewer.render(100).map((line) => stripAnsi(line));
-		expect(top.join("\n")).toContain("26%");
+		expect(top.join("\n")).toContain("26% paused");
 		expect(top.join("\n")).toContain("result line 0");
 
 		viewer.handleInput("\x1b[F");
@@ -213,13 +210,12 @@ describe("Riemann Subagent UI", () => {
 				live: false,
 			}),
 		];
-		const rendered = stripAnsi(
-			renderSubagentFleet(agents, theme, Date.parse("2026-08-13T12:00:12.000Z"), 80).join("\n"),
-		);
-		expect(rendered).toContain("✓ reviewer");
-		expect(rendered).toContain("✓ tester");
-		expect(rendered).not.toContain("● reviewer");
-		expect(rendered).not.toContain("Done");
+		const raw = renderSubagentFleet(agents, theme, Date.parse("2026-08-13T12:00:12.000Z"), 80).join("\n");
+		const rendered = stripAnsi(raw);
+		expect(rendered).toContain("● reviewer");
+		expect(rendered).toContain("● tester");
+		expect(raw).toContain(theme.fg("success", "●"));
+		expect(raw).not.toContain(theme.fg("accent", "●"));
 		expect(rendered).not.toContain("Review parser changes");
 		expect(rendered).not.toContain("tokens");
 	});
@@ -263,8 +259,15 @@ describe("Riemann Subagent UI", () => {
 			const installed = widgetUpdates[0];
 			expect(installed).toMatchObject({ key: "riemann-subagents:fleet", options: { placement: "belowEditor" } });
 			if (!installed || typeof installed.content !== "function") throw new Error("Fleet widget was not installed");
-			const component = installed.content({ requestRender: () => undefined } as unknown as TUI, theme);
-			expect(stripAnsi(component.render(80).join("\n"))).toContain("○ reviewer  Review parser changes");
+			const component = installed.content(
+				{
+					hasOverlay: () => false,
+					getFocusedComponent: () => ({ getText: () => "", setText: () => undefined }),
+					requestRender: () => undefined,
+				} as unknown as TUI,
+				theme,
+			);
+			expect(stripAnsi(component.render(80).join("\n"))).toContain("○ reviewer");
 
 			agents = [
 				snapshot({
@@ -276,10 +279,10 @@ describe("Riemann Subagent UI", () => {
 			];
 			listener?.();
 			await vi.advanceTimersByTimeAsync(32);
-			expect(stripAnsi(component.render(80).join("\n"))).toContain("✓ reviewer");
+			expect(stripAnsi(component.render(80).join("\n"))).toContain("● reviewer");
 
 			await vi.advanceTimersByTimeAsync(3_967);
-			expect(stripAnsi(component.render(80).join("\n"))).toContain("✓ reviewer");
+			expect(stripAnsi(component.render(80).join("\n"))).toContain("● reviewer");
 			await vi.advanceTimersByTimeAsync(1);
 			expect(stripAnsi(component.render(80).join("\n"))).not.toContain("reviewer");
 			expect(widgetUpdates.at(-1)).toMatchObject({ key: "riemann-subagents:fleet", content: undefined });
@@ -333,7 +336,14 @@ describe("Riemann Subagent UI", () => {
 		try {
 			const installed = widgetUpdates[0];
 			if (!installed || typeof installed.content !== "function") throw new Error("Fleet widget was not installed");
-			const component = installed.content({ requestRender: () => undefined } as unknown as TUI, theme);
+			const component = installed.content(
+				{
+					hasOverlay: () => false,
+					getFocusedComponent: () => ({ getText: () => "", setText: () => undefined }),
+					requestRender: () => undefined,
+				} as unknown as TUI,
+				theme,
+			);
 			const inactive = stripAnsi(component.render(80).join("\n"));
 			expect(inactive).toContain("○ reviewer");
 			expect(inactive).not.toContain("main");
@@ -417,7 +427,7 @@ describe("Riemann Subagent UI", () => {
 		expect(rendered).toContain("reviewer");
 		expect(rendered).not.toContain("Main");
 		expect(rendered).not.toContain("x stop");
-		expect(armed).toContain("again to RELEASE SLOT");
+		expect(armed).toContain("r confirm");
 		expect(releases).toBe(1);
 		expect(aborts).toBe(0);
 		expect(closes).toBe(1);

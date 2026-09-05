@@ -79,7 +79,29 @@ export interface IPythonPatchActivity extends IPythonActivityBase {
 	diffTruncated?: boolean;
 }
 
-export type IPythonActivity = IPythonShellActivity | IPythonAgentActivity | IPythonFileActivity | IPythonPatchActivity;
+export interface IPythonExploreActivity extends IPythonActivityBase {
+	kind: "explore";
+	operation: "read" | "list" | "search";
+	target: string;
+	query?: string;
+}
+
+export interface IPythonMcpActivity extends IPythonActivityBase {
+	kind: "mcp";
+	/** Registered qualified Python operation, not a guessed server namespace. */
+	operation: string;
+	/** Bounded host-event previews; omitted tails are marked [truncated]. */
+	input?: string;
+	output?: string;
+}
+
+export type IPythonActivity =
+	| IPythonShellActivity
+	| IPythonAgentActivity
+	| IPythonFileActivity
+	| IPythonPatchActivity
+	| IPythonExploreActivity
+	| IPythonMcpActivity;
 
 export interface IPythonToolDetails {
 	status: "running" | KernelExecuteStatus;

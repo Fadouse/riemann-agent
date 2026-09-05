@@ -128,6 +128,9 @@ describe("FooterDataProvider reftable branch detection", () => {
 		const provider = new FooterDataProvider(repoDir);
 		try {
 			expect(provider.getGitBranch()).toBe("main");
+			// Footer repaints must reuse the branch snapshot, not run git per frame.
+			for (let frame = 0; frame < 100; frame++) expect(provider.getGitBranch()).toBe("main");
+			expect(vi.mocked(spawnSync)).toHaveBeenCalledTimes(1);
 			expect(vi.mocked(spawnSync)).toHaveBeenCalledWith(
 				"git",
 				["--no-optional-locks", "symbolic-ref", "--quiet", "--short", "HEAD"],

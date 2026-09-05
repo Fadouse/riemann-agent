@@ -5,13 +5,17 @@ import { graphemeSafePrefix, graphemeSafeSuffix } from "../utils/text.ts";
 import type {
 	IPythonActivity,
 	IPythonAgentActivity,
+	IPythonExploreActivity,
 	IPythonFileActivity,
+	IPythonMcpActivity,
 	IPythonPatchActivity,
 	IPythonShellActivity,
 } from "./ipython.ts";
-import type { JsonValue, KernelHostRequestEvent } from "./kernel/types.ts";
+import type { JsonValue, KernelHostRequestError, KernelHostRequestEvent } from "./kernel/types.ts";
 
 const MAX_STREAM_CHARS = 20_000;
+const MAX_PREVIEW_CHARS = 20_000;
+const TRUNCATED_PREVIEW = "\n[truncated]";
 const MAX_DIFF_INPUT_CHARS = 1_000_000;
 const MAX_DIFF_CHARS = 40_000;
 const OMITTED_OUTPUT = "[earlier output omitted]\n";
@@ -94,15 +98,73 @@ function agentInfo(value: JsonValue | undefined): Record<string, JsonValue> | un
 	return nested ?? direct;
 }
 
+function boundedPreview(text: string, limit = MAX_PREVIEW_CHARS): string {
+	return text.length <= limit
+		? text
+		: `${graphemeSafePrefix(text, limit - TRUNCATED_PREVIEW.length)}${TRUNCATED_PREVIEW}`;
+}
+
+function mcpOutput(value: JsonValue | undefined): string | undefined {
+	const result = objectValue(value);
+	if (result?.$riemann !== "mcp_result") return undefined;
+	const parts: string[] = [];
+	let remaining = MAX_PREVIEW_CHARS;
+	let truncated = false;
+	const append = (text: string) => {
+		if (!text) return;
+		if (parts.length > 0) remaining -= 1;
+		if (text.length > remaining) {
+			parts.push(graphemeSafePrefix(text, Math.max(0, remaining)));
+			truncated = true;
+			remaining = 0;
+		} else {
+			parts.push(text);
+			remaining -= text.length;
+		}
+	};
+	if (Array.isArray(result.content)) {
+		for (const content of result.content) {
+			const wrapper = objectValue(content);
+			const item = wrapper?.$riemann === "mcp_json" ? objectValue(wrapper.value) : undefined;
+			const text =
+				item?.type === "text"
+					? stringValue(item.text)
+					: item?.type === "resource"
+						? stringValue(objectValue(item.resource)?.text)
+						: undefined;
+			if (text !== undefined) append(text);
+			if (truncated) break;
+		}
+	}
+	const structured = objectValue(result.structured_content);
+	if (
+		!truncated &&
+		structured?.$riemann === "mcp_json" &&
+		structured.value !== null &&
+		structured.value !== undefined
+	) {
+		if (remaining <= 0) truncated = true;
+		else append(JSON.stringify(structured.value));
+	}
+	const output = parts.join("\n");
+	return output || truncated ? boundedPreview(`${output}${truncated ? TRUNCATED_PREVIEW : ""}`) : undefined;
+}
+
 /** Converts host-bridge lifecycle events into bounded, display-safe IPython activity details. */
 export class RiemannActivityTracker {
 	private readonly workspace: string;
 	private readonly resolveFileCapability: FileCapabilityPathResolver;
+	private readonly isMcpOperation?: (operation: string) => boolean;
 	private readonly tracked = new Map<string, TrackedActivity>();
 
-	constructor(workspace: string, resolveFileCapability: FileCapabilityPathResolver) {
+	constructor(
+		workspace: string,
+		resolveFileCapability: FileCapabilityPathResolver,
+		isMcpOperation?: (operation: string) => boolean,
+	) {
 		this.workspace = resolve(workspace);
 		this.resolveFileCapability = resolveFileCapability;
+		this.isMcpOperation = isMcpOperation;
 	}
 
 	async observe(event: KernelHostRequestEvent): Promise<IPythonActivity[] | undefined> {
@@ -130,7 +192,7 @@ export class RiemannActivityTracker {
 			case "end": {
 				const tracked = this.tracked.get(event.requestId);
 				if (!tracked) return undefined;
-				this.finish(tracked, event.result, event.error?.message, event.durationMs);
+				this.finish(tracked, event.result, event.error, event.durationMs);
 				return this.snapshot();
 			}
 		}
@@ -141,6 +203,38 @@ export class RiemannActivityTracker {
 		type: string,
 		args: Record<string, JsonValue>,
 	): Promise<TrackedActivity | undefined> {
+		if (this.isMcpOperation?.(type)) {
+			const activity: IPythonMcpActivity = {
+				id,
+				kind: "mcp",
+				status: "running",
+				operation: type,
+				...(args.input === undefined ? {} : { input: boundedPreview(JSON.stringify(args.input)) }),
+			};
+			return { activity };
+		}
+
+		if (type === "fs.read" || type === "fs.glob" || type === "fs.search") {
+			const activity: IPythonExploreActivity = {
+				id,
+				kind: "explore",
+				status: "running",
+				operation: type === "fs.read" ? "read" : type === "fs.glob" ? "list" : "search",
+				target: boundedPreview(
+					type === "fs.read"
+						? this.displayPath(stringValue(args.path) ?? "unknown")
+						: type === "fs.glob"
+							? (stringValue(args.pattern) ?? "unknown")
+							: (stringValue(args.glob) ?? "**/*"),
+					2_000,
+				),
+				...(type === "fs.search" && typeof args.query === "string"
+					? { query: boundedPreview(args.query, 2_000) }
+					: {}),
+			};
+			return { activity };
+		}
+
 		if (type === "shell.run") {
 			const activity: IPythonShellActivity = {
 				id,
@@ -222,16 +316,19 @@ export class RiemannActivityTracker {
 	private finish(
 		tracked: TrackedActivity,
 		result: JsonValue | undefined,
-		error: string | undefined,
+		error: KernelHostRequestError | undefined,
 		durationMs: number,
 	): void {
 		let activity: IPythonActivity = {
 			...tracked.activity,
 			status: error ? "error" : "ok",
 			durationMs,
-			...(error ? { error: graphemeSafePrefix(error, 2_000) } : {}),
+			...(error ? { error: graphemeSafePrefix(error.message, 2_000) } : {}),
 		};
-		if (!error && activity.kind === "shell") {
+		if (activity.kind === "mcp") {
+			const output = mcpOutput(error ? error.details : result);
+			activity = { ...activity, ...(output === undefined ? {} : { output }) };
+		} else if (!error && activity.kind === "shell") {
 			const value = objectValue(result);
 			const exitCode = value?.exit_code === null ? null : numberValue(value?.exit_code);
 			const termination = stringValue(value?.termination);

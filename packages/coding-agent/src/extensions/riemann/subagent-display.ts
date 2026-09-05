@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { keyText } from "../../modes/interactive/components/keybinding-hints.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { SubagentUiSnapshot } from "../../riemann/agents/supervisor.ts";
@@ -58,6 +58,7 @@ export function renderSubagentFleet(
 	width = 80,
 	selectedIndex = 0,
 	selectionActive = false,
+	previews?: ReadonlyMap<string, string>,
 ): string[] {
 	if (agents.length === 0) return [];
 	const safeWidth = Math.max(1, width);
@@ -65,29 +66,45 @@ export function renderSubagentFleet(
 	const selected = selectionActive ? windowIndex : -1;
 	const { start, visible } = fleetWindow(windowIndex, agents.length);
 	const hint = selectionActive
-		? `${keyText("tui.select.up")}/${keyText("tui.select.down")} select · ${keyText("tui.select.confirm")} view · ${keyText("tui.select.cancel")} back`
-		: `${keyText("app.interrupt")} interrupt · ${keyText("tui.editor.cursorLeft")}/${keyText("tui.select.down")} select`;
+		? fitSubagentHints(
+				[
+					`${keyText("tui.select.cancel").split("/")[0]} back`,
+					`${keyText("tui.select.confirm")} view`,
+					`${keyText("tui.select.up")}/${keyText("tui.select.down")} select`,
+				],
+				safeWidth - 2,
+			)
+		: fitSubagentHints(
+				[
+					`${keyText("tui.editor.cursorLeft").split("/")[0]}/${keyText("tui.select.down")} agents`,
+					`${keyText("app.interrupt")} interrupt`,
+				],
+				safeWidth - 2,
+			);
 	const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, safeWidth, "")];
 	if (start > 0) lines.push(rightAlign("", theme.fg("dim", `↑ ${start} more`), safeWidth));
 	for (let index = start; index < start + visible; index += 1) {
 		const agent = agents[index];
 		if (!agent) continue;
 		const isSelected = index === selected;
-		const name = isSelected ? theme.fg("accent", theme.bold(agent.name)) : theme.bold(agent.name);
+		const name = truncateToWidth(agent.name, Math.max(1, safeWidth - 4), "…");
+		const styledName = isSelected ? theme.fg("accent", theme.bold(name)) : theme.bold(name);
 		const icon =
 			isSelected && isActiveSubagent(agent)
 				? theme.fg("accent", "●")
 				: agent.status === "running"
 					? theme.fg("accent", "○")
 					: subagentStatusIcon(agent, theme);
-		const left = `  ${icon} ${name}`;
-		if (!isActiveSubagent(agent)) {
+		const left = `  ${icon} ${styledName}`;
+		const elapsed = theme.fg("dim", formatFleetElapsed(agent, now));
+		// Keep the Agent name visible before adding its latest activity and timing.
+		if (visibleWidth(left) + visibleWidth(elapsed) + 2 > safeWidth) {
 			lines.push(truncateToWidth(left, safeWidth, ""));
 			continue;
 		}
-		const preview = theme.fg("muted", compactLine(latestAssistantText(agent) ?? agent.task));
-		const right = theme.fg("dim", `${formatFleetElapsed(agent, now)} · ${formatFleetTokens(agent.tokens)}`);
-		lines.push(rightAlign(`${left}  ${preview}`, right, safeWidth));
+		const summary = previews?.get(agent.id) ?? compactLine(latestAssistantText(agent) ?? "");
+		const preview = summary ? `  ${theme.fg("muted", summary)}` : "";
+		lines.push(rightAlign(`${left}${preview}`, elapsed, safeWidth));
 	}
 	const hiddenBelow = agents.length - (start + visible);
 	if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), safeWidth));
@@ -96,9 +113,9 @@ export function renderSubagentFleet(
 
 export function subagentStatusText(agent: SubagentUiSnapshot): string {
 	if (agent.status === "queued") return "queued";
-	if (agent.status === "running") return agent.currentTool ? `${agent.currentTool}…` : "Working…";
+	if (agent.status === "running") return "running";
 	if (agent.status === "stopped") return "Stopped";
-	if (agent.lastOutcome === "error") return `Error: ${agent.error ?? "unknown"}`;
+	if (agent.lastOutcome === "error") return "Error";
 	if (agent.lastOutcome === "cancelled") return "Cancelled";
 	if (agent.lastOutcome === "ok") return "Done";
 	return "Idle";
@@ -108,8 +125,8 @@ export function subagentStatusIcon(agent: SubagentUiSnapshot, theme: Theme): str
 	if (agent.status === "running") return theme.fg("accent", "●");
 	if (agent.status === "queued") return theme.fg("dim", "○");
 	if (agent.status === "stopped" || agent.lastOutcome === "cancelled") return theme.fg("dim", "■");
-	if (agent.lastOutcome === "error") return theme.fg("error", "✗");
-	if (agent.lastOutcome === "ok") return theme.fg("success", "✓");
+	if (agent.lastOutcome === "error") return theme.fg("error", "●");
+	if (agent.lastOutcome === "ok") return theme.fg("success", "●");
 	return theme.fg("warning", "Ⅱ");
 }
 
@@ -143,4 +160,75 @@ export function latestAssistantText(agent: SubagentUiSnapshot): string | undefin
 		if (text) return text;
 	}
 	return agent.result;
+}
+
+/** Keep essential controls intact; omit optional hints instead of cutting them in half. */
+export function fitSubagentHints(hints: readonly string[], width: number): string {
+	let result = "";
+	for (const hint of hints) {
+		const candidate = result ? `${result} · ${hint}` : hint;
+		if (visibleWidth(candidate) <= width) result = candidate;
+		else if (!result) return truncateToWidth(hint, Math.max(1, width), "");
+	}
+	return result;
+}
+
+export function subagentReleaseLines(agent: SubagentUiSnapshot, width: number): string[] {
+	// The UI snapshot does not expose workspaceMode. Do not infer isolation from a path.
+	return [
+		"Release identity and slot. Any isolated worktree is deleted; shared files remain.",
+		`Workspace: ${agent.workspace}`,
+		`Transcript: ${agent.transcriptHandle ? `saved ${agent.transcriptHandle}` : "not saved"}`,
+		`Patch: ${agent.patchHandle ? `saved ${agent.patchHandle}` : "none saved"}`,
+	].flatMap((line) => wrapTextWithAnsi(line, Math.max(1, width)));
+}
+
+/** Reserve state beside a shortened name before adding optional task or timing text. */
+export function subagentIdentityLine(
+	agent: SubagentUiSnapshot,
+	theme: Theme,
+	width: number,
+	selected?: boolean,
+	highlighted = selected,
+): string {
+	const prefix = selected === undefined ? "" : selected ? "> " : "  ";
+	const fullStatus = subagentStatusText(agent);
+	const status =
+		visibleWidth(agent.name) + visibleWidth(fullStatus) + prefix.length + 3 <= width
+			? fullStatus
+			: fullStatus.split(" · ")[0]!;
+	const name = truncateToWidth(agent.name, Math.max(1, width - visibleWidth(status) - prefix.length - 3), "…");
+	const styledName = highlighted ? theme.fg("accent", theme.bold(name)) : theme.bold(name);
+	return `${prefix}${subagentStatusIcon(agent, theme)} ${styledName} ${theme.fg("muted", status)}`;
+}
+
+export function subagentBackHint(cancel = false, width = 0): string {
+	const keys = [...keyText("app.agents.close").split("/"), ...keyText("tui.select.cancel").split("/")].filter(Boolean);
+	if (width >= 60) return `${[...new Set(keys)].join("/")} ${cancel ? "cancel" : "close"}`;
+	const shortest = keys.reduce((best, key) => (key.length < best.length ? key : best), keys[0] ?? "");
+	return `${shortest} ${cancel ? "cancel" : "close"}`;
+}
+
+export function wrapSubagentHints(hints: readonly string[], width: number, maxRows: number): string[] {
+	const lines: string[] = [];
+	let line = "";
+	for (const hint of hints) {
+		const candidate = line ? `${line} · ${hint}` : hint;
+		if (visibleWidth(candidate) <= width) line = candidate;
+		else {
+			if (line) lines.push(line);
+			if (lines.length === maxRows) return lines;
+			line = truncateToWidth(hint, Math.max(1, width), "");
+		}
+	}
+	if (line && lines.length < maxRows) lines.push(line);
+	return lines;
+}
+
+export function subagentReleaseFooterRows(width: number, height: number): number {
+	const actionWidth = Math.max(
+		visibleWidth(`${keyText("app.agents.release")} confirm`),
+		visibleWidth(`${keyText("tui.select.down")} more`),
+	);
+	return height >= 6 && visibleWidth(subagentBackHint(true, width)) + 3 + actionWidth > width ? 2 : 1;
 }

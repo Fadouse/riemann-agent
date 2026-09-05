@@ -128,6 +128,9 @@ describe("InteractiveMode image attachments", () => {
 				followUp: [{ text: "second [Image #2]", images: [second] }],
 			}),
 			updatePendingMessagesDisplay: vi.fn(),
+			pastedImages,
+			nextImageMarkerId: 3,
+			collectImagesFor: (text: string) => collectMarkedImages(pastedImages, text),
 			editor: { getText: () => "", setText },
 			agent: { abort: vi.fn() },
 		};

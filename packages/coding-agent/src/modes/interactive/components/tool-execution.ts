@@ -17,6 +17,7 @@ import { convertToPng } from "../../../utils/image-convert.ts";
 import { type Theme, theme } from "../theme/theme.ts";
 import { getIPythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.ts";
 import { keyHint } from "./keybinding-hints.ts";
+import { requestToolStatusFrame } from "./tool-status-marker.ts";
 
 /**
  * What this component needs from a tool: how to draw it. It neither executes tools nor reads their
@@ -41,6 +42,10 @@ const FALLBACK_PREVIEW_LINES = 10;
 export interface ToolExecutionOptions {
 	showImages?: boolean;
 	imageWidthCells?: number;
+	/** Hide main-session interrupt hints in embedded transcript viewers. */
+	interruptHint?: boolean;
+	/** Embedded viewers can supply their own animation clock. */
+	requestAnimationFrames?: boolean;
 }
 
 export class ToolExecutionComponent extends Container {
@@ -68,6 +73,8 @@ export class ToolExecutionComponent extends Container {
 	private cwd: string;
 	private executionStarted = false;
 	private argsComplete = false;
+	private readonly interruptHint: boolean;
+	private readonly requestAnimationFrames: boolean;
 	private result?: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 		isError: boolean;
@@ -92,6 +99,8 @@ export class ToolExecutionComponent extends Container {
 		this.toolDefinition = toolDefinition;
 		this.showImages = options.showImages ?? true;
 		this.imageWidthCells = options.imageWidthCells ?? 60;
+		this.interruptHint = options.interruptHint ?? true;
+		this.requestAnimationFrames = options.requestAnimationFrames ?? true;
 		this.ui = ui;
 		this.cwd = cwd;
 
@@ -268,6 +277,8 @@ export class ToolExecutionComponent extends Container {
 
 		if (this.hasSpecializedRenderer() && this.getRenderShell() === "self") {
 			const contentLines = this.selfRenderContainer.render(width);
+			if (this.requestAnimationFrames && this.ipythonCellComponent?.hasRunningAnimation())
+				requestToolStatusFrame(this.ui);
 			this.selfRenderHeight = contentLines.length;
 			if (contentLines.length === 0 && this.imageComponents.length === 0) {
 				return [];
@@ -276,7 +287,7 @@ export class ToolExecutionComponent extends Container {
 			const lines: string[] = [];
 			if (contentLines.length > 0) {
 				lines.push("");
-				lines.push(...contentLines);
+				for (const line of contentLines) lines.push(line);
 			}
 			for (let i = 0; i < this.imageComponents.length; i++) {
 				const spacer = this.imageSpacers[i];
@@ -323,6 +334,7 @@ export class ToolExecutionComponent extends Container {
 				expanded: this.expanded,
 				executionStarted: this.executionStarted,
 				argsComplete: this.argsComplete,
+				interruptHint: this.interruptHint,
 				activities:
 					this.result?.details &&
 					typeof this.result.details === "object" &&

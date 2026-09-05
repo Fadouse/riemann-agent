@@ -1,8 +1,11 @@
 import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import type { IPythonActivity } from "../../../riemann/ipython.ts";
+import type { IPythonActivity, IPythonExploreActivity, IPythonMcpActivity } from "../../../riemann/ipython.ts";
+import { stripAnsi } from "../../../utils/ansi.ts";
 import { highlightCode, theme } from "../theme/theme.ts";
 import { IPythonActivityComponent } from "./ipython-activity.ts";
 import { keyText } from "./keybinding-hints.ts";
+import { refreshToolMarkers, runningToolMarker } from "./tool-status-marker.ts";
+import { truncateToVisualLines } from "./visual-truncate.ts";
 
 export interface IPythonCellContentBlock {
 	type: string;
@@ -21,6 +24,7 @@ export interface IPythonCellState {
 	executionStarted?: boolean;
 	argsComplete?: boolean;
 	hidden?: boolean;
+	interruptHint?: boolean;
 	activities?: readonly IPythonActivity[];
 }
 
@@ -127,6 +131,8 @@ export class IPythonCellComponent implements Component {
 	private state: IPythonCellState;
 	private activityComponents = new Map<string, IPythonActivityComponent>();
 	private cachedWidth?: number;
+	private animatedRows: number[] = [];
+	private cachedRunningMarker = "";
 	private cachedState?: IPythonCellState;
 	private cachedThemeFg?: string;
 	private cachedLines?: string[];
@@ -134,6 +140,13 @@ export class IPythonCellComponent implements Component {
 	private cachedCodeSummary?: { text: string; firstLine: string; lines: number };
 	private cachedOutputSummary?: { parts: string[]; lines: number };
 	private cachedPreview?: { text: string; theme: typeof theme; line: string };
+	private compactOutputCache?: {
+		parts: string[];
+		width: number;
+		errorName?: string;
+		failed: boolean;
+		lines: string[];
+	};
 
 	constructor(state: IPythonCellState) {
 		this.state = state;
@@ -150,6 +163,7 @@ export class IPythonCellComponent implements Component {
 			this.state.executionStarted === state.executionStarted &&
 			this.state.argsComplete === state.argsComplete &&
 			this.state.hidden === state.hidden &&
+			this.state.interruptHint === state.interruptHint &&
 			this.state.activities === state.activities
 		) {
 			return;
@@ -174,9 +188,11 @@ export class IPythonCellComponent implements Component {
 	render(width: number): string[] {
 		if (this.state.hidden) {
 			this.activityComponents.clear();
+			this.animatedRows = [];
 			this.invalidate();
 			this.cachedCodeSummary = undefined;
 			this.cachedOutputSummary = undefined;
+			this.compactOutputCache = undefined;
 			return [];
 		}
 		const safeWidth = Math.max(1, width);
@@ -187,13 +203,33 @@ export class IPythonCellComponent implements Component {
 			this.cachedState === this.state &&
 			this.cachedThemeFg === themeFg &&
 			this.cachedTheme === theme
-		)
+		) {
+			if (this.animatedRows.length === 0) return this.cachedLines;
+			const marker = runningToolMarker();
+			this.cachedLines = refreshToolMarkers(this.cachedLines, this.animatedRows, this.cachedRunningMarker, marker);
+			this.cachedRunningMarker = marker;
 			return this.cachedLines;
+		}
 		const details = readDetails(this.state.details);
-		const lines = [truncateToWidth(` ${this.summaryLine(details)}`, safeWidth, "")];
+		const running = this.statusKind(details) === "running";
+		const marker = running ? runningToolMarker() : theme.fg("muted", "●");
+		this.cachedRunningMarker = marker;
+		const failed = this.statusKind(details) === "error" || this.statusKind(details) === "aborted";
+		const hasRunningActivity = this.state.activities?.some((activity) => activity.status === "running") ?? false;
+		// A completed host call does not mean the surrounding Python computation has ended.
+		const showWrapper =
+			this.state.expanded ||
+			failed ||
+			(this.state.activities?.length ?? 0) === 0 ||
+			(running && !hasRunningActivity);
+		this.animatedRows = running && showWrapper ? [0] : [];
+		const lines: string[] = showWrapper ? [truncateToWidth(` ${this.summaryLine(details)}`, safeWidth, "")] : [];
 		if (this.state.expanded) this.renderCode(lines, safeWidth);
-		this.renderActivities(lines, safeWidth);
+		else if (showWrapper) this.renderCompactOutput(lines, safeWidth, details, failed);
+		this.renderActivities(lines, safeWidth, running);
 		if (this.state.expanded) this.renderOutput(lines, safeWidth, details, true);
+		const markerPrefix = ` ${marker.slice(0, -"\x1b[39m".length)}`;
+		this.animatedRows = this.animatedRows.filter((row) => lines[row]?.startsWith(markerPrefix));
 		this.cachedWidth = safeWidth;
 		this.cachedState = this.state;
 		this.cachedThemeFg = themeFg;
@@ -202,11 +238,24 @@ export class IPythonCellComponent implements Component {
 		return lines;
 	}
 
+	hasRunningAnimation(): boolean {
+		return this.animatedRows.length > 0;
+	}
+
 	private summaryLine(details: IPythonDetails): string {
 		const parts = [`${this.marker(details)} ${theme.fg("muted", "python")}`];
-		if (this.state.executionStarted && this.statusKind(details) === "running") {
+		if (this.state.interruptHint !== false && this.state.executionStarted && this.statusKind(details) === "running") {
 			const interruptKey = keyText("app.interrupt");
 			if (interruptKey) parts.push(theme.fg("muted", `${interruptKey} to interrupt`));
+		}
+		if (!this.state.expanded) {
+			const duration = formatDuration(details.durationMs);
+			if (duration) parts.push(theme.fg("muted", duration));
+			const status = this.statusKind(details);
+			if (details.status === "timeout") parts.push(theme.fg("error", "Timed out"));
+			else if (status === "aborted") parts.push(theme.fg("warning", "Cancelled"));
+			else if (status === "error") parts.push(theme.fg("error", details.errorName ?? "Error"));
+			return parts.join(theme.fg("dim", " · "));
 		}
 		if (this.cachedCodeSummary?.text !== this.state.code) {
 			const summary = summarizeLines(this.state.code);
@@ -242,26 +291,29 @@ export class IPythonCellComponent implements Component {
 	}
 
 	private statusKind(details: IPythonDetails): StatusKind {
-		if (this.state.isError || details.status === "error") return "error";
-		if (details.status === "aborted") return "aborted";
-		if (!this.state.isPartial && (details.status !== undefined || (this.state.content?.length ?? 0) > 0))
+		if (this.state.isError || details.status === "error" || details.status === "timeout") return "error";
+		if (details.status === "aborted" || details.status === "cancelled") return "aborted";
+		if (
+			this.state.isPartial === false ||
+			(!this.state.isPartial && (details.status !== undefined || (this.state.content?.length ?? 0) > 0))
+		)
 			return "done";
-		if (this.state.isPartial || this.state.executionStarted) return "running";
+		if (this.state.executionStarted) return "running";
 		return "queued";
 	}
 
 	private marker(details: IPythonDetails): string {
 		switch (this.statusKind(details)) {
 			case "error":
-				return theme.fg("error", "✗");
+				return theme.fg("error", "●");
 			case "aborted":
-				return theme.fg("warning", "✗");
+				return theme.fg("warning", "●");
 			case "done":
-				return theme.fg("success", "✓");
+				return theme.fg("success", "●");
 			case "running":
-				return theme.fg("bashMode", "◆");
+				return this.cachedRunningMarker;
 			case "queued":
-				return theme.fg("muted", "◇");
+				return theme.fg("muted", "●");
 		}
 	}
 
@@ -293,15 +345,74 @@ export class IPythonCellComponent implements Component {
 		return segments.length > 0 ? `${segments.join(" ")} lines` : undefined;
 	}
 
-	private renderActivities(lines: string[], width: number): void {
+	private renderCompactOutput(lines: string[], width: number, details: IPythonDetails, failed: boolean): void {
+		const parts: string[] = [];
+		for (const block of this.state.content ?? []) {
+			if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
+		}
+		const cached = this.compactOutputCache;
+		if (
+			!cached ||
+			cached.width !== width ||
+			cached.failed !== failed ||
+			cached.errorName !== details.errorName ||
+			cached.parts.length !== parts.length ||
+			parts.some((part, index) => part !== cached.parts[index])
+		) {
+			let output = parts.join("\n").trim();
+			// Python tracebacks end in the actual exception; show its reason, not stack frames.
+			if (failed) output = stripAnsi(output);
+			if (failed && details.errorName) {
+				const index = output.lastIndexOf(`${details.errorName}:`);
+				if (index >= 0) output = output.slice(index);
+			}
+			const { visualLines, skippedCount } = truncateToVisualLines(output, 3, Math.max(1, width - 3), 0, 2);
+			const preview: string[] = [];
+			for (let index = 0; index < visualLines.length; index++) {
+				if (skippedCount > 0 && index === 2) preview.push(`… ${skippedCount} more lines`);
+				preview.push(visualLines[index]!);
+			}
+			this.compactOutputCache = { parts, width, failed, errorName: details.errorName, lines: preview };
+		}
+		for (const line of this.compactOutputCache!.lines) {
+			lines.push(truncateToWidth(`   ${theme.fg(failed ? "error" : "toolOutput", line)}`, width, ""));
+		}
+	}
+
+	private renderActivities(lines: string[], width: number, running: boolean): void {
 		const activities = this.state.activities ?? [];
 		if (activities.length === 0) {
 			this.activityComponents.clear();
 			return;
 		}
-		this.addBlank(lines);
+		if (lines.length > 0) this.addBlank(lines);
 		const activeIds = new Set<string>();
-		for (const activity of activities) {
+		for (let index = 0; index < activities.length; index++) {
+			const activity = activities[index]!;
+			if (!this.state.expanded && activity.kind === "explore" && activity.status !== "error") {
+				const group = [activity];
+				while (index + 1 < activities.length) {
+					const next = activities[index + 1]!;
+					if (next.kind !== "explore" || next.status === "error") break;
+					group.push(next);
+					index++;
+				}
+				this.renderExploration(lines, width, group, running);
+				continue;
+			}
+			if (!this.state.expanded && activity.kind === "mcp" && activity.status !== "error") {
+				const group = [activity];
+				while (index + 1 < activities.length) {
+					const next = activities[index + 1]!;
+					if (next.kind !== "mcp" || next.status === "error" || next.operation !== activity.operation) break;
+					group.push(next);
+					index++;
+				}
+				if (group.length > 1) {
+					this.renderMcpGroup(lines, width, group, running);
+					continue;
+				}
+			}
 			activeIds.add(activity.id);
 			let component = this.activityComponents.get(activity.id);
 			if (!component) {
@@ -310,10 +421,81 @@ export class IPythonCellComponent implements Component {
 			} else {
 				component.update(activity, this.state.expanded ?? false);
 			}
-			for (const line of component.render(width)) lines.push(line);
+			if (running && activity.status === "running") this.animatedRows.push(lines.length);
+			for (const line of component.render(width, this.cachedRunningMarker)) lines.push(line);
 		}
 		for (const id of this.activityComponents.keys()) {
 			if (!activeIds.has(id)) this.activityComponents.delete(id);
+		}
+	}
+
+	private renderExploration(
+		lines: string[],
+		width: number,
+		group: readonly IPythonExploreActivity[],
+		running: boolean,
+	): void {
+		const active = group.some((activity) => activity.status === "running");
+		if (active && running) this.animatedRows.push(lines.length);
+		const marker = active ? this.cachedRunningMarker : theme.fg("success", "●");
+		lines.push(truncateToWidth(` ${marker} ${theme.bold(active ? "Exploring" : "Explored")}`, width, ""));
+		let rows = 0;
+		for (let index = 0; index < group.length; ) {
+			if (rows === 3) {
+				lines.push(
+					truncateToWidth(`     ${theme.fg("dim", `… ${group.length - index} more operations`)}`, width, ""),
+				);
+				break;
+			}
+			const activity = group[index]!;
+			let detail: string;
+			if (activity.operation === "read") {
+				const names: string[] = [];
+				let count = 0;
+				while (index < group.length && group[index]!.operation === "read") {
+					if (names.length < 3) names.push(group[index]!.target);
+					count++;
+					index++;
+				}
+				detail = `Read ${names.join(", ")}${count > names.length ? `, … +${count - names.length} files` : ""}`;
+			} else {
+				detail =
+					activity.operation === "list"
+						? `List ${activity.target}`
+						: `Search ${activity.query ?? ""} in ${activity.target}`;
+				index++;
+			}
+			lines.push(
+				truncateToWidth(
+					` ${rows === 0 ? "  └ " : "    "}${theme.fg("muted", detail.replace(/[\r\n\t]/g, " "))}`,
+					width,
+				),
+			);
+			rows++;
+		}
+	}
+
+	private renderMcpGroup(
+		lines: string[],
+		width: number,
+		group: readonly IPythonMcpActivity[],
+		running: boolean,
+	): void {
+		const active = group.some((activity) => activity.status === "running");
+		if (active && running) this.animatedRows.push(lines.length);
+		const marker = active ? this.cachedRunningMarker : theme.fg("success", "●");
+		lines.push(
+			truncateToWidth(
+				` ${marker} ${active ? "Calling" : "Called"} ${group[0]!.operation} · ${group.length} calls`,
+				width,
+			),
+		);
+		const latest = group[group.length - 1]!;
+		if (latest.output) {
+			const { visualLines, skippedCount } = truncateToVisualLines(latest.output, 2, Math.max(1, width - 5));
+			if (skippedCount > 0)
+				lines.push(truncateToWidth(`     ${theme.fg("dim", `… ${skippedCount} earlier lines`)}`, width));
+			for (const line of visualLines) lines.push(truncateToWidth(`     ${theme.fg("toolOutput", line)}`, width, ""));
 		}
 	}
 

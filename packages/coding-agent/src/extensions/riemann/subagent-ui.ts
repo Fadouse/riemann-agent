@@ -15,15 +15,17 @@ import type { RiemannRuntime } from "../../riemann/runtime.ts";
 import {
 	compactLine,
 	formatFleetElapsed,
-	formatFleetTokens,
 	isActiveSubagent,
 	latestAssistantText,
 	renderSubagentFleet,
 	rightAlign,
-	subagentStatusIcon,
-	subagentStatusText,
+	subagentBackHint,
+	subagentIdentityLine,
+	subagentReleaseFooterRows,
+	subagentReleaseLines,
+	wrapSubagentHints,
 } from "./subagent-display.ts";
-import { runSubagentView } from "./subagent-view.ts";
+import { runSubagentView, type SubagentViewState } from "./subagent-view.ts";
 
 const FLEET_WIDGET_KEY = "riemann-subagents:fleet";
 const UPDATE_COALESCE_MS = 32;
@@ -40,11 +42,14 @@ export class RiemannSubagentUiController implements SubagentUiController {
 	private readonly context: ExtensionContext;
 	private readonly unsubscribeRuntime: () => void;
 	private agents: readonly SubagentUiSnapshot[] = [];
+	private previews = new Map<string, string>();
 	private active = false;
 	private selectedIndex = 0;
 	private viewerOpen = false;
 	private viewingAgentId: string | undefined;
 	private hubOpen = false;
+	private readonly hubState: SubagentHubState = {};
+	private readonly viewStates = new Map<string, SubagentViewState>();
 	private disposed = false;
 	private widgetRegistered = false;
 	private tui: TUI | undefined;
@@ -71,8 +76,12 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		try {
 			let selectedAgentId: string | undefined;
 			do {
-				selectedAgentId = await showSubagentsHub(context, this.runtime);
-				if (selectedAgentId) await runSubagentView(context, this.runtime, selectedAgentId);
+				selectedAgentId = await showSubagentsHub(context, this.runtime, this.hubState);
+				if (selectedAgentId) {
+					const state = this.viewStates.get(selectedAgentId) ?? {};
+					this.viewStates.set(selectedAgentId, state);
+					await runSubagentView(context, this.runtime, selectedAgentId, state);
+				}
 			} while (selectedAgentId);
 		} finally {
 			this.hubOpen = false;
@@ -94,11 +103,13 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		this.tui = undefined;
 	}
 
-	private refresh(): void {
+	private refresh(updatePreviews = true): void {
 		if (this.disposed || this.context.mode !== "tui") return;
 		const selectedAgentId = this.agents[this.selectedIndex]?.id;
 		const now = Date.now();
 		this.agents = this.runtime.listSubagentsForUi().filter((agent) => this.isFleetVisible(agent, now));
+		if (updatePreviews)
+			this.previews = new Map(this.agents.map((agent) => [agent.id, compactLine(latestAssistantText(agent) ?? "")]));
 		const preservedIndex = selectedAgentId ? this.agents.findIndex((agent) => agent.id === selectedAgentId) : -1;
 		this.selectedIndex =
 			preservedIndex >= 0 ? preservedIndex : Math.max(0, Math.min(this.agents.length - 1, this.selectedIndex));
@@ -121,7 +132,15 @@ export class RiemannSubagentUiController implements SubagentUiController {
 				this.tui = tui;
 				return {
 					render: (width: number) =>
-						renderSubagentFleet(this.agents, theme, Date.now(), width, this.selectedIndex, this.active),
+						renderSubagentFleet(
+							this.agents,
+							theme,
+							Date.now(),
+							width,
+							this.selectedIndex,
+							this.active,
+							this.previews,
+						),
 					invalidate: () => tui.requestRender(),
 					dispose: () => {
 						if (this.tui !== tui) return;
@@ -157,6 +176,24 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		if (this.disposed || this.viewerOpen || this.hubOpen || isKeyRelease(data) || this.agents.length === 0) {
 			return undefined;
 		}
+		// Built-in TUI implementations expose this query on TuiBase. Inspect the
+		// editor contract rather than instanceof, so extension editors remain usable.
+		const focused: unknown =
+			this.tui && "getFocusedComponent" in this.tui && typeof this.tui.getFocusedComponent === "function"
+				? this.tui.getFocusedComponent()
+				: undefined;
+		if (
+			this.tui?.hasOverlay() ||
+			typeof focused !== "object" ||
+			focused === null ||
+			!("getText" in focused) ||
+			typeof focused.getText !== "function" ||
+			!("setText" in focused) ||
+			typeof focused.setText !== "function"
+		) {
+			if (this.active) this.deactivate();
+			return undefined;
+		}
 		const keybindings = getKeybindings();
 		if (!this.active) {
 			if (this.context.ui.getEditorText().length > 0) return undefined;
@@ -166,12 +203,7 @@ export class RiemannSubagentUiController implements SubagentUiController {
 				this.tui?.requestRender();
 				return { consume: true };
 			}
-			if (keybindings.matches(data, "tui.select.up")) {
-				this.active = true;
-				this.selectedIndex = this.agents.length - 1;
-				this.tui?.requestRender();
-				return { consume: true };
-			}
+
 			return undefined;
 		}
 		if (keybindings.matches(data, "tui.select.down")) {
@@ -210,7 +242,9 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		if (!agent) return;
 		this.viewerOpen = true;
 		this.viewingAgentId = agent.id;
-		void runSubagentView(this.context, this.runtime, agent.id).then(
+		const state = this.viewStates.get(agent.id) ?? {};
+		this.viewStates.set(agent.id, state);
+		void runSubagentView(this.context, this.runtime, agent.id, state).then(
 			() => this.clearViewer(agent.id),
 			(error: unknown) => {
 				this.context.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -266,7 +300,7 @@ export class RiemannSubagentUiController implements SubagentUiController {
 		}
 		this.tickTimer = setTimeout(() => {
 			this.tickTimer = undefined;
-			this.refresh();
+			this.refresh(false);
 		}, nextDelay);
 		this.tickTimer.unref?.();
 	}
@@ -276,14 +310,22 @@ export function installSubagentUi(runtime: RiemannRuntime, context: ExtensionCon
 	return new RiemannSubagentUiController(runtime, context);
 }
 
+export interface SubagentHubState {
+	selectedAgentId?: string;
+}
+
 export async function showSubagentsHub(
 	context: ExtensionCommandContext,
 	runtime: RiemannRuntime,
+	state: SubagentHubState = {},
 ): Promise<string | undefined> {
 	return context.ui.custom<string | undefined>(
 		(tui, theme, keybindings, done) => {
 			let agents = runtime.listSubagentsForUi();
-			let selectedIndex = Math.max(0, agents.length - 1);
+			const rememberedIndex = agents.findIndex((agent) => agent.id === state.selectedAgentId);
+			let selectedIndex = rememberedIndex < 0 ? Math.max(0, agents.length - 1) : rememberedIndex;
+			let releaseScroll = 0;
+			let lastWidth = 80;
 			let stopArmedId: string | undefined;
 			let stoppingId: string | undefined;
 			let releaseArmedId: string | undefined;
@@ -314,6 +356,7 @@ export async function showSubagentsHub(
 
 			return {
 				dispose: () => {
+					state.selectedAgentId = agents[selectedIndex]?.id;
 					closed = true;
 					unsubscribe();
 					clearInterval(timer);
@@ -324,11 +367,22 @@ export async function showSubagentsHub(
 					if (isKeyRelease(data)) return;
 					if (keybindings.matches(data, "tui.select.cancel") || keybindings.matches(data, "app.agents.close")) {
 						if (isKeyRepeat(data)) return;
+						if (releaseArmedId || stopArmedId) {
+							releaseArmedId = undefined;
+							stopArmedId = undefined;
+							tui.requestRender();
+							return;
+						}
 						closed = true;
 						done(undefined);
 						return;
 					}
 					if (keybindings.matches(data, "tui.select.up") || keybindings.matches(data, "app.agents.previous")) {
+						if (releaseArmedId) {
+							releaseScroll = Math.max(0, releaseScroll - 1);
+							tui.requestRender();
+							return;
+						}
 						selectedIndex = Math.max(0, selectedIndex - 1);
 						stopArmedId = undefined;
 						releaseArmedId = undefined;
@@ -336,6 +390,25 @@ export async function showSubagentsHub(
 						return;
 					}
 					if (keybindings.matches(data, "tui.select.down") || keybindings.matches(data, "app.agents.next")) {
+						if (releaseArmedId) {
+							const agent = agents[selectedIndex];
+							if (agent)
+								releaseScroll = Math.min(
+									Math.max(
+										0,
+										subagentReleaseLines(agent, lastWidth - 4).length -
+											Math.max(
+												0,
+												Math.floor(tui.terminal.rows * 0.7) -
+													3 -
+													subagentReleaseFooterRows(lastWidth - 4, Math.floor(tui.terminal.rows * 0.7)),
+											),
+									),
+									releaseScroll + 1,
+								);
+							tui.requestRender();
+							return;
+						}
 						selectedIndex = Math.min(Math.max(0, agents.length - 1), selectedIndex + 1);
 						stopArmedId = undefined;
 						releaseArmedId = undefined;
@@ -343,7 +416,7 @@ export async function showSubagentsHub(
 						return;
 					}
 					const agent = agents[selectedIndex];
-					if (keybindings.matches(data, "tui.select.confirm") && agent) {
+					if (keybindings.matches(data, "tui.select.confirm") && agent && !releaseArmedId && !stopArmedId) {
 						closed = true;
 						done(agent.id);
 						return;
@@ -378,15 +451,28 @@ export async function showSubagentsHub(
 						keybindings.matches(data, "app.agents.release") &&
 						agent &&
 						!isActiveSubagent(agent) &&
+						!agent.live &&
 						releasingId === undefined
 					) {
 						if (isKeyRepeat(data)) return;
 						stopArmedId = undefined;
 						if (releaseArmedId !== agent.id) {
 							releaseArmedId = agent.id;
+							releaseScroll = 0;
 							tui.requestRender();
 							return;
 						}
+						const reviewRows = Math.max(
+							0,
+							Math.floor(tui.terminal.rows * 0.7) -
+								3 -
+								subagentReleaseFooterRows(lastWidth - 4, Math.floor(tui.terminal.rows * 0.7)),
+						);
+						if (
+							reviewRows === 0 ||
+							releaseScroll + reviewRows < subagentReleaseLines(agent, lastWidth - 4).length
+						)
+							return;
 						releaseArmedId = undefined;
 						releasingId = agent.id;
 						void runtime
@@ -400,18 +486,21 @@ export async function showSubagentsHub(
 							});
 					}
 				},
-				render: (width: number) =>
-					renderHub(
+				render: (width: number) => {
+					lastWidth = width;
+					return renderHub(
 						agents,
 						selectedIndex,
 						stopArmedId,
 						stoppingId,
 						releaseArmedId,
 						releasingId,
+						releaseScroll,
 						width,
 						tui,
 						theme,
-					),
+					);
+				},
 			};
 		},
 		{
@@ -428,81 +517,73 @@ function renderHub(
 	stoppingId: string | undefined,
 	releaseArmedId: string | undefined,
 	releasingId: string | undefined,
+	releaseScroll: number,
 	width: number,
 	tui: TUI,
 	theme: Theme,
 ): string[] {
-	const safeWidth = Math.max(20, width);
-	const innerWidth = safeWidth - 4;
-	const pad = (value: string) => `${value}${" ".repeat(Math.max(0, innerWidth - visibleWidth(value)))}`;
+	const height = Math.max(1, Math.floor(tui.terminal.rows * 0.7));
+	const innerWidth = Math.max(1, width - 4);
+	const close = subagentBackHint(false, innerWidth);
+	if (width < 6 || height < 4) return [truncateToWidth(close, width, "")];
 	const row = (content: string) =>
-		`${theme.fg("border", "│")} ${truncateToWidth(pad(content), innerWidth, "...", true)} ${theme.fg("border", "│")}`;
-	const top = theme.fg("border", `╭${"─".repeat(safeWidth - 2)}╮`);
-	const bottom = theme.fg("border", `╰${"─".repeat(safeWidth - 2)}╯`);
-	const middle = row(theme.fg("dim", "─".repeat(innerWidth)));
-	const activeCount = agents.filter(isActiveSubagent).length;
-	const lines = [
-		top,
-		row(
-			`${theme.fg("accent", theme.bold("Agents Hub"))} ${theme.fg("dim", `· ${activeCount} active · ${agents.length} total`)}`,
-		),
-		middle,
-	];
-	if (agents.length === 0) {
-		lines.push(row(""), row(theme.fg("muted", "No Subagents in this run.")), row(""), middle);
-		lines.push(row(theme.fg("dim", `${keyText("tui.select.cancel")} close`)), bottom);
-		return lines;
-	}
-	const maxRows = Math.max(1, Math.min(8, Math.floor(tui.terminal.rows * 0.7 - 12)));
-	const start = selectedIndex < maxRows ? 0 : selectedIndex - maxRows + 1;
-	if (start > 0) lines.push(row(rightAlign("", theme.fg("dim", `↑ ${start} more`), innerWidth)));
-	for (let index = start; index < Math.min(agents.length, start + maxRows); index += 1) {
-		const agent = agents[index];
-		if (!agent) continue;
-		const selected = index === selectedIndex;
-		const left = `${selected ? ">" : " "} ${subagentStatusIcon(agent, theme)} ${theme.bold(agent.name)}  ${theme.fg("muted", subagentStatusText(agent))}`;
-		const right = theme.fg("dim", `${formatFleetElapsed(agent)} · ${formatFleetTokens(agent.tokens)}`);
-		const content = rightAlign(left, right, innerWidth);
-		lines.push(row(selected ? theme.bg("selectedBg", pad(content)) : content));
-	}
-	const hiddenBelow = agents.length - (start + maxRows);
-	if (hiddenBelow > 0) lines.push(row(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), innerWidth)));
+		`${theme.fg("border", "│")} ${truncateToWidth(content, innerWidth, "", true)} ${theme.fg("border", "│")}`;
 	const selected = agents[selectedIndex];
-	if (selected) {
-		lines.push(middle);
-		const stats = [
-			selected.model,
-			selected.turnCount > 0 ? `↻${selected.turnCount}` : "",
-			selected.toolUses > 0 ? `${selected.toolUses} tool${selected.toolUses === 1 ? "" : "s"}` : "",
-		]
-			.filter(Boolean)
-			.join(" · ");
-		lines.push(row(theme.fg("dim", stats)));
-		for (const taskLine of wrapTextWithAnsi(selected.task, innerWidth).slice(0, 2)) lines.push(row(taskLine));
-		const output = latestAssistantText(selected);
-		if (output) lines.push(row(theme.fg("muted", compactLine(output, innerWidth))));
+	const armed = selected !== undefined && releaseArmedId === selected.id;
+	const footerRows = armed ? subagentReleaseFooterRows(innerWidth, height) : height >= 12 ? 2 : 1;
+	const bodyRows = Math.max(0, height - 3 - footerRows);
+	const body: string[] = [];
+	let title = `Agents Hub · ${agents.filter(isActiveSubagent).length} active · ${agents.length} total`;
+	let hints = [
+		close,
+		`${keyText("tui.select.confirm")} view`,
+		`${keyText("tui.select.up")}/${keyText("tui.select.down")}/${keyText("app.agents.previous")}/${keyText("app.agents.next")} select`,
+	];
+	if (armed) {
+		title = `${selected.name} · release`;
+		const warning = subagentReleaseLines(selected, innerWidth);
+		const start = Math.min(releaseScroll, Math.max(0, warning.length - bodyRows));
+		body.push(...warning.slice(start, start + bodyRows));
+		hints = [
+			subagentBackHint(true),
+			bodyRows === 0
+				? "resize to review"
+				: start + bodyRows >= warning.length
+					? `${keyText("app.agents.release")} confirm`
+					: `${keyText("tui.select.down")} more`,
+		];
+	} else if (!selected) {
+		body.push("No Subagents in this run.");
+	} else {
+		const detailRows = bodyRows >= 6 ? 3 : 0;
+		const count = Math.min(8, Math.max(1, bodyRows - detailRows));
+		const start = Math.max(0, selectedIndex - count + 1);
+		for (let index = start; index < Math.min(agents.length, start + count); index++) {
+			const agent = agents[index]!;
+			const left = subagentIdentityLine(agent, theme, innerWidth, index === selectedIndex);
+			const elapsed = theme.fg("dim", formatFleetElapsed(agent));
+			const content =
+				visibleWidth(left) + visibleWidth(elapsed) + 2 <= innerWidth ? rightAlign(left, elapsed, innerWidth) : left;
+			body.push(index === selectedIndex ? theme.bg("selectedBg", content) : content);
+		}
+		if (agents.length > count) title = `Agents Hub · ${selectedIndex + 1}/${agents.length}`;
+		if (detailRows) {
+			body.push(theme.fg("dim", `${selected.model} · ${selected.workspace}`));
+			body.push(...wrapTextWithAnsi(selected.task, innerWidth).slice(0, 1));
+			const output = selected.error ?? latestAssistantText(selected);
+			if (output) body.push(theme.fg(selected.error ? "error" : "muted", compactLine(output, innerWidth)));
+		}
+		if (stopArmedId === selected.id) hints = [subagentBackHint(true), `${keyText("app.agents.stop")} again to STOP`];
+		else if (stoppingId === selected.id) hints = [close, "stopping…"];
+		else if (releasingId === selected.id) hints = [close, "releasing…"];
+		else if (isActiveSubagent(selected)) hints.splice(2, 0, `${keyText("app.agents.stop")} stop`);
+		else if (!selected.live) hints.splice(2, 0, `${keyText("app.agents.release")} release`);
 	}
-	lines.push(middle);
-	const canStopSelected = selected !== undefined && isActiveSubagent(selected);
-	const canReleaseSelected = selected !== undefined && !isActiveSubagent(selected);
-	const stopKey = keyText("app.agents.stop");
-	const releaseKey = keyText("app.agents.release");
-	const closeKey = keyText("tui.select.cancel");
-	const controls = `${keyText("tui.select.up")}/${keyText("tui.select.down")}/${keyText("app.agents.previous")}/${keyText("app.agents.next")} select · ${keyText("tui.select.confirm")} view`;
-	const footer =
-		stopArmedId === selected?.id
-			? theme.fg("error", `${stopKey} again to STOP · ${closeKey} close`)
-			: releaseArmedId === selected?.id
-				? theme.fg("error", `${releaseKey} again to RELEASE SLOT · ${closeKey} close`)
-				: stoppingId === selected?.id
-					? theme.fg("warning", "stopping…")
-					: releasingId === selected?.id
-						? theme.fg("warning", "releasing…")
-						: canStopSelected
-							? theme.fg("dim", `${controls} · ${stopKey} stop · ${closeKey} close`)
-							: canReleaseSelected
-								? theme.fg("dim", `${controls} · ${releaseKey} release · ${closeKey} close`)
-								: theme.fg("dim", `${controls} · ${closeKey} close`);
-	lines.push(row(footer), bottom);
-	return lines;
+	return [
+		theme.fg("border", `╭${"─".repeat(width - 2)}╮`),
+		row(theme.fg("accent", theme.bold(title))),
+		...body.slice(0, bodyRows).map(row),
+		...wrapSubagentHints(hints, innerWidth, footerRows).map((hint) => row(theme.fg("dim", hint))),
+		theme.fg("border", `╰${"─".repeat(width - 2)}╯`),
+	];
 }

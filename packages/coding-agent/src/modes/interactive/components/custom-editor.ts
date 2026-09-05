@@ -1,11 +1,14 @@
 import { Editor, type EditorOptions, type EditorTheme, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import type { AppKeybinding, KeybindingsManager } from "../../../core/keybindings.ts";
+import { theme } from "../theme/theme.ts";
 import type { WorkingStatusIndicator } from "./status-indicator.ts";
 
 export type CustomEditorOptions = EditorOptions & {
 	/** Render the streaming working status in the editor's top border. */
 	embedWorkingStatus?: boolean;
 	highlightImageMarker?: (text: string) => string;
+	/** Main composer chrome is opt-in; extension editors retain their layout. */
+	showPrompt?: boolean;
 };
 
 const IMAGE_MARKER_REGEX = /\[Image #\d+\]/g;
@@ -15,6 +18,7 @@ const IMAGE_MARKER_REGEX = /\[Image #\d+\]/g;
  */
 export class CustomEditor extends Editor {
 	private keybindings: KeybindingsManager;
+	private readonly showPrompt: boolean;
 	private readonly highlightImageMarker?: (text: string) => string;
 	private workingStatusIndicator: WorkingStatusIndicator | undefined;
 	public readonly embedWorkingStatus: boolean;
@@ -28,9 +32,10 @@ export class CustomEditor extends Editor {
 	public onExtensionShortcut?: (data: string) => boolean;
 
 	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, options: CustomEditorOptions = {}) {
-		const { highlightImageMarker, embedWorkingStatus, ...editorOptions } = options;
+		const { highlightImageMarker, embedWorkingStatus, showPrompt, ...editorOptions } = options;
 		super(tui, theme, editorOptions);
 		this.keybindings = keybindings;
+		this.showPrompt = showPrompt ?? false;
 		this.highlightImageMarker = highlightImageMarker;
 		this.embedWorkingStatus = embedWorkingStatus ?? false;
 	}
@@ -91,11 +96,17 @@ export class CustomEditor extends Editor {
 		this.actionHandlers.set(action, handler);
 	}
 
+	protected override getPlaceholder(): string {
+		return this.showPrompt ? theme.fg("dim", "Ask anything") : "";
+	}
+
 	render(width: number): string[] {
-		const lines = super.render(width);
+		let lines = super.render(width);
 		const highlightImageMarker = this.highlightImageMarker;
-		if (!highlightImageMarker) return lines;
-		return lines.map((line) => line.replace(IMAGE_MARKER_REGEX, (marker) => highlightImageMarker(marker)));
+		if (highlightImageMarker) {
+			lines = lines.map((line) => line.replace(IMAGE_MARKER_REGEX, (marker) => highlightImageMarker(marker)));
+		}
+		return lines;
 	}
 
 	handleInput(data: string): void {

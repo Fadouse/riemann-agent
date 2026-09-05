@@ -1131,6 +1131,7 @@ export class RiemannRuntime {
 				const activityTracker = new RiemannActivityTracker(
 					runtime.agent.workspace,
 					(capability) => runtime.shared.store.getFileCapability(runtime.shared.run.id, capability)?.path,
+					(operation) => runtime.registry.get(operation)?.pythonReturnType === "McpResult",
 				);
 				let activities: IPythonToolDetails["activities"] = [];
 				const result = await kernel.execute(params.code, {

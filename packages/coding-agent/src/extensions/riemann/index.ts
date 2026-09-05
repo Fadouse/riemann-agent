@@ -224,9 +224,9 @@ const riemannExtension: ExtensionFactory = (pi) => {
 		const completions = completionDisplays(entry.data);
 		if (completions.length === 0) return undefined;
 		const lines = completions.map(({ name, outcome }) => {
-			if (outcome === "error") return `${theme.fg("error", "✗")} ${theme.fg("muted", `${name} failed`)}`;
+			if (outcome === "error") return `${theme.fg("error", "●")} ${theme.fg("muted", `${name} failed`)}`;
 			if (outcome === "cancelled") return `${theme.fg("dim", "■")} ${theme.fg("muted", `${name} cancelled`)}`;
-			return `${theme.fg("success", "✓")} ${theme.fg("muted", `${name} completed`)}`;
+			return `${theme.fg("success", "●")} ${theme.fg("muted", `${name} completed`)}`;
 		});
 		return new Text(lines.join("\n"), 1, 0);
 	});

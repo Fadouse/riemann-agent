@@ -23,6 +23,7 @@
 
 ### Added
 
+- Added theme-aware, color-only running-tool dots with shared, bounded animation frames and cached tool-body rendering.
 - Added configurable reusable Agent slots and default child-model selection to the settings panel.
 - Added durable Agent completion delivery, standard transcript rendering, configurable Hub/viewer controls, and confirmed settled-slot release.
 - Added exact-Turn `AgentTurnHandle.wait()`, `steer()`, cancellable settlement, durable results, and explicit queued/running admission status.
@@ -33,6 +34,10 @@
 
 ### Changed
 
+- Condensed collapsed IPython transcripts into structured exploration, command, file-change, and MCP summaries; adjacent exploration and repeated MCP calls are grouped within each cell, while expanded code and output remain available.
+- Removed redundant running/tool labels from Subagent Fleet rows; the middle now shows only the latest available activity summary, without falling back to the original task.
+- Simplified the main composer and Fleet rows; removed the prompt arrow, its reserved indentation, and the shortcut hint row, with the working directory on the left and model/context on the right. Detailed statistics remain in `/session`.
+- Unified tool status markers and Subagent success/failure markers as full-size solid circles, with green success and red failure; Subagent selection and controls are unchanged.
 - Restructured the Riemann main, child, operation, and compaction prompts around one runtime contract and catalog-backed schema discovery.
 - Changed Riemann shell execution to resolve bash through pi's shared shell configuration (`bash -c`, legacy WSL stdin transport) instead of `$SHELL -lc`/`cmd /d /s /c`.
 - Changed child delegation to one `agents.start()` operation returning durable `AgentTurnHandle` values with deterministic `info()`, `wait()`, `steer()`, `stop()`, and `release()` lifecycle controls.
@@ -52,6 +57,9 @@
 
 ### Fixed
 
+- Fixed Fleet focus isolation, child draft and navigation restoration, hidden settlement errors, and short-window controls; release confirmation now explains worktree deletion and saved artifacts.
+- Fixed empty final IPython results, cancellation, and timeouts retaining running or successful status indicators.
+- Preserved long pasted drafts and queued image multiplicity when messages return to the editor.
 - Fixed configurable save keybindings in the model and thinking selectors ([#8797](https://github.com/earendil-works/pi/issues/8797)).
 - Fixed models treating `fs`, `shell`, `web`, Agent, catalog, state, and MCP namespace calls as parallel native tools by declaring `ipython` as the sole callable tool across its schema, main/child prompts, operation headings, and MCP guidance.
 - Fixed managed Python startup on NixOS by resolving the host C++ runtime for ZeroMQ wheels while preserving existing library-path entries.

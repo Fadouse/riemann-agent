@@ -6,275 +6,223 @@ import { FooterComponent, formatCwdForFooter } from "../src/modes/interactive/co
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
-type AssistantUsage = {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: { total: number };
-};
-
-function createSession(options: {
-	sessionName: string;
-	modelId?: string;
-	provider?: string;
-	reasoning?: boolean;
-	thinkingLevel?: string;
-	usage?: AssistantUsage;
-	branchUsage?: AssistantUsage;
-	compactionUsage?: AssistantUsage;
-	toolUsage?: AssistantUsage;
-	usingSubscription?: boolean;
-	onUsageRead?: () => void;
-}): AgentSession {
-	const usage = options.usage;
-	const entries: Array<Record<string, unknown>> = [];
-
-	if (usage !== undefined) {
-		entries.push({
-			type: "message",
-			message: {
-				role: "assistant",
-				usage,
-			},
-		});
-	}
-
-	if (options.branchUsage !== undefined) {
-		entries.push({
-			type: "branch_summary",
-			usage: options.branchUsage,
-		});
-	}
-
-	if (options.compactionUsage !== undefined) {
-		entries.push({
-			type: "compaction",
-			usage: options.compactionUsage,
-		});
-	}
-
-	if (options.toolUsage !== undefined) {
-		entries.push({
-			type: "message",
-			message: {
-				role: "toolResult",
-				usage: options.toolUsage,
-			},
-		});
-	}
-
-	const session = {
+function createSession(
+	options: {
+		sessionName?: string;
+		modelId?: string;
+		provider?: string;
+		reasoning?: boolean;
+		thinkingLevel?: string;
+		noModel?: boolean;
+		percent?: number | null;
+		noContext?: boolean;
+		onUsageRead?: () => void;
+		onContextRead?: () => void;
+	} = {},
+): AgentSession {
+	return {
 		state: {
-			model: {
-				id: options.modelId ?? "test-model",
-				provider: options.provider ?? "test",
-				contextWindow: 200_000,
-				reasoning: options.reasoning ?? false,
-			},
+			model: options.noModel
+				? undefined
+				: {
+						id: options.modelId ?? "test-model",
+						provider: options.provider ?? "test",
+						contextWindow: 200_000,
+						reasoning: options.reasoning ?? false,
+					},
 			thinkingLevel: options.thinkingLevel ?? "off",
 		},
 		sessionManager: {
 			getEntries: () => {
 				options.onUsageRead?.();
-				return entries;
+				return [
+					{
+						type: "message",
+						message: {
+							role: "assistant",
+							usage: {
+								input: 12345,
+								output: 6789,
+								cacheRead: 50,
+								cacheWrite: 50,
+								cost: { total: 1.234 },
+							},
+						},
+					},
+				];
 			},
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",
 		},
-		getContextUsage: () => ({ contextWindow: 200_000, percent: 12.3 }),
-		modelRuntime: {
-			isUsingSubscription: () => options.usingSubscription ?? false,
+		getContextUsage: () => {
+			options.onContextRead?.();
+			return options.noContext
+				? undefined
+				: { contextWindow: 200_000, percent: options.percent === undefined ? 12.3 : options.percent };
 		},
-	};
-
-	return session as unknown as AgentSession;
+		modelRuntime: { isUsingSubscription: () => false },
+	} as unknown as AgentSession;
 }
 
-function createFooterData(providerCount: number): ReadonlyFooterDataProvider {
-	const provider = {
+function createFooterData(providerCount = 1, statuses = new Map<string, string>()): ReadonlyFooterDataProvider {
+	return {
 		getGitBranch: () => "main",
-		getExtensionStatuses: () => new Map<string, string>(),
+		getExtensionStatuses: () => statuses,
 		getAvailableProviderCount: () => providerCount,
-		onBranchChange: (callback: () => void) => {
-			void callback;
-			return () => {};
-		},
+		onBranchChange: () => () => {},
 	};
-
-	return provider;
 }
 
 describe("formatCwdForFooter", () => {
 	it("does not abbreviate sibling paths that share the home prefix", () => {
 		expect(formatCwdForFooter("/home/user2", "/home/user")).toBe("/home/user2");
 	});
-
 	it("abbreviates the home directory and descendants", () => {
 		expect(formatCwdForFooter("/home/user", "/home/user")).toBe("~");
 		expect(formatCwdForFooter("/home/user/project", "/home/user")).toBe("~/project");
 	});
 });
 
-describe("FooterComponent width handling", () => {
+describe("FooterComponent compact layout", () => {
 	beforeAll(() => {
 		initTheme(undefined, false);
 	});
 
-	it("keeps all lines within width for wide session names", () => {
-		const width = 93;
-		const session = createSession({ sessionName: "한글".repeat(30) });
-		const footer = new FooterComponent(session, createFooterData(1));
-
-		const lines = footer.render(width);
-		for (const line of lines) {
-			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
-		}
+	it("shows cwd and branch on the left with model, thinking and context right-aligned in one wide row", () => {
+		const footer = new FooterComponent(createSession({ reasoning: true, thinkingLevel: "high" }), createFooterData());
+		const lines = footer.render(80).map(stripAnsi);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(/^\/tmp\/project \(main\) {2,}test-model • high/);
+		expect(lines[0]).toContain("12.3%/200k");
+		expect(lines[0]).toMatch(/test-model • high • 12\.3%\/200k \(auto\)$/);
+		expect(visibleWidth(lines[0])).toBe(80);
 	});
 
-	it("keeps stats line within width for wide model and provider names", () => {
-		const width = 60;
+	it("keeps model, thinking and context right-aligned without the path at 40 columns", () => {
+		const lines = new FooterComponent(createSession({ reasoning: true, thinkingLevel: "high" }), createFooterData())
+			.render(40)
+			.map(stripAnsi);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("test-model • high");
+		expect(lines[0]).toContain("12.3%/200k");
+		expect(lines[0]).not.toContain("/tmp");
+		expect(lines[0]).toMatch(/test-model • high • 12\.3%\/200k \(auto\)$/);
+		expect(visibleWidth(lines[0])).toBe(40);
+	});
+
+	it("does not show cumulative tokens, cache or cost or scan history", () => {
+		let reads = 0;
+		const footer = new FooterComponent(createSession({ onUsageRead: () => reads++ }), createFooterData());
+		const text = footer.render(120).map(stripAnsi).join("\n");
+		expect(text).not.toMatch(/↑|↓|CH|\$|R50|W50/);
+		expect(reads).toBe(0);
+	});
+
+	it.each([40, 80])("retains a named session or its details entry at width %i", (width) => {
+		const footer = new FooterComponent(createSession({ sessionName: "한글".repeat(30) }), createFooterData());
+		const lines = footer.render(width).map(stripAnsi);
+		expect(lines.join("\n")).toContain("한글");
+		expect(lines.join("\n")).toContain("/session");
+		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+	});
+
+	it("fits a short session name alongside the directory on wide terminals", () => {
+		const lines = new FooterComponent(createSession({ sessionName: "release" }), createFooterData())
+			.render(120)
+			.map(stripAnsi);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(/^\/tmp\/project \(main\) • release {2,}test-model/);
+		expect(lines[0]).toMatch(/12\.3%\/200k \(auto\)$/);
+		expect(visibleWidth(lines[0])).toBe(120);
+	});
+
+	it("includes provider only when multiple providers are available and it fits", () => {
+		const session = createSession({ provider: "provider-name", reasoning: true, thinkingLevel: "high" });
+		expect(new FooterComponent(session, createFooterData(2)).render(120).map(stripAnsi).join("")).toContain(
+			"(provider-name)",
+		);
+		expect(new FooterComponent(session, createFooterData(1)).render(120).map(stripAnsi).join("")).not.toContain(
+			"(provider-name)",
+		);
+		const narrow = new FooterComponent(session, createFooterData(2)).render(40).map(stripAnsi).join("");
+		expect(narrow).not.toContain("(provider-name)");
+		expect(narrow).toContain("test-model");
+		expect(narrow).toContain("12.3%/200k");
+	});
+
+	it("right-aligns provider and manual compaction alongside the model on wide terminals", () => {
+		const footer = new FooterComponent(
+			createSession({ provider: "openai-codex", modelId: "gpt-6-astra", reasoning: true, thinkingLevel: "medium" }),
+			createFooterData(2),
+		);
+		footer.setAutoCompactEnabled(false);
+		const lines = footer.render(120).map(stripAnsi);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(
+			/^\/tmp\/project \(main\) {2,}\(openai-codex\) gpt-6-astra • medium • 12\.3%\/200k \(manual\)$/,
+		);
+		expect(visibleWidth(lines[0])).toBe(120);
+	});
+
+	it("reserves context when a long model identifier cannot fit and omits the path", () => {
+		const lines = new FooterComponent(createSession({ modelId: "model".repeat(20) }), createFooterData())
+			.render(20)
+			.map(stripAnsi);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(/^modelm… • 12\.3%\/200k$/);
+		expect(visibleWidth(lines[0])).toBe(20);
+	});
+
+	it.each([{ percent: null }, { noContext: true }, { noContext: true, noModel: true }])(
+		"does not present unknown context as zero: %j",
+		(options) => {
+			const text = new FooterComponent(createSession(options), createFooterData())
+				.render(40)
+				.map(stripAnsi)
+				.join("");
+			expect(text).toContain("?/");
+			expect(text).not.toContain("0.0%");
+			if (options.noModel) expect(text).toContain("no-model");
+		},
+	);
+
+	it("keeps extension statuses sorted, sanitized and width bounded in their existing line", () => {
+		const statuses = new Map([
+			["z", "last\nstatus"],
+			["a", "first\tstatus"],
+		]);
+		const footer = new FooterComponent(createSession(), createFooterData(1, statuses));
+		expect(stripAnsi(footer.render(80).at(-1)!)).toBe("first status last status");
+		statuses.set("b", "模".repeat(100));
+		const lines = footer.render(40);
+		expect(lines).toHaveLength(2);
+		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(40);
+	});
+
+	it.each([1, 8, 20, 40, 80])("bounds wide model, provider and session text at %i columns", (width) => {
 		const session = createSession({
-			sessionName: "",
 			modelId: "模".repeat(30),
 			provider: "공급자",
 			reasoning: true,
-			thinkingLevel: "high",
-			usage: {
-				input: 12_345,
-				output: 6_789,
-				cacheRead: 0,
-				cacheWrite: 0,
-				cost: { total: 1.234 },
-			},
+			sessionName: "한글".repeat(30),
 		});
-		const footer = new FooterComponent(session, createFooterData(2));
-
-		const lines = footer.render(width);
-		for (const line of lines) {
+		for (const line of new FooterComponent(session, createFooterData(2)).render(width)) {
 			expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 		}
 	});
 
-	it("includes summary and tool result usage in the total cost", () => {
-		const session = createSession({
-			sessionName: "",
-			usage: {
-				input: 100,
-				output: 10,
-				cacheRead: 0,
-				cacheWrite: 0,
-				cost: { total: 0.5 },
-			},
-			branchUsage: {
-				input: 20,
-				output: 5,
-				cacheRead: 0,
-				cacheWrite: 0,
-				cost: { total: 0.25 },
-			},
-			compactionUsage: {
-				input: 5,
-				output: 2,
-				cacheRead: 0,
-				cacheWrite: 0,
-				cost: { total: 0.125 },
-			},
-			toolUsage: {
-				input: 15,
-				output: 3,
-				cacheRead: 0,
-				cacheWrite: 0,
-				cost: { total: 0.375 },
-			},
-		});
-		const footer = new FooterComponent(session, createFooterData(1));
-
-		const statsLine = stripAnsi(footer.render(120)[1]);
-		expect(statsLine).toContain("$1.250");
-	});
-
-	it("shows the latest cache hit rate when cache usage is present", () => {
-		const session = createSession({
-			sessionName: "",
-			usage: {
-				input: 100,
-				output: 10,
-				cacheRead: 50,
-				cacheWrite: 50,
-				cost: { total: 0.001 },
-			},
-		});
-		const footer = new FooterComponent(session, createFooterData(1));
-
-		const statsLine = stripAnsi(footer.render(120)[1]);
-		expect(statsLine).toContain("CH25.0%");
-	});
-
-	it("marks Kimi Coding costs as subscription estimates", () => {
-		const session = createSession({
-			sessionName: "",
-			provider: "kimi-coding",
-			usage: {
-				input: 100,
-				output: 10,
-				cacheRead: 0,
-				cacheWrite: 0,
-				cost: { total: 1.234 },
-			},
-		});
-		const footer = new FooterComponent(session, createFooterData(1));
-
-		expect(stripAnsi(footer.render(120)[1])).toContain("$1.234 (sub)");
-	});
-
-	it("marks explicitly identified subscription auth", () => {
-		const session = createSession({ sessionName: "", provider: "anthropic", usingSubscription: true });
-		const footer = new FooterComponent(session, createFooterData(1));
-
-		expect(stripAnsi(footer.render(120)[1])).toContain("$0.000 (sub)");
-	});
-
-	it("does not mark generic OAuth sign-in as a subscription", () => {
-		const session = createSession({
-			sessionName: "",
-			provider: "openrouter",
-			usage: {
-				input: 100,
-				output: 10,
-				cacheRead: 0,
-				cacheWrite: 0,
-				cost: { total: 1.234 },
-			},
-		});
-		const footer = new FooterComponent(session, createFooterData(1));
-		const stats = stripAnsi(footer.render(120)[1]);
-
-		expect(stats).toContain("$1.234");
-		expect(stats).not.toContain("(sub)");
-	});
-
-	it("caches history usage scans until invalidated", () => {
-		let usageReads = 0;
-		const session = createSession({
-			sessionName: "",
-			onUsageRead: () => usageReads++,
-			usage: {
-				input: 100,
-				output: 10,
-				cacheRead: 0,
-				cacheWrite: 0,
-				cost: { total: 0.001 },
-			},
-		});
-		const footer = new FooterComponent(session, createFooterData(1));
-
+	it("caches context queries, including unknown results, until invalidated or switched", () => {
+		let reads = 0;
+		const session = createSession({ noContext: true, onContextRead: () => reads++ });
+		const footer = new FooterComponent(session, createFooterData());
 		footer.render(120);
-		footer.render(80);
-		expect(usageReads).toBe(1);
-
+		footer.render(40);
+		expect(reads).toBe(1);
 		footer.invalidate();
-		footer.render(120);
-		expect(usageReads).toBe(2);
+		footer.render(80);
+		expect(reads).toBe(2);
+		footer.setSession(createSession({ onContextRead: () => reads++ }));
+		expect(footer.render(80).map(stripAnsi).join("")).toContain("12.3%/200k");
+		expect(reads).toBe(3);
 	});
 });
