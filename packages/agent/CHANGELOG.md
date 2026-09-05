@@ -6,6 +6,8 @@
 
 - Serialized tool progress delivery with bounded bookkeeping while preserving update ordering and completion waits.
 
+## [0.85.0] - 2026-09-04
+
 ### Fixed
 
 - Fixed proxied assistant responses dropping persisted provider-native thinking levels.

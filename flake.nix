@@ -18,11 +18,11 @@
       ];
       riemannAgent = pkgs.buildNpmPackage {
         pname = "riemann-agent";
-        version = "0.84.4-git-${self.shortRev or "dirty"}";
+        version = "0.85.0-git-${self.shortRev or "dirty"}";
         src = ./.;
         nodejs = pkgs.nodejs_24;
         npmDepsFetcherVersion = 2;
-        npmDepsHash = "sha256-iNW2iV9Yd3LCx2G+8YHnJTU9xSeSwOIagvzGNQdHxZM=";
+        npmDepsHash = "sha256-YPu4qEmGQB0j06IXPxlVgljZ53qxzJS/EzPbP725qlg=";
         npmFlags = [ "--ignore-scripts" ];
         npmBuildScript = "build:offline";
         nativeBuildInputs = [ pkgs.makeWrapper ];
