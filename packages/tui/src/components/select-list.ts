@@ -64,6 +64,15 @@ export class SelectList implements Component {
 		this.selectedIndex = 0;
 	}
 
+	setItems(items: SelectItem[]): void {
+		const selectedValue = this.filteredItems[this.selectedIndex]?.value;
+		this.items = items;
+		this.filteredItems = items;
+		this.mousePressedIndex = undefined;
+		const keptIndex = selectedValue ? items.findIndex((item) => item.value === selectedValue) : -1;
+		this.selectedIndex = keptIndex >= 0 ? keptIndex : 0;
+	}
+
 	setSelectedIndex(index: number): void {
 		this.selectedIndex = Math.max(0, Math.min(index, this.filteredItems.length - 1));
 	}

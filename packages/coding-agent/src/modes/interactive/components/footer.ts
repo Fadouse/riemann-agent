@@ -93,16 +93,16 @@ export class FooterComponent implements Component {
 
 		const modelName = sanitizeStatusText(state.model?.id || "no-model");
 		const thinkingLevel = state.thinkingLevel || "off";
-		const thinking = state.model?.reasoning ? ` • ${thinkingLevel === "off" ? "thinking off" : thinkingLevel}` : "";
-		let right = `${modelName}${thinking} • ${context}`;
-		if (visibleWidth(right) > width) {
-			right = `${modelName} • ${context}`;
+		const thinking = state.model?.reasoning ? ` ${thinkingLevel === "off" ? "thinking off" : thinkingLevel}` : "";
+		let modelStatus = `${modelName}${thinking} • ${context}`;
+		if (visibleWidth(modelStatus) > width) {
+			modelStatus = `${modelName} • ${context}`;
 		}
-		if (visibleWidth(right) > width) {
+		if (visibleWidth(modelStatus) > width) {
 			// Reserve context before truncating a long model name. At tiny widths only
 			// context fits; never let a long identifier push it completely offscreen.
 			const modelWidth = width - visibleWidth(context) - 3;
-			right =
+			modelStatus =
 				modelWidth > 0
 					? `${truncateToWidth(modelName, modelWidth, "…")} • ${context}`
 					: truncateToWidth(context, width, "");
@@ -114,29 +114,32 @@ export class FooterComponent implements Component {
 		);
 		const branch = this.footerData.getGitBranch();
 		if (branch) directory += ` (${sanitizeStatusText(branch)})`;
-		let left = sessionName ? `${directory} • ${sessionName}` : directory;
+		let location = sessionName ? `${directory} ${sessionName}` : directory;
 		let separateSession = false;
-		if (visibleWidth(right) + 2 + visibleWidth(left) > width) {
+		if (visibleWidth(modelStatus) + 2 + visibleWidth(location) > width) {
 			// Directory is secondary. Keep a named session in the existing footer area
 			// with an explicit /session entry when it cannot share the primary row.
-			left = "";
+			location = "";
 			separateSession = !!sessionName;
 		}
 
 		if (this.footerData.getAvailableProviderCount() > 1 && state.model) {
 			const provider = `(${sanitizeStatusText(state.model.provider)}) `;
-			if (visibleWidth(provider + right) + (left ? 2 + visibleWidth(left) : 0) <= width) right = provider + right;
+			if (visibleWidth(provider + modelStatus) + (location ? 2 + visibleWidth(location) : 0) <= width)
+				modelStatus = provider + modelStatus;
 		}
 		const autoIndicator = this.autoCompactEnabled ? " (auto)" : " (manual)";
-		if (visibleWidth(right + autoIndicator) + (left ? 2 + visibleWidth(left) : 0) <= width) right += autoIndicator;
+		if (visibleWidth(modelStatus + autoIndicator) + (location ? 2 + visibleWidth(location) : 0) <= width)
+			modelStatus += autoIndicator;
 		if (areExperimentalFeaturesEnabled()) {
-			const experimental = ` • ${theme.bold(theme.fg("warning", "xp"))}`;
-			if (visibleWidth(right + experimental) + (left ? 2 + visibleWidth(left) : 0) <= width) right += experimental;
+			const experimental = ` ${theme.bold(theme.fg("warning", "xp"))}`;
+			if (visibleWidth(modelStatus + experimental) + (location ? 2 + visibleWidth(location) : 0) <= width)
+				modelStatus += experimental;
 		}
 
-		// Keep model/context at the right edge even when the directory cannot fit.
-		const padding = " ".repeat(width - visibleWidth(left) - visibleWidth(right));
-		const lines = [theme.fg("dim", left) + theme.fg("dim", padding + right)];
+		// Keep model/context on the left, with the secondary directory aligned right.
+		const padding = " ".repeat(width - visibleWidth(location) - visibleWidth(modelStatus));
+		const lines = [theme.fg("dim", modelStatus) + theme.fg("dim", padding + location)];
 		if (separateSession) {
 			const entry = " • /session";
 			const available = width - visibleWidth(entry);

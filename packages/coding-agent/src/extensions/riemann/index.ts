@@ -1,5 +1,6 @@
-import { Text } from "@earendil-works/pi-tui";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { BuildSystemPromptOptions, ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
+import { formatAgentCompletion } from "../../modes/interactive/components/tool-status-marker.ts";
 import type { AgentEventDelivery } from "../../riemann/agents/supervisor.ts";
 import { resolveCompactionStrategy } from "../../riemann/compaction-strategy.ts";
 import {
@@ -223,12 +224,11 @@ const riemannExtension: ExtensionFactory = (pi) => {
 	pi.registerEntryRenderer<AgentEventReceipt>(AGENT_EVENT_RECEIPT_TYPE, (entry, _options, theme) => {
 		const completions = completionDisplays(entry.data);
 		if (completions.length === 0) return undefined;
-		const lines = completions.map(({ name, outcome }) => {
-			if (outcome === "error") return `${theme.fg("error", "●")} ${theme.fg("muted", `${name} failed`)}`;
-			if (outcome === "cancelled") return `${theme.fg("dim", "■")} ${theme.fg("muted", `${name} cancelled`)}`;
-			return `${theme.fg("success", "●")} ${theme.fg("muted", `${name} completed`)}`;
-		});
-		return new Text(lines.join("\n"), 1, 0);
+		const lines = completions.map(({ name, outcome }) => formatAgentCompletion(name, outcome, theme));
+		return {
+			render: (width: number) => lines.map((line) => truncateToWidth(` ${line}`, width, "…")),
+			invalidate: () => {},
+		};
 	});
 
 	let runtime: RiemannRuntime | undefined;

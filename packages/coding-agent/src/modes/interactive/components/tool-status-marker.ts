@@ -1,5 +1,6 @@
-import type { TUI } from "@earendil-works/pi-tui";
+import { type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../theme/theme.ts";
+import { toolAction, toolTarget } from "./tool-display.ts";
 
 export const TOOL_STATUS_FRAME_MS = 80;
 const PERIOD_MS = 2_000;
@@ -65,4 +66,67 @@ export function requestToolStatusFrame(ui: TUI): void {
 	}, TOOL_STATUS_FRAME_MS);
 	timer.unref?.();
 	pendingFrames.set(ui, timer);
+}
+
+/** Header-only clocks share the existing bounded animation scheduler. */
+export interface RunningToolHeader {
+	row: number;
+	label: string;
+	startedAt: number;
+	seconds: number;
+	metadata?: string;
+}
+
+export function formatToolDuration(durationMs: number, running = false): string {
+	const seconds = Math.max(0, durationMs) / 1_000;
+	return `${running ? Math.floor(seconds) : seconds.toFixed(1)}s`;
+}
+
+export function renderToolHeader(
+	label: string,
+	marker: string,
+	width: number,
+	durationMs?: number,
+	running = false,
+	metadata?: string,
+): string {
+	const details = [
+		metadata,
+		durationMs === undefined || durationMs < 1_000 ? undefined : formatToolDuration(durationMs, running),
+	]
+		.filter((value): value is string => Boolean(value))
+		.map((value) => theme.fg("dim", value))
+		.join(theme.fg("dim", ", "));
+	const suffix = details ? `${theme.fg("dim", "  (")}${details}${theme.fg("dim", ")")}` : "";
+	const available = width - visibleWidth(suffix);
+	if (available < 4) return truncateToWidth(` ${marker} ${label}${suffix}`, width, "");
+	return truncateToWidth(` ${truncateToWidth(`${marker} ${label}`, available - 1, "…")}${suffix}`, width, "");
+}
+
+export function refreshToolClocks(
+	lines: string[],
+	headers: readonly RunningToolHeader[],
+	marker: string,
+	width: number,
+	now = Date.now(),
+): string[] {
+	let updated = lines;
+	for (const header of headers) {
+		const seconds = Math.floor(Math.max(0, now - header.startedAt) / 1_000);
+		if (seconds === header.seconds) continue;
+		header.seconds = seconds;
+		if (updated === lines) updated = lines.slice();
+		updated[header.row] = renderToolHeader(header.label, marker, width, seconds * 1_000, true, header.metadata);
+	}
+	return updated;
+}
+
+export function formatAgentCompletion(
+	name: string,
+	outcome: "ok" | "error" | "cancelled",
+	colors: Theme = theme,
+): string {
+	const label = outcome === "ok" ? "completed" : outcome === "error" ? "failed" : "cancelled";
+	const color = outcome === "ok" ? "success" : outcome === "error" ? "error" : "dim";
+	return `${colors.fg(color, outcome === "cancelled" ? "■" : "●")} ${toolAction(label, colors)} ${toolTarget(name.replace(/[\r\n\t]/g, " "), colors)}`;
 }

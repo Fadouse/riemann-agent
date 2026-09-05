@@ -113,4 +113,24 @@ describe("SelectList", () => {
 		assert.ok(rendered[0].includes("…"));
 		assert.equal(visibleIndexOf(rendered[0], "first"), visibleIndexOf(rendered[1], "second"));
 	});
+
+	it("replaces items in place and keeps the selected value when present", () => {
+		const list = new SelectList(
+			[
+				{ value: "agents", label: "agents" },
+				{ value: "write", label: "write" },
+				{ value: "model", label: "model" },
+			],
+			5,
+			testTheme,
+		);
+		list.setSelectedIndex(1);
+		list.setItems([
+			{ value: "write", label: "write" },
+			{ value: "watch", label: "watch" },
+		]);
+		assert.equal(list.getSelectedItem()?.value, "write");
+		list.setItems([{ value: "model", label: "model" }]);
+		assert.equal(list.getSelectedItem()?.value, "model");
+	});
 });

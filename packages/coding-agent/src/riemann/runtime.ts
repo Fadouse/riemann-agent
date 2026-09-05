@@ -1134,6 +1134,10 @@ export class RiemannRuntime {
 					(operation) => runtime.registry.get(operation)?.pythonReturnType === "McpResult",
 				);
 				let activities: IPythonToolDetails["activities"] = [];
+				// Exclude managed-Python/kernel startup. Keep the same dispatch timestamp
+				// through host updates and the final result; durationMs remains kernel-authoritative.
+				const startedAt = Date.now();
+				onUpdate?.({ content: [], details: { status: "running", startedAt, activities } });
 				const result = await kernel.execute(params.code, {
 					signal: executionSignal,
 					onHostRequest: async (event) => {
@@ -1144,6 +1148,7 @@ export class RiemannRuntime {
 							content: [],
 							details: {
 								status: "running",
+								startedAt,
 								durationMs: undefined,
 								activities,
 							},
@@ -1159,6 +1164,7 @@ export class RiemannRuntime {
 					content: formatted.content,
 					details: {
 						status: result.status,
+						startedAt,
 						durationMs: result.durationMs,
 						...(result.error ? { errorName: result.error.ename } : {}),
 						...(result.executionCount === undefined ? {} : { executionCount: result.executionCount }),

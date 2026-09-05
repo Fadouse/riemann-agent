@@ -33,6 +33,8 @@ interface IPythonActivityBase {
 	id: string;
 	status: IPythonActivityStatus;
 	operation: string;
+	/** Host operation start time in epoch milliseconds. */
+	startedAt?: number;
 	durationMs?: number;
 	error?: string;
 }
@@ -57,6 +59,8 @@ export interface IPythonAgentActivity extends IPythonActivityBase {
 	modelRole?: string;
 	workspace?: string;
 	agentStatus?: string;
+	/** Outcome of the exact Turn returned by agents.wait, not the reusable Agent identity. */
+	agentOutcome?: "ok" | "error" | "cancelled";
 }
 
 export interface IPythonFileActivity extends IPythonActivityBase {
@@ -105,6 +109,8 @@ export type IPythonActivity =
 
 export interface IPythonToolDetails {
 	status: "running" | KernelExecuteStatus;
+	/** Cell dispatch time after kernel initialization, in epoch milliseconds. */
+	startedAt?: number;
 	durationMs?: number;
 	errorName?: string;
 	executionCount?: number;

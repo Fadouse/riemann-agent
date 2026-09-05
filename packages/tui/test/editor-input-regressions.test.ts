@@ -42,11 +42,11 @@ describe("editor input regressions", () => {
 		});
 	}
 
-	it("hides old suggestions immediately while a replacement request is pending", async () => {
+	it("keeps suggestions visible while a replacement request is pending", async () => {
 		const editor = createEditor();
 		await openCompletions(editor);
 		editor.handleInput("z");
-		assert(!editor.render(80).join("\n").includes("model"));
+		assert(editor.render(80).join("\n").includes("model"));
 		let submitted = "";
 		editor.onSubmit = (text) => {
 			submitted = text;

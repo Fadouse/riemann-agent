@@ -350,6 +350,7 @@ export class Editor implements Component, Focusable {
 	private autocompleteRequestTask: Promise<void> = Promise.resolve();
 	private autocompleteStartToken: number = 0;
 	private autocompleteRequestId: number = 0;
+	private autocompleteRefreshPending = false;
 
 	// Paste tracking for large pastes
 	private pastes: Map<number, string> = new Map();
@@ -843,7 +844,13 @@ export class Editor implements Component, Focusable {
 				return;
 			}
 
-			if (kb.matches(data, "tui.input.tab")) {
+			if (
+				this.autocompleteRefreshPending &&
+				(kb.matches(data, "tui.input.tab") || kb.matches(data, "tui.select.confirm"))
+			) {
+				if (kb.matches(data, "tui.input.tab")) return;
+				this.cancelAutocomplete();
+			} else if (kb.matches(data, "tui.input.tab")) {
 				const selected = this.autocompleteList.getSelectedItem();
 				if (selected && this.autocompleteProvider) {
 					this.pushUndoSnapshot();
@@ -862,9 +869,7 @@ export class Editor implements Component, Focusable {
 					if (this.onChange) this.onChange(this.getText());
 				}
 				return;
-			}
-
-			if (kb.matches(data, "tui.select.confirm")) {
+			} else if (kb.matches(data, "tui.select.confirm")) {
 				const selected = this.autocompleteList.getSelectedItem();
 				if (selected && this.autocompleteProvider) {
 					this.pushUndoSnapshot();
@@ -2399,9 +2404,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		this.cancelAutocompleteRequest();
-		// Never let Enter/Tab apply a candidate from the previous text/cursor.
-		// Keep the completion mode so further typing still refreshes forced paths.
-		this.autocompleteList = undefined;
+		this.autocompleteRefreshPending = true;
 		const startToken = ++this.autocompleteStartToken;
 
 		const debounceMs = this.getAutocompleteDebounceMs(options);
@@ -2533,14 +2536,14 @@ export class Editor implements Component, Focusable {
 
 	private applyAutocompleteSuggestions(suggestions: AutocompleteSuggestions, state: "regular" | "force"): void {
 		this.autocompletePrefix = suggestions.prefix;
-		this.autocompleteList = this.createAutocompleteList(suggestions.prefix, suggestions.items);
+		if (this.autocompleteList) this.autocompleteList.setItems(suggestions.items);
+		else this.autocompleteList = this.createAutocompleteList(suggestions.prefix, suggestions.items);
 
 		const bestMatchIndex = this.getBestAutocompleteMatchIndex(suggestions.items, suggestions.prefix);
-		if (bestMatchIndex >= 0) {
-			this.autocompleteList.setSelectedIndex(bestMatchIndex);
-		}
+		if (bestMatchIndex >= 0) this.autocompleteList.setSelectedIndex(bestMatchIndex);
 
 		this.autocompleteState = state;
+		this.autocompleteRefreshPending = false;
 	}
 
 	private cancelAutocompleteRequest(): void {
@@ -2557,6 +2560,7 @@ export class Editor implements Component, Focusable {
 		this.autocompleteState = null;
 		this.autocompleteList = undefined;
 		this.autocompletePrefix = "";
+		this.autocompleteRefreshPending = false;
 	}
 
 	private cancelAutocomplete(): void {

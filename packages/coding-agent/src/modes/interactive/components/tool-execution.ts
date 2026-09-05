@@ -72,6 +72,7 @@ export class ToolExecutionComponent extends Container {
 	private ui: TUI;
 	private cwd: string;
 	private executionStarted = false;
+	private startedAt?: number;
 	private argsComplete = false;
 	private readonly interruptHint: boolean;
 	private readonly requestAnimationFrames: boolean;
@@ -203,6 +204,7 @@ export class ToolExecutionComponent extends Container {
 
 	markExecutionStarted(): void {
 		this.executionStarted = true;
+		this.startedAt ??= Date.now();
 		this.updateDisplay();
 		this.ui.requestRender();
 	}
@@ -333,6 +335,7 @@ export class ToolExecutionComponent extends Container {
 				isError: this.result?.isError ?? false,
 				expanded: this.expanded,
 				executionStarted: this.executionStarted,
+				startedAt: this.startedAt,
 				argsComplete: this.argsComplete,
 				interruptHint: this.interruptHint,
 				activities:

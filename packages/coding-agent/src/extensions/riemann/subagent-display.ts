@@ -65,23 +65,7 @@ export function renderSubagentFleet(
 	const windowIndex = Math.max(0, Math.min(agents.length - 1, selectedIndex));
 	const selected = selectionActive ? windowIndex : -1;
 	const { start, visible } = fleetWindow(windowIndex, agents.length);
-	const hint = selectionActive
-		? fitSubagentHints(
-				[
-					`${keyText("tui.select.cancel").split("/")[0]} back`,
-					`${keyText("tui.select.confirm")} view`,
-					`${keyText("tui.select.up")}/${keyText("tui.select.down")} select`,
-				],
-				safeWidth - 2,
-			)
-		: fitSubagentHints(
-				[
-					`${keyText("tui.editor.cursorLeft").split("/")[0]}/${keyText("tui.select.down")} agents`,
-					`${keyText("app.interrupt")} interrupt`,
-				],
-				safeWidth - 2,
-			);
-	const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, safeWidth, "")];
+	const lines: string[] = [];
 	if (start > 0) lines.push(rightAlign("", theme.fg("dim", `↑ ${start} more`), safeWidth));
 	for (let index = start; index < start + visible; index += 1) {
 		const agent = agents[index];

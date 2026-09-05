@@ -22,6 +22,7 @@
 - Fixed short width-cache keys retaining entire previous message strings and preserved surrogate pairs across terminal write chunks.
 
 - Fixed large Markdown list and table output exceeding JavaScript spread argument limits.
+- Keep autocomplete suggestions visible while a replacement request is in flight instead of collapsing the menu between keystrokes.
 
 ## [0.85.0] - 2026-09-04
 

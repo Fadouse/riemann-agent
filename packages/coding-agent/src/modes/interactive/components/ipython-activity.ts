@@ -1,4 +1,4 @@
-import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Component, truncateToWidth } from "@earendil-works/pi-tui";
 import type {
 	IPythonActivity,
 	IPythonAgentActivity,
@@ -8,19 +8,18 @@ import type {
 	IPythonPatchActivity,
 	IPythonShellActivity,
 } from "../../../riemann/ipython.ts";
+import { stripAnsi } from "../../../utils/ansi.ts";
 import { highlightCode, theme } from "../theme/theme.ts";
 import { renderDiff } from "./diff.ts";
-import { refreshToolMarkers, runningToolMarker } from "./tool-status-marker.ts";
-import { truncateToVisualLines } from "./visual-truncate.ts";
-
-const OUTPUT_PREVIEW_LINES = 4;
-const TASK_PREVIEW_LINES = 3;
-
-function formatDuration(durationMs: number | undefined): string | undefined {
-	if (durationMs === undefined) return undefined;
-	if (durationMs < 1_000) return `${Math.round(durationMs)}ms`;
-	return `${(durationMs / 1_000).toFixed(1)}s`;
-}
+import { appendToolCode, appendToolOutput, toolAction, toolPath, toolTarget } from "./tool-display.ts";
+import {
+	formatAgentCompletion,
+	type RunningToolHeader,
+	refreshToolClocks,
+	refreshToolMarkers,
+	renderToolHeader,
+	runningToolMarker,
+} from "./tool-status-marker.ts";
 
 function marker(activity: IPythonActivity, runningMarker: string): string {
 	if (activity.status === "running") return runningMarker;
@@ -38,6 +37,10 @@ export class IPythonActivityComponent implements Component {
 	private expanded: boolean;
 	private cachedWidth?: number;
 	private runningMarker = "";
+	private clockNow = 0;
+	private fallbackStartedAt: number;
+	private activityId: string;
+	private runningHeader: RunningToolHeader | undefined;
 	private cachedActivity?: Readonly<Record<string, string | number | boolean | null | undefined>>;
 	private cachedFieldCount = 0;
 	private cachedExpanded?: boolean;
@@ -48,11 +51,22 @@ export class IPythonActivityComponent implements Component {
 	constructor(activity: IPythonActivity, expanded: boolean) {
 		this.activity = activity;
 		this.expanded = expanded;
+		this.fallbackStartedAt = Date.now();
+		this.activityId = activity.id;
+	}
+
+	getRunningHeader(): RunningToolHeader | undefined {
+		return this.runningHeader;
 	}
 
 	update(activity: IPythonActivity, expanded: boolean): void {
 		// Trackers may copy unchanged activities. Let render compare the scalar
 		// snapshot rather than discarding cached output merely on identity change.
+		if (this.activityId !== activity.id) {
+			this.activityId = activity.id;
+			this.fallbackStartedAt = Date.now();
+			this.runningHeader = undefined;
+		}
 		this.activity = activity;
 		this.expanded = expanded;
 	}
@@ -64,10 +78,13 @@ export class IPythonActivityComponent implements Component {
 		this.cachedActivity = undefined;
 		this.cachedExpanded = undefined;
 		this.cachedLines = undefined;
+		this.runningHeader = undefined;
 	}
 
-	render(width: number, markerFrame?: string): string[] {
-		const marker = this.activity.status === "running" ? (markerFrame ?? runningToolMarker()) : "";
+	render(width: number, markerFrame?: string, endedAt?: number): string[] {
+		const now = endedAt ?? Date.now();
+		this.clockNow = now;
+		const marker = this.activity.status === "running" ? (markerFrame ?? runningToolMarker(now)) : "";
 		const safeWidth = Math.max(1, width);
 		// Activity fields are scalar values (including potentially large output
 		// strings). Snapshot the fields instead of serializing their contents.
@@ -91,10 +108,13 @@ export class IPythonActivityComponent implements Component {
 			this.cachedFieldCount === fieldCount
 		) {
 			this.cachedLines = refreshToolMarkers(this.cachedLines, [0], this.runningMarker, marker);
+			if (this.runningHeader)
+				this.cachedLines = refreshToolClocks(this.cachedLines, [this.runningHeader], marker, safeWidth, now);
 			this.runningMarker = marker;
 			return this.cachedLines;
 		}
 		this.runningMarker = marker;
+		this.runningHeader = undefined;
 		const lines: string[] = [];
 		switch (this.activity.kind) {
 			case "shell":
@@ -126,196 +146,180 @@ export class IPythonActivityComponent implements Component {
 		return lines;
 	}
 
-	private renderShell(lines: string[], width: number, activity: IPythonShellActivity): void {
-		if (this.expanded) {
-			const commandLines = highlightCode(activity.command, "bash");
-			const cwd = activity.cwd ? theme.fg("dim", `cd ${activity.cwd} && `) : "";
-			for (const [index, line] of commandLines.entries()) {
-				this.pushWrapped(
-					lines,
-					width,
-					index === 0 ? `${marker(activity, this.runningMarker)} ${theme.fg("dim", "$ ")}${cwd}` : "    ",
-					line,
-				);
-			}
-		} else {
-			const newline = activity.command.search(/[\r\n]/);
-			const firstLine = replaceTabs(newline < 0 ? activity.command : activity.command.slice(0, newline));
-			const suffix = newline < 0 ? "" : theme.fg("dim", " … [multiline]");
-			const title = `${marker(activity, this.runningMarker)} ${activity.status === "running" ? "Running" : "Ran"} `;
-			const available = Math.max(1, width - 1 - visibleWidth(suffix));
-			const command = truncateToWidth(firstLine, Math.max(1, available - visibleWidth(title)), "…");
-			const highlighted = highlightCode(command, "bash")[0] ?? command;
-			lines.push(
-				truncateToWidth(` ${truncateToWidth(`${title}${highlighted}`, available, "…")}${suffix}`, width, ""),
-			);
+	private pushHeader(
+		lines: string[],
+		width: number,
+		activity: IPythonActivity,
+		label: string,
+		metadata?: string,
+	): void {
+		const running = activity.status === "running";
+		const startedAt = activity.startedAt ?? this.fallbackStartedAt;
+		const durationMs = running ? Math.max(0, this.clockNow - startedAt) : activity.durationMs;
+		const styledLabel = label.replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+		metadata = metadata?.replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+		if (running) {
+			this.runningHeader = {
+				row: 0,
+				label: styledLabel,
+				startedAt,
+				seconds: Math.floor((durationMs ?? 0) / 1_000),
+				...(metadata ? { metadata } : {}),
+			};
 		}
-		const output = [activity.stdout, activity.stderr].filter(Boolean).join("\n").trimEnd();
-		if (output) {
-			if (this.expanded) {
-				for (const line of output.split(/\r?\n/)) {
-					this.pushWrapped(lines, width, "    ", theme.fg("toolOutput", replaceTabs(line)));
-				}
-			} else {
-				this.pushPreview(lines, width, theme.fg("toolOutput", replaceTabs(output)));
-			}
+		lines.push(
+			renderToolHeader(styledLabel, marker(activity, this.runningMarker), width, durationMs, running, metadata),
+		);
+	}
+
+	private renderShell(lines: string[], width: number, activity: IPythonShellActivity): void {
+		const newline = activity.command.search(/[\r\n]/);
+		const firstLine = replaceTabs(newline < 0 ? activity.command : activity.command.slice(0, newline));
+		const multiline = newline < 0 ? "" : theme.fg("dim", " [multiline]");
+		const command = truncateToWidth(firstLine, Math.max(1, width), "…");
+		const highlighted = highlightCode(command, "bash")[0] ?? command;
+		const action = toolAction(activity.status === "running" ? "Running" : "Ran");
+		this.pushHeader(lines, width, activity, this.expanded ? action : `${action}${multiline} ${highlighted}`);
+		if (this.expanded) {
+			const cwd = activity.cwd ? theme.fg("dim", `cd ${activity.cwd} && `) : "";
+			appendToolCode(lines, cwd + highlightCode(activity.command, "bash").join("\n"), width);
+		}
+		// stdout may already end with a newline. Never insert a second separator.
+		let output = activity.stdout ?? "";
+		if (activity.stderr) {
+			const needsNewline =
+				output && !/[\r\n]$/.test(stripAnsi(output)) && !/^[\r\n]/.test(stripAnsi(activity.stderr));
+			output += `${needsNewline ? "\n" : ""}${activity.stderr}`;
 		}
 		const failed =
 			activity.status === "error" ||
 			activity.timedOut ||
 			Boolean(activity.error) ||
 			(activity.exitCode !== undefined && activity.exitCode !== null && activity.exitCode !== 0);
-		if (this.expanded || failed) {
-			const stats: string[] = [];
-			if (activity.status === "running") stats.push("running");
-			if (failed) stats.push("failed");
-			if (activity.exitCode !== undefined && activity.exitCode !== null) stats.push(`exit ${activity.exitCode}`);
-			if (activity.timedOut) stats.push("timed out");
-			const duration = formatDuration(activity.durationMs);
-			if (duration) stats.push(duration);
-			if (stats.length > 0)
-				this.pushWrapped(lines, width, "    ", theme.fg(failed ? "error" : "dim", stats.join(" · ")));
+		const parts: string[] = [];
+		if (failed) {
+			const reason =
+				activity.error ??
+				(activity.timedOut
+					? "Timed out"
+					: activity.exitCode !== undefined && activity.exitCode !== null
+						? `Exit ${activity.exitCode}`
+						: "Command failed");
+			parts.push(theme.fg("error", reason));
 		}
-		if (activity.error) this.pushWrapped(lines, width, "    ", theme.fg("error", activity.error));
+		if (output) parts.push(theme.fg("toolOutput", replaceTabs(output)));
+		if (this.expanded && !failed && activity.exitCode !== undefined && activity.exitCode !== null) {
+			if (parts.length > 0 && /[\r\n]$/.test(stripAnsi(parts[parts.length - 1]!))) {
+				parts[parts.length - 1] += theme.fg("dim", `exit ${activity.exitCode}`);
+			} else parts.push(theme.fg("dim", `exit ${activity.exitCode}`));
+		}
+		appendToolOutput(lines, parts.join("\n"), width, this.expanded);
 	}
 
 	private renderExplore(lines: string[], width: number, activity: IPythonExploreActivity): void {
-		const verb =
-			activity.status === "error"
-				? `${activity.operation} failed`
-				: activity.status === "running"
-					? { read: "Reading", list: "Listing", search: "Searching" }[activity.operation]
-					: { read: "Read", list: "Listed", search: "Searched" }[activity.operation];
-		const query = activity.query !== undefined ? theme.fg("dim", ` · ${activity.query}`) : "";
-		this.pushWrapped(
-			lines,
-			width,
-			"",
-			`${marker(activity, this.runningMarker)} ${theme.fg("accent", verb)} ${theme.bold(activity.target)}${query}`,
-		);
-		if (activity.error) this.pushWrapped(lines, width, "    ", theme.fg("error", activity.error));
-		if (this.expanded) {
-			const duration = formatDuration(activity.durationMs);
-			if (duration) this.pushWrapped(lines, width, "    ", theme.fg("dim", duration));
-		}
+		const path = activity.target.replace(/[\r\n\t]/g, " ");
+		const detail =
+			activity.operation === "search" && activity.query
+				? `${toolPath(activity.query.replace(/[\r\n\t]/g, " "))} in ${toolPath(path)}`
+				: toolPath(path);
+		this.pushHeader(lines, width, activity, `${activity.operation} ${detail}`);
+		if (activity.error) appendToolOutput(lines, theme.fg("error", activity.error), width, this.expanded);
 	}
 
 	private renderMcp(lines: string[], width: number, activity: IPythonMcpActivity): void {
 		const verb = activity.status === "running" ? "Calling" : "Called";
-		this.pushWrapped(
-			lines,
-			width,
-			"",
-			`${marker(activity, this.runningMarker)} ${theme.fg("accent", verb)} ${theme.bold(activity.operation)}`,
-		);
+		this.pushHeader(lines, width, activity, `${toolAction(verb)} ${toolTarget(activity.operation)}`);
 		if (this.expanded && activity.input !== undefined) {
-			this.pushWrapped(lines, width, "    ", theme.fg("dim", "Input:"));
-			for (const line of activity.input.split(/\r?\n/))
-				this.pushWrapped(lines, width, "    ", theme.fg("toolOutput", replaceTabs(line)));
+			appendToolCode(lines, theme.fg("dim", `Input:\n${replaceTabs(activity.input)}`), width);
 		}
-		if (activity.output !== undefined) {
-			if (this.expanded) {
-				this.pushWrapped(lines, width, "    ", theme.fg("dim", "Output:"));
-				for (const line of activity.output.split(/\r?\n/))
-					this.pushWrapped(lines, width, "    ", theme.fg("toolOutput", replaceTabs(line)));
-			} else this.pushPreview(lines, width, theme.fg("toolOutput", replaceTabs(activity.output)));
-		}
-		if (activity.error || activity.status === "error") {
-			this.pushWrapped(lines, width, "    ", theme.fg("error", `Error: ${activity.error ?? "MCP call failed"}`));
-		}
-		if (this.expanded) {
-			const duration = formatDuration(activity.durationMs);
-			if (duration) this.pushWrapped(lines, width, "    ", theme.fg("dim", duration));
-		}
+		const parts: string[] = [];
+		if (activity.error || activity.status === "error")
+			parts.push(theme.fg("error", `Error: ${activity.error ?? "MCP call failed"}`));
+		if (activity.output !== undefined) parts.push(theme.fg("toolOutput", replaceTabs(activity.output)));
+		appendToolOutput(lines, parts.join("\n"), width, this.expanded);
 	}
 
 	private renderAgent(lines: string[], width: number, activity: IPythonAgentActivity): void {
+		if (activity.operation === "list" && activity.status !== "error" && !activity.error) return;
 		const name = activity.name ?? activity.agentId ?? "agents";
-		const title = `${marker(activity, this.runningMarker)} ${theme.fg("accent", activity.operation)} ${theme.bold(name)}`;
-		const metadata = [activity.agentStatus, activity.modelRole ?? activity.profile, activity.workspace]
-			.filter((value): value is string => Boolean(value))
-			.join(" · ");
-		this.pushWrapped(lines, width, "", metadata ? `${title}${theme.fg("dim", ` · ${metadata}`)}` : title);
-		const body = activity.task ?? activity.message;
-		if (body) {
-			const bodyLines = body.trim().split(/\r?\n/);
-			const shown = this.expanded ? bodyLines : bodyLines.slice(0, TASK_PREVIEW_LINES);
-			for (const line of shown) this.pushWrapped(lines, width, "    ", theme.fg("toolOutput", replaceTabs(line)));
-			if (!this.expanded && bodyLines.length > shown.length) {
-				this.pushWrapped(lines, width, "    ", theme.fg("dim", `… ${bodyLines.length - shown.length} more lines`));
-			}
+		const outcome = activity.agentOutcome;
+		if (
+			activity.operation === "wait" &&
+			activity.status !== "running" &&
+			outcome &&
+			!(outcome === "ok" && (activity.status === "error" || activity.error))
+		) {
+			lines.push(truncateToWidth(` ${formatAgentCompletion(name, outcome)}`, width, "…"));
+		} else {
+			const metadata = [activity.modelRole ?? activity.profile, activity.workspace]
+				.filter((value): value is string => Boolean(value))
+				.join(", ");
+			const operation = activity.status === "error" ? `${activity.operation} failed` : activity.operation;
+			this.pushHeader(lines, width, activity, `${toolAction(operation)} ${toolTarget(name)}`, metadata || undefined);
 		}
-		if (activity.error) this.pushWrapped(lines, width, "    ", theme.fg("error", activity.error));
+		const parts: string[] = [];
+		if (activity.error) parts.push(theme.fg("error", activity.error));
+		const body = activity.task ?? activity.message;
+		if (body) parts.push(theme.fg("toolOutput", body));
+		appendToolOutput(lines, parts.join("\n"), width, this.expanded);
 	}
 
 	private renderFile(lines: string[], width: number, activity: IPythonFileActivity): void {
-		const stats = this.changeStats(activity);
 		const verb =
 			activity.status === "error"
 				? { create: "Add failed", remove: "Delete failed", materialize: "Materialize failed" }[activity.operation]
 				: activity.status === "running"
 					? { create: "Adding", remove: "Deleting", materialize: "Materializing" }[activity.operation]
 					: { create: "Added", remove: "Deleted", materialize: "Materialized" }[activity.operation];
-		this.pushWrapped(
+		this.pushHeader(
 			lines,
 			width,
-			"",
-			`${marker(activity, this.runningMarker)} ${theme.fg("accent", verb)} ${theme.bold(activity.path)}${stats}`,
+			activity,
+			`${toolAction(verb)} ${toolPath(activity.path)}`,
+			this.changeStats(activity),
 		);
-		if (activity.diff) this.renderDiffLines(lines, width, activity.diff);
-		if (activity.error) this.pushWrapped(lines, width, "    ", theme.fg("error", activity.error));
+		this.renderFileResult(lines, width, activity);
 	}
 
 	private renderPatch(lines: string[], width: number, activity: IPythonPatchActivity): void {
-		const stats = this.changeStats(activity);
 		const verb = activity.status === "error" ? "Edit failed" : activity.status === "running" ? "Editing" : "Edited";
-		this.pushWrapped(
+		this.pushHeader(
 			lines,
 			width,
-			"",
-			`${marker(activity, this.runningMarker)} ${theme.fg("accent", verb)} ${theme.bold(activity.path)}${stats}`,
+			activity,
+			`${toolAction(verb)} ${toolPath(activity.path)}`,
+			this.changeStats(activity),
 		);
-		if (activity.diff) this.renderDiffLines(lines, width, activity.diff);
-		if (activity.error) this.pushWrapped(lines, width, "    ", theme.fg("error", activity.error));
+		this.renderFileResult(lines, width, activity);
 	}
 
-	private changeStats(activity: IPythonFileActivity | IPythonPatchActivity): string {
+	private changeStats(activity: IPythonFileActivity | IPythonPatchActivity): string | undefined {
 		const stats: string[] = [];
 		if (activity.additions) stats.push(theme.fg("toolDiffAdded", `+${activity.additions}`));
 		if (activity.removals) stats.push(theme.fg("toolDiffRemoved", `-${activity.removals}`));
-		if (activity.diffTruncated) stats.push(theme.fg("dim", "diff truncated"));
-		if (this.expanded) {
-			if (activity.status === "running") stats.push(theme.fg("dim", "running"));
-			const duration = formatDuration(activity.durationMs);
-			if (duration) stats.push(theme.fg("dim", duration));
-		}
-		return stats.length > 0 ? theme.fg("dim", " · ") + stats.join(theme.fg("dim", " ")) : "";
+		if (activity.diffTruncated) stats.push("diff truncated");
+		return stats.length > 0 ? stats.join(" ") : undefined;
 	}
 
-	private renderDiffLines(lines: string[], width: number, diff: string): void {
-		const rendered = renderDiff(diff);
-		if (this.expanded) {
-			for (const line of rendered.split("\n")) this.pushWrapped(lines, width, "    ", line);
-		} else this.pushPreview(lines, width, rendered);
-	}
-
-	private pushPreview(lines: string[], width: number, text: string): void {
-		const outputWidth = Math.max(1, width - 5);
-		const { visualLines, skippedCount } = truncateToVisualLines(text, OUTPUT_PREVIEW_LINES, outputWidth, 0, 2);
-		for (const [index, line] of visualLines.entries()) {
-			if (index === 2 && skippedCount > 0) {
-				lines.push(truncateToWidth(`     ${theme.fg("dim", `… ${skippedCount} lines omitted`)}`, width, "…"));
+	private renderFileResult(
+		lines: string[],
+		width: number,
+		activity: IPythonFileActivity | IPythonPatchActivity,
+	): void {
+		const parts: string[] = [];
+		if (activity.error) parts.push(theme.fg("error", activity.error));
+		if (activity.diff) {
+			let diff = activity.diff;
+			if (!this.expanded) {
+				const rows = diff.split("\n");
+				const firstChange = rows.findIndex((row) => /^[+-]\s*\d/.test(row));
+				const start = Math.max(0, firstChange - 1);
+				if (start > 0) parts.push(theme.fg("dim", `… ${start} context lines omitted`));
+				diff = rows.slice(start).join("\n");
 			}
-			lines.push(truncateToWidth(`     ${line}`, width, ""));
+			parts.push(renderDiff(diff));
 		}
-	}
-
-	private pushWrapped(lines: string[], width: number, prefix: string, text: string): void {
-		const available = Math.max(1, width - 1 - visibleWidth(prefix));
-		const wrapped = wrapTextWithAnsi(text, available);
-		for (const [index, line] of (wrapped.length > 0 ? wrapped : [""]).entries()) {
-			const linePrefix = index === 0 ? prefix : " ".repeat(visibleWidth(prefix));
-			lines.push(truncateToWidth(` ${linePrefix}${line}`, width, ""));
-		}
+		// Keep the first changed region together instead of splicing unrelated diff tails.
+		appendToolOutput(lines, parts.join("\n"), width, this.expanded, true);
 	}
 }

@@ -54,6 +54,8 @@
 - Reduced file-search line allocations, web-response copies, activity snapshot allocations, and Jupyter diagnostic-path construction; shell artifacts can be persisted in complete text parts without concatenating another full-sized output string.
 
 - Reduced context-cache metadata retention and reused IPython source/output summaries on status updates; existing collapsed previews no longer materialize a padded copy of the full output.
+- Unified collapsed tool rows onto one layout with default-color action titles, muted paths and search queries, shared result gutters, and unexpanded edit `+n -n` stats.
+- Removed the Subagent Fleet operation-hint row above agent list entries.
 
 ### Fixed
 
@@ -80,6 +82,7 @@
 - Fixed snapshot compaction context estimates omitting archive text and image blocks.
 
 - Fixed expanded IPython activity output exceeding JavaScript spread argument limits and released derived activity caches when a cell is hidden.
+- Show file-change addition and removal counts on collapsed Edited, Added, and Deleted headers.
 
 ## [0.85.0] - 2026-09-04
 

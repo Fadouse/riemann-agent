@@ -1,11 +1,25 @@
-import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { Component } from "@earendil-works/pi-tui";
 import type { IPythonActivity, IPythonExploreActivity, IPythonMcpActivity } from "../../../riemann/ipython.ts";
 import { stripAnsi } from "../../../utils/ansi.ts";
 import { highlightCode, theme } from "../theme/theme.ts";
 import { IPythonActivityComponent } from "./ipython-activity.ts";
 import { keyText } from "./keybinding-hints.ts";
-import { refreshToolMarkers, runningToolMarker } from "./tool-status-marker.ts";
-import { truncateToVisualLines } from "./visual-truncate.ts";
+import {
+	appendToolCode,
+	appendToolOutput,
+	appendToolResult,
+	previewToolOutput,
+	toolAction,
+	toolPath,
+	toolTarget,
+} from "./tool-display.ts";
+import {
+	type RunningToolHeader,
+	refreshToolClocks,
+	refreshToolMarkers,
+	renderToolHeader,
+	runningToolMarker,
+} from "./tool-status-marker.ts";
 
 export interface IPythonCellContentBlock {
 	type: string;
@@ -22,6 +36,7 @@ export interface IPythonCellState {
 	isError?: boolean;
 	expanded?: boolean;
 	executionStarted?: boolean;
+	startedAt?: number;
 	argsComplete?: boolean;
 	hidden?: boolean;
 	interruptHint?: boolean;
@@ -29,41 +44,10 @@ export interface IPythonCellState {
 }
 
 interface IPythonDetails {
+	startedAt?: number;
 	status?: string;
 	durationMs?: number;
 	errorName?: string;
-}
-
-const OUTPUT_INDENT = "  ";
-const SGR_PATTERN = /\x1b\[([0-9;]*)m/g;
-
-function closeOpenSgr(line: string): string {
-	let foregroundOpen = false;
-	let backgroundOpen = false;
-	for (const match of line.matchAll(SGR_PATTERN)) {
-		const parameters = match[1] === "" ? [0] : (match[1]?.split(";").map(Number) ?? [0]);
-		for (let index = 0; index < parameters.length; index++) {
-			const code = parameters[index] ?? 0;
-			if (code === 0) {
-				foregroundOpen = false;
-				backgroundOpen = false;
-			} else if (code === 39) {
-				foregroundOpen = false;
-			} else if (code === 49) {
-				backgroundOpen = false;
-			} else if (code === 38 || code === 48) {
-				if (code === 38) foregroundOpen = true;
-				else backgroundOpen = true;
-				const mode = parameters[index + 1];
-				index += mode === 2 ? 4 : mode === 5 ? 2 : 1;
-			} else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) {
-				foregroundOpen = true;
-			} else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) {
-				backgroundOpen = true;
-			}
-		}
-	}
-	return foregroundOpen || backgroundOpen ? `${line}\x1b[0m` : line;
 }
 
 function readDetails(value: unknown): IPythonDetails {
@@ -71,6 +55,7 @@ function readDetails(value: unknown): IPythonDetails {
 	const record = value as Record<string, unknown>;
 	return {
 		status: typeof record.status === "string" ? record.status : undefined,
+		startedAt: typeof record.startedAt === "number" ? record.startedAt : undefined,
 		durationMs: typeof record.durationMs === "number" ? record.durationMs : undefined,
 		errorName: typeof record.errorName === "string" ? record.errorName : undefined,
 	};
@@ -81,12 +66,6 @@ function textFromBlocks(blocks: readonly IPythonCellContentBlock[] | undefined):
 		.filter((block) => block.type === "text" && typeof block.text === "string")
 		.map((block) => block.text ?? "")
 		.join("\n");
-}
-
-function formatDuration(durationMs: number | undefined): string | undefined {
-	if (durationMs === undefined) return undefined;
-	if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
-	return `${(durationMs / 1000).toFixed(1)}s`;
 }
 
 interface LineSummary {
@@ -132,24 +111,28 @@ export class IPythonCellComponent implements Component {
 	private activityComponents = new Map<string, IPythonActivityComponent>();
 	private cachedWidth?: number;
 	private animatedRows: number[] = [];
+	private headerClocks: RunningToolHeader[] = [];
+	private startedAt?: number;
+	private endedAt?: number;
 	private cachedRunningMarker = "";
 	private cachedState?: IPythonCellState;
 	private cachedThemeFg?: string;
 	private cachedLines?: string[];
 	private cachedTheme?: typeof theme;
-	private cachedCodeSummary?: { text: string; firstLine: string; lines: number };
+	private cachedCodeSummary?: { text: string; firstLine: string; lines: number; sourceLines: number };
 	private cachedOutputSummary?: { parts: string[]; lines: number };
-	private cachedPreview?: { text: string; theme: typeof theme; line: string };
 	private compactOutputCache?: {
 		parts: string[];
 		width: number;
 		errorName?: string;
 		failed: boolean;
+		theme: typeof theme;
 		lines: string[];
 	};
 
 	constructor(state: IPythonCellState) {
 		this.state = state;
+		if (state.executionStarted) this.startedAt = state.startedAt ?? Date.now();
 	}
 
 	update(state: IPythonCellState): void {
@@ -161,6 +144,7 @@ export class IPythonCellComponent implements Component {
 			this.state.isError === state.isError &&
 			this.state.expanded === state.expanded &&
 			this.state.executionStarted === state.executionStarted &&
+			this.state.startedAt === state.startedAt &&
 			this.state.argsComplete === state.argsComplete &&
 			this.state.hidden === state.hidden &&
 			this.state.interruptHint === state.interruptHint &&
@@ -169,6 +153,7 @@ export class IPythonCellComponent implements Component {
 			return;
 		}
 		this.state = state;
+		if (state.executionStarted) this.startedAt ??= state.startedAt ?? Date.now();
 		this.cachedWidth = undefined;
 		this.cachedState = undefined;
 		this.cachedThemeFg = undefined;
@@ -181,7 +166,6 @@ export class IPythonCellComponent implements Component {
 		this.cachedThemeFg = undefined;
 		this.cachedTheme = undefined;
 		this.cachedLines = undefined;
-		this.cachedPreview = undefined;
 		for (const component of this.activityComponents.values()) component.invalidate();
 	}
 
@@ -189,6 +173,7 @@ export class IPythonCellComponent implements Component {
 		if (this.state.hidden) {
 			this.activityComponents.clear();
 			this.animatedRows = [];
+			this.headerClocks = [];
 			this.invalidate();
 			this.cachedCodeSummary = undefined;
 			this.cachedOutputSummary = undefined;
@@ -207,29 +192,68 @@ export class IPythonCellComponent implements Component {
 			if (this.animatedRows.length === 0) return this.cachedLines;
 			const marker = runningToolMarker();
 			this.cachedLines = refreshToolMarkers(this.cachedLines, this.animatedRows, this.cachedRunningMarker, marker);
+			this.cachedLines = refreshToolClocks(this.cachedLines, this.headerClocks, marker, safeWidth);
 			this.cachedRunningMarker = marker;
 			return this.cachedLines;
 		}
 		const details = readDetails(this.state.details);
-		const running = this.statusKind(details) === "running";
-		const marker = running ? runningToolMarker() : theme.fg("muted", "●");
+		const status = this.statusKind(details);
+		const running = status === "running";
+		const queued = status === "queued";
+		const animated = running || queued;
+		const now = Date.now();
+		const startedAt = details.startedAt ?? this.state.startedAt ?? this.startedAt;
+		if (!running && this.statusKind(details) !== "queued" && startedAt !== undefined)
+			this.endedAt ??= details.durationMs === undefined ? now : startedAt + details.durationMs;
+		const durationMs = running
+			? now - (startedAt ?? now)
+			: (details.durationMs ??
+				(startedAt === undefined || this.endedAt === undefined ? undefined : this.endedAt - startedAt));
+		const marker = animated ? runningToolMarker(now) : theme.fg("muted", "●");
 		this.cachedRunningMarker = marker;
 		const failed = this.statusKind(details) === "error" || this.statusKind(details) === "aborted";
-		const hasRunningActivity = this.state.activities?.some((activity) => activity.status === "running") ?? false;
+		const hasRunningActivity =
+			this.state.activities?.some(
+				(activity) =>
+					activity.status === "running" && !(activity.kind === "agent" && activity.operation === "list"),
+			) ?? false;
 		// A completed host call does not mean the surrounding Python computation has ended.
 		const showWrapper =
 			this.state.expanded ||
 			failed ||
 			(this.state.activities?.length ?? 0) === 0 ||
 			(running && !hasRunningActivity);
-		this.animatedRows = running && showWrapper ? [0] : [];
-		const lines: string[] = showWrapper ? [truncateToWidth(` ${this.summaryLine(details)}`, safeWidth, "")] : [];
-		if (this.state.expanded) this.renderCode(lines, safeWidth);
-		else if (showWrapper) this.renderCompactOutput(lines, safeWidth, details, failed);
+		this.animatedRows = animated && showWrapper ? [0] : [];
+		this.headerClocks = [];
+		const label = this.summaryLabel(details);
+		const interruptKey =
+			running && this.state.interruptHint !== false && this.state.executionStarted ? keyText("app.interrupt") : "";
+		const sourceLines = queued ? this.codeSummary().sourceLines : undefined;
+		const metadata =
+			sourceLines !== undefined
+				? `${sourceLines} ${sourceLines === 1 ? "line" : "lines"}`
+				: interruptKey
+					? `${interruptKey} to interrupt`
+					: undefined;
+		const lines: string[] = showWrapper
+			? [renderToolHeader(label, this.marker(details), safeWidth, durationMs, running, metadata)]
+			: [];
+		if (running && showWrapper)
+			this.headerClocks.push({
+				row: 0,
+				label,
+				metadata,
+				startedAt: startedAt ?? now,
+				seconds: Math.floor(Math.max(0, durationMs ?? 0) / 1_000),
+			});
+		if (this.state.expanded) {
+			this.renderCode(lines, safeWidth);
+			this.renderOutput(lines, safeWidth, details);
+		} else if (showWrapper) this.renderCompactOutput(lines, safeWidth, details, failed);
 		this.renderActivities(lines, safeWidth, running);
-		if (this.state.expanded) this.renderOutput(lines, safeWidth, details, true);
 		const markerPrefix = ` ${marker.slice(0, -"\x1b[39m".length)}`;
 		this.animatedRows = this.animatedRows.filter((row) => lines[row]?.startsWith(markerPrefix));
+		this.headerClocks = this.headerClocks.filter((header) => this.animatedRows.includes(header.row));
 		this.cachedWidth = safeWidth;
 		this.cachedState = this.state;
 		this.cachedThemeFg = themeFg;
@@ -242,52 +266,26 @@ export class IPythonCellComponent implements Component {
 		return this.animatedRows.length > 0;
 	}
 
-	private summaryLine(details: IPythonDetails): string {
-		const parts = [`${this.marker(details)} ${theme.fg("muted", "python")}`];
-		if (this.state.interruptHint !== false && this.state.executionStarted && this.statusKind(details) === "running") {
-			const interruptKey = keyText("app.interrupt");
-			if (interruptKey) parts.push(theme.fg("muted", `${interruptKey} to interrupt`));
-		}
+	private summaryLabel(details: IPythonDetails): string {
+		const parts = [toolAction("Python")];
 		if (!this.state.expanded) {
-			const duration = formatDuration(details.durationMs);
-			if (duration) parts.push(theme.fg("muted", duration));
 			const status = this.statusKind(details);
 			if (details.status === "timeout") parts.push(theme.fg("error", "Timed out"));
 			else if (status === "aborted") parts.push(theme.fg("warning", "Cancelled"));
 			else if (status === "error") parts.push(theme.fg("error", details.errorName ?? "Error"));
-			return parts.join(theme.fg("dim", " · "));
+			return parts.join(" ");
 		}
-		if (this.cachedCodeSummary?.text !== this.state.code) {
-			const summary = summarizeLines(this.state.code);
-			this.cachedCodeSummary = { text: this.state.code, firstLine: summary.firstLine, lines: summary.nonEmptyLines };
-		}
-		const inputSummary = this.cachedCodeSummary;
-		const preview = inputSummary.firstLine;
-		if (preview) {
-			if (this.cachedPreview?.text !== preview || this.cachedPreview.theme !== theme) {
-				this.cachedPreview = {
-					text: preview,
-					theme,
-					line: highlightCode(preview, "python")[0] ?? theme.fg("mdCodeBlock", preview),
-				};
-			}
-			parts.push(this.cachedPreview.line);
-		} else {
-			this.cachedPreview = undefined;
-			if (!this.state.executionStarted) parts.push(theme.fg("muted", "waiting for code"));
-		}
+		const inputSummary = this.codeSummary();
 
 		const counts = this.lineCounts(inputSummary.lines);
 		if (counts) parts.push(theme.fg("muted", counts));
-		const duration = formatDuration(details.durationMs);
-		if (duration) parts.push(theme.fg("muted", duration));
 		if (details.errorName && !this.state.isPartial) parts.push(theme.fg("error", details.errorName));
 		else if (
 			this.state.isPartial &&
 			(this.state.activities?.some((activity) => activity.status === "running") ?? false)
 		)
 			parts.push(theme.fg("muted", "working"));
-		return parts.join(theme.fg("dim", " · "));
+		return parts.join(" ");
 	}
 
 	private statusKind(details: IPythonDetails): StatusKind {
@@ -311,10 +309,22 @@ export class IPythonCellComponent implements Component {
 			case "done":
 				return theme.fg("success", "●");
 			case "running":
-				return this.cachedRunningMarker;
 			case "queued":
-				return theme.fg("muted", "●");
+				return this.cachedRunningMarker;
 		}
+	}
+
+	private codeSummary(): NonNullable<IPythonCellComponent["cachedCodeSummary"]> {
+		if (this.cachedCodeSummary?.text !== this.state.code) {
+			const summary = summarizeLines(this.state.code);
+			this.cachedCodeSummary = {
+				text: this.state.code,
+				firstLine: summary.firstLine,
+				lines: summary.nonEmptyLines,
+				sourceLines: summary.breaks + (this.state.code.length > 0 && !this.state.code.endsWith("\n") ? 1 : 0),
+			};
+		}
+		return this.cachedCodeSummary;
 	}
 
 	private lineCounts(input: number): string | undefined {
@@ -355,28 +365,32 @@ export class IPythonCellComponent implements Component {
 			!cached ||
 			cached.width !== width ||
 			cached.failed !== failed ||
+			cached.theme !== theme ||
 			cached.errorName !== details.errorName ||
 			cached.parts.length !== parts.length ||
 			parts.some((part, index) => part !== cached.parts[index])
 		) {
-			let output = parts.join("\n").trim();
+			let output = parts.join("\n");
 			// Python tracebacks end in the actual exception; show its reason, not stack frames.
 			if (failed) output = stripAnsi(output);
 			if (failed && details.errorName) {
 				const index = output.lastIndexOf(`${details.errorName}:`);
 				if (index >= 0) output = output.slice(index);
 			}
-			const { visualLines, skippedCount } = truncateToVisualLines(output, 3, Math.max(1, width - 3), 0, 2);
-			const preview: string[] = [];
-			for (let index = 0; index < visualLines.length; index++) {
-				if (skippedCount > 0 && index === 2) preview.push(`… ${skippedCount} more lines`);
-				preview.push(visualLines[index]!);
-			}
-			this.compactOutputCache = { parts, width, failed, errorName: details.errorName, lines: preview };
+			this.compactOutputCache = {
+				parts,
+				width,
+				failed,
+				errorName: details.errorName,
+				theme,
+				lines: previewToolOutput(output, width),
+			};
 		}
-		for (const line of this.compactOutputCache!.lines) {
-			lines.push(truncateToWidth(`   ${theme.fg(failed ? "error" : "toolOutput", line)}`, width, ""));
-		}
+		appendToolResult(
+			lines,
+			this.compactOutputCache!.lines.map((line) => theme.fg(failed ? "error" : "toolOutput", line)),
+			width,
+		);
 	}
 
 	private renderActivities(lines: string[], width: number, running: boolean): void {
@@ -385,10 +399,18 @@ export class IPythonCellComponent implements Component {
 			this.activityComponents.clear();
 			return;
 		}
-		if (lines.length > 0) this.addBlank(lines);
 		const activeIds = new Set<string>();
 		for (let index = 0; index < activities.length; index++) {
 			const activity = activities[index]!;
+			if (
+				activity.kind === "agent" &&
+				activity.operation === "list" &&
+				activity.status !== "error" &&
+				!activity.error
+			)
+				continue;
+			// This assembler alone owns spacing between logical tool blocks.
+			if (lines.length > 0 && stripAnsi(lines[lines.length - 1]!).trim()) lines.push("");
 			if (!this.state.expanded && activity.kind === "explore" && activity.status !== "error") {
 				const group = [activity];
 				while (index + 1 < activities.length) {
@@ -422,7 +444,11 @@ export class IPythonCellComponent implements Component {
 				component.update(activity, this.state.expanded ?? false);
 			}
 			if (running && activity.status === "running") this.animatedRows.push(lines.length);
-			for (const line of component.render(width, this.cachedRunningMarker)) lines.push(line);
+			const row = lines.length;
+			for (const line of component.render(width, this.cachedRunningMarker, running ? undefined : this.endedAt))
+				lines.push(line);
+			const header = component.getRunningHeader();
+			if (running && header) this.headerClocks.push({ ...header, row: row + header.row });
 		}
 		for (const id of this.activityComponents.keys()) {
 			if (!activeIds.has(id)) this.activityComponents.delete(id);
@@ -437,19 +463,18 @@ export class IPythonCellComponent implements Component {
 	): void {
 		const active = group.some((activity) => activity.status === "running");
 		if (active && running) this.animatedRows.push(lines.length);
-		const marker = active ? this.cachedRunningMarker : theme.fg("success", "●");
-		lines.push(truncateToWidth(` ${marker} ${theme.bold(active ? "Exploring" : "Explored")}`, width, ""));
-		let rows = 0;
+		this.pushGroupHeader(lines, width, toolAction(active ? "Exploring" : "Explored"), group, active && running);
+		const rows: string[] = [];
 		for (let index = 0; index < group.length; ) {
-			if (rows === 3) {
-				lines.push(
-					truncateToWidth(`     ${theme.fg("dim", `… ${group.length - index} more operations`)}`, width, ""),
-				);
+			if (rows.length === 4) {
+				rows.push(theme.fg("dim", `… ${group.length - index} more operations`));
 				break;
 			}
 			const activity = group[index]!;
 			let detail: string;
+			let verb: string;
 			if (activity.operation === "read") {
+				verb = "read";
 				const names: string[] = [];
 				let count = 0;
 				while (index < group.length && group[index]!.operation === "read") {
@@ -457,22 +482,24 @@ export class IPythonCellComponent implements Component {
 					count++;
 					index++;
 				}
-				detail = `Read ${names.join(", ")}${count > names.length ? `, … +${count - names.length} files` : ""}`;
+				detail = toolPath(
+					`${names.join(", ")}${count > names.length ? `, … +${count - names.length} files` : ""}`.replace(
+						/[\r\n\t]/g,
+						" ",
+					),
+				);
+			} else if (activity.operation === "list") {
+				verb = "list";
+				detail = toolPath(activity.target.replace(/[\r\n\t]/g, " "));
+				index++;
 			} else {
-				detail =
-					activity.operation === "list"
-						? `List ${activity.target}`
-						: `Search ${activity.query ?? ""} in ${activity.target}`;
+				verb = "search";
+				detail = `${toolPath((activity.query ?? "").replace(/[\r\n\t]/g, " "))} in ${toolPath(activity.target.replace(/[\r\n\t]/g, " "))}`;
 				index++;
 			}
-			lines.push(
-				truncateToWidth(
-					` ${rows === 0 ? "  └ " : "    "}${theme.fg("muted", detail.replace(/[\r\n\t]/g, " "))}`,
-					width,
-				),
-			);
-			rows++;
+			rows.push(`${verb} ${detail}`);
 		}
+		appendToolOutput(lines, rows.join("\n"), width, false, true);
 	}
 
 	private renderMcpGroup(
@@ -483,62 +510,72 @@ export class IPythonCellComponent implements Component {
 	): void {
 		const active = group.some((activity) => activity.status === "running");
 		if (active && running) this.animatedRows.push(lines.length);
-		const marker = active ? this.cachedRunningMarker : theme.fg("success", "●");
-		lines.push(
-			truncateToWidth(
-				` ${marker} ${active ? "Calling" : "Called"} ${group[0]!.operation} · ${group.length} calls`,
-				width,
-			),
+		this.pushGroupHeader(
+			lines,
+			width,
+			`${toolAction(active ? "Calling" : "Called")} ${toolTarget(group[0]!.operation)}`,
+			group,
+			active && running,
+			`${group.length} calls`,
 		);
 		const latest = group[group.length - 1]!;
-		if (latest.output) {
-			const { visualLines, skippedCount } = truncateToVisualLines(latest.output, 2, Math.max(1, width - 5));
-			if (skippedCount > 0)
-				lines.push(truncateToWidth(`     ${theme.fg("dim", `… ${skippedCount} earlier lines`)}`, width));
-			for (const line of visualLines) lines.push(truncateToWidth(`     ${theme.fg("toolOutput", line)}`, width, ""));
-		}
+		if (latest.output) appendToolOutput(lines, theme.fg("toolOutput", latest.output), width);
 	}
 
-	private renderCode(lines: string[], width: number): boolean {
-		const code = this.state.code.trimEnd();
-		this.addBlank(lines);
-		if (!code) {
-			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "waiting for code"), width);
-			return false;
-		}
-
-		const highlighted = highlightCode(code, "python");
-		for (const [index, line] of highlighted.entries()) {
-			const prefix = theme.fg("dim", index === 0 ? "› " : "  ");
-			this.addWrapped(lines, prefix, line || " ", width);
-		}
-		return true;
-	}
-
-	private renderOutput(lines: string[], width: number, details: IPythonDetails, hasCode: boolean): void {
-		const output = textFromBlocks(this.state.content).trimEnd();
-		if (hasCode) this.addBlank(lines);
-		if (output) {
-			const color = this.statusKind(details) === "error" ? "muted" : "toolOutput";
-			for (const line of output.split("\n")) {
-				this.addWrapped(lines, OUTPUT_INDENT, theme.fg(color, line || " "), width);
+	private pushGroupHeader(
+		lines: string[],
+		width: number,
+		text: string,
+		group: readonly IPythonActivity[],
+		running: boolean,
+		metadata?: string,
+	): void {
+		let start = Infinity;
+		let end = -Infinity;
+		for (const activity of group) {
+			if (activity.startedAt !== undefined) {
+				start = Math.min(start, activity.startedAt);
+				if (activity.durationMs !== undefined) end = Math.max(end, activity.startedAt + activity.durationMs);
 			}
-			return;
 		}
-		const waiting = this.state.isPartial || (this.state.executionStarted && !this.state.argsComplete);
-		this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", waiting ? "waiting for output..." : "no output"), width);
+		const now = Date.now();
+		const startedAt = Number.isFinite(start) ? start : (this.startedAt ?? now);
+		const durationMs = running
+			? now - startedAt
+			: Number.isFinite(start) && Number.isFinite(end)
+				? end - start
+				: undefined;
+		const label = text;
+		const row = lines.length;
+		lines.push(
+			renderToolHeader(
+				label,
+				running ? this.cachedRunningMarker : theme.fg("success", "●"),
+				width,
+				durationMs,
+				running,
+				metadata,
+			),
+		);
+		if (running)
+			this.headerClocks.push({
+				row,
+				label,
+				metadata,
+				startedAt,
+				seconds: Math.floor(Math.max(0, durationMs ?? 0) / 1_000),
+			});
 	}
 
-	private addWrapped(lines: string[], prefix: string, text: string, width: number): void {
-		const available = Math.max(1, width - 1 - visibleWidth(prefix));
-		const wrapped = wrapTextWithAnsi(text, available);
-		for (const [index, line] of (wrapped.length > 0 ? wrapped : [""]).entries()) {
-			const linePrefix = index === 0 ? prefix : " ".repeat(visibleWidth(prefix));
-			lines.push(truncateToWidth(` ${linePrefix}${closeOpenSgr(line)}`, width, ""));
-		}
+	private renderCode(lines: string[], width: number): void {
+		if (!this.state.code) return;
+		appendToolCode(lines, highlightCode(this.state.code, "python").join("\n"), width);
 	}
 
-	private addBlank(lines: string[]): void {
-		lines.push("");
+	private renderOutput(lines: string[], width: number, details: IPythonDetails): void {
+		const output = textFromBlocks(this.state.content);
+		if (!output) return;
+		const color = this.statusKind(details) === "error" ? "error" : "toolOutput";
+		appendToolOutput(lines, theme.fg(color, output), width, true);
 	}
 }

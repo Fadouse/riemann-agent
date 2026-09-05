@@ -172,6 +172,7 @@ export class RiemannActivityTracker {
 			case "start": {
 				const tracked = await this.start(event.requestId, event.request.operation, event.request.arguments);
 				if (!tracked) return undefined;
+				tracked.activity.startedAt = event.startedAt;
 				this.tracked.set(event.requestId, tracked);
 				return this.snapshot();
 			}
@@ -351,13 +352,18 @@ export class RiemannActivityTracker {
 		} else if (!error && activity.kind === "agent") {
 			const info = agentInfo(result);
 			const agentStatus = stringValue(info?.status);
-			const agentOutcome = stringValue(info?.last_outcome);
+			const waitOutcome = activity.operation === "wait" ? objectValue(result)?.outcome : undefined;
+			const agentOutcome =
+				waitOutcome === "ok" || waitOutcome === "error" || waitOutcome === "cancelled" ? waitOutcome : undefined;
+			const failed = agentOutcome === "error" || (activity.operation !== "wait" && info?.last_outcome === "error");
 			activity = {
 				...activity,
 				...(stringValue(info?.id) ? { agentId: stringValue(info?.id) } : {}),
 				...(stringValue(info?.name) ? { name: stringValue(info?.name) } : {}),
 				...(agentStatus ? { agentStatus } : activity.operation === "start" ? { agentStatus: "running" } : {}),
-				...(agentOutcome === "error" ? { status: "error", error: "Agent failed" } : {}),
+				...(agentOutcome ? { agentOutcome } : {}),
+				...(failed ? { status: "error", error: "Agent failed" } : {}),
+				...(agentOutcome === "cancelled" ? { status: "error", error: "Agent cancelled" } : {}),
 			};
 		} else if (!error && activity.kind === "patch") {
 			const value = objectValue(result);
