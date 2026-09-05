@@ -173,6 +173,25 @@ markdownParser.setOptions({
 	tokenizer: new StrictStrikethroughTokenizer(),
 });
 markdownParser.use({ extensions: [...LATEX_MARKDOWN_EXTENSIONS] });
+// Marked asks extensions to find their next start in each remaining block/inline
+// tail. Without any math opener those repeated scans are unnecessary.
+const plainMarkdownParser = new Marked();
+plainMarkdownParser.setOptions({ tokenizer: new StrictStrikethroughTokenizer() });
+const inlineMathMarkdownParser = new Marked();
+inlineMathMarkdownParser.setOptions({ tokenizer: new StrictStrikethroughTokenizer() });
+inlineMathMarkdownParser.use({ extensions: [LATEX_MARKDOWN_EXTENSIONS[1]!] });
+
+function parseMarkdown(text: string): Token[] {
+	const parser =
+		text.includes("$$") || text.includes("\\[")
+			? markdownParser
+			: text.includes("$") || text.includes("\\(")
+				? inlineMathMarkdownParser
+				: plainMarkdownParser;
+	const tokens = parser.lexer(text);
+	trimPartialClosingFences(tokens);
+	return tokens;
+}
 
 /**
  * Default text styling for markdown content.
@@ -224,6 +243,12 @@ export interface MarkdownOptions {
 	preserveBackslashEscapes?: boolean;
 	/** Transform source Markdown before parsing, with the exact width available for content. */
 	transform?: (markdown: string, availableWidth: number) => string;
+	/**
+	 * Reuse stable rendered blocks across source updates (default: false).
+	 * Opt in only when theme/transform callbacks are deterministic between
+	 * invalidate() calls. Invalidate before changing their external state.
+	 */
+	reuseStableBlocks?: boolean;
 	/** Render supported LaTeX math expressions as Unicode text (default: true). */
 	renderLatex?: boolean;
 }
@@ -231,6 +256,42 @@ export interface MarkdownOptions {
 interface InlineStyleContext {
 	applyText: (text: string) => string;
 	stylePrefix: string;
+}
+
+// These tokens use width while rendering their contents. Other tokens can
+// retain just their unwrapped lines and release the parsed inline token tree.
+const WIDTH_DEPENDENT_TOKENS = new Set(["blockquote", "list", "table", "hr"]);
+type ParsedMarkdownBlock =
+	| { token: Token; nextTokenType: string | undefined }
+	| { tokenIndex: number; nextTokenType: string | undefined }
+	| { lines: string[] };
+
+/** Compare the fully resolved token trees, not raw source or a lossy hash.
+ * Definitions elsewhere in the document can change inline tokens with identical raw text.
+ */
+function equalMarkdownTokens(previous: unknown, next: unknown): boolean {
+	if (previous === next) return true;
+	const pending: unknown[] = [previous, next];
+	while (pending.length > 0) {
+		const right = pending.pop();
+		const left = pending.pop();
+		if (left === right) continue;
+		if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
+		if (Array.isArray(left) !== Array.isArray(right)) return false;
+		const leftRecord = left as Record<string, unknown>;
+		const rightRecord = right as Record<string, unknown>;
+		const keys = Object.keys(leftRecord);
+		if (keys.length !== Object.keys(rightRecord).length) return false;
+		for (const key of keys) {
+			if (!Object.hasOwn(rightRecord, key)) return false;
+			const a = leftRecord[key];
+			const b = rightRecord[key];
+			if (a === b) continue;
+			if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+			pending.push(a, b);
+		}
+	}
+	return true;
 }
 
 export class Markdown implements Component {
@@ -246,6 +307,19 @@ export class Markdown implements Component {
 	private cachedText?: string;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	// Parsing and unwrapped styling do not depend on terminal width. Keep only
+	// the current transformed source; width changes still rerun the transform.
+	private parsedText?: string;
+	private parsedBlocks?: ParsedMarkdownBlock[];
+	// Only mutable/streaming components retain full token trees and a private
+	// output snapshot. Static history keeps the compact width cache above.
+	private keepParsedTokens = false;
+	private retainLayoutTokens = false;
+	private parsedTokens?: Token[];
+	private reusableLines?: string[];
+	private blockLineEnds?: number[];
+	private reusableHyperlinks?: boolean;
+	private renderedTokens = new WeakMap<Token, { nextTokenType: string | undefined; lines: string[] }>();
 
 	constructor(
 		text: string,
@@ -264,107 +338,158 @@ export class Markdown implements Component {
 	}
 
 	setText(text: string): void {
+		if (!this.options.reuseStableBlocks || text === this.text) {
+			// An explicit refresh must still observe external theme/transform state.
+			this.invalidate();
+		} else {
+			this.keepParsedTokens = true;
+		}
 		this.text = text;
-		this.invalidate();
 	}
 
 	invalidate(): void {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		this.parsedText = undefined;
+		this.parsedBlocks = undefined;
+		this.keepParsedTokens = false;
+		this.retainLayoutTokens = false;
+		this.parsedTokens = undefined;
+		this.reusableLines = undefined;
+		this.blockLineEnds = undefined;
+		this.reusableHyperlinks = undefined;
+		this.renderedTokens = new WeakMap();
 	}
 
 	render(width: number): string[] {
-		// Check cache
-		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
+		// Keep cache hits outside the preparation method's closure scope.
+		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) return this.cachedLines;
+		try {
+			return this.renderWithCache(width);
+		} catch (error) {
+			// Do not retain partially prepared blocks when a theme/transform fails.
+			this.invalidate();
+			throw error;
+		}
+	}
+
+	private renderWithCache(width: number): string[] {
+		if (this.cachedWidth !== undefined && this.cachedWidth !== width) this.retainLayoutTokens = true;
+		const hyperlinks = getCapabilities().hyperlinks;
+		if (this.reusableHyperlinks !== undefined && this.reusableHyperlinks !== hyperlinks) {
+			this.parsedBlocks = undefined;
+			this.parsedTokens = undefined;
+			this.renderedTokens = new WeakMap();
+		}
+		const contentWidth = Math.max(1, width - this.paddingX * 2);
+		const text = this.options.transform?.(this.text, contentWidth) ?? this.text;
+		if (!text || text.trim() === "") {
+			this.parsedText = undefined;
+			this.parsedBlocks = undefined;
+			this.parsedTokens = undefined;
+			this.reusableLines = undefined;
+			this.blockLineEnds = undefined;
+			this.renderedTokens = new WeakMap();
+			this.cachedText = this.text;
+			this.cachedWidth = width;
+			this.cachedLines = [];
 			return this.cachedLines;
 		}
 
-		// Calculate available width for content (subtract horizontal padding)
-		const contentWidth = Math.max(1, width - this.paddingX * 2);
-		const text = this.options.transform?.(this.text, contentWidth) ?? this.text;
-
-		// Don't render anything if there's no actual text
-		if (!text || text.trim() === "") {
-			const result: string[] = [];
-			// Update cache
-			this.cachedText = this.text;
-			this.cachedWidth = width;
-			this.cachedLines = result;
-			return result;
-		}
-
-		// Replace tabs with 3 spaces for consistent rendering
 		const normalizedText = text.replace(/\t/g, "   ");
-
-		// Parse markdown to HTML-like tokens
-		const tokens = markdownParser.lexer(normalizedText);
-		trimPartialClosingFences(tokens);
-
-		// Convert tokens to styled terminal output
-		const renderedLines: string[] = [];
-
-		for (let i = 0; i < tokens.length; i++) {
-			const token = tokens[i];
-			const nextToken = tokens[i + 1];
-			const tokenLines = this.renderToken(token, contentWidth, nextToken?.type);
-			for (const tokenLine of tokenLines) {
-				renderedLines.push(tokenLine);
+		const previousLines = this.reusableLines;
+		const previousEnds = this.blockLineEnds;
+		let reusable: boolean[] | undefined;
+		// Always parse the full updated source. This resolves references and all
+		// list/table/fence/HTML context before any prior rendered block is reused.
+		if (!this.parsedBlocks || this.parsedText !== normalizedText) {
+			const tokens = parseMarkdown(normalizedText);
+			const previousTokens = this.parsedTokens;
+			if (previousTokens && previousLines && previousEnds && this.cachedWidth === width) {
+				reusable = tokens.map(
+					(token, index) =>
+						tokens[index + 1]?.type === previousTokens[index + 1]?.type &&
+						equalMarkdownTokens(previousTokens[index], token),
+				);
 			}
+			this.parsedTokens = this.keepParsedTokens ? tokens : undefined;
+			this.parsedBlocks = tokens.map((token, index) => ({ token, nextTokenType: tokens[index + 1]?.type }));
+			this.parsedText = normalizedText;
+			this.renderedTokens = new WeakMap();
 		}
+		const blocks = this.parsedBlocks;
+		// Preserve token styling order without flattening all intermediate lines.
+		let layoutTokens = this.parsedTokens;
+		const rendered = blocks.map((block, index) => {
+			if (reusable?.[index]) return undefined;
+			if ("lines" in block) return block.lines;
+			// Static history retains an index rather than a list/table/quote AST.
+			// A resize reparses once on demand, still using full document context.
+			if (!("token" in block)) layoutTokens ??= parseMarkdown(normalizedText);
+			const token = "token" in block ? block.token : layoutTokens![block.tokenIndex]!;
+			const lines = this.renderToken(token, contentWidth, block.nextTokenType);
+			blocks[index] = WIDTH_DEPENDENT_TOKENS.has(token.type)
+				? this.retainLayoutTokens
+					? { token, nextTokenType: block.nextTokenType }
+					: { tokenIndex: index, nextTokenType: block.nextTokenType }
+				: { lines };
+			return lines;
+		});
 
-		// Wrap lines (NO padding, NO background yet)
-		const wrappedLines: string[] = [];
-		for (const line of renderedLines) {
-			if (isImageLine(line)) {
-				wrappedLines.push(line);
+		const result: string[] = [];
+		for (let row = 0; row < this.paddingY; row++) result.push("");
+		const paddingRows = result.length;
+		const lineEnds: number[] | undefined = this.keepParsedTokens ? [] : undefined;
+		const margin = " ".repeat(this.paddingX);
+		const bgFn = this.defaultTextStyle?.bgColor;
+		for (let index = 0; index < blocks.length; index++) {
+			if (reusable?.[index] && previousLines && previousEnds) {
+				const start = index === 0 ? paddingRows : previousEnds[index - 1]!;
+				for (let row = start; row < previousEnds[index]!; row++) result.push(previousLines[row]!);
 			} else {
-				for (const wrappedLine of wrapTextWithAnsi(line, contentWidth)) {
-					wrappedLines.push(wrappedLine);
+				const blockStart = result.length;
+				for (const line of rendered[index]!) {
+					if (isImageLine(line)) {
+						result.push(line);
+						continue;
+					}
+					for (const wrapped of wrapTextWithAnsi(line, contentWidth)) {
+						const padded = margin + wrapped + margin;
+						result.push(
+							bgFn
+								? applyBackgroundToLine(padded, width, bgFn)
+								: padded + " ".repeat(Math.max(0, width - visibleWidth(padded))),
+						);
+					}
+				}
+				if (this.keepParsedTokens) {
+					// A short rendered row can be a slice/rope backed by the entire
+					// source. Detach new rows before reusing them across revisions,
+					// otherwise appended blocks can pin quadratic historical source
+					// storage. Structured cloning preserves exact UTF-16/image bytes.
+					const detached = structuredClone(result.slice(blockStart));
+					for (let row = 0; row < detached.length; row++) result[blockStart + row] = detached[row]!;
 				}
 			}
+			lineEnds?.push(result.length);
 		}
-
-		// Add margins and background to each wrapped line
-		const leftMargin = " ".repeat(this.paddingX);
-		const rightMargin = " ".repeat(this.paddingX);
-		const bgFn = this.defaultTextStyle?.bgColor;
-		const contentLines: string[] = [];
-
-		for (const line of wrappedLines) {
-			if (isImageLine(line)) {
-				contentLines.push(line);
-				continue;
-			}
-
-			const lineWithMargins = leftMargin + line + rightMargin;
-
-			if (bgFn) {
-				contentLines.push(applyBackgroundToLine(lineWithMargins, width, bgFn));
-			} else {
-				// No background - just pad to width
-				const visibleLen = visibleWidth(lineWithMargins);
-				const paddingNeeded = Math.max(0, width - visibleLen);
-				contentLines.push(lineWithMargins + " ".repeat(paddingNeeded));
-			}
-		}
-
-		// Add top/bottom padding (empty lines)
+		// As before, evaluate padding styles after content and reuse them below.
 		const emptyLine = " ".repeat(width);
-		const emptyLines: string[] = [];
-		for (let i = 0; i < this.paddingY; i++) {
+		for (let row = 0; row < paddingRows; row++) {
 			const line = bgFn ? applyBackgroundToLine(emptyLine, width, bgFn) : emptyLine;
-			emptyLines.push(line);
+			result[row] = line;
+			result.push(line);
 		}
 
-		// Combine top padding, content, and bottom padding
-		const result = emptyLines.concat(contentLines, emptyLines);
-
-		// Update cache
 		this.cachedText = this.text;
 		this.cachedWidth = width;
 		this.cachedLines = result;
-
+		this.blockLineEnds = lineEnds;
+		this.reusableHyperlinks = hyperlinks;
+		// Public render arrays remain mutable; never reuse caller mutations after
+		// a source update. Strings are immutable, so an array copy is sufficient.
+		this.reusableLines = this.keepParsedTokens ? result.slice() : undefined;
 		return result.length > 0 ? result : [""];
 	}
 
@@ -457,6 +582,23 @@ export class Markdown implements Component {
 		nextTokenType?: string,
 		styleContext?: InlineStyleContext,
 	): string[] {
+		// Quotes/lists/tables lay out their children at constrained widths, and
+		// rules use the available width. Contextual styles must not share cached
+		// output with the same token rendered in the default style.
+		const cacheable = styleContext === undefined && !WIDTH_DEPENDENT_TOKENS.has(token.type);
+		const cached = cacheable ? this.renderedTokens.get(token) : undefined;
+		if (cached && cached.nextTokenType === nextTokenType) return cached.lines;
+		const lines = this.renderTokenUncached(token, width, nextTokenType, styleContext);
+		if (cacheable) this.renderedTokens.set(token, { nextTokenType, lines });
+		return lines;
+	}
+
+	private renderTokenUncached(
+		token: Token,
+		width: number,
+		nextTokenType?: string,
+		styleContext?: InlineStyleContext,
+	): string[] {
 		const lines: string[] = [];
 
 		switch (token.type) {
@@ -541,7 +683,7 @@ export class Markdown implements Component {
 
 			case "list": {
 				const listLines = this.renderList(token as Tokens.List, 0, width, styleContext);
-				lines.push(...listLines);
+				for (const line of listLines) lines.push(line);
 				// Don't add spacing after lists if a space token follows
 				// (the space token will handle it)
 				break;
@@ -549,7 +691,7 @@ export class Markdown implements Component {
 
 			case "table": {
 				const tableLines = this.renderTable(token as Tokens.Table, width, nextTokenType, styleContext);
-				lines.push(...tableLines);
+				for (const line of tableLines) lines.push(line);
 				break;
 			}
 
@@ -579,9 +721,13 @@ export class Markdown implements Component {
 				for (let i = 0; i < quoteTokens.length; i++) {
 					const quoteToken = quoteTokens[i];
 					const nextQuoteToken = quoteTokens[i + 1];
-					renderedQuoteLines.push(
-						...this.renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext),
-					);
+					for (const line of this.renderToken(
+						quoteToken,
+						quoteContentWidth,
+						nextQuoteToken?.type,
+						quoteInlineStyleContext,
+					))
+						renderedQuoteLines.push(line);
 				}
 
 				// Avoid rendering an extra empty quote line before the outer blockquote spacing.
@@ -778,7 +924,8 @@ export class Markdown implements Component {
 
 			for (const itemToken of item.tokens) {
 				if (itemToken.type === "list") {
-					lines.push(...this.renderList(itemToken as Tokens.List, depth + 1, width, styleContext));
+					for (const line of this.renderList(itemToken as Tokens.List, depth + 1, width, styleContext))
+						lines.push(line);
 					renderedAnyLine = true;
 					continue;
 				}

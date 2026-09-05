@@ -2,9 +2,24 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in stable Markdown block reuse, complete wrapped-line iteration, and customizable undo snapshot cloning.
+
+### Changed
+
+- Reused width-independent Markdown parsing and styling across terminal resizes while preserving width-dependent layout and cache invalidation.
+
+- Reduced repeated transcript line copies, long-input cursor movement and paste allocations, and immutable text duplication across editor undo snapshots.
+- Streamed complete fullscreen exit and image output through the shared terminal writer without retaining another full history copy.
+
 ### Fixed
 
 - Fixed mouse hover changing selection and recentering autocomplete and settings lists, causing clicks to target a different item.
+
+- Fixed short width-cache keys retaining entire previous message strings and preserved surrogate pairs across terminal write chunks.
+
+- Fixed large Markdown list and table output exceeding JavaScript spread argument limits.
 
 ## [0.85.0] - 2026-09-04
 

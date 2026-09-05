@@ -866,6 +866,42 @@ async function listSessionsFromDir(
 	return sessions;
 }
 
+// Four reference slots per path entry: id, parentId, type, and role/kept boundary.
+// A flat array avoids allocating a separate validation object for every entry.
+const CONTEXT_ENTRY_METADATA_WIDTH = 4;
+// Grow metadata in independent blocks so appending does not copy or overallocate
+// a second history-sized array. The number of blocks grows with the full path.
+const CONTEXT_ENTRIES_PER_METADATA_BLOCK = 1024;
+
+interface SessionContextCache {
+	leafId: string | null;
+	path: SessionEntry[];
+	metadataBlocks: Array<Array<string | null | undefined>>;
+	entries: SessionEntry[];
+	modelEntry: ModelChangeEntry | SessionMessageEntry | undefined;
+	thinkingEntry: ThinkingLevelChangeEntry | undefined;
+}
+
+function writeContextEntryMetadata(
+	metadata: Array<string | null | undefined>,
+	index: number,
+	entry: SessionEntry,
+): void {
+	const offset = index * CONTEXT_ENTRY_METADATA_WIDTH;
+	metadata[offset] = entry.id;
+	metadata[offset + 1] = entry.parentId;
+	metadata[offset + 2] = entry.type;
+	metadata[offset + 3] =
+		entry.type === "message" ? entry.message.role : entry.type === "compaction" ? entry.firstKeptEntryId : undefined;
+}
+
+function updateContextSettings(cache: SessionContextCache, entry: SessionEntry): void {
+	if (entry.type === "thinking_level_change") cache.thinkingEntry = entry;
+	else if (entry.type === "model_change" || (entry.type === "message" && entry.message.role === "assistant")) {
+		cache.modelEntry = entry;
+	}
+}
+
 /**
  * Manages conversation sessions as append-only trees stored in JSONL files.
  *
@@ -890,6 +926,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private contextCache: SessionContextCache | undefined;
 
 	private constructor(
 		cwd: string,
@@ -962,6 +999,7 @@ export class SessionManager {
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
 		};
+		this.contextCache = undefined;
 		this.fileEntries = [header];
 		this.byId.clear();
 		this.labelsById.clear();
@@ -996,6 +1034,7 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
+		this.contextCache = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1091,6 +1130,22 @@ export class SessionManager {
 		}
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
+		const cache = this.contextCache;
+		if (cache && cache.leafId === entry.parentId && entry.type !== "compaction") {
+			cache.leafId = entry.id;
+			const index = cache.path.length % CONTEXT_ENTRIES_PER_METADATA_BLOCK;
+			let metadata = cache.metadataBlocks[Math.floor(cache.path.length / CONTEXT_ENTRIES_PER_METADATA_BLOCK)];
+			if (!metadata) {
+				metadata = [];
+				cache.metadataBlocks.push(metadata);
+			}
+			writeContextEntryMetadata(metadata, index, entry);
+			cache.path.push(entry);
+			if (cache.entries !== cache.path) cache.entries.push(entry);
+			updateContextSettings(cache, entry);
+		} else {
+			this.contextCache = undefined;
+		}
 		this._persist(entry);
 	}
 
@@ -1330,7 +1385,7 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildContextEntries(): SessionEntry[] {
-		return buildContextEntriesFromPath(this._getContextPath());
+		return this._getContextCache().entries.slice();
 	}
 
 	/**
@@ -1338,7 +1393,66 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionContext(): SessionContext {
-		return buildSessionContextFromPath(this._getContextPath());
+		const cache = this._getContextCache();
+		const settingsEntries: SessionEntry[] = [];
+		if (cache.modelEntry) settingsEntries.push(cache.modelEntry);
+		if (cache.thinkingEntry) settingsEntries.push(cache.thinkingEntry);
+		return {
+			...getSessionContextSettings(settingsEntries),
+			messages: cache.entries.flatMap(sessionEntryToContextMessages),
+		};
+	}
+
+	private _getContextCache(): SessionContextCache {
+		const cached = this.contextCache;
+		if (cached && cached.leafId === this.leafId) {
+			// Read APIs expose shallow entry references, and message payloads can be
+			// mutated by their caller. Validate only fields affecting path selection
+			// and settings precedence; project mutable content afresh on every read.
+			// This linear, contiguous pass avoids repeated Map traversal and rebuilding
+			// the archived path, without silently ignoring external entry mutations.
+			let unchanged = true;
+			for (let blockIndex = 0; blockIndex < cached.metadataBlocks.length && unchanged; blockIndex++) {
+				const metadata = cached.metadataBlocks[blockIndex];
+				const start = blockIndex * CONTEXT_ENTRIES_PER_METADATA_BLOCK;
+				const end = Math.min(start + CONTEXT_ENTRIES_PER_METADATA_BLOCK, cached.path.length);
+				for (let index = start, offset = 0; index < end; index++, offset += CONTEXT_ENTRY_METADATA_WIDTH) {
+					const entry = cached.path[index];
+					if (
+						entry.id !== metadata[offset] ||
+						entry.parentId !== metadata[offset + 1] ||
+						entry.type !== metadata[offset + 2] ||
+						(entry.type === "message" && entry.message.role !== metadata[offset + 3]) ||
+						(entry.type === "compaction" && entry.firstKeptEntryId !== metadata[offset + 3])
+					) {
+						unchanged = false;
+						break;
+					}
+				}
+			}
+			if (unchanged) return cached;
+		}
+		const path = this._getContextPath();
+		const cache: SessionContextCache = {
+			leafId: this.leafId,
+			path,
+			metadataBlocks: [],
+			entries: buildContextEntriesFromPath(path),
+			modelEntry: undefined,
+			thinkingEntry: undefined,
+		};
+		for (let start = 0; start < path.length; start += CONTEXT_ENTRIES_PER_METADATA_BLOCK) {
+			const end = Math.min(start + CONTEXT_ENTRIES_PER_METADATA_BLOCK, path.length);
+			const metadata = new Array<string | null | undefined>((end - start) * CONTEXT_ENTRY_METADATA_WIDTH);
+			cache.metadataBlocks.push(metadata);
+			for (let index = start; index < end; index++) {
+				const entry = path[index];
+				writeContextEntryMetadata(metadata, index - start, entry);
+				updateContextSettings(cache, entry);
+			}
+		}
+		this.contextCache = cache;
+		return cache;
 	}
 
 	/**

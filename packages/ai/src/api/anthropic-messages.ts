@@ -36,13 +36,13 @@ import { splitDeferredTools } from "../utils/deferred-tools.ts";
 import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
-import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
+import { parseJsonWithRepair, parseStreamingJson, StreamingJsonParser } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 
-import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
+import { resolveJsonSchemaToolParameters } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampMaxTokensToContext } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
@@ -589,6 +589,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
+			const toolJsonParsers = new WeakMap<ToolCall, StreamingJsonParser>();
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
 				if (event.type === "message_start") {
@@ -659,6 +660,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							partialJson: "",
 							index: event.index,
 						};
+						toolJsonParsers.set(block, new StreamingJsonParser());
 						output.content.push(block);
 						stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
 					}
@@ -692,7 +694,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						const block = blocks[index];
 						if (block && block.type === "toolCall") {
 							block.partialJson += event.delta.partial_json;
-							block.arguments = parseStreamingJson(block.partialJson);
+							block.arguments = toolJsonParsers.get(block)!.append(event.delta.partial_json);
 							stream.push({
 								type: "toolcall_delta",
 								contentIndex: index,
@@ -732,6 +734,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							// Finalize in-place and strip the scratch buffer so replay only
 							// carries parsed arguments.
 							delete (block as { partialJson?: string }).partialJson;
+							toolJsonParsers.delete(block);
 							stream.push({
 								type: "toolcall_end",
 								contentIndex: index,
@@ -1432,8 +1435,7 @@ function convertTools(
 	if (!tools) return [];
 
 	return tools.map((tool, index) => {
-		const strict = resolveJsonSchemaStrictSampling(tool, supportsStrictTools);
-		const parameters = getJsonSchemaToolParameters(tool, strict);
+		const { strict, parameters } = resolveJsonSchemaToolParameters(tool, supportsStrictTools);
 		const schema = parameters as { properties?: unknown; required?: string[] };
 		const legacyInputSchema = {
 			type: "object" as const,

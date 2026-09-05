@@ -151,4 +151,5 @@ export {
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
+	wrapTextWithAnsiIterator,
 } from "./utils.ts";

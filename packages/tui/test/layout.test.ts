@@ -6,6 +6,7 @@ import { Text } from "../src/components/text.ts";
 import { VStack } from "../src/components/v-stack.ts";
 import { renderLayoutFrame } from "../src/layout.ts";
 import { encodeKitty, registerKittyImageMetadata } from "../src/terminal-image.ts";
+import { type Component, Container } from "../src/tui.ts";
 import { stripTerminalSequences } from "../src/utils.ts";
 
 function visibleLines(lines: string[]): string[] {
@@ -13,6 +14,96 @@ function visibleLines(lines: string[]): string[] {
 }
 
 describe("viewport layout", () => {
+	it("reuses unchanged container rows without copying history and preserves mutable render snapshots", () => {
+		const stable = Array.from({ length: 2_000 }, (_, index) => `history-${index} 界😀`);
+		let renders = 0;
+		const mutable: Component = {
+			render: () => {
+				renders++;
+				return stable;
+			},
+			invalidate: () => {},
+		};
+		const chat = new Container();
+		chat.addChild(mutable);
+		const document = new Container();
+		document.addChild(chat);
+		const scroll = new ScrollView(document, { follow: "end" });
+		const first = renderLayoutFrame(scroll, 30, 3, () => {});
+		const firstRows = first.root.scrollContentLines!;
+		const firstCopy = [...firstRows];
+		let historyCopies = 0;
+		const push = Array.prototype.push;
+		Array.prototype.push = function (this: unknown[], ...items: unknown[]) {
+			for (const item of items) if (typeof item === "string" && item.startsWith("history-")) historyCopies++;
+			return Reflect.apply(push, this, items);
+		};
+		let second: ReturnType<typeof renderLayoutFrame>;
+		try {
+			second = renderLayoutFrame(scroll, 30, 3, () => {});
+		} finally {
+			Array.prototype.push = push;
+		}
+		assert.deepStrictEqual(second.lines, first.lines);
+		assert.strictEqual(renders, 2, "arbitrary components still render each frame");
+		assert.notStrictEqual(second.root.scrollContentLines, firstRows);
+		// Old returned arrays, including layout snapshots, must not poison retained internal rows.
+		(firstRows as string[])[0] = "poison";
+		const external = document.render(30);
+		external[1] = "poison";
+		stable[0] = "changed 界👩";
+		stable.push("new tail");
+		const third = renderLayoutFrame(scroll, 30, 3, () => {});
+		assert.strictEqual(third.root.scrollContentLines?.[0], "changed 界👩");
+		assert.strictEqual(third.root.scrollContentLines?.[1], stable[1]);
+		assert.strictEqual(third.root.scrollContentLines?.length, 2_001);
+		assert.strictEqual(scroll.scrollTop, 1_998);
+		assert.deepStrictEqual(second.root.scrollContentLines, firstCopy);
+		assert.strictEqual(
+			first.root.children[0]?.lines,
+			firstRows,
+			"same-frame box arrays retain their original aliasing",
+		);
+		assert.strictEqual(first.root.children[0]?.lines?.[0], "poison");
+		first.root.children[0]!.lines = ["assigned"];
+		assert.deepStrictEqual(first.root.children[0]?.lines, ["assigned"]);
+		assert.strictEqual(firstRows[0], "poison");
+		first.root.scrollContentLines = undefined;
+		assert.strictEqual(first.root.scrollContentLines, undefined);
+		class DecoratedContainer extends Container {
+			calls = 0;
+			override render(width: number): string[] {
+				this.calls++;
+				const rows = super.render(width);
+				rows.unshift(`decorated ${width}`);
+				return rows;
+			}
+		}
+		const decorated = new DecoratedContainer();
+		decorated.addChild(new Text("content", 0, 0));
+		const extension = new ScrollView(decorated);
+		assert.deepStrictEqual(visibleLines(renderLayoutFrame(extension, 20, 2, () => {}).lines), [
+			"decorated 20",
+			"content",
+		]);
+		assert.deepStrictEqual(visibleLines(renderLayoutFrame(extension, 10, 2, () => {}).lines), [
+			"decorated 10",
+			"content",
+		]);
+		assert.strictEqual(decorated.calls, 2, "render overrides and super.render mutation are not bypassed");
+		// Direct children mutation, replacement, reorder and removal remain observable without invalidate.
+		chat.children.unshift(new Text("prefix", 0, 0));
+		scroll.scrollToStart();
+		assert.strictEqual(visibleLines(renderLayoutFrame(scroll, 30, 3, () => {}).lines)[0], "prefix");
+		chat.children.reverse();
+		assert.strictEqual(renderLayoutFrame(scroll, 30, 3, () => {}).root.scrollContentLines?.[0], stable[0]);
+		chat.children = [new Text("replacement", 0, 0)];
+		assert.deepStrictEqual(visibleLines(renderLayoutFrame(scroll, 30, 3, () => {}).lines), ["replacement", "", ""]);
+		chat.children.length = 0;
+		assert.strictEqual(renderLayoutFrame(scroll, 30, 3, () => {}).root.scrollContentLines?.length, 0);
+		assert.strictEqual(historyCopies, 0, "steady layout must not push full-history rows into new arrays");
+	});
+
 	it("allocates vertical grow space deterministically", () => {
 		const frame = renderLayoutFrame(
 			new VStack([

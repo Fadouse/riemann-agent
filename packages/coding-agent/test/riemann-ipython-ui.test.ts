@@ -1,6 +1,6 @@
 import { setKeybindings, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { beforeAll, describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test, vi } from "vitest";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { IPythonActivityComponent } from "../src/modes/interactive/components/ipython-activity.ts";
@@ -249,6 +249,92 @@ describe("Riemann IPython transcript", () => {
 
 		component.update(activity, true);
 		expect(component.render(32).length).toBeGreaterThan(14);
+	});
+
+	test("checks an activity render cache without serializing full output", () => {
+		const activity = {
+			id: "large",
+			kind: "shell",
+			status: "ok",
+			operation: "run",
+			command: "print logs",
+			stdout: "line\n".repeat(20_000),
+		} as const;
+		const component = new IPythonActivityComponent(activity, false);
+		const first = component.render(80);
+		const stringify = vi.spyOn(JSON, "stringify");
+		try {
+			expect(component.render(80)).toBe(first);
+			expect(stringify).not.toHaveBeenCalled();
+		} finally {
+			stringify.mockRestore();
+		}
+	});
+
+	test("compares cached activity fields without allocating entry tuples", () => {
+		const activity = {
+			id: "fields",
+			kind: "shell",
+			status: "ok",
+			operation: "run",
+			command: "true",
+			stdout: "output",
+		} as const;
+		const component = new IPythonActivityComponent(activity, false);
+		const first = component.render(80);
+		const entries = vi.spyOn(Object, "entries");
+		try {
+			expect(component.render(80)).toBe(first);
+			expect(entries.mock.calls.some(([value]) => value === activity)).toBe(false);
+		} finally {
+			entries.mockRestore();
+		}
+	});
+
+	test("reuses rendered output when a tracker returns an equal copied activity", () => {
+		const activity = {
+			id: "copied",
+			kind: "shell",
+			status: "ok",
+			operation: "run",
+			command: "print logs",
+			stdout: "first",
+		} as const;
+		const component = new IPythonActivityComponent(activity, false);
+		const first = component.render(80);
+		component.update({ ...activity }, false);
+		expect(component.render(80)).toBe(first);
+		component.update({ ...activity, stdout: "changed" }, false);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("changed");
+	});
+
+	test("detects in-place activity mutations and removed fields without update", () => {
+		const activity: {
+			id: string;
+			kind: "shell";
+			status: "ok" | "error";
+			operation: string;
+			command: string;
+			stdout?: string;
+			error?: string;
+		} = {
+			id: "mutable",
+			kind: "shell",
+			status: "ok",
+			operation: "run",
+			command: "print logs",
+			stdout: "first",
+		};
+		const component = new IPythonActivityComponent(activity, true);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("first");
+		activity.stdout = "second";
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("second");
+		delete activity.stdout;
+		activity.status = "error";
+		activity.error = "failed";
+		const output = stripAnsi(component.render(80).join("\n"));
+		expect(output).not.toContain("second");
+		expect(output).toContain("failed");
 	});
 
 	test("keeps narrow error output inside the viewport", () => {

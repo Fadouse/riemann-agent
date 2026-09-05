@@ -8,37 +8,50 @@ const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 
 type JsonContainer = Record<string, unknown> | unknown[];
 
-function jsonPath(parent: string, key: string | number): string {
-	return typeof key === "number" ? `${parent}[${key}]` : `${parent}[${JSON.stringify(key)}]`;
+function jsonPath(root: string, keys: readonly (string | number)[]): string {
+	let path = root;
+	for (const key of keys) path += typeof key === "number" ? `[${key}]` : `[${JSON.stringify(key)}]`;
+	return path;
 }
 
-function validateJsonValue(value: unknown, path: string, active: Set<JsonContainer>): void {
+function validateJsonValue(
+	value: unknown,
+	root: string,
+	active: Set<JsonContainer>,
+	keys: (string | number)[] = [],
+): void {
 	if (value === null || typeof value === "string" || typeof value === "boolean") return;
 	if (typeof value === "number") {
-		if (!Number.isFinite(value)) throw new TypeError(`Cannot encode non-finite float at ${path}: ${String(value)}`);
+		if (!Number.isFinite(value))
+			throw new TypeError(`Cannot encode non-finite float at ${jsonPath(root, keys)}: ${String(value)}`);
 		if (Number.isInteger(value) && Math.abs(value) > MAX_SAFE_INTEGER) {
-			throw new TypeError(`Cannot encode unsafe integer at ${path}: ${String(value)}`);
+			throw new TypeError(`Cannot encode unsafe integer at ${jsonPath(root, keys)}: ${String(value)}`);
 		}
 		return;
 	}
 	if (typeof value !== "object") {
-		throw new TypeError(`Cannot encode ${typeof value} as JSON at ${path}`);
+		throw new TypeError(`Cannot encode ${typeof value} as JSON at ${jsonPath(root, keys)}`);
 	}
 	const container = value as JsonContainer;
-	if (active.has(container)) throw new TypeError(`Cannot encode cyclic JSON value at ${path}`);
+	if (active.has(container)) throw new TypeError(`Cannot encode cyclic JSON value at ${jsonPath(root, keys)}`);
 	active.add(container);
 	try {
+		// Diagnostic paths are only formatted on errors, not once per payload field.
 		if (Array.isArray(container)) {
 			for (let index = 0; index < container.length; index += 1) {
-				validateJsonValue(container[index], jsonPath(path, index), active);
+				keys.push(index);
+				validateJsonValue(container[index], root, active, keys);
+				keys.pop();
 			}
 			return;
 		}
 		for (const key of Reflect.ownKeys(container)) {
 			if (typeof key !== "string") {
-				throw new TypeError(`Cannot encode non-string dict key at ${path}: ${String(key)}`);
+				throw new TypeError(`Cannot encode non-string dict key at ${jsonPath(root, keys)}: ${String(key)}`);
 			}
-			validateJsonValue(container[key], jsonPath(path, key), active);
+			keys.push(key);
+			validateJsonValue(container[key], root, active, keys);
+			keys.pop();
 		}
 	} finally {
 		active.delete(container);

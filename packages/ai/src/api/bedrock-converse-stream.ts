@@ -52,7 +52,7 @@ import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, StreamingJsonParser } from "../utils/json-parse.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
@@ -140,6 +140,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 		};
 
 		const blocks = output.content as Block[];
+		const toolJsonParsers = new WeakMap<ToolCall, StreamingJsonParser>();
 
 		// A profile explicitly configured through pi's auth flow (the `profile`
 		// option or scoped `AWS_PROFILE` on the stored credential's env) must win
@@ -283,11 +284,11 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 					}
 					stream.push({ type: "start", partial: output });
 				} else if (item.contentBlockStart) {
-					handleContentBlockStart(item.contentBlockStart, blocks, output, stream);
+					handleContentBlockStart(item.contentBlockStart, blocks, output, stream, toolJsonParsers);
 				} else if (item.contentBlockDelta) {
-					handleContentBlockDelta(item.contentBlockDelta, blocks, output, stream);
+					handleContentBlockDelta(item.contentBlockDelta, blocks, output, stream, toolJsonParsers);
 				} else if (item.contentBlockStop) {
-					handleContentBlockStop(item.contentBlockStop, blocks, output, stream);
+					handleContentBlockStop(item.contentBlockStop, blocks, output, stream, toolJsonParsers);
 				} else if (item.messageStop) {
 					output.rawStopReason = item.messageStop.stopReason;
 					const { stopReason, errorMessage } = mapStopReason(item.messageStop.stopReason);
@@ -564,6 +565,7 @@ function handleContentBlockStart(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
+	toolJsonParsers: WeakMap<ToolCall, StreamingJsonParser>,
 ): void {
 	const index = event.contentBlockIndex!;
 	const start = event.start;
@@ -577,6 +579,7 @@ function handleContentBlockStart(
 			partialJson: "",
 			index,
 		};
+		toolJsonParsers.set(block, new StreamingJsonParser());
 		output.content.push(block);
 		stream.push({ type: "toolcall_start", contentIndex: blocks.length - 1, partial: output });
 	}
@@ -587,6 +590,7 @@ function handleContentBlockDelta(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
+	toolJsonParsers: WeakMap<ToolCall, StreamingJsonParser>,
 ): void {
 	const contentBlockIndex = event.contentBlockIndex!;
 	const delta = event.delta;
@@ -608,7 +612,7 @@ function handleContentBlockDelta(
 		}
 	} else if (delta?.toolUse && block?.type === "toolCall") {
 		block.partialJson = (block.partialJson || "") + (delta.toolUse.input || "");
-		block.arguments = parseStreamingJson(block.partialJson);
+		block.arguments = toolJsonParsers.get(block)!.append(delta.toolUse.input || "");
 		stream.push({ type: "toolcall_delta", contentIndex: index, delta: delta.toolUse.input || "", partial: output });
 	} else if (delta?.reasoningContent) {
 		let thinkingBlock = block;
@@ -702,6 +706,7 @@ function handleContentBlockStop(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
+	toolJsonParsers: WeakMap<ToolCall, StreamingJsonParser>,
 ): void {
 	const index = blocks.findIndex((b) => b.index === event.contentBlockIndex);
 	const block = blocks[index];
@@ -721,6 +726,7 @@ function handleContentBlockStop(
 			// Finalize in-place and strip the scratch buffer so replay only
 			// carries parsed arguments.
 			delete (block as Block).partialJson;
+			toolJsonParsers.delete(block);
 			stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
 			break;
 	}

@@ -53,6 +53,8 @@ const WIDTH_CACHE_SIZE = 512;
 const WIDTH_CACHE_MAX_KEY_LENGTH = 256;
 const GRAPHEME_WIDTH_CACHE_SIZE = 2048;
 const GRAPHEME_WIDTH_CACHE_MAX_KEY_LENGTH = 64;
+// Copy inserted string keys: a short V8 slice can otherwise keep an entire
+// previous streaming message alive. Cache capacities and measured values stay unchanged.
 const widthCache = new Map<string, number>();
 const graphemeWidthCache = new Map<string, number>();
 
@@ -192,7 +194,7 @@ function graphemeWidth(segment: string): number {
 			const firstKey = graphemeWidthCache.keys().next().value;
 			if (firstKey !== undefined) graphemeWidthCache.delete(firstKey);
 		}
-		graphemeWidthCache.set(safeSegment, width);
+		graphemeWidthCache.set(structuredClone(safeSegment), width);
 	}
 	return width;
 }
@@ -312,7 +314,7 @@ export function visibleWidth(str: string): number {
 			const firstKey = widthCache.keys().next().value;
 			if (firstKey !== undefined) widthCache.delete(firstKey);
 		}
-		widthCache.set(cacheKey, width);
+		widthCache.set(structuredClone(cacheKey), width);
 	}
 
 	return width;
@@ -924,29 +926,35 @@ function splitIntoTokensWithAnsi(text: string): string[] {
  * @returns Array of wrapped lines (NOT padded to width)
  */
 export function wrapTextWithAnsi(text: string, width: number): string[] {
-	if (!text) {
-		return [""];
+	if (!text) return [""];
+	if (!text.includes("\n") && !text.includes("\r")) {
+		return wrapSingleLine(sanitizeTerminalText(text), width);
 	}
-
-	// Handle newlines by processing each line separately
-	// Track ANSI state across lines so styles carry over after literal newlines
-	const inputLines = text.split(/\r\n|\r|\n/);
 	const result: string[] = [];
-	const tracker = new AnsiCodeTracker();
+	for (const line of wrapTextWithAnsiIterator(text, width)) result.push(line);
+	return result;
+}
 
-	for (const inputLine of inputLines) {
-		const safeInputLine = sanitizeTerminalText(inputLine);
-		// Prepend active ANSI codes from previous lines (except for first line)
-		const prefix = result.length > 0 ? tracker.getActiveCodes() : "";
-		const wrappedLines = wrapSingleLine(prefix + safeInputLine, width);
-		for (const wrappedLine of wrappedLines) {
-			result.push(wrappedLine);
-		}
-		// Update tracker with codes from this line for next iteration
-		updateTrackerFromText(safeInputLine, tracker);
+/** Iterate complete wrapped output without retaining every logical/visual line. */
+export function* wrapTextWithAnsiIterator(text: string, width: number): Generator<string> {
+	if (!text) {
+		yield "";
+		return;
 	}
-
-	return result.length > 0 ? result : [""];
+	const tracker = new AnsiCodeTracker();
+	const newlines = /\r\n|\r|\n/g;
+	let start = 0;
+	let first = true;
+	while (true) {
+		const newline = newlines.exec(text);
+		const inputLine = sanitizeTerminalText(text.slice(start, newline?.index ?? text.length));
+		const prefix = first ? "" : tracker.getActiveCodes();
+		for (const line of wrapSingleLine(prefix + inputLine, width)) yield line;
+		if (!newline) return;
+		updateTrackerFromText(inputLine, tracker);
+		first = false;
+		start = newline.index + newline[0].length;
+	}
 }
 
 function wrapSingleLine(line: string, width: number): string[] {
@@ -1051,65 +1059,38 @@ function breakLongWord(word: string, width: number, tracker: AnsiCodeTracker): s
 	let currentLine = tracker.getActiveCodes();
 	let currentWidth = 0;
 
-	// First, separate ANSI codes from visible content
-	// We need to handle ANSI codes specially since they're not graphemes
+	// Consume graphemes directly instead of allocating one tagged object per
+	// character of a long token before any wrapping can begin.
 	let i = 0;
-	const segments: Array<{ type: "ansi" | "grapheme"; value: string }> = [];
-
 	while (i < word.length) {
-		const ansiResult = extractAnsiCode(word, i);
-		if (ansiResult) {
-			segments.push({ type: "ansi", value: ansiResult.code });
-			i += ansiResult.length;
-		} else {
-			// Find the next ANSI code or end of string
-			let end = i;
-			while (end < word.length) {
-				const nextAnsi = extractAnsiCode(word, end);
-				if (nextAnsi) break;
-				end++;
-			}
-			// Segment this non-ANSI portion into graphemes
-			const textPortion = word.slice(i, end);
-			for (const seg of graphemeSegmenter.segment(textPortion)) {
-				segments.push({ type: "grapheme", value: seg.segment });
-			}
-			i = end;
-		}
-	}
-
-	// Now process segments
-	for (const seg of segments) {
-		if (seg.type === "ansi") {
-			currentLine += seg.value;
-			tracker.process(seg.value);
+		const ansi = extractAnsiCode(word, i);
+		if (ansi) {
+			currentLine += ansi.code;
+			tracker.process(ansi.code);
+			i += ansi.length;
 			continue;
 		}
-
-		const grapheme = seg.value;
-		// Skip empty graphemes to avoid issues with string-width calculation
-		if (!grapheme) continue;
-
-		let renderedGrapheme = grapheme;
-		let graphemeWidth = visibleWidth(grapheme);
-		if (graphemeWidth > width) {
-			renderedGrapheme = "?";
-			graphemeWidth = 1;
-		}
-
-		if (currentWidth > 0 && currentWidth + graphemeWidth > width) {
-			// Add specific reset for underline only (preserves background)
-			const lineEndReset = tracker.getLineEndReset();
-			if (lineEndReset) {
-				currentLine += lineEndReset;
+		let end = i;
+		while (end < word.length && !extractAnsiCode(word, end)) end++;
+		for (const { segment } of graphemeSegmenter.segment(word.slice(i, end))) {
+			if (!segment) continue;
+			let renderedGrapheme = segment;
+			let graphemeWidth = visibleWidth(segment);
+			if (graphemeWidth > width) {
+				renderedGrapheme = "?";
+				graphemeWidth = 1;
 			}
-			lines.push(currentLine);
-			currentLine = tracker.getActiveCodes();
-			currentWidth = 0;
+			if (currentWidth > 0 && currentWidth + graphemeWidth > width) {
+				const lineEndReset = tracker.getLineEndReset();
+				if (lineEndReset) currentLine += lineEndReset;
+				lines.push(currentLine);
+				currentLine = tracker.getActiveCodes();
+				currentWidth = 0;
+			}
+			currentLine += renderedGrapheme;
+			currentWidth += graphemeWidth;
 		}
-
-		currentLine += renderedGrapheme;
-		currentWidth += graphemeWidth;
+		i = end;
 	}
 
 	if (currentLine) {

@@ -3,7 +3,7 @@
  * Used by both tool-execution.ts and bash-execution.ts for consistent behavior.
  */
 
-import { Text } from "@earendil-works/pi-tui";
+import { Text, visibleWidth, wrapTextWithAnsiIterator } from "@earendil-works/pi-tui";
 
 export interface VisualTruncateResult {
 	/** The visual lines to display */
@@ -34,17 +34,37 @@ export function truncateToVisualLines(
 		return { visualLines: [], skippedCount: 0 };
 	}
 
-	// Create a temporary Text component to render and get visual lines
-	const tempText = new Text(text, paddingX, 0);
-	const allVisualLines = tempText.render(width);
-
-	if (allVisualLines.length <= maxVisualLines) {
-		return { visualLines: allVisualLines, skippedCount: 0 };
+	// Keep unusual legacy arguments on the original path (slice(-0), fractional
+	// counts below one, infinities and invalid widths have observable semantics).
+	if (maxVisualLines < 1 || !Number.isFinite(maxVisualLines) || width < 0 || !Number.isFinite(width)) {
+		const allVisualLines = new Text(text, paddingX, 0).render(width);
+		return allVisualLines.length <= maxVisualLines
+			? { visualLines: allVisualLines, skippedCount: 0 }
+			: { visualLines: allVisualLines.slice(-maxVisualLines), skippedCount: allVisualLines.length - maxVisualLines };
 	}
-
-	// Take the last N visual lines
-	const truncatedLines = allVisualLines.slice(-maxVisualLines);
-	const skippedCount = allVisualLines.length - maxVisualLines;
-
-	return { visualLines: truncatedLines, skippedCount };
+	if (text.trim() === "") return { visualLines: [], skippedCount: 0 };
+	const padding = Math.min(paddingX, Math.max(0, Math.floor((width - 1) / 2)));
+	const margin = " ".repeat(padding);
+	const contentWidth = Math.max(1, width - padding * 2);
+	const keep = Math.trunc(maxVisualLines);
+	const tail: string[] = [];
+	let next = 0;
+	let count = 0;
+	// Scan every visual line, preserving cross-line ANSI state and exact counts.
+	// Only the existing collapsed presentation is retained, not a padded copy
+	// of the full document. The source and expanded output remain unchanged.
+	for (const line of wrapTextWithAnsiIterator(text, contentWidth)) {
+		count++;
+		if (tail.length < keep) tail.push(line);
+		else {
+			tail[next] = line;
+			next = (next + 1) % keep;
+		}
+	}
+	const ordered = next === 0 ? tail : tail.slice(next).concat(tail.slice(0, next));
+	const visualLines = ordered.map((line) => {
+		const padded = margin + line + margin;
+		return padded + " ".repeat(Math.max(0, width - visibleWidth(padded)));
+	});
+	return { visualLines, skippedCount: count > maxVisualLines ? count - maxVisualLines : 0 };
 }

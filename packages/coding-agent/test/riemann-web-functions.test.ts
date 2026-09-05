@@ -165,6 +165,83 @@ describe("Riemann web search", () => {
 });
 
 describe("Riemann web fetch", () => {
+	test("normalizes HTML whitespace in one horizontal-space pass without changing the extracted text", async () => {
+		const { fetchDefinition, store } = await webDefinitions();
+		const rawText = `html-whitespace-marker ${"words\u00a0 \t\u00a0text\n\n\nmore\r\n".repeat(20)} end`;
+		const expected = rawText
+			.replace(/\u00a0/g, " ")
+			.replace(/[ \t]+/g, " ")
+			.replace(/\n{3,}/g, "\n\n")
+			.trim();
+		vi.stubGlobal(
+			"fetch",
+			vi
+				.fn<typeof fetch>()
+				.mockResolvedValue(
+					new Response(
+						`<html><head><title> Page </title></head><body><article><p>${rawText}</p><script>excluded</script><style>excluded</style></article></body></html>`,
+						{ headers: { "content-type": "text/html" } },
+					),
+				),
+		);
+		const replace = vi.spyOn(String.prototype, "replace");
+		try {
+			const result = record(
+				await fetchDefinition.handler({ url: "https://example.test/html" }, new AbortController().signal),
+			);
+			expect(result).toMatchObject({ title: "Page", text: expected, artifact: null, trust: "untrusted" });
+			// A separate NBSP replacement creates an avoidable full-text intermediate string.
+			const separateNbspPasses = replace.mock.calls.filter(
+				([pattern], index) =>
+					pattern instanceof RegExp &&
+					pattern.source === "\\u00a0" &&
+					String(replace.mock.contexts[index]).includes("html-whitespace-marker"),
+			);
+			expect(separateNbspPasses).toHaveLength(0);
+		} finally {
+			replace.mockRestore();
+			store.close();
+		}
+	});
+
+	test("assembles every response chunk once and preserves byte offsets and durable binary contents", async () => {
+		const { fetchDefinition, artifacts, store } = await webDefinitions();
+		const backing = Uint8Array.from({ length: 4_096 }, (_, index) => index % 256);
+		const chunks = [
+			backing.subarray(1, 1),
+			...Array.from({ length: 1_024 }, (_, index) => backing.subarray(index, index + 127)),
+		];
+		const expected = Buffer.concat(chunks);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn<typeof fetch>().mockResolvedValue(
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							for (const chunk of chunks) controller.enqueue(chunk);
+							controller.close();
+						},
+					}),
+					{ headers: { "content-type": "application/octet-stream" } },
+				),
+			),
+		);
+		const from = vi.spyOn(Buffer, "from");
+		try {
+			const result = record(
+				await fetchDefinition.handler({ url: "https://example.test/chunks" }, new AbortController().signal),
+			);
+			const artifact = record(result.artifact);
+			expect(await artifacts.readBuffer(String(artifact.handle))).toEqual(expected);
+			const chunkSet = new Set<unknown>(chunks);
+			// Buffer.concat accepts Uint8Array views; copying each view first doubles body copying.
+			expect(from.mock.calls.filter(([value]) => chunkSet.has(value))).toHaveLength(0);
+		} finally {
+			from.mockRestore();
+			store.close();
+		}
+	});
+
 	test("returns untrusted text without injecting a repeated warning", async () => {
 		const { fetchDefinition, store } = await webDefinitions();
 		vi.stubGlobal(

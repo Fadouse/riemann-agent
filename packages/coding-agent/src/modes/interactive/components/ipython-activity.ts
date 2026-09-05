@@ -41,8 +41,11 @@ export class IPythonActivityComponent implements Component {
 	private activity: IPythonActivity;
 	private expanded: boolean;
 	private cachedWidth?: number;
-	private cachedKey?: string;
+	private cachedActivity?: Readonly<Record<string, string | number | boolean | null | undefined>>;
+	private cachedFieldCount = 0;
+	private cachedExpanded?: boolean;
 	private cachedThemeFg?: string;
+	private cachedTheme?: typeof theme;
 	private cachedLines?: string[];
 
 	constructor(activity: IPythonActivity, expanded: boolean) {
@@ -51,28 +54,43 @@ export class IPythonActivityComponent implements Component {
 	}
 
 	update(activity: IPythonActivity, expanded: boolean): void {
-		if (this.activity === activity && this.expanded === expanded) return;
+		// Trackers may copy unchanged activities. Let render compare the scalar
+		// snapshot rather than discarding cached output merely on identity change.
 		this.activity = activity;
 		this.expanded = expanded;
-		this.invalidate();
 	}
 
 	invalidate(): void {
 		this.cachedThemeFg = undefined;
+		this.cachedTheme = undefined;
 		this.cachedWidth = undefined;
-		this.cachedKey = undefined;
+		this.cachedActivity = undefined;
+		this.cachedExpanded = undefined;
 		this.cachedLines = undefined;
 	}
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
-		const key = `${this.expanded}:${JSON.stringify(this.activity)}`;
+		// Activity fields are scalar values (including potentially large output
+		// strings). Snapshot the fields instead of serializing their contents.
+		// Comparing values, not object identity, also detects in-place mutations.
+		const activity = this.activity as IPythonActivity & Record<string, string | number | boolean | null | undefined>;
+		let sameFields = this.cachedActivity !== undefined;
+		let fieldCount = 0;
+		for (const key in activity) {
+			if (!Object.hasOwn(activity, key)) continue;
+			fieldCount++;
+			if (this.cachedActivity?.[key] !== activity[key]) sameFields = false;
+		}
 		const themeFg = theme.getFgAnsi("text");
 		if (
 			this.cachedLines &&
 			this.cachedWidth === safeWidth &&
-			this.cachedKey === key &&
-			this.cachedThemeFg === themeFg
+			this.cachedExpanded === this.expanded &&
+			this.cachedThemeFg === themeFg &&
+			this.cachedTheme === theme &&
+			sameFields &&
+			this.cachedFieldCount === fieldCount
 		)
 			return this.cachedLines;
 		const lines: string[] = [];
@@ -91,8 +109,11 @@ export class IPythonActivityComponent implements Component {
 				break;
 		}
 		this.cachedWidth = safeWidth;
-		this.cachedKey = key;
+		this.cachedActivity = { ...this.activity };
+		this.cachedFieldCount = fieldCount;
+		this.cachedExpanded = this.expanded;
 		this.cachedThemeFg = themeFg;
+		this.cachedTheme = theme;
 		this.cachedLines = lines;
 		return lines;
 	}

@@ -33,6 +33,7 @@ import type {
 	Usage,
 } from "./types.ts";
 import { operationSignal, raceWithAbortSignal } from "./utils/abort.ts";
+import { consumeAssistantMessageStream } from "./utils/event-stream.ts";
 
 export { ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
 
@@ -689,7 +690,7 @@ class ModelsImpl implements MutableModels {
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
 	): Promise<AssistantMessage> {
-		return this.stream(model, context, options).result();
+		return consumeAssistantMessageStream(this.stream(model, context, options));
 	}
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
@@ -705,7 +706,7 @@ class ModelsImpl implements MutableModels {
 		context: Context,
 		options?: ModelsSimpleStreamOptions,
 	): Promise<AssistantMessage> {
-		return this.streamSimple(model, context, options).result();
+		return consumeAssistantMessageStream(this.streamSimple(model, context, options));
 	}
 
 	streamDeferred(
@@ -728,7 +729,7 @@ class ModelsImpl implements MutableModels {
 		handle: DeferredHandle,
 		options?: ModelsDeferredFetchOptions,
 	): Promise<AssistantMessage> {
-		return this.streamDeferred(model, handle, options).result();
+		return consumeAssistantMessageStream(this.streamDeferred(model, handle, options));
 	}
 
 	async cancelDeferred(
@@ -778,10 +779,21 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 	const fetchModels = input.fetchModels;
 	const currentModels = (): readonly Model<TApi>[] => {
 		const merged = [...baselineModels];
+		if (dynamicModels.length === 0) return merged;
+		// Rebuild from live lists so caller-owned model mutations stay visible.
+		// Index only the first baseline occurrence, matching findIndex semantics.
+		const indices = new Map<string, number>();
+		for (let index = 0; index < merged.length; index++) {
+			const id = merged[index].id;
+			if (!indices.has(id)) indices.set(id, index);
+		}
 		for (const model of dynamicModels) {
-			const index = merged.findIndex((entry) => entry.id === model.id);
-			if (index >= 0) merged[index] = model;
-			else merged.push(model);
+			const index = indices.get(model.id);
+			if (index !== undefined) merged[index] = model;
+			else {
+				indices.set(model.id, merged.length);
+				merged.push(model);
+			}
 		}
 		return merged;
 	};

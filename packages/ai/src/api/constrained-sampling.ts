@@ -205,14 +205,13 @@ function inferGrammarInputProperty(tool: Tool): string {
 	return inputProperty;
 }
 
-export function resolveJsonSchemaStrictSampling(tool: Tool, supportsStrictMode: boolean): boolean | undefined {
+function resolveStrictJsonSchema(tool: Tool, supportsStrictMode: boolean): Tool["parameters"] | undefined {
 	const config = tool.constrainedSampling;
 	if (!config || config.type !== "json_schema") return undefined;
 
 	if (supportsStrictMode) {
 		try {
-			makeStrictJsonSchema(tool.parameters);
-			return true;
+			return makeStrictJsonSchema(tool.parameters) as Tool["parameters"];
 		} catch (error) {
 			if (!(error instanceof UnsupportedStrictJsonSchemaError)) throw error;
 			if (config.strict !== "require") return undefined;
@@ -225,6 +224,23 @@ export function resolveJsonSchemaStrictSampling(tool: Tool, supportsStrictMode: 
 		);
 	}
 	return undefined;
+}
+
+export function resolveJsonSchemaStrictSampling(tool: Tool, supportsStrictMode: boolean): boolean | undefined {
+	return resolveStrictJsonSchema(tool, supportsStrictMode) ? true : undefined;
+}
+
+/** Resolve strictness and its converted schema together, without cloning twice.
+ * No identity cache: tool schemas and onPayload results may be mutated by callers.
+ */
+export function resolveJsonSchemaToolParameters(
+	tool: Tool,
+	supportsStrictMode: boolean,
+	defaultStrict?: boolean | null,
+): { strict: boolean | null | undefined; parameters: Tool["parameters"] } {
+	const converted = resolveStrictJsonSchema(tool, supportsStrictMode);
+	const strict = converted ? true : defaultStrict;
+	return { strict, parameters: converted ?? getJsonSchemaToolParameters(tool, strict === true) };
 }
 
 export function resolveGrammarConstrainedSampling(

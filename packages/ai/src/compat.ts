@@ -41,6 +41,7 @@ import { piMessagesApi } from "./api/pi-messages.lazy.ts";
 import { getEnvApiKey } from "./env-api-keys.ts";
 import type { ModelsApiStreamOptions } from "./models.ts";
 import { builtinModels, getBuiltinModel, getBuiltinModels, getBuiltinProviders } from "./providers/all.ts";
+import { consumeAssistantMessageStream } from "./utils/event-stream.ts";
 
 export type { BuiltinProvider } from "./providers/all.ts";
 
@@ -269,7 +270,7 @@ export async function complete<TApi extends Api>(
 	options?: ProviderStreamOptions,
 ): Promise<AssistantMessage> {
 	const s = stream(model, context, options);
-	return s.result();
+	return consumeAssistantMessageStream(s);
 }
 
 export function streamSimple<TApi extends Api>(
@@ -294,5 +295,5 @@ export async function completeSimple<TApi extends Api>(
 	options?: SimpleStreamOptions,
 ): Promise<AssistantMessage> {
 	const s = streamSimple(model, context, options);
-	return s.result();
+	return consumeAssistantMessageStream(s);
 }

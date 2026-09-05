@@ -16,6 +16,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import { FRAME_TOKEN_ESTIMATE } from "../../riemann/snapshot-compaction.ts";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionContext,
@@ -305,9 +306,14 @@ export function estimateTokens(message: AgentMessage): number {
 			chars = message.command.length + message.output.length;
 			return Math.ceil(chars / 4);
 		}
-		case "branchSummary":
+		case "branchSummary": {
+			return Math.ceil(message.summary.length / 4);
+		}
 		case "compactionSummary": {
 			chars = message.summary.length;
+			for (const block of message.blocks ?? []) {
+				chars += block.type === "text" ? block.text.length : FRAME_TOKEN_ESTIMATE * 4;
+			}
 			return Math.ceil(chars / 4);
 		}
 	}

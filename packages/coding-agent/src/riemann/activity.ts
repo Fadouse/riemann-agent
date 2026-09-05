@@ -44,9 +44,9 @@ function numberValue(value: JsonValue | undefined): number | undefined {
 
 function lineCount(text: string): number {
 	if (!text) return 0;
-	const lines = text.split(/\r?\n/);
-	if (lines.at(-1) === "") lines.pop();
-	return lines.length;
+	let count = text.endsWith("\n") ? 0 : 1;
+	for (let index = text.indexOf("\n"); index !== -1; index = text.indexOf("\n", index + 1)) count++;
+	return count;
 }
 
 function diffDetails(before: string, after: string): DiffDetails {
@@ -307,6 +307,9 @@ export class RiemannActivityTracker {
 	}
 
 	private snapshot(): IPythonActivity[] {
-		return [...this.tracked.values()].map(({ activity }) => ({ ...activity }));
+		const activities = new Array<IPythonActivity>(this.tracked.size);
+		let index = 0;
+		for (const { activity } of this.tracked.values()) activities[index++] = { ...activity };
+		return activities;
 	}
 }

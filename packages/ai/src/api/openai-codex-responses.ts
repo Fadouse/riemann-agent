@@ -169,6 +169,10 @@ function getRetryAfterDelayMs(headers: Headers): number | undefined {
 
 class RetryDelayExceededError extends Error {}
 
+// HTTP responses have already passed the status/body retry policy. Do not treat
+// a rejected response as a network exception in the transport catch below.
+class CodexHttpError extends Error {}
+
 function validateRetryDelayMs(delayMs: number, options?: StreamOptions): number {
 	const maxRetryDelayMs = options?.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
 	if (maxRetryDelayMs > 0 && delayMs > maxRetryDelayMs) {
@@ -441,7 +445,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					throw new CodexHttpError(info.friendlyMessage || info.message);
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -453,6 +457,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					if (
 						attempt < maxRetries &&
 						!(lastError instanceof RetryDelayExceededError) &&
+						!(lastError instanceof CodexHttpError) &&
 						!lastError.message.includes("usage limit")
 					) {
 						const delayMs = BASE_DELAY_MS * 2 ** attempt;

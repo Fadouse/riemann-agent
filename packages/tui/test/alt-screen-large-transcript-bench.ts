@@ -14,9 +14,10 @@
  * final assistant message, and width changes that invalidate Markdown caches.
  *
  * Run from the repository root:
- *   node --experimental-strip-types packages/tui/test/alt-screen-large-transcript-bench.ts
+ *   node --expose-gc packages/tui/test/alt-screen-large-transcript-bench.ts
  */
 
+import { Session } from "node:inspector/promises";
 import { performance } from "node:perf_hooks";
 import { Markdown, type MarkdownTheme } from "../src/components/markdown.ts";
 import { ScrollView } from "../src/components/scroll-view.ts";
@@ -25,6 +26,8 @@ import { VStack } from "../src/components/v-stack.ts";
 import type { Terminal } from "../src/terminal.ts";
 import { Container } from "../src/tui.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
+
+if (!globalThis.gc) throw new Error("Run this benchmark with node --expose-gc");
 
 const COLUMNS = 80;
 const ROWS = 50;
@@ -142,25 +145,60 @@ const totalLines = document.render(terminal.columns).length;
 transcript.scrollTo(Math.floor(totalLines / 2));
 for (let frame = 0; frame < WARMUP_FRAMES; frame++) tui.renderNow();
 
-function measure(name: string, frames: number, beforeFrame: (frame: number) => void): void {
+interface SamplingNode {
+	selfSize: number;
+	children: SamplingNode[];
+}
+
+function sumProfile(node: SamplingNode): number {
+	let total = node.selfSize;
+	for (const child of node.children) total += sumProfile(child);
+	return total;
+}
+
+const session = new Session();
+session.connect();
+
+async function measure(name: string, frames: number, beforeFrame: (frame: number) => void): Promise<void> {
+	globalThis.gc?.();
+	const heapBefore = process.memoryUsage().heapUsed;
+	await session.post("HeapProfiler.startSampling", {
+		samplingInterval: 4096,
+		includeObjectsCollectedByMajorGC: true,
+		includeObjectsCollectedByMinorGC: true,
+	});
+	const cpuBefore = process.cpuUsage();
 	const start = performance.now();
 	for (let frame = 0; frame < frames; frame++) {
 		beforeFrame(frame);
 		tui.renderNow();
 	}
 	const millisecondsPerFrame = (performance.now() - start) / frames;
-	console.log(`${name}: ${millisecondsPerFrame.toFixed(3)} ms/frame (${frames} frames)`);
+	const cpu = process.cpuUsage(cpuBefore);
+	const allocatedBytes = await session
+		.post("HeapProfiler.stopSampling")
+		.then(({ profile }) => sumProfile(profile.head as SamplingNode));
+	globalThis.gc?.();
+	const heapAfter = process.memoryUsage().heapUsed;
+	console.log(
+		`${name}: ${millisecondsPerFrame.toFixed(3)} ms/frame (${frames} frames)  ` +
+			`${((cpu.user + cpu.system) / 1000 / frames).toFixed(3)} CPU ms/frame  ` +
+			`${(allocatedBytes / frames / 1024).toFixed(1)} KiB allocated/frame  ` +
+			`${((heapAfter - heapBefore) / 1024).toFixed(1)} KiB retained delta  ` +
+			`${(heapAfter / 1024 / 1024).toFixed(2)} MiB heap after GC`,
+	);
 }
 
 console.log(`components=${COMPONENT_COUNT} lines=${totalLines} viewport=${terminal.columns}x${terminal.rows}`);
-measure("steady", 200, () => {});
+await measure("steady", 200, () => {});
 transcript.scrollTo(Math.floor(totalLines / 2));
-measure("scroll", 200, () => transcript.scrollBy(1));
-measure("streaming", 100, (frame) => {
+await measure("scroll", 200, () => transcript.scrollBy(1));
+await measure("streaming", 100, (frame) => {
 	streamingMarkdown.setText(`${assistantMarkdown}\n\nstream ${"x".repeat(frame + 1)}`);
 });
-measure("resize", 10, (frame) => {
+await measure("resize", 10, (frame) => {
 	terminal.columns = frame % 2 === 0 ? COLUMNS - 1 : COLUMNS;
 });
 
+session.disconnect();
 tui.stop();

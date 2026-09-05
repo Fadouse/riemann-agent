@@ -3301,13 +3301,15 @@ export class InteractiveMode {
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
+					const markdownTransformers = this.getMarkdownTransformers();
 					this.streamingComponent = new AssistantMessageComponent(
 						undefined,
 						this.hideThinkingBlock,
 						this.getMarkdownThemeWithSettings(),
 						this.hiddenThinkingLabel,
 						this.outputPad,
-						this.getMarkdownTransformers(),
+						markdownTransformers,
+						markdownTransformers.length === 1,
 					);
 					this.streamingMessage = event.message;
 					this.chatContainer.addChild(this.streamingComponent);
@@ -3738,13 +3740,15 @@ export class InteractiveMode {
 				break;
 			}
 			case "assistant": {
+				const markdownTransformers = this.getMarkdownTransformers();
 				const assistantComponent = new AssistantMessageComponent(
 					message,
 					this.hideThinkingBlock,
 					this.getMarkdownThemeWithSettings(),
 					this.hiddenThinkingLabel,
 					this.outputPad,
-					this.getMarkdownTransformers(),
+					markdownTransformers,
+					markdownTransformers.length === 1,
 				);
 				this.chatContainer.addChild(assistantComponent);
 				break;

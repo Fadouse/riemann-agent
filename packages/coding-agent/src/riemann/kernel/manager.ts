@@ -862,7 +862,26 @@ export class IPythonKernelManager {
 		}
 		const escapedPath = JSON.stringify(kernelPath);
 		const result = await this.execute(
-			`import dill as _riemann_dill, json as _riemann_json, pathlib as _riemann_pathlib\n_riemann_restore = {"restored": [], "skipped": []}\n_riemann_snapshot_path = _riemann_pathlib.Path(${escapedPath})\nif _riemann_snapshot_path.exists():\n    try:\n        with _riemann_snapshot_path.open("rb") as _riemann_file:\n            _riemann_values = _riemann_dill.load(_riemann_file)\n        for _riemann_name, _riemann_value in _riemann_values.items():\n            globals()[_riemann_name] = _riemann_value\n            _riemann_restore["restored"].append(_riemann_name)\n    except Exception as _riemann_error:\n        _riemann_restore["error"] = f"{type(_riemann_error).__name__}: {_riemann_error}"\nprint("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps(_riemann_restore, sort_keys=True))`,
+			`import json as _riemann_json
+# Keep loaded values local so deleting a restored binding can release its object graph.
+def _riemann_restore_snapshot(path, namespace):
+    import dill, pathlib
+    restored = {"restored": [], "skipped": []}
+    snapshot_path = pathlib.Path(path)
+    if snapshot_path.exists():
+        try:
+            with snapshot_path.open("rb") as file:
+                values = dill.load(file)
+            for name, value in values.items():
+                namespace[name] = value
+                restored["restored"].append(name)
+        except Exception as error:
+            restored["error"] = f"{type(error).__name__}: {error}"
+    return restored
+try:
+    print("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps(_riemann_restore_snapshot(${escapedPath}, globals()), sort_keys=True))
+finally:
+    del _riemann_restore_snapshot`,
 			{ internal: true, signal: AbortSignal.timeout(30_000) },
 		);
 		this.options.onRestore?.(this.parseSnapshotResult(result));
@@ -876,37 +895,44 @@ export class IPythonKernelManager {
 		if (this.execution)
 			return { restored: [], skipped: [], error: "Cannot snapshot while an IPython cell is running" };
 		const escapedPath = JSON.stringify(kernelPath);
-		const code = `import builtins as _riemann_builtins, dill as _riemann_dill, json as _riemann_json, os as _riemann_os, pathlib as _riemann_pathlib, tempfile as _riemann_tempfile
-_riemann_snapshot_path = _riemann_pathlib.Path(${escapedPath})
-_riemann_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-_riemann_candidates, _riemann_values, _riemann_skipped = {}, {}, []
-_riemann_reserved = {"In", "Out", "get_ipython", "exit", "quit"} | set(globals().get("_RIEMANN_PROTECTED", set()))
-for _riemann_name, _riemann_value in list(globals().items()):
-    if _riemann_name.startswith("_") or _riemann_name in _riemann_reserved or isinstance(_riemann_value, type(_riemann_builtins)):
-        continue
-    _riemann_candidates[_riemann_name] = _riemann_value
-_riemann_fd, _riemann_tmp = _riemann_tempfile.mkstemp(dir=str(_riemann_snapshot_path.parent), prefix=".snapshot-", suffix=".tmp")
+		const code = `import json as _riemann_json
+# A function scope releases checkpoint-only references after serialization.
+def _riemann_write_snapshot(path, namespace):
+    import builtins, dill, os, pathlib, tempfile
+    snapshot_path = pathlib.Path(path)
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    candidates, values, skipped = {}, {}, []
+    reserved = {"In", "Out", "get_ipython", "exit", "quit"} | set(namespace.get("_RIEMANN_PROTECTED", set()))
+    for name, value in list(namespace.items()):
+        if name.startswith("_") or name in reserved or isinstance(value, type(builtins)):
+            continue
+        candidates[name] = value
+    fd, temporary = tempfile.mkstemp(dir=str(snapshot_path.parent), prefix=".snapshot-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as file:
+            try:
+                dill.dump(candidates, file)
+                values = candidates
+            except Exception:
+                file.seek(0)
+                file.truncate()
+                for name, value in candidates.items():
+                    try:
+                        dill.dumps(value)
+                        values[name] = value
+                    except Exception as error:
+                        skipped.append({"name": name, "reason": f"{type(error).__name__}: {error}"})
+                dill.dump(values, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, snapshot_path)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+    return {"restored": sorted(values), "skipped": skipped}
 try:
-    with _riemann_os.fdopen(_riemann_fd, "wb") as _riemann_file:
-        try:
-            _riemann_dill.dump(_riemann_candidates, _riemann_file)
-            _riemann_values = _riemann_candidates
-        except Exception:
-            _riemann_file.seek(0)
-            _riemann_file.truncate()
-            for _riemann_name, _riemann_value in _riemann_candidates.items():
-                try:
-                    _riemann_dill.dumps(_riemann_value)
-                    _riemann_values[_riemann_name] = _riemann_value
-                except Exception as _riemann_error:
-                    _riemann_skipped.append({"name": _riemann_name, "reason": f"{type(_riemann_error).__name__}: {_riemann_error}"})
-            _riemann_dill.dump(_riemann_values, _riemann_file)
-        _riemann_file.flush()
-        _riemann_os.fsync(_riemann_file.fileno())
-    _riemann_os.replace(_riemann_tmp, _riemann_snapshot_path)
+    print("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps(_riemann_write_snapshot(${escapedPath}, globals()), sort_keys=True))
 finally:
-    if _riemann_os.path.exists(_riemann_tmp): _riemann_os.unlink(_riemann_tmp)
-print("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps({"restored": sorted(_riemann_values), "skipped": _riemann_skipped}, sort_keys=True))`;
+    del _riemann_write_snapshot`;
 		const result = await this.execute(code, { internal: true, signal });
 		if (result.status !== "ok") return { restored: [], skipped: [], error: result.error?.evalue ?? result.stderr };
 		const parsed = this.parseSnapshotResult(result);

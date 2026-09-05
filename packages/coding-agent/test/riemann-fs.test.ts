@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Value } from "typebox/value";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { FULL_FILESYSTEM, fileAccessPolicy, resolveFilesystemSnapshot } from "../src/riemann/access-policy.ts";
 import { FileFunctions } from "../src/riemann/functions/fs.ts";
 import { isKernelHostResult, type JsonValue, type KernelHostResult } from "../src/riemann/kernel/types.ts";
@@ -27,6 +27,62 @@ function fullPolicy(cwd: string) {
 }
 
 describe("Riemann fs capabilities", () => {
+	test("scans all lines without allocating a whole-file split, preserving newline and match semantics", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-fs-search-lines-"));
+		roots.push(root);
+		const longLine = `needle${"x".repeat(4_000)}`;
+		const content = `${"plain\r\n".repeat(4_096)}needle😀\r\n\r\nx\rneedle\r\n${longLine}\nneedle\r\n`;
+		await writeFile(join(root, "lines.txt"), `\ufeff${content}`);
+		await writeFile(join(root, "empty.txt"), "");
+		await writeFile(join(root, "cr.txt"), "\r");
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("fs-search-lines", root);
+		const definitions = new FileFunctions(
+			fullPolicy(root),
+			run.id,
+			store,
+			new ArtifactStore(store, run.id),
+		).definitions();
+		const search = definitions.find((definition) => definition.name === "search");
+		const glob = definitions.find((definition) => definition.name === "glob");
+		if (!search || !glob) throw new Error("fs definitions are incomplete");
+		const signal = new AbortController().signal;
+		const split = vi.spyOn(String.prototype, "split");
+		try {
+			for (const mode of ["literal", "regex"]) {
+				expect(
+					await search.handler(
+						{ query: "NEEDLE", mode, case_sensitive: false, glob: "*.txt", limit: 2_000 },
+						signal,
+					),
+				).toEqual([
+					{ path: "lines.txt", line: 4_097, text: "needle😀", truncated: false },
+					{ path: "lines.txt", line: 4_099, text: "x\rneedle", truncated: false },
+					{ path: "lines.txt", line: 4_100, text: longLine.slice(0, 4_000), truncated: true },
+					{ path: "lines.txt", line: 4_101, text: "needle", truncated: false },
+				]);
+			}
+			expect(await search.handler({ query: "^$", mode: "regex", glob: "*.txt" }, signal)).toEqual([
+				{ path: "empty.txt", line: 1, text: "", truncated: false },
+				{ path: "lines.txt", line: 4_098, text: "", truncated: false },
+				{ path: "lines.txt", line: 4_102, text: "", truncated: false },
+			]);
+			expect(await search.handler({ query: "^\\r$", mode: "regex", glob: "cr.txt" }, signal)).toEqual([
+				{ path: "cr.txt", line: 1, text: "\r", truncated: false },
+			]);
+			expect(await glob.handler({ pattern: "*.txt", limit: 5_000 }, signal)).toEqual([
+				"cr.txt",
+				"empty.txt",
+				"lines.txt",
+			]);
+			// Count the allocation, not elapsed time: this must fail if the eager line array returns.
+			expect(split.mock.contexts.filter((receiver) => String(receiver) === content)).toHaveLength(0);
+		} finally {
+			split.mockRestore();
+			store.close();
+		}
+	});
+
 	test("applies atomic snapshot edits and rejects stale capabilities", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-fs-test-"));
 		roots.push(root);

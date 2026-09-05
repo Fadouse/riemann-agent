@@ -671,9 +671,14 @@ export class FileFunctions {
 						} catch {
 							continue;
 						}
-						const lines = text.split(/\r?\n/);
-						for (let index = 0; index < lines.length && hits.length < limit; index += 1) {
-							const line = lines[index] ?? "";
+						// Visit lines without retaining a second, whole-file array of strings.
+						// Include the final empty line and strip CR only when it precedes LF.
+						let start = 0;
+						for (let lineNumber = 1; start <= text.length && hits.length < limit; lineNumber += 1) {
+							const newline = text.indexOf("\n", start);
+							const end = newline === -1 ? text.length : newline;
+							const line = text.slice(start, newline !== -1 && text.charCodeAt(end - 1) === 13 ? end - 1 : end);
+							start = newline === -1 ? text.length + 1 : newline + 1;
 							const searchableLine = matcher ? graphemeSafePrefix(line, MAX_SEARCH_LINE_CHARS) : line;
 							if (matcher) matcher.lastIndex = 0;
 							const matched = matcher
@@ -682,7 +687,7 @@ export class FileFunctions {
 							if (matched) {
 								hits.push({
 									path: displayPath,
-									line: index + 1,
+									line: lineNumber,
 									text: graphemeSafePrefix(line, MAX_SEARCH_LINE_CHARS),
 									truncated: line.length > MAX_SEARCH_LINE_CHARS,
 								});

@@ -423,7 +423,7 @@ def _wire_path(path: str, key: str | int) -> str:
     return f"{path}[{key!r}]"
 
 
-def _to_wire(value, *, _seen=None, _path="$"):
+def _to_wire(value, *, _seen=None, _path="$", _key=_RIEMANN_MISSING):
     if _seen is None:
         _seen = set()
     if isinstance(value, TextSnapshot):
@@ -442,14 +442,23 @@ def _to_wire(value, *, _seen=None, _path="$"):
         return value
     if isinstance(value, int):
         if abs(value) > _RIEMANN_MAX_SAFE_INTEGER:
+            if _key is not _RIEMANN_MISSING:
+                _path = _wire_path(_path, _key)
             raise TypeError(f"Cannot pass unsafe integer through the Riemann host bridge at {_path}: {value}")
         return value
     if isinstance(value, float):
         if not _math.isfinite(value):
+            if _key is not _RIEMANN_MISSING:
+                _path = _wire_path(_path, _key)
             raise TypeError(f"Cannot pass non-finite float through the Riemann host bridge at {_path}: {value!r}")
         if value.is_integer() and abs(value) > _RIEMANN_MAX_SAFE_INTEGER:
+            if _key is not _RIEMANN_MISSING:
+                _path = _wire_path(_path, _key)
             raise TypeError(f"Cannot pass unsafe integer through the Riemann host bridge at {_path}: {value!r}")
         return value
+    # Primitive values need a diagnostic path only when validation fails.
+    if _key is not _RIEMANN_MISSING:
+        _path = _wire_path(_path, _key)
     if _dataclasses.is_dataclass(value) or isinstance(value, (dict, list, tuple)):
         identity = id(value)
         if identity in _seen:
@@ -461,7 +470,8 @@ def _to_wire(value, *, _seen=None, _path="$"):
                     field.name: _to_wire(
                         getattr(value, field.name),
                         _seen=_seen,
-                        _path=_wire_path(_path, field.name),
+                        _path=_path,
+                        _key=field.name,
                     )
                     for field in _dataclasses.fields(value)
                 }
@@ -473,10 +483,10 @@ def _to_wire(value, *, _seen=None, _path="$"):
                             f"Riemann host bridge dict keys must be strings at {_path}; "
                             f"got {type(key).__name__}"
                         )
-                    result[key] = _to_wire(item, _seen=_seen, _path=_wire_path(_path, key))
+                    result[key] = _to_wire(item, _seen=_seen, _path=_path, _key=key)
                 return result
             return [
-                _to_wire(item, _seen=_seen, _path=_wire_path(_path, index))
+                _to_wire(item, _seen=_seen, _path=_path, _key=index)
                 for index, item in enumerate(value)
             ]
         finally:

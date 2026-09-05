@@ -30,15 +30,14 @@ import type {
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, StreamingJsonParser } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import {
 	appendGrammarToolInputJsonDelta,
 	type GrammarToolInputJsonBuffer,
 	getGrammarToolInput,
-	getJsonSchemaToolParameters,
 	resolveGrammarConstrainedSampling,
-	resolveJsonSchemaStrictSampling,
+	resolveJsonSchemaToolParameters,
 } from "./constrained-sampling.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -387,15 +386,14 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 			} satisfies OpenAITool;
 		}
 
-		const constrainedStrict = resolveJsonSchemaStrictSampling(tool, supportsStrictMode);
-		const strict = constrainedStrict ?? defaultStrict;
+		const { strict, parameters } = resolveJsonSchemaToolParameters(tool, supportsStrictMode, defaultStrict);
 		const functionTool: Omit<Extract<OpenAITool, { type: "function" }>, "strict"> & {
 			strict?: Extract<OpenAITool, { type: "function" }>["strict"];
 		} = {
 			type: "function",
 			name: tool.name,
 			description: tool.description,
-			parameters: getJsonSchemaToolParameters(tool, strict === true) as Record<string, unknown>,
+			parameters: parameters as Record<string, unknown>,
 			...(options?.deferLoading ? { defer_loading: true } : {}),
 		};
 		if (supportsStrictMode) {
@@ -448,6 +446,7 @@ export async function processResponsesStream<TApi extends Api>(
 ): Promise<void> {
 	let sawTerminalResponseEvent = false;
 	const outputSlots = new Map<number, ResponsesOutputSlot>();
+	const toolJsonParsers = new WeakMap<StreamingToolCall, StreamingJsonParser>();
 	const reasoningBlocksById = new Map<string, ThinkingContent>();
 	const applyMessagePhaseStopReason = (item: ResponseOutputItem): void => {
 		if (item.type === "message" && item.phase === "final_answer") {
@@ -501,6 +500,7 @@ export async function processResponsesStream<TApi extends Api>(
 				...(item.namespace !== undefined ? { namespace: item.namespace } : {}),
 				partialJson: item.arguments || "",
 			};
+			toolJsonParsers.set(block, new StreamingJsonParser(block.partialJson));
 			output.content.push(block);
 			const slot = {
 				type: "toolCall",
@@ -664,13 +664,14 @@ export async function processResponsesStream<TApi extends Api>(
 			const slot = getSlot(event.output_index, "toolCall");
 			if (!slot || slot.block.partialJson === undefined) continue;
 			slot.block.partialJson += event.delta;
-			slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+			slot.block.arguments = toolJsonParsers.get(slot.block)!.append(event.delta);
 			pushToolCallDelta(slot, event.delta);
 		} else if (event.type === "response.function_call_arguments.done") {
 			const slot = getSlot(event.output_index, "toolCall");
 			if (!slot || slot.block.partialJson === undefined) continue;
 			const previousPartialJson = slot.block.partialJson;
 			slot.block.partialJson = event.arguments;
+			toolJsonParsers.set(slot.block, new StreamingJsonParser(event.arguments));
 			slot.block.arguments = parseStreamingJson(slot.block.partialJson);
 
 			if (event.arguments.startsWith(previousPartialJson)) {
@@ -726,6 +727,7 @@ export async function processResponsesStream<TApi extends Api>(
 				// Finalize in-place and strip the scratch buffer so replay only
 				// carries parsed arguments.
 				delete slot.block.partialJson;
+				toolJsonParsers.delete(slot.block);
 				stream.push({
 					type: "toolcall_end",
 					contentIndex: slot.contentIndex,

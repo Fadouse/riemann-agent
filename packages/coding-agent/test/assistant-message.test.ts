@@ -1,5 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Markdown, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 import {
 	AssistantMessageComponent,
@@ -7,7 +7,7 @@ import {
 	queueAssistantMessageComponentUpdate,
 } from "../src/modes/interactive/components/assistant-message.ts";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
-import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -38,6 +38,131 @@ function createAssistantMessage(
 }
 
 describe("AssistantMessageComponent", () => {
+	test("refreshes custom theme closures unless block reuse is explicitly enabled", () => {
+		initTheme("dark");
+		let prefix = "old:";
+		const component = new AssistantMessageComponent(undefined, false, {
+			...getMarkdownTheme(),
+			heading: (text) => prefix + text,
+		});
+		const stable = { type: "text", text: "## stable" } as const;
+		component.updateContent(createAssistantMessage([stable, { type: "text", text: "tail one" }]), true);
+		component.render(80);
+		prefix = "new:";
+		component.updateContent(createAssistantMessage([stable, { type: "text", text: "tail two" }]), true);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("new:");
+	});
+
+	test("forwards explicit reuse to Markdown with a caller-trusted transform chain", () => {
+		initTheme("dark");
+		const highlightCode = vi.fn((code: string) => code.split("\n"));
+		const component = new AssistantMessageComponent(
+			undefined,
+			false,
+			{ ...getMarkdownTheme(), highlightCode },
+			"Thinking...",
+			1,
+			[(text) => text],
+			true,
+		);
+		const prefix = "```ts\nconst value = 1;\n```\n\n";
+		for (const tail of ["one", "two"]) {
+			component.updateContent(createAssistantMessage([{ type: "text", text: `${prefix}${tail}` }]), true);
+			component.render(80);
+		}
+		const before = highlightCode.mock.calls.length;
+		component.updateContent(createAssistantMessage([{ type: "text", text: `${prefix}three` }]), true);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("three");
+		expect(highlightCode).toHaveBeenCalledTimes(before);
+	});
+
+	test("reuses stable text blocks while the trailing block streams", () => {
+		initTheme("dark");
+		const highlightCode = vi.fn((code: string) => code.split("\n"));
+		const component = new AssistantMessageComponent(
+			undefined,
+			false,
+			{ ...getMarkdownTheme(), highlightCode },
+			"Thinking...",
+			1,
+			[],
+			true,
+		);
+		const stable = { type: "text", text: "```ts\nconst value = 1;\n```" } as const;
+		component.updateContent(createAssistantMessage([stable, { type: "text", text: "tail" }]), true);
+		component.render(80);
+		component.updateContent(createAssistantMessage([stable, { type: "text", text: "tail updated" }]), true);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("tail updated");
+		expect(highlightCode).toHaveBeenCalledTimes(1);
+	});
+
+	test("reuses coalesced thinking Markdown while the following answer streams", () => {
+		initTheme("dark");
+		const render = vi.spyOn(Markdown.prototype, "render");
+		try {
+			const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking...", 1, [], true);
+			const thinking = [
+				{ type: "thinking", thinking: "first thought" },
+				{ type: "thinking", thinking: "second thought" },
+			] as const;
+			component.updateContent(createAssistantMessage([...thinking, { type: "text", text: "answer" }]), true);
+			component.render(80);
+			const firstThinking = render.mock.contexts[0];
+			render.mockClear();
+			component.updateContent(createAssistantMessage([...thinking, { type: "text", text: "answer updated" }]), true);
+			component.render(80);
+			expect(render.mock.contexts[0]).toBe(firstThinking);
+		} finally {
+			render.mockRestore();
+		}
+	});
+
+	test("preserves custom transformer refreshes on unchanged source updates", () => {
+		initTheme("dark");
+		let suffix = "first";
+		const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking...", 1, [
+			(markdown) => `${markdown} ${suffix}`,
+		]);
+		const message = createAssistantMessage([{ type: "text", text: "answer" }]);
+		component.updateContent(message, true);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("answer first");
+		suffix = "second";
+		component.updateContent(message, true);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("answer second");
+	});
+
+	test("matches a fresh component after block replacements, finalization and invalidation", () => {
+		initTheme("dark");
+		const component = new AssistantMessageComponent();
+		const messages = [
+			createAssistantMessage([
+				{ type: "thinking", thinking: "first" },
+				{ type: "text", text: "[link][ref]" },
+			]),
+			createAssistantMessage([
+				{ type: "thinking", thinking: "first" },
+				{ type: "text", text: "[link][ref]\n\n[ref]: https://example.com" },
+			]),
+			createAssistantMessage([
+				{ type: "text", text: "replacement" },
+				{ type: "thinking", thinking: "second" },
+			]),
+			createAssistantMessage([{ type: "text", text: "remaining" }], { stopReason: "length" }),
+		];
+		for (const message of messages) {
+			for (const streaming of [true, false]) {
+				component.updateContent(message, streaming);
+				const fresh = new AssistantMessageComponent();
+				fresh.updateContent(message, streaming);
+				for (const width of [80, 24]) expect(component.render(width)).toEqual(fresh.render(width));
+			}
+		}
+		component.setOutputPad(3);
+		component.invalidate();
+		const fresh = new AssistantMessageComponent(messages[messages.length - 1], false, undefined, "Thinking...", 3);
+		expect(component.render(80)).toEqual(fresh.render(80));
+	});
+
 	test("adds OSC 133 zone markers to assistant messages without tool calls", () => {
 		initTheme("dark");
 

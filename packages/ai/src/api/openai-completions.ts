@@ -40,7 +40,7 @@ import { formatProviderError, normalizeProviderError } from "../utils/error-body
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, StreamingJsonParser } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
@@ -396,6 +396,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			let hasFinishReason = false;
 			const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
 			const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
+			const toolJsonParsers = new WeakMap<StreamingToolCallBlock, StreamingJsonParser>();
 			const blocks = output.content as StreamingBlock[];
 			const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
 			const getCustomToolCallInput = (block: StreamingToolCallBlock): string => {
@@ -457,6 +458,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					// Finalize in-place and strip the scratch buffers so replay only
 					// carries parsed arguments.
 					delete block.partialArgs;
+					toolJsonParsers.delete(block);
 					delete block.customInput;
 					delete block.streamIndex;
 					stream.push({
@@ -542,6 +544,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						jsonBuffer: { input: "", started: false, closed: false },
 					};
 					delete block.partialArgs;
+					toolJsonParsers.delete(block);
 				}
 				return block;
 			};
@@ -642,8 +645,10 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 							let delta = "";
 							if (toolCall.function?.arguments) {
 								delta = toolCall.function.arguments;
+								const parser = toolJsonParsers.get(block) ?? new StreamingJsonParser(block.partialArgs);
+								toolJsonParsers.set(block, parser);
 								block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
-								block.arguments = parseStreamingJson(block.partialArgs);
+								block.arguments = parser.append(delta);
 							} else if (toolCall.custom?.input) {
 								const nextInput = getCustomToolCallInput(block) + toolCall.custom.input;
 								delta = appendCustomToolCallInput(block, nextInput, false) ?? "";

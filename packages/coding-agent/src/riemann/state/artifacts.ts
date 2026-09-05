@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, copyFile, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { access, copyFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { RiemannHostError } from "../errors.ts";
 import type { JsonValue } from "../kernel/types.ts";
@@ -40,6 +40,15 @@ export class ArtifactStore {
 
 	async putBuffer(data: Buffer, options: { name?: string; mimeType: string }): Promise<JsonValue> {
 		const hash = createHash("sha256").update(data).digest("hex");
+		return this.putKnownData([data], hash, data.length, options);
+	}
+
+	private async putKnownData(
+		chunks: Iterable<string | Uint8Array>,
+		hash: string,
+		size: number,
+		options: { name?: string; mimeType: string },
+	): Promise<JsonValue> {
 		const directory = join(this.store.artifactsDir, "sha256", hash.slice(0, 2));
 		const path = join(directory, hash);
 		await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -51,7 +60,7 @@ export class ArtifactStore {
 			try {
 				const file = await open(temporary, "wx", 0o600);
 				try {
-					await file.writeFile(data);
+					await writeFile(file, chunks);
 					await file.sync();
 				} finally {
 					await file.close();
@@ -76,6 +85,104 @@ export class ArtifactStore {
 				// Directory fsync is unavailable on some supported platforms.
 			}
 		}
+		return this.registerArtifact(hash, size, path, options);
+	}
+
+	/** Persist complete text without joining the parts into another full-sized string. */
+	async putTextParts(
+		parts: readonly string[],
+		options: { name?: string; mimeType?: string } = {},
+	): Promise<JsonValue> {
+		const sourceParts = parts.slice();
+		function* textChunks(): Generator<string> {
+			let pending = "";
+			for (const part of sourceParts) {
+				if (part.length === 0) continue;
+				const text = pending + part;
+				let end = text.length;
+				const last = text.charCodeAt(end - 1);
+				pending = last >= 0xd800 && last <= 0xdbff ? text.slice(--end) : "";
+				for (let offset = 0; offset < end; ) {
+					let next = Math.min(end, offset + 65_536);
+					const boundary = text.charCodeAt(next - 1);
+					if (next < end && boundary >= 0xd800 && boundary <= 0xdbff) next--;
+					yield text.slice(offset, next);
+					offset = next;
+				}
+			}
+			if (pending) yield pending;
+		}
+		// Text parts are replayable. Hash before writing so repeated output keeps
+		// the existing content-addressed fast path, without a full encoded copy.
+		const digest = createHash("sha256");
+		let size = 0;
+		for (const chunk of textChunks()) {
+			digest.update(chunk);
+			size += Buffer.byteLength(chunk);
+		}
+		return this.putKnownData(textChunks(), digest.digest("hex"), size, {
+			name: options.name,
+			mimeType: options.mimeType ?? "text/plain; charset=utf-8",
+		});
+	}
+
+	/** Hash and persist every chunk; chunking does not limit artifact size. */
+	async putStream(
+		chunks: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+		options: { name?: string; mimeType: string },
+	): Promise<JsonValue> {
+		await mkdir(this.store.artifactsDir, { recursive: true, mode: 0o700 });
+		const temporary = join(this.store.artifactsDir, `.stream.${process.pid}.${randomUUID()}.tmp`);
+		const digest = createHash("sha256");
+		let size = 0;
+		async function* recordedChunks(): AsyncGenerator<Uint8Array> {
+			for await (const chunk of chunks) {
+				digest.update(chunk);
+				size += chunk.byteLength;
+				yield chunk;
+			}
+		}
+		try {
+			const file = await open(temporary, "wx", 0o600);
+			try {
+				await writeFile(file, recordedChunks());
+				await file.sync();
+			} finally {
+				await file.close();
+			}
+			const hash = digest.digest("hex");
+			const directory = join(this.store.artifactsDir, "sha256", hash.slice(0, 2));
+			const path = join(directory, hash);
+			await mkdir(directory, { recursive: true, mode: 0o700 });
+			try {
+				await access(path, constants.F_OK);
+			} catch {
+				await rename(temporary, path).catch((error: NodeJS.ErrnoException) => {
+					if (error.code !== "EEXIST") throw error;
+				});
+				try {
+					const directoryHandle = await open(directory, constants.O_RDONLY);
+					try {
+						await directoryHandle.sync();
+					} finally {
+						await directoryHandle.close();
+					}
+				} catch {
+					// Directory fsync is unavailable on some supported platforms.
+				}
+			}
+			return this.registerArtifact(hash, size, path, options);
+		} finally {
+			await rm(temporary, { force: true });
+		}
+	}
+
+	private registerArtifact(
+		hash: string,
+		size: number,
+		path: string,
+		options: { name?: string; mimeType: string },
+	): JsonValue {
 		const metadataHash = createHash("sha256")
 			.update(options.mimeType)
 			.update("\0")
@@ -87,7 +194,7 @@ export class ArtifactStore {
 			runId: this.runId,
 			hash,
 			mimeType: options.mimeType,
-			size: data.length,
+			size,
 			name: options.name ?? null,
 			path,
 			createdAt: new Date().toISOString(),

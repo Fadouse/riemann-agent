@@ -85,13 +85,32 @@ function formatDuration(durationMs: number | undefined): string | undefined {
 	return `${(durationMs / 1000).toFixed(1)}s`;
 }
 
-function firstCodeLine(code: string): string {
-	return (
-		code
-			.split(/\r?\n/)
-			.map((line) => line.trim())
-			.find(Boolean) ?? ""
-	);
+interface LineSummary {
+	firstLine: string;
+	nonEmptyLines: number;
+	firstNonEmpty: number;
+	lastNonEmpty: number;
+	breaks: number;
+}
+
+function summarizeLines(text: string): LineSummary {
+	const summary: LineSummary = { firstLine: "", nonEmptyLines: 0, firstNonEmpty: -1, lastNonEmpty: -1, breaks: 0 };
+	let start = 0;
+	while (true) {
+		const newline = text.indexOf("\n", start);
+		const line = text.slice(start, newline === -1 ? text.length : newline).trim();
+		if (line) {
+			if (summary.firstNonEmpty === -1) {
+				summary.firstLine = line;
+				summary.firstNonEmpty = summary.breaks;
+			}
+			summary.nonEmptyLines++;
+			summary.lastNonEmpty = summary.breaks;
+		}
+		if (newline === -1) return summary;
+		start = newline + 1;
+		summary.breaks++;
+	}
 }
 
 type StatusKind = "error" | "aborted" | "running" | "queued" | "done";
@@ -111,6 +130,10 @@ export class IPythonCellComponent implements Component {
 	private cachedState?: IPythonCellState;
 	private cachedThemeFg?: string;
 	private cachedLines?: string[];
+	private cachedTheme?: typeof theme;
+	private cachedCodeSummary?: { text: string; firstLine: string; lines: number };
+	private cachedOutputSummary?: { parts: string[]; lines: number };
+	private cachedPreview?: { text: string; theme: typeof theme; line: string };
 
 	constructor(state: IPythonCellState) {
 		this.state = state;
@@ -142,18 +165,28 @@ export class IPythonCellComponent implements Component {
 		this.cachedWidth = undefined;
 		this.cachedState = undefined;
 		this.cachedThemeFg = undefined;
+		this.cachedTheme = undefined;
 		this.cachedLines = undefined;
+		this.cachedPreview = undefined;
+		for (const component of this.activityComponents.values()) component.invalidate();
 	}
 
 	render(width: number): string[] {
-		if (this.state.hidden) return [];
+		if (this.state.hidden) {
+			this.activityComponents.clear();
+			this.invalidate();
+			this.cachedCodeSummary = undefined;
+			this.cachedOutputSummary = undefined;
+			return [];
+		}
 		const safeWidth = Math.max(1, width);
 		const themeFg = theme.getFgAnsi("text");
 		if (
 			this.cachedLines &&
 			this.cachedWidth === safeWidth &&
 			this.cachedState === this.state &&
-			this.cachedThemeFg === themeFg
+			this.cachedThemeFg === themeFg &&
+			this.cachedTheme === theme
 		)
 			return this.cachedLines;
 		const details = readDetails(this.state.details);
@@ -164,6 +197,7 @@ export class IPythonCellComponent implements Component {
 		this.cachedWidth = safeWidth;
 		this.cachedState = this.state;
 		this.cachedThemeFg = themeFg;
+		this.cachedTheme = theme;
 		this.cachedLines = lines;
 		return lines;
 	}
@@ -174,14 +208,27 @@ export class IPythonCellComponent implements Component {
 			const interruptKey = keyText("app.interrupt");
 			if (interruptKey) parts.push(theme.fg("muted", `${interruptKey} to interrupt`));
 		}
-		const preview = firstCodeLine(this.state.code);
+		if (this.cachedCodeSummary?.text !== this.state.code) {
+			const summary = summarizeLines(this.state.code);
+			this.cachedCodeSummary = { text: this.state.code, firstLine: summary.firstLine, lines: summary.nonEmptyLines };
+		}
+		const inputSummary = this.cachedCodeSummary;
+		const preview = inputSummary.firstLine;
 		if (preview) {
-			parts.push(highlightCode(preview, "python")[0] ?? theme.fg("mdCodeBlock", preview));
-		} else if (!this.state.executionStarted) {
-			parts.push(theme.fg("muted", "waiting for code"));
+			if (this.cachedPreview?.text !== preview || this.cachedPreview.theme !== theme) {
+				this.cachedPreview = {
+					text: preview,
+					theme,
+					line: highlightCode(preview, "python")[0] ?? theme.fg("mdCodeBlock", preview),
+				};
+			}
+			parts.push(this.cachedPreview.line);
+		} else {
+			this.cachedPreview = undefined;
+			if (!this.state.executionStarted) parts.push(theme.fg("muted", "waiting for code"));
 		}
 
-		const counts = this.lineCounts();
+		const counts = this.lineCounts(inputSummary.lines);
 		if (counts) parts.push(theme.fg("muted", counts));
 		const duration = formatDuration(details.durationMs);
 		if (duration) parts.push(theme.fg("muted", duration));
@@ -218,10 +265,28 @@ export class IPythonCellComponent implements Component {
 		}
 	}
 
-	private lineCounts(): string | undefined {
-		const input = this.state.code.split(/\r?\n/).filter((line) => line.trim().length > 0).length;
-		const outputText = textFromBlocks(this.state.content).trim();
-		const output = outputText ? outputText.split("\n").length : 0;
+	private lineCounts(input: number): string | undefined {
+		const parts: string[] = [];
+		this.state.content?.forEach((block) => {
+			if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
+		});
+		if (
+			!this.cachedOutputSummary ||
+			this.cachedOutputSummary.parts.length !== parts.length ||
+			parts.some((text, index) => text !== this.cachedOutputSummary?.parts[index])
+		) {
+			let first = -1;
+			let last = -1;
+			let offset = 0;
+			for (const text of parts) {
+				const summary = summarizeLines(text);
+				if (first === -1 && summary.firstNonEmpty !== -1) first = offset + summary.firstNonEmpty;
+				if (summary.lastNonEmpty !== -1) last = offset + summary.lastNonEmpty;
+				offset += summary.breaks + 1; // The separator inserted between text blocks.
+			}
+			this.cachedOutputSummary = { parts, lines: first === -1 ? 0 : last - first + 1 };
+		}
+		const output = this.cachedOutputSummary.lines;
 		const segments: string[] = [];
 		if (input > 0) segments.push(`↑ ${input}`);
 		if (output > 0) segments.push(`↓ ${output}`);
@@ -245,7 +310,7 @@ export class IPythonCellComponent implements Component {
 			} else {
 				component.update(activity, this.state.expanded ?? false);
 			}
-			lines.push(...component.render(width));
+			for (const line of component.render(width)) lines.push(line);
 		}
 		for (const id of this.activityComponents.keys()) {
 			if (!activeIds.has(id)) this.activityComponents.delete(id);

@@ -16,7 +16,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, StreamingJsonParser } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
@@ -565,6 +565,7 @@ async function consumeChatStream(
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 	const toolBlocksByKey = new Map<string | number, number>();
+	const toolJsonParsers = new WeakMap<ToolCall, StreamingJsonParser>();
 
 	const finishCurrentBlock = (block?: typeof currentBlock) => {
 		if (!block) return;
@@ -712,6 +713,7 @@ async function consumeChatStream(
 					arguments: {},
 					partialArgs: "",
 				};
+				toolJsonParsers.set(block, new StreamingJsonParser());
 				output.content.push(block);
 				toolBlocksByKey.set(key, output.content.length - 1);
 				stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
@@ -722,7 +724,7 @@ async function consumeChatStream(
 					? toolCall.function.arguments
 					: JSON.stringify(toolCall.function.arguments || {});
 			block.partialArgs = (block.partialArgs || "") + argsDelta;
-			block.arguments = parseStreamingJson<Record<string, unknown>>(block.partialArgs);
+			block.arguments = toolJsonParsers.get(block)!.append(argsDelta);
 			stream.push({
 				type: "toolcall_delta",
 				contentIndex: toolBlocksByKey.get(key)!,
@@ -741,6 +743,7 @@ async function consumeChatStream(
 		// Finalize in-place and strip the scratch buffer so replay only
 		// carries parsed arguments.
 		delete toolBlock.partialArgs;
+		toolJsonParsers.delete(toolBlock);
 		stream.push({
 			type: "toolcall_end",
 			contentIndex: index,

@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { RiemannActivityTracker } from "../src/riemann/activity.ts";
 import type { KernelHostRequest, KernelHostRequestEvent } from "../src/riemann/kernel/types.ts";
 
@@ -167,5 +167,40 @@ describe("Riemann IPython activity tracking", () => {
 		const finished = activities[0];
 		expect(Buffer.from(finished?.error ?? "", "utf8").toString("utf8")).toBe(finished?.error);
 		expect(finished?.error).toBe("x".repeat(1_999));
+	});
+	test("counts complete large file lines without allocating an array of lines", async () => {
+		const tracker = new RiemannActivityTracker(process.cwd(), () => undefined);
+		const text = "content\r\n".repeat(120_000);
+		const split = vi.spyOn(String.prototype, "split");
+		try {
+			const result = await observe(tracker, {
+				phase: "start",
+				requestId: "large-file",
+				startedAt: 1,
+				request: request("fs.create", { path: "large.txt", text }),
+			});
+			expect(result[0]).toMatchObject({ additions: 120_000, diffTruncated: true });
+			expect(split.mock.contexts.some((context) => String(context) === text)).toBe(false);
+		} finally {
+			split.mockRestore();
+		}
+	});
+
+	test("keeps returned snapshots independent from subsequent events and caller mutation", async () => {
+		const tracker = new RiemannActivityTracker(process.cwd(), () => undefined);
+		const shellRequest = request("shell.run", { script: "true" });
+		const first = await observe(tracker, { phase: "start", requestId: "one", startedAt: 1, request: shellRequest });
+		first[0].status = "error";
+		const second = await observe(tracker, { phase: "start", requestId: "two", startedAt: 1, request: shellRequest });
+		expect(second.map((activity) => activity.status)).toEqual(["running", "running"]);
+		await observe(tracker, {
+			phase: "end",
+			requestId: "one",
+			request: shellRequest,
+			durationMs: 2,
+			result: { exit_code: 0 },
+		});
+		expect(first[0].status).toBe("error");
+		expect(second[0].status).toBe("running");
 	});
 });

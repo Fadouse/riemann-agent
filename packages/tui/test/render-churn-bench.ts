@@ -13,7 +13,7 @@
  * Allocation is estimated with the V8 sampling heap profiler including
  * objects collected by minor/major GC, i.e. it measures churn, not retention.
  *
- * Run from packages/tui: node test/render-churn-bench.ts
+ * Run from packages/tui: node --expose-gc test/render-churn-bench.ts
  */
 
 import { Session } from "node:inspector/promises";
@@ -24,6 +24,8 @@ import { VStack } from "../src/components/v-stack.ts";
 import type { Terminal } from "../src/terminal.ts";
 import { type Component, Container, CURSOR_MARKER } from "../src/tui.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
+
+if (!globalThis.gc) throw new Error("Run this benchmark with node --expose-gc");
 
 const COLUMNS = 100;
 const ROWS = 30;
@@ -115,6 +117,9 @@ function sumProfile(node: SamplingNode): number {
 interface ScenarioResult {
 	allocatedBytes: number;
 	elapsedMs: number;
+	cpuMs: number;
+	retainedHeapBytes: number;
+	heapAfterGcBytes: number;
 	bytesWritten: number;
 }
 
@@ -124,22 +129,33 @@ async function runScenario(
 	tui: TuiAltScreen,
 	frame: (index: number) => void,
 ): Promise<ScenarioResult> {
+	globalThis.gc?.();
+	const heapBefore = process.memoryUsage().heapUsed;
 	const writtenBefore = terminal.bytesWritten;
 	await session.post("HeapProfiler.startSampling", {
 		samplingInterval: SAMPLING_INTERVAL,
 		includeObjectsCollectedByMajorGC: true,
 		includeObjectsCollectedByMinorGC: true,
 	});
+	const cpuBefore = process.cpuUsage();
 	const start = performance.now();
 	for (let i = 0; i < FRAMES; i++) {
 		frame(i);
 		tui.renderNow();
 	}
 	const elapsedMs = performance.now() - start;
-	const { profile } = await session.post("HeapProfiler.stopSampling");
+	const cpu = process.cpuUsage(cpuBefore);
+	const allocatedBytes = await session
+		.post("HeapProfiler.stopSampling")
+		.then(({ profile }) => sumProfile(profile.head as SamplingNode));
+	globalThis.gc?.();
+	const heapAfterGcBytes = process.memoryUsage().heapUsed;
 	return {
-		allocatedBytes: sumProfile(profile.head as SamplingNode),
+		allocatedBytes,
 		elapsedMs,
+		cpuMs: (cpu.user + cpu.system) / 1000,
+		retainedHeapBytes: heapAfterGcBytes - heapBefore,
+		heapAfterGcBytes,
 		bytesWritten: terminal.bytesWritten - writtenBefore,
 	};
 }
@@ -152,7 +168,10 @@ function report(name: string, result: ScenarioResult): void {
 		`${name.padEnd(8)} allocated ${totalMiB.toFixed(1).padStart(7)} MiB total  ` +
 			`${perFrameKiB.toFixed(1).padStart(8)} KiB/frame  ` +
 			`${msPerFrame.toFixed(3).padStart(7)} ms/frame  ` +
-			`${(result.bytesWritten / FRAMES).toFixed(0).padStart(6)} written bytes/frame`,
+			`${(result.bytesWritten / FRAMES).toFixed(0).padStart(6)} written bytes/frame  ` +
+			`${(result.cpuMs / FRAMES).toFixed(3)} CPU ms/frame  ` +
+			`${(result.retainedHeapBytes / 1024).toFixed(1)} KiB retained delta  ` +
+			`${(result.heapAfterGcBytes / 1024 / 1024).toFixed(2)} MiB heap after GC`,
 	);
 }
 

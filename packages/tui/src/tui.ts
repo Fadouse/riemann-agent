@@ -313,11 +313,14 @@ type ActiveOverlayFocusRestoreState = EligibleOverlayFocusRestoreState | Blocked
 type OverlayFocusRestoreState = { status: "inactive" } | ActiveOverlayFocusRestoreState;
 type OverlayFocusRestorePolicy = "clear" | "preserve";
 
+const CONTAINER_RENDER = Symbol("container-render");
+
 /**
  * Container - a component that contains other components
  */
 export class Container implements Component {
 	children: Component[] = [];
+	private renderedLines: string[] = [];
 	private mouseLayout?: { width: number; children: Array<{ component: Component; height: number }> };
 
 	addChild(component: Component): void {
@@ -336,6 +339,7 @@ export class Container implements Component {
 	}
 
 	invalidate(): void {
+		this.renderedLines = [];
 		for (const child of this.children) {
 			child.invalidate?.();
 		}
@@ -364,18 +368,51 @@ export class Container implements Component {
 	}
 
 	render(width: number): string[] {
-		const lines: string[] = [];
-		const mouseChildren: Array<{ component: Component; height: number }> = [];
+		// Public renders remain independently mutable, including calls through super.render().
+		return this[CONTAINER_RENDER](width).slice();
+	}
+
+	[CONTAINER_RENDER](width: number): readonly string[] {
+		const previous = this.renderedLines;
+		const previousMouse = this.mouseLayout?.children ?? [];
+		let lines: string[] | undefined;
+		let mouseChildren: Array<{ component: Component; height: number }> | undefined;
+		let row = 0;
+		let childIndex = 0;
 		for (const child of this.children) {
-			const childLines = child.render(width);
-			mouseChildren.push({ component: child, height: childLines.length });
+			const childLines = renderContainerSnapshot(child, width) ?? child.render(width);
+			const previousChild = previousMouse[childIndex];
+			if (!mouseChildren && (previousChild?.component !== child || previousChild.height !== childLines.length)) {
+				mouseChildren = previousMouse.slice(0, childIndex);
+			}
+			mouseChildren?.push({ component: child, height: childLines.length });
+			childIndex++;
+			// Components may mutate returned arrays in place, so identity alone is not a revision.
+			// Compare each rendered row before reusing the private, never-exposed snapshot.
 			for (const line of childLines) {
-				lines.push(line);
+				if (!lines && (row >= previous.length || previous[row] !== line)) lines = previous.slice();
+				if (lines) lines[row] = line;
+				row++;
 			}
 		}
-		this.mouseLayout = { width, children: mouseChildren };
-		return lines;
+		if (!lines && row !== previous.length) lines = previous.slice(0, row);
+		if (lines) lines.length = row;
+		if (!mouseChildren && childIndex !== previousMouse.length) mouseChildren = previousMouse.slice(0, childIndex);
+		if (mouseChildren || this.mouseLayout?.width !== width) {
+			this.mouseLayout = { width, children: mouseChildren ?? previousMouse };
+		}
+		this.renderedLines = lines ?? previous;
+		return this.renderedLines;
 	}
+}
+
+const defaultContainerRender = Container.prototype.render;
+
+/** Internal borrowed snapshot for layout. Never expose or mutate this array. */
+export function renderContainerSnapshot(component: Component, width: number): readonly string[] | undefined {
+	return component instanceof Container && component.render === defaultContainerRender
+		? component[CONTAINER_RENDER](width)
+		: undefined;
 }
 
 /**

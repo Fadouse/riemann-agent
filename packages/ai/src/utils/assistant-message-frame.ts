@@ -1,5 +1,5 @@
 import type { AssistantMessage, AssistantMessageEvent, TextContent, ThinkingContent, ToolCall } from "../types.ts";
-import { parseStreamingJson } from "./json-parse.ts";
+import { parseStreamingJson, StreamingJsonParser } from "./json-parse.ts";
 
 /**
  * Compact, replayable assistant-message progress. Terminal settlement is
@@ -39,6 +39,8 @@ type EncoderBlockState =
 			caughtUp: boolean;
 			catchupJson: string;
 			snapshotArguments: string;
+			snapshotValue?: ToolCall["arguments"];
+			catchupParser?: StreamingJsonParser<ToolCall["arguments"]>;
 	  };
 
 type ReducerBlockState =
@@ -152,9 +154,11 @@ export class AssistantMessageFrameEncoder {
 			case "done":
 				if (!this.started) throw new Error("Assistant message done event appears before start");
 				this.terminal = true;
+				this.blocks.clear();
 				return undefined;
 			case "error":
 				this.terminal = true;
+				this.blocks.clear();
 				return undefined;
 		}
 
@@ -232,6 +236,8 @@ export class AssistantMessageFrameEncoder {
 					caughtUp,
 					catchupJson: "",
 					snapshotArguments: caughtUp ? "" : snapshotArguments,
+					snapshotValue: caughtUp ? undefined : parseStreamingJson<ToolCall["arguments"]>(snapshotArguments),
+					catchupParser: caughtUp ? undefined : new StreamingJsonParser<ToolCall["arguments"]>(),
 				});
 				return { type: "toolcall_start", contentIndex: event.contentIndex, toolCall: cloneToolCall(content) };
 			}
@@ -244,16 +250,17 @@ export class AssistantMessageFrameEncoder {
 						: { type: "toolcall_delta", contentIndex: event.contentIndex, delta: event.delta };
 				}
 				state.catchupJson += event.delta;
-				const argumentsValue = parseStreamingJson<ToolCall["arguments"]>(state.catchupJson);
+				const argumentsValue = state.catchupParser!.append(event.delta);
 				if (serializedArguments(argumentsValue) !== state.snapshotArguments) {
 					// Legacy grammar calls include the initial input in toolcall_start, but their
 					// JSON delta stream still begins at an empty input. Its parsed arguments can
 					// therefore extend, rather than exactly reproduce, the start snapshot.
-					const snapshotArguments = parseStreamingJson<ToolCall["arguments"]>(state.snapshotArguments);
-					if (!isJsonPrefix(snapshotArguments, argumentsValue)) return undefined;
+					if (!isJsonPrefix(state.snapshotValue, argumentsValue)) return undefined;
 				}
 				state.caughtUp = true;
 				state.snapshotArguments = "";
+				state.snapshotValue = undefined;
+				state.catchupParser = undefined;
 				const json = state.catchupJson;
 				state.catchupJson = "";
 				return json.length === 0

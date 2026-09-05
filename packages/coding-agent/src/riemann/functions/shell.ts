@@ -286,8 +286,15 @@ export class ShellFunctions {
 		if (stdoutTruncated || stderrTruncated) {
 			const captureMarker = (truncated: boolean): string =>
 				truncated ? `\n[capture truncated at ${MAX_CAPTURE_BYTES} bytes]` : "";
-			artifact = await this.artifacts.putText(
-				`$ ${commandLine}\n\n[stdout]\n${stdoutText}${captureMarker(stdoutCaptureTruncated)}\n\n[stderr]\n${stderrText}${captureMarker(stderrCaptureTruncated)}`,
+			artifact = await this.artifacts.putTextParts(
+				[
+					`$ ${commandLine}\n\n[stdout]\n`,
+					stdoutText,
+					captureMarker(stdoutCaptureTruncated),
+					"\n\n[stderr]\n",
+					stderrText,
+					captureMarker(stderrCaptureTruncated),
+				],
 				{ name: "process-output.txt" },
 			);
 		}

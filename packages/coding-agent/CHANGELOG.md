@@ -44,6 +44,12 @@
 - Reduced IPython checkpoint serialization to one common-path pass while retaining automatic snapshots and per-variable fallback diagnostics.
 - Changed OpenAI Codex cloud compaction to persist opaque context records without provider/model metadata.
 
+- Reduced repeated session-context traversal, SQLite statement preparation and inbox sorting; agent patches no longer rewrite unchanged payload columns.
+- Reused stable assistant Markdown blocks for the built-in renderer while preserving refresh semantics for custom themes and transforms; compared IPython activity fields without serializing output for cache keys.
+- Reduced file-search line allocations, web-response copies, activity snapshot allocations, and Jupyter diagnostic-path construction; shell artifacts can be persisted in complete text parts without concatenating another full-sized output string.
+
+- Reduced context-cache metadata retention and reused IPython source/output summaries on status updates; existing collapsed previews no longer materialize a padded copy of the full output.
+
 ### Fixed
 
 - Fixed configurable save keybindings in the model and thinking selectors ([#8797](https://github.com/earendil-works/pi/issues/8797)).
@@ -61,6 +67,11 @@
 - Fixed Riemann and tool output decoding, grapheme-boundary previews, and trailing-newline expansion so Unicode streams render without mojibake or extra rows.
 - Fixed Bubblewrap launches to preserve host cwd, HOME, temporary and terminal environment values; validate same-path mount policies; keep private IPC writable through exclusions; and detach brokers from the terminal foreground group.
 - Fixed Riemann compaction configuration reloads, concurrent settings writes, async UI rollback, and truncated checkpoint rejection.
+
+- Fixed Python checkpoint and restore temporaries retaining deleted user objects, while preserving every checkpoint and object-graph recovery.
+- Fixed snapshot compaction context estimates omitting archive text and image blocks.
+
+- Fixed expanded IPython activity output exceeding JavaScript spread argument limits and released derived activity caches when a cell is hidden.
 
 ## [0.85.0] - 2026-09-04
 

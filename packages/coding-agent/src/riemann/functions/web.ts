@@ -209,10 +209,7 @@ async function readLimitedBody(response: Response, maximumBytes: number): Promis
 	} finally {
 		reader.releaseLock();
 	}
-	return Buffer.concat(
-		chunks.map((chunk) => Buffer.from(chunk)),
-		total,
-	);
+	return Buffer.concat(chunks, total);
 }
 
 function responseError(body: string): string {
@@ -229,8 +226,7 @@ function readableHtml(html: string, finalUrl: string): { title: string | null; t
 	const article = new Readability(document as unknown as ConstructorParameters<typeof Readability>[0]).parse();
 	const title = article?.title?.replace(/\s+/g, " ").trim() || document.title?.trim() || null;
 	const text = (article?.textContent || document.body?.textContent || "")
-		.replace(/\u00a0/g, " ")
-		.replace(/[ \t]+/g, " ")
+		.replace(/[ \t\u00a0]+/g, " ")
 		.replace(/\n{3,}/g, "\n\n")
 		.trim();
 	return { title, text: text || finalUrl };

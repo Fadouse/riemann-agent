@@ -93,6 +93,13 @@ export function flushAssistantMessageComponentUpdate(component: AssistantMessage
 	component.updateContent(pending.message, pending.isStreaming);
 }
 
+interface CachedMarkdownBlock {
+	messageType: "assistant" | "assistant-thinking";
+	text: string;
+	isStreaming: boolean;
+	component: Markdown;
+}
+
 /**
  * Component that renders a complete assistant message
  */
@@ -103,10 +110,12 @@ export class AssistantMessageComponent extends Container {
 	private hiddenThinkingLabel: string;
 	private outputPad: number;
 	private markdownTransformers: readonly MarkdownTransformer[];
+	private readonly reuseStableBlocks: boolean;
 	private lastMessage?: AssistantMessage;
 	private hasToolCalls = false;
 	private isStreaming = false;
 	private thinkingVisibilityOverrides = new Map<number, boolean>();
+	private markdownBlocks = new Map<number, CachedMarkdownBlock>();
 
 	constructor(
 		message?: AssistantMessage,
@@ -115,6 +124,8 @@ export class AssistantMessageComponent extends Container {
 		hiddenThinkingLabel = "Thinking...",
 		outputPad = 1,
 		markdownTransformers: readonly MarkdownTransformer[] = [],
+		// Opt in only for theme/transform chains whose external changes invalidate the component.
+		reuseStableBlocks = false,
 	) {
 		super();
 
@@ -123,6 +134,7 @@ export class AssistantMessageComponent extends Container {
 		this.hiddenThinkingLabel = hiddenThinkingLabel;
 		this.outputPad = outputPad;
 		this.markdownTransformers = markdownTransformers;
+		this.reuseStableBlocks = reuseStableBlocks;
 
 		// Container for text/thinking content
 		this.contentContainer = new Container();
@@ -135,6 +147,7 @@ export class AssistantMessageComponent extends Container {
 
 	override invalidate(): void {
 		super.invalidate();
+		this.markdownBlocks.clear();
 		if (this.lastMessage) {
 			this.updateContent(this.lastMessage);
 		}
@@ -157,6 +170,7 @@ export class AssistantMessageComponent extends Container {
 
 	setOutputPad(padding: number): void {
 		this.outputPad = padding;
+		this.markdownBlocks.clear();
 		if (this.lastMessage) {
 			this.updateContent(this.lastMessage);
 		}
@@ -172,6 +186,40 @@ export class AssistantMessageComponent extends Container {
 		lines[0] = OSC133_ZONE_START + lines[0];
 		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
 		return lines;
+	}
+
+	private reconcileMarkdownBlock(
+		index: number,
+		messageType: CachedMarkdownBlock["messageType"],
+		text: string,
+		nextBlocks: Map<number, CachedMarkdownBlock>,
+	): Markdown {
+		const previous = this.markdownBlocks.get(index);
+		let component: Markdown;
+		if (
+			this.reuseStableBlocks &&
+			previous?.messageType === messageType &&
+			previous.isStreaming === this.isStreaming
+		) {
+			component = previous.component;
+			if (previous.text !== text) component.setText(text);
+		} else {
+			const thinking = messageType === "assistant-thinking";
+			component = new Markdown(
+				text,
+				this.outputPad,
+				0,
+				thinking ? getThinkingMarkdownTheme(this.markdownTheme) : this.markdownTheme,
+				thinking ? { color: (value: string) => theme.fg("thinkingText", value) } : undefined,
+				{
+					transform: createMarkdownTransform(messageType, this.isStreaming, this.markdownTransformers),
+					reuseStableBlocks: this.reuseStableBlocks,
+				},
+			);
+		}
+		if (this.reuseStableBlocks)
+			nextBlocks.set(index, { messageType, text, isStreaming: this.isStreaming, component });
+		return component;
 	}
 
 	updateContent(message: AssistantMessage, isStreaming = this.isStreaming): void {
@@ -190,17 +238,18 @@ export class AssistantMessageComponent extends Container {
 			this.contentContainer.addChild(new Spacer(1));
 		}
 
-		// Render content in order
+		// Reuse Markdown for stable blocks, and release blocks removed or hidden
+		// by this update. Keep the existing ordering and thinking-run grouping.
+		const nextMarkdownBlocks = new Map<number, CachedMarkdownBlock>();
 		let thinkingRunIndex = 0;
 		for (let i = 0; i < message.content.length; i++) {
+			const contentIndex = i;
 			const content = message.content[i];
 			if (content.type === "text" && content.text.trim()) {
 				// Assistant text messages with no background - trim the text
 				// Set paddingY=0 to avoid extra spacing before tool executions
 				this.contentContainer.addChild(
-					new Markdown(content.text.trim(), this.outputPad, 0, this.markdownTheme, undefined, {
-						transform: createMarkdownTransform("assistant", this.isStreaming, this.markdownTransformers),
-					}),
+					this.reconcileMarkdownBlock(contentIndex, "assistant", content.text.trim(), nextMarkdownBlocks),
 				);
 			} else if (content.type === "thinking") {
 				const thinkingBlocks: string[] = [];
@@ -232,19 +281,11 @@ export class AssistantMessageComponent extends Container {
 				const hidden = visibilityOverride ?? this.hideThinkingBlock;
 				let thinkingComponent: Component;
 				if (!hidden) {
-					thinkingComponent = new Markdown(
+					thinkingComponent = this.reconcileMarkdownBlock(
+						contentIndex,
+						"assistant-thinking",
 						combinedThinking,
-						this.outputPad,
-						0,
-						getThinkingMarkdownTheme(this.markdownTheme),
-						{ color: (text: string) => theme.fg("thinkingText", text) },
-						{
-							transform: createMarkdownTransform(
-								"assistant-thinking",
-								this.isStreaming,
-								this.markdownTransformers,
-							),
-						},
+						nextMarkdownBlocks,
 					);
 				} else if (visibilityOverride === true) {
 					thinkingComponent = new Text(
@@ -271,6 +312,8 @@ export class AssistantMessageComponent extends Container {
 				}
 			}
 		}
+
+		this.markdownBlocks = nextMarkdownBlocks;
 
 		// Check if incomplete/failed - show after partial content.
 		// For aborted/error tool calls, tool execution components show the error.

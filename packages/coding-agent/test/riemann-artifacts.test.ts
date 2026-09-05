@@ -1,7 +1,7 @@
-import { mkdtemp, open, rm } from "node:fs/promises";
+import { type FileHandle, mkdtemp, open, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { JsonValue } from "../src/riemann/kernel/types.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
@@ -136,5 +136,76 @@ describe("Riemann artifact storage", () => {
 		} finally {
 			store.close();
 		}
+	});
+	describe("streamed artifacts", () => {
+		test("matches contiguous UTF-8 encoding across text chunk boundaries", async () => {
+			const root = await mkdtemp(join(tmpdir(), "riemann-artifact-stream-"));
+			roots.push(root);
+			const store = new RiemannStore(join(root, ".agent"));
+			const run = store.openRun("stream", root);
+			const artifacts = new ArtifactStore(store, run.id);
+			try {
+				const parts = ["a\ud83d", "", "\ude00b", "\ud800", "c", "\udfff", "\ud800"];
+				const options = { name: "stream.txt" };
+				const streamed = await artifacts.putTextParts(parts, options);
+				const contiguous = await artifacts.putText(parts.join(""), options);
+				expect(streamed).toEqual(contiguous);
+				expect(await artifacts.readBuffer(artifactHandle(streamed))).toEqual(Buffer.from(parts.join("")));
+				expect(await artifacts.putTextParts([])).toEqual(await artifacts.putText(""));
+			} finally {
+				store.close();
+			}
+		});
+
+		test("does not rewrite an existing text artifact when persisting parts", async () => {
+			const root = await mkdtemp(join(tmpdir(), "riemann-artifact-text-dedupe-"));
+			roots.push(root);
+			const store = new RiemannStore(join(root, ".agent"));
+			const run = store.openRun("text-dedupe", root);
+			const artifacts = new ArtifactStore(store, run.id);
+			try {
+				const parts = ["x".repeat(65_535), "😀", "y".repeat(65_537), "\ud800"];
+				const existing = await artifacts.putText(parts.join(""));
+				const file = await open(artifacts.getMetadata(artifactHandle(existing)).path, "r");
+				const prototype = Object.getPrototypeOf(file) as FileHandle;
+				await file.close();
+				// Reusing existing content must not require another write/fsync.
+				const sync = vi.spyOn(prototype, "sync");
+				try {
+					expect(await artifacts.putTextParts(parts)).toEqual(existing);
+					expect(sync).not.toHaveBeenCalled();
+				} finally {
+					sync.mockRestore();
+				}
+			} finally {
+				store.close();
+			}
+		});
+
+		test("streams binary chunks and cleans staging files on producer failure", async () => {
+			const root = await mkdtemp(join(tmpdir(), "riemann-artifact-stream-error-"));
+			roots.push(root);
+			const store = new RiemannStore(join(root, ".agent"));
+			const run = store.openRun("stream-error", root);
+			const artifacts = new ArtifactStore(store, run.id);
+			try {
+				const options = { mimeType: "application/octet-stream" };
+				const data = Buffer.from([0, 255, 128, 1]);
+				async function* chunks() {
+					yield data.subarray(0, 1);
+					yield Buffer.alloc(0);
+					yield data.subarray(1);
+				}
+				expect(await artifacts.putStream(chunks(), options)).toEqual(await artifacts.putBuffer(data, options));
+				async function* failed() {
+					yield data;
+					throw new Error("producer failed");
+				}
+				await expect(artifacts.putStream(failed(), options)).rejects.toThrow("producer failed");
+				expect((await readdir(store.artifactsDir)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+			} finally {
+				store.close();
+			}
+		});
 	});
 });

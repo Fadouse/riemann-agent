@@ -108,3 +108,13 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 export function createAssistantMessageEventStream(): AssistantMessageEventStream {
 	return new AssistantMessageEventStream();
 }
+
+/** Consume a privately owned stream when only its final message is exposed.
+ * Keep result() itself non-consuming: direct stream callers may iterate later.
+ */
+export async function consumeAssistantMessageStream(stream: AssistantMessageEventStream): Promise<AssistantMessage> {
+	for await (const event of stream) {
+		if (event.type === "done" || event.type === "error") break;
+	}
+	return stream.result();
+}

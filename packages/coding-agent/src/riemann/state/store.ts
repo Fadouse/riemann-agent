@@ -370,6 +370,7 @@ export class RiemannStore {
 	readonly snapshotsDir: string;
 	readonly artifactsDir: string;
 	private readonly db: RiemannDatabase;
+	private readonly statements = new Map<string, ReturnType<RiemannDatabase["prepare"]>>();
 
 	constructor(agentDir: string) {
 		this.root = join(agentDir, "state");
@@ -382,6 +383,15 @@ export class RiemannStore {
 			"PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;",
 		);
 		this.migrate();
+	}
+
+	private prepare(sql: string): ReturnType<RiemannDatabase["prepare"]> {
+		let statement = this.statements.get(sql);
+		if (!statement) {
+			statement = this.db.prepare(sql);
+			this.statements.set(sql, statement);
+		}
+		return statement;
 	}
 
 	private migrate(): void {
@@ -488,9 +498,9 @@ export class RiemannStore {
 				created_at TEXT NOT NULL
 			);
 		`);
-		const schemaVersion = (this.db.prepare("SELECT version FROM schema_version LIMIT 1").get() as { version: number })
+		const schemaVersion = (this.prepare("SELECT version FROM schema_version LIMIT 1").get() as { version: number })
 			.version;
-		const agentColumns = this.db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+		const agentColumns = this.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
 		const hasLegacyPermissions = agentColumns.some((column) => column.name === "permissions");
 		const hasFilesystem = agentColumns.some((column) => column.name === "filesystem_json");
 		if (!agentColumns.some((column) => column.name === "workspace_mode")) {
@@ -523,28 +533,31 @@ export class RiemannStore {
 			this.db.exec("ALTER TABLE agents ADD COLUMN filesystem_json TEXT NOT NULL DEFAULT '{}'");
 		}
 		if (!hasFilesystem || schemaVersion < FILESYSTEM_SCHEMA_VERSION) {
-			const legacy = this.db
-				.prepare(
-					hasLegacyPermissions
-						? "SELECT id, permissions, workspace FROM agents"
-						: hasFilesystem
-							? "SELECT id, NULL AS permissions, workspace FROM agents WHERE filesystem_json = '{}'"
-							: "SELECT id, NULL AS permissions, workspace FROM agents",
-				)
-				.all() as unknown as Array<{ id: string; permissions: string | null; workspace: string }>;
-			const update = this.db.prepare("UPDATE agents SET filesystem_json = ? WHERE id = ?");
+			const legacy = this.prepare(
+				hasLegacyPermissions
+					? "SELECT id, permissions, workspace FROM agents"
+					: hasFilesystem
+						? "SELECT id, NULL AS permissions, workspace FROM agents WHERE filesystem_json = '{}'"
+						: "SELECT id, NULL AS permissions, workspace FROM agents",
+			).all() as unknown as Array<{ id: string; permissions: string | null; workspace: string }>;
+			const update = this.prepare("UPDATE agents SET filesystem_json = ? WHERE id = ?");
 			for (const row of legacy) {
 				const roots = row.permissions === "host" ? ["/"] : [row.workspace];
 				update.run(JSON.stringify({ read: roots, readExclude: [], write: roots, writeExclude: [] }), row.id);
 			}
 		}
-		const eventColumns = this.db.prepare("PRAGMA table_info(agent_events)").all() as Array<{ name: string }>;
+		const eventColumns = this.prepare("PRAGMA table_info(agent_events)").all() as Array<{ name: string }>;
 		if (!eventColumns.some((column) => column.name === "turn_id")) {
 			this.db.exec("ALTER TABLE agent_events ADD COLUMN turn_id TEXT");
 		}
 		this.db.exec(`
 			CREATE INDEX IF NOT EXISTS agents_parent ON agents(parent_id);
 			CREATE INDEX IF NOT EXISTS agents_run_created ON agents(run_id, created_at, id);
+			CREATE INDEX IF NOT EXISTS messages_recipient_created ON messages(recipient_id, created_at, id);
+			CREATE INDEX IF NOT EXISTS messages_unread_created ON messages(recipient_id, created_at, id)
+				WHERE delivered_at IS NULL;
+			CREATE INDEX IF NOT EXISTS agent_events_pending_created ON agent_events(recipient_id, created_at, id)
+				WHERE delivered_at IS NULL;
 			CREATE INDEX IF NOT EXISTS messages_run ON messages(run_id);
 			CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender_id);
 			CREATE INDEX IF NOT EXISTS messages_reply ON messages(reply_to);
@@ -576,15 +589,15 @@ export class RiemannStore {
 			this.db.exec("ALTER TABLE agents DROP COLUMN permissions");
 		}
 		if (schemaVersion < CURRENT_SCHEMA_VERSION) {
-			this.db.prepare("UPDATE schema_version SET version = ?").run(CURRENT_SCHEMA_VERSION);
+			this.prepare("UPDATE schema_version SET version = ?").run(CURRENT_SCHEMA_VERSION);
 		}
 	}
 
 	private backfillAgentTurns(): void {
-		const agents = this.db.prepare("SELECT * FROM agents WHERE parent_id IS NOT NULL").all() as unknown as AgentRow[];
-		const events = this.db
-			.prepare("SELECT * FROM agent_events ORDER BY created_at, id")
-			.all() as unknown as AgentEventRow[];
+		const agents = this.prepare("SELECT * FROM agents WHERE parent_id IS NOT NULL").all() as unknown as AgentRow[];
+		const events = this.prepare(
+			"SELECT * FROM agent_events ORDER BY created_at, id",
+		).all() as unknown as AgentEventRow[];
 		const eventAgentIds = new Map<string, string>();
 		const pendingEventAgentIds = new Set<string>();
 		for (const event of events) {
@@ -596,17 +609,17 @@ export class RiemannStore {
 			if (event.delivered_at === null) pendingEventAgentIds.add(agentId);
 		}
 		const turnIds = new Map<string, string>();
-		const existingTurns = this.db
-			.prepare("SELECT agent_id, id FROM agent_turns ORDER BY created_at, id")
-			.all() as Array<{ agent_id: string; id: string }>;
+		const existingTurns = this.prepare(
+			"SELECT agent_id, id FROM agent_turns ORDER BY created_at, id",
+		).all() as Array<{ agent_id: string; id: string }>;
 		for (const turn of existingTurns) turnIds.set(turn.agent_id, turn.id);
 
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
-			const insertTurn = this.db.prepare(
+			const insertTurn = this.prepare(
 				"INSERT INTO agent_turns(id, run_id, agent_id, task, status, delivery_mode, delivered_via, outcome, result, error, transcript_handle, patch_handle, created_at, started_at, completed_at, delivered_at, updated_at) VALUES(?, ?, ?, ?, ?, 'notify', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			);
-			const updateAgent = this.db.prepare("UPDATE agents SET active_turn_id = ?, last_turn_id = ? WHERE id = ?");
+			const updateAgent = this.prepare("UPDATE agents SET active_turn_id = ?, last_turn_id = ? WHERE id = ?");
 			for (const row of agents) {
 				let turnId = turnIds.get(row.id);
 				const active = row.status === "queued" || row.status === "running";
@@ -640,7 +653,7 @@ export class RiemannStore {
 				updateAgent.run(active ? turnId : null, turnId, row.id);
 			}
 
-			const updateEvent = this.db.prepare("UPDATE agent_events SET turn_id = ?, payload_json = ? WHERE id = ?");
+			const updateEvent = this.prepare("UPDATE agent_events SET turn_id = ?, payload_json = ? WHERE id = ?");
 			for (const event of events) {
 				const agentId = eventAgentIds.get(event.id);
 				const turnId = agentId ? turnIds.get(agentId) : undefined;
@@ -657,14 +670,12 @@ export class RiemannStore {
 	}
 
 	openRun(sessionId: string, cwd: string): StoredRun {
-		const existing = this.db.prepare("SELECT * FROM runs WHERE session_id = ?").get(sessionId) as RunRow | undefined;
+		const existing = this.prepare("SELECT * FROM runs WHERE session_id = ?").get(sessionId) as RunRow | undefined;
 		const timestamp = now();
 		if (existing) {
-			const updated = this.db
-				.prepare(
-					"UPDATE runs SET cwd = ?, status = 'active', updated_at = ? WHERE id = ? AND NOT EXISTS (SELECT 1 FROM retention_runs WHERE run_id = ?)",
-				)
-				.run(cwd, timestamp, existing.id, existing.id);
+			const updated = this.prepare(
+				"UPDATE runs SET cwd = ?, status = 'active', updated_at = ? WHERE id = ? AND NOT EXISTS (SELECT 1 FROM retention_runs WHERE run_id = ?)",
+			).run(cwd, timestamp, existing.id, existing.id);
 			if (updated.changes === 0) throw new Error(`Run ${existing.id} is being removed by retention`);
 			return { ...runFromRow(existing), cwd, status: "active", updatedAt: timestamp };
 		}
@@ -676,14 +687,14 @@ export class RiemannStore {
 			createdAt: timestamp,
 			updatedAt: timestamp,
 		};
-		this.db
-			.prepare("INSERT INTO runs(id, session_id, cwd, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)")
-			.run(run.id, run.sessionId, run.cwd, run.status, run.createdAt, run.updatedAt);
+		this.prepare(
+			"INSERT INTO runs(id, session_id, cwd, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)",
+		).run(run.id, run.sessionId, run.cwd, run.status, run.createdAt, run.updatedAt);
 		return run;
 	}
 
 	closeRun(runId: string): void {
-		this.db.prepare("UPDATE runs SET status = 'closed', updated_at = ? WHERE id = ?").run(now(), runId);
+		this.prepare("UPDATE runs SET status = 'closed', updated_at = ? WHERE id = ?").run(now(), runId);
 	}
 
 	ensureRootAgent(
@@ -692,7 +703,7 @@ export class RiemannStore {
 		filesystem: FilesystemSnapshot = FULL_FILESYSTEM,
 		network: EffectiveAgentNetwork = "deny",
 	): StoredAgent {
-		const existing = this.db.prepare("SELECT * FROM agents WHERE run_id = ? AND parent_id IS NULL").get(runId) as
+		const existing = this.prepare("SELECT * FROM agents WHERE run_id = ? AND parent_id IS NULL").get(runId) as
 			| AgentRow
 			| undefined;
 		if (existing) {
@@ -733,53 +744,52 @@ export class RiemannStore {
 			createdAt: timestamp,
 			updatedAt: timestamp,
 		};
-		this.db
-			.prepare(
-				"INSERT INTO agents(id, run_id, parent_id, name, status, prompt, model_role, workspace, workspace_mode, filesystem_json, network, depth, capabilities_json, active_turn_id, last_turn_id, result, error, last_outcome, transcript_handle, patch_handle, released_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)",
-			)
-			.run(
-				agent.id,
-				agent.runId,
-				agent.parentId,
-				agent.name,
-				agent.status,
-				agent.prompt,
-				agent.modelRole,
-				agent.workspace,
-				agent.workspaceMode,
-				JSON.stringify(agent.filesystem),
-				agent.network,
-				agent.depth,
-				JSON.stringify(agent.capabilities),
-				agent.createdAt,
-				agent.updatedAt,
-			);
+		this.prepare(
+			"INSERT INTO agents(id, run_id, parent_id, name, status, prompt, model_role, workspace, workspace_mode, filesystem_json, network, depth, capabilities_json, active_turn_id, last_turn_id, result, error, last_outcome, transcript_handle, patch_handle, released_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)",
+		).run(
+			agent.id,
+			agent.runId,
+			agent.parentId,
+			agent.name,
+			agent.status,
+			agent.prompt,
+			agent.modelRole,
+			agent.workspace,
+			agent.workspaceMode,
+			JSON.stringify(agent.filesystem),
+			agent.network,
+			agent.depth,
+			JSON.stringify(agent.capabilities),
+			agent.createdAt,
+			agent.updatedAt,
+		);
 		return agent;
 	}
 
 	reserveAgentSlot(input: AgentCreateInput, maxAgents: number): AgentSlotReservation {
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
-			const existing = this.db
-				.prepare("SELECT * FROM agents WHERE run_id = ? AND name = ?")
-				.get(input.runId, input.name) as AgentRow | undefined;
+			const existing = this.prepare("SELECT * FROM agents WHERE run_id = ? AND name = ?").get(
+				input.runId,
+				input.name,
+			) as AgentRow | undefined;
 			if (existing && existing.released_at === null) {
 				this.db.exec("ROLLBACK");
 				return { ok: false, reason: "name" };
 			}
-			const count = this.db
-				.prepare(
-					"SELECT COUNT(*) AS count FROM agents WHERE run_id = ? AND parent_id IS NOT NULL AND released_at IS NULL",
-				)
-				.get(input.runId) as { count: number };
+			const count = this.prepare(
+				"SELECT COUNT(*) AS count FROM agents WHERE run_id = ? AND parent_id IS NOT NULL AND released_at IS NULL",
+			).get(input.runId) as { count: number };
 			if (count.count >= maxAgents) {
 				this.db.exec("ROLLBACK");
 				return { ok: false, reason: "limit" };
 			}
 			if (existing) {
-				this.db
-					.prepare("UPDATE agents SET name = ?, updated_at = ? WHERE id = ?")
-					.run(`${existing.name}~released-${existing.id.slice(0, 8)}`, now(), existing.id);
+				this.prepare("UPDATE agents SET name = ?, updated_at = ? WHERE id = ?").run(
+					`${existing.name}~released-${existing.id.slice(0, 8)}`,
+					now(),
+					existing.id,
+				);
 			}
 			const agent = this.createAgent(input);
 			this.db.exec("COMMIT");
@@ -791,33 +801,33 @@ export class RiemannStore {
 	}
 
 	getAgent(id: string): StoredAgent | undefined {
-		const row = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as AgentRow | undefined;
+		const row = this.prepare("SELECT * FROM agents WHERE id = ?").get(id) as AgentRow | undefined;
 		return row ? agentFromRow(row) : undefined;
 	}
 
 	listAgents(runId: string, options: { includeReleased?: boolean } = {}): StoredAgent[] {
 		const rows = (
 			options.includeReleased
-				? this.db.prepare("SELECT * FROM agents WHERE run_id = ? ORDER BY created_at, id")
-				: this.db.prepare("SELECT * FROM agents WHERE run_id = ? AND released_at IS NULL ORDER BY created_at, id")
+				? this.prepare("SELECT * FROM agents WHERE run_id = ? ORDER BY created_at, id")
+				: this.prepare("SELECT * FROM agents WHERE run_id = ? AND released_at IS NULL ORDER BY created_at, id")
 		).all(runId);
 		return rows.map((row) => agentFromRow(row as unknown as AgentRow));
 	}
 
 	getAgentTurn(id: string): StoredAgentTurn | undefined {
-		const row = this.db.prepare("SELECT * FROM agent_turns WHERE id = ?").get(id) as AgentTurnRow | undefined;
+		const row = this.prepare("SELECT * FROM agent_turns WHERE id = ?").get(id) as AgentTurnRow | undefined;
 		return row ? agentTurnFromRow(row) : undefined;
 	}
 
 	listAgentTurns(agentId: string): StoredAgentTurn[] {
-		const rows = this.db.prepare("SELECT * FROM agent_turns WHERE agent_id = ? ORDER BY created_at, id").all(agentId);
+		const rows = this.prepare("SELECT * FROM agent_turns WHERE agent_id = ? ORDER BY created_at, id").all(agentId);
 		return rows.map((row) => agentTurnFromRow(row as unknown as AgentTurnRow));
 	}
 
 	startAgentTurn(input: AgentTurnCreateInput): { agent: StoredAgent; turn: StoredAgentTurn } {
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
-			const row = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(input.agentId) as AgentRow | undefined;
+			const row = this.prepare("SELECT * FROM agents WHERE id = ?").get(input.agentId) as AgentRow | undefined;
 			if (!row) throw new Error(`Agent not found: ${input.agentId}`);
 			if (row.released_at !== null) throw new Error(`Agent is released: ${row.name}`);
 			if (
@@ -846,16 +856,12 @@ export class RiemannStore {
 				deliveredAt: null,
 				updatedAt: timestamp,
 			};
-			this.db
-				.prepare(
-					"INSERT INTO agent_turns(id, run_id, agent_id, task, status, delivery_mode, delivered_via, outcome, result, error, transcript_handle, patch_handle, created_at, started_at, completed_at, delivered_at, updated_at) VALUES(?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?)",
-				)
-				.run(turn.id, turn.runId, turn.agentId, turn.task, turn.deliveryMode, turn.createdAt, turn.updatedAt);
-			this.db
-				.prepare(
-					"UPDATE agents SET status = 'queued', prompt = ?, active_turn_id = ?, last_turn_id = ?, result = NULL, error = NULL, last_outcome = NULL, transcript_handle = NULL, patch_handle = NULL, updated_at = ? WHERE id = ?",
-				)
-				.run(input.prompt, turn.id, turn.id, timestamp, row.id);
+			this.prepare(
+				"INSERT INTO agent_turns(id, run_id, agent_id, task, status, delivery_mode, delivered_via, outcome, result, error, transcript_handle, patch_handle, created_at, started_at, completed_at, delivered_at, updated_at) VALUES(?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, ?)",
+			).run(turn.id, turn.runId, turn.agentId, turn.task, turn.deliveryMode, turn.createdAt, turn.updatedAt);
+			this.prepare(
+				"UPDATE agents SET status = 'queued', prompt = ?, active_turn_id = ?, last_turn_id = ?, result = NULL, error = NULL, last_outcome = NULL, transcript_handle = NULL, patch_handle = NULL, updated_at = ? WHERE id = ?",
+			).run(input.prompt, turn.id, turn.id, timestamp, row.id);
 			const agent = this.getAgent(row.id);
 			if (!agent) throw new Error(`Agent disappeared while starting a Turn: ${row.id}`);
 			this.db.exec("COMMIT");
@@ -869,18 +875,16 @@ export class RiemannStore {
 	markAgentTurnRunning(agentId: string, turnId: string): StoredAgentTurn {
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
-			const row = this.db.prepare("SELECT * FROM agent_turns WHERE id = ?").get(turnId) as AgentTurnRow | undefined;
+			const row = this.prepare("SELECT * FROM agent_turns WHERE id = ?").get(turnId) as AgentTurnRow | undefined;
 			if (!row || row.agent_id !== agentId) throw new Error(`Agent Turn not found: ${turnId}`);
 			if (row.status === "settled") throw new Error(`Agent Turn is already settled: ${turnId}`);
-			const agent = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
+			const agent = this.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as AgentRow | undefined;
 			if (!agent || agent.active_turn_id !== turnId) throw new Error(`Agent Turn is no longer active: ${turnId}`);
 			const timestamp = now();
-			this.db
-				.prepare(
-					"UPDATE agent_turns SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?",
-				)
-				.run(timestamp, timestamp, turnId);
-			this.db.prepare("UPDATE agents SET status = 'running', updated_at = ? WHERE id = ?").run(timestamp, agentId);
+			this.prepare(
+				"UPDATE agent_turns SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ? WHERE id = ?",
+			).run(timestamp, timestamp, turnId);
+			this.prepare("UPDATE agents SET status = 'running', updated_at = ? WHERE id = ?").run(timestamp, agentId);
 			const updated = this.getAgentTurn(turnId);
 			if (!updated) throw new Error(`Agent Turn disappeared while starting: ${turnId}`);
 			this.db.exec("COMMIT");
@@ -894,16 +898,14 @@ export class RiemannStore {
 	settleAgentTurn(input: AgentTurnSettlementInput): AgentTurnSettlement {
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
-			const row = this.db.prepare("SELECT * FROM agent_turns WHERE id = ?").get(input.turnId) as
+			const row = this.prepare("SELECT * FROM agent_turns WHERE id = ?").get(input.turnId) as
 				| AgentTurnRow
 				| undefined;
 			if (!row || row.agent_id !== input.agentId) throw new Error(`Agent Turn not found: ${input.turnId}`);
-			const agentRow = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(input.agentId) as
-				| AgentRow
-				| undefined;
+			const agentRow = this.prepare("SELECT * FROM agents WHERE id = ?").get(input.agentId) as AgentRow | undefined;
 			if (!agentRow) throw new Error(`Agent not found: ${input.agentId}`);
 			if (row.status === "settled") {
-				const existingEvent = this.db.prepare("SELECT * FROM agent_events WHERE turn_id = ?").get(input.turnId) as
+				const existingEvent = this.prepare("SELECT * FROM agent_events WHERE turn_id = ?").get(input.turnId) as
 					| AgentEventRow
 					| undefined;
 				this.db.exec("COMMIT");
@@ -918,37 +920,33 @@ export class RiemannStore {
 			}
 			const timestamp = now();
 			const deliveredVia = input.delivery === "notify" ? null : input.delivery;
-			this.db
-				.prepare(
-					"UPDATE agent_turns SET status = 'settled', delivered_via = ?, outcome = ?, result = ?, error = ?, transcript_handle = ?, patch_handle = ?, started_at = COALESCE(started_at, created_at), completed_at = ?, delivered_at = ?, updated_at = ? WHERE id = ?",
-				)
-				.run(
-					deliveredVia,
-					input.outcome,
-					input.result,
-					input.error,
-					input.transcriptHandle,
-					input.patchHandle,
-					timestamp,
-					deliveredVia ? timestamp : null,
-					timestamp,
-					input.turnId,
-				);
-			this.db
-				.prepare(
-					"UPDATE agents SET status = ?, active_turn_id = NULL, last_turn_id = ?, result = ?, error = ?, last_outcome = ?, transcript_handle = ?, patch_handle = ?, updated_at = ? WHERE id = ?",
-				)
-				.run(
-					input.outcome === "cancelled" ? "stopped" : "idle",
-					input.turnId,
-					input.result,
-					input.error,
-					input.outcome,
-					input.transcriptHandle,
-					input.patchHandle,
-					timestamp,
-					input.agentId,
-				);
+			this.prepare(
+				"UPDATE agent_turns SET status = 'settled', delivered_via = ?, outcome = ?, result = ?, error = ?, transcript_handle = ?, patch_handle = ?, started_at = COALESCE(started_at, created_at), completed_at = ?, delivered_at = ?, updated_at = ? WHERE id = ?",
+			).run(
+				deliveredVia,
+				input.outcome,
+				input.result,
+				input.error,
+				input.transcriptHandle,
+				input.patchHandle,
+				timestamp,
+				deliveredVia ? timestamp : null,
+				timestamp,
+				input.turnId,
+			);
+			this.prepare(
+				"UPDATE agents SET status = ?, active_turn_id = NULL, last_turn_id = ?, result = ?, error = ?, last_outcome = ?, transcript_handle = ?, patch_handle = ?, updated_at = ? WHERE id = ?",
+			).run(
+				input.outcome === "cancelled" ? "stopped" : "idle",
+				input.turnId,
+				input.result,
+				input.error,
+				input.outcome,
+				input.transcriptHandle,
+				input.patchHandle,
+				timestamp,
+				input.agentId,
+			);
 			let event: StoredAgentEvent | undefined;
 			if (input.delivery === "notify") {
 				if (!input.event || input.event.payload.turnId !== input.turnId) {
@@ -962,18 +960,16 @@ export class RiemannStore {
 					createdAt: timestamp,
 					deliveredAt: null,
 				};
-				this.db
-					.prepare(
-						"INSERT INTO agent_events(id, run_id, recipient_id, turn_id, payload_json, created_at, delivered_at) VALUES(?, ?, ?, ?, ?, ?, NULL)",
-					)
-					.run(
-						event.id,
-						event.runId,
-						event.recipientId,
-						input.turnId,
-						JSON.stringify(event.payload),
-						event.createdAt,
-					);
+				this.prepare(
+					"INSERT INTO agent_events(id, run_id, recipient_id, turn_id, payload_json, created_at, delivered_at) VALUES(?, ?, ?, ?, ?, ?, NULL)",
+				).run(
+					event.id,
+					event.runId,
+					event.recipientId,
+					input.turnId,
+					JSON.stringify(event.payload),
+					event.createdAt,
+				);
 			}
 			const agent = this.getAgent(input.agentId);
 			const turn = this.getAgentTurn(input.turnId);
@@ -989,18 +985,17 @@ export class RiemannStore {
 	claimAgentTurnForWait(agentId: string, turnId: string): StoredAgentTurn {
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
-			const row = this.db.prepare("SELECT * FROM agent_turns WHERE id = ?").get(turnId) as AgentTurnRow | undefined;
+			const row = this.prepare("SELECT * FROM agent_turns WHERE id = ?").get(turnId) as AgentTurnRow | undefined;
 			if (!row || row.agent_id !== agentId) throw new Error(`Agent Turn not found: ${turnId}`);
 			if (row.status === "settled" && row.delivered_via === null) {
 				const timestamp = now();
-				this.db
-					.prepare("UPDATE agent_events SET delivered_at = ? WHERE turn_id = ? AND delivered_at IS NULL")
-					.run(timestamp, turnId);
-				this.db
-					.prepare(
-						"UPDATE agent_turns SET delivered_via = 'wait', delivered_at = ?, updated_at = ? WHERE id = ? AND delivered_via IS NULL",
-					)
-					.run(timestamp, timestamp, turnId);
+				this.prepare("UPDATE agent_events SET delivered_at = ? WHERE turn_id = ? AND delivered_at IS NULL").run(
+					timestamp,
+					turnId,
+				);
+				this.prepare(
+					"UPDATE agent_turns SET delivered_via = 'wait', delivered_at = ?, updated_at = ? WHERE id = ? AND delivered_via IS NULL",
+				).run(timestamp, timestamp, turnId);
 			}
 			const turn = this.getAgentTurn(turnId);
 			if (!turn) throw new Error(`Agent Turn disappeared while claiming: ${turnId}`);
@@ -1040,24 +1035,22 @@ export class RiemannStore {
 		const filesystem = patch.filesystem === undefined ? current.filesystem : patch.filesystem;
 		const network = patch.network ?? current.network;
 		const updatedAt = now();
-		this.db
-			.prepare(
-				"UPDATE agents SET status = ?, prompt = ?, result = ?, error = ?, last_outcome = ?, transcript_handle = ?, patch_handle = ?, workspace = ?, filesystem_json = ?, network = ?, updated_at = ? WHERE id = ?",
-			)
-			.run(
-				status,
-				prompt,
-				result,
-				error,
-				lastOutcome,
-				transcriptHandle,
-				patchHandle,
-				workspace,
-				JSON.stringify(filesystem),
-				network,
-				updatedAt,
-				id,
-			);
+		const fields: Array<[column: string, value: string | null]> = [["updated_at", updatedAt]];
+		if (status !== current.status) fields.push(["status", status]);
+		if (prompt !== current.prompt) fields.push(["prompt", prompt]);
+		if (result !== current.result) fields.push(["result", result]);
+		if (error !== current.error) fields.push(["error", error]);
+		if (lastOutcome !== current.lastOutcome) fields.push(["last_outcome", lastOutcome]);
+		if (transcriptHandle !== current.transcriptHandle) fields.push(["transcript_handle", transcriptHandle]);
+		if (patchHandle !== current.patchHandle) fields.push(["patch_handle", patchHandle]);
+		if (workspace !== current.workspace) fields.push(["workspace", workspace]);
+		if (patch.filesystem !== undefined) fields.push(["filesystem_json", JSON.stringify(filesystem)]);
+		if (network !== current.network) fields.push(["network", network]);
+		// Column names come only from the fixed list above; all values stay bound.
+		this.prepare(`UPDATE agents SET ${fields.map(([column]) => `${column} = ?`).join(", ")} WHERE id = ?`).run(
+			...fields.map(([, value]) => value),
+			id,
+		);
 		return {
 			...current,
 			status,
@@ -1078,7 +1071,7 @@ export class RiemannStore {
 		const current = this.getAgent(id);
 		if (!current) throw new Error(`Agent not found: ${id}`);
 		const releasedAt = now();
-		this.db.prepare("UPDATE agents SET released_at = ?, updated_at = ? WHERE id = ?").run(releasedAt, releasedAt, id);
+		this.prepare("UPDATE agents SET released_at = ?, updated_at = ? WHERE id = ?").run(releasedAt, releasedAt, id);
 		return { ...current, releasedAt, updatedAt: releasedAt };
 	}
 
@@ -1086,16 +1079,12 @@ export class RiemannStore {
 		const timestamp = now();
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
-			this.db
-				.prepare(
-					"UPDATE agent_turns SET status = 'settled', delivered_via = COALESCE(delivered_via, 'return'), outcome = 'cancelled', error = COALESCE(error, 'host process interrupted'), completed_at = COALESCE(completed_at, ?), delivered_at = COALESCE(delivered_at, ?), updated_at = ? WHERE run_id = ? AND status IN ('queued','running')",
-				)
-				.run(timestamp, timestamp, timestamp, runId);
-			this.db
-				.prepare(
-					"UPDATE agents SET status = 'stopped', active_turn_id = NULL, last_outcome = 'cancelled', error = COALESCE(error, 'host process interrupted'), updated_at = ? WHERE run_id = ? AND status IN ('queued','running') AND parent_id IS NOT NULL",
-				)
-				.run(timestamp, runId);
+			this.prepare(
+				"UPDATE agent_turns SET status = 'settled', delivered_via = COALESCE(delivered_via, 'return'), outcome = 'cancelled', error = COALESCE(error, 'host process interrupted'), completed_at = COALESCE(completed_at, ?), delivered_at = COALESCE(delivered_at, ?), updated_at = ? WHERE run_id = ? AND status IN ('queued','running')",
+			).run(timestamp, timestamp, timestamp, runId);
+			this.prepare(
+				"UPDATE agents SET status = 'stopped', active_turn_id = NULL, last_outcome = 'cancelled', error = COALESCE(error, 'host process interrupted'), updated_at = ? WHERE run_id = ? AND status IN ('queued','running') AND parent_id IS NOT NULL",
+			).run(timestamp, runId);
 			this.db.exec("COMMIT");
 		} catch (error) {
 			this.db.exec("ROLLBACK");
@@ -1120,19 +1109,17 @@ export class RiemannStore {
 			createdAt: now(),
 			deliveredAt: null,
 		};
-		this.db
-			.prepare(
-				"INSERT INTO messages(id, run_id, sender_id, recipient_id, body, reply_to, created_at, delivered_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)",
-			)
-			.run(
-				message.id,
-				message.runId,
-				message.senderId,
-				message.recipientId,
-				message.body,
-				message.replyTo,
-				message.createdAt,
-			);
+		this.prepare(
+			"INSERT INTO messages(id, run_id, sender_id, recipient_id, body, reply_to, created_at, delivered_at) VALUES(?, ?, ?, ?, ?, ?, ?, NULL)",
+		).run(
+			message.id,
+			message.runId,
+			message.senderId,
+			message.recipientId,
+			message.body,
+			message.replyTo,
+			message.createdAt,
+		);
 		return message;
 	}
 
@@ -1140,15 +1127,12 @@ export class RiemannStore {
 		const sql = options.unreadOnly
 			? "SELECT * FROM messages WHERE recipient_id = ? AND delivered_at IS NULL ORDER BY created_at, id"
 			: "SELECT * FROM messages WHERE recipient_id = ? ORDER BY created_at, id";
-		const messages = this.db
-			.prepare(sql)
+		const messages = this.prepare(sql)
 			.all(recipientId)
 			.map((row) => messageFromRow(row as unknown as MessageRow));
 		if (options.markDelivered && messages.length > 0) {
 			const deliveredAt = now();
-			const statement = this.db.prepare(
-				"UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL",
-			);
+			const statement = this.prepare("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL");
 			this.db.exec("BEGIN IMMEDIATE");
 			try {
 				for (const message of messages) statement.run(deliveredAt, message.id);
@@ -1163,7 +1147,7 @@ export class RiemannStore {
 	}
 
 	markMessageDelivered(id: string): void {
-		this.db.prepare("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL").run(now(), id);
+		this.prepare("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL").run(now(), id);
 	}
 
 	enqueueAgentEvent(input: { runId: string; recipientId: string; payload: AgentEventPayload }): StoredAgentEvent {
@@ -1175,41 +1159,39 @@ export class RiemannStore {
 			createdAt: now(),
 			deliveredAt: null,
 		};
-		this.db
-			.prepare(
-				"INSERT INTO agent_events(id, run_id, recipient_id, turn_id, payload_json, created_at, delivered_at) VALUES(?, ?, ?, ?, ?, ?, NULL)",
-			)
-			.run(
-				event.id,
-				event.runId,
-				event.recipientId,
-				event.payload.turnId,
-				JSON.stringify(event.payload),
-				event.createdAt,
-			);
+		this.prepare(
+			"INSERT INTO agent_events(id, run_id, recipient_id, turn_id, payload_json, created_at, delivered_at) VALUES(?, ?, ?, ?, ?, ?, NULL)",
+		).run(
+			event.id,
+			event.runId,
+			event.recipientId,
+			event.payload.turnId,
+			JSON.stringify(event.payload),
+			event.createdAt,
+		);
 		return event;
 	}
 
 	listPendingAgentEvents(recipientId: string): StoredAgentEvent[] {
-		const rows = this.db
-			.prepare("SELECT * FROM agent_events WHERE recipient_id = ? AND delivered_at IS NULL ORDER BY created_at, id")
-			.all(recipientId);
+		const rows = this.prepare(
+			"SELECT * FROM agent_events WHERE recipient_id = ? AND delivered_at IS NULL ORDER BY created_at, id",
+		).all(recipientId);
 		return rows.map((row) => agentEventFromRow(row as unknown as AgentEventRow));
 	}
 
 	markAgentEventsDelivered(ids: readonly string[]): void {
 		if (ids.length === 0) return;
 		const deliveredAt = now();
-		const eventStatement = this.db.prepare(
+		const eventStatement = this.prepare(
 			"UPDATE agent_events SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL",
 		);
-		const turnStatement = this.db.prepare(
+		const turnStatement = this.prepare(
 			"UPDATE agent_turns SET delivered_via = 'notify', delivered_at = ?, updated_at = ? WHERE id = ? AND delivered_via IS NULL",
 		);
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
 			for (const id of ids) {
-				const event = this.db.prepare("SELECT turn_id FROM agent_events WHERE id = ?").get(id) as
+				const event = this.prepare("SELECT turn_id FROM agent_events WHERE id = ?").get(id) as
 					| { turn_id: string | null }
 					| undefined;
 				const updated = eventStatement.run(deliveredAt, id);
@@ -1226,87 +1208,81 @@ export class RiemannStore {
 
 	putFileCapability(input: { runId: string; token: string; path: string; contentHash: string }): void {
 		const tokenHash = createHash("sha256").update(input.token).digest("hex");
-		this.db
-			.prepare(
-				"INSERT OR REPLACE INTO file_capabilities(token_hash, run_id, path, content_hash, created_at) VALUES(?, ?, ?, ?, ?)",
-			)
-			.run(tokenHash, input.runId, input.path, input.contentHash, now());
+		this.prepare(
+			"INSERT OR REPLACE INTO file_capabilities(token_hash, run_id, path, content_hash, created_at) VALUES(?, ?, ?, ?, ?)",
+		).run(tokenHash, input.runId, input.path, input.contentHash, now());
 	}
 
 	getFileCapability(runId: string, token: string): { path: string; contentHash: string } | undefined {
 		const tokenHash = createHash("sha256").update(token).digest("hex");
-		const row = this.db
-			.prepare("SELECT path, content_hash FROM file_capabilities WHERE token_hash = ? AND run_id = ?")
-			.get(tokenHash, runId) as { path: string; content_hash: string } | undefined;
+		const row = this.prepare(
+			"SELECT path, content_hash FROM file_capabilities WHERE token_hash = ? AND run_id = ?",
+		).get(tokenHash, runId) as { path: string; content_hash: string } | undefined;
 		return row ? { path: row.path, contentHash: row.content_hash } : undefined;
 	}
 
 	putArtifact(artifact: StoredArtifact): void {
-		this.db
-			.prepare(
-				"INSERT OR REPLACE INTO artifacts(handle, run_id, hash, mime_type, size, name, path, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-			)
-			.run(
-				artifact.handle,
-				artifact.runId,
-				artifact.hash,
-				artifact.mimeType,
-				artifact.size,
-				artifact.name,
-				artifact.path,
-				artifact.createdAt,
-			);
+		this.prepare(
+			"INSERT OR REPLACE INTO artifacts(handle, run_id, hash, mime_type, size, name, path, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+		).run(
+			artifact.handle,
+			artifact.runId,
+			artifact.hash,
+			artifact.mimeType,
+			artifact.size,
+			artifact.name,
+			artifact.path,
+			artifact.createdAt,
+		);
 	}
 
 	getArtifact(handle: string): StoredArtifact | undefined {
-		const row = this.db.prepare("SELECT * FROM artifacts WHERE handle = ?").get(handle) as ArtifactRow | undefined;
+		const row = this.prepare("SELECT * FROM artifacts WHERE handle = ?").get(handle) as ArtifactRow | undefined;
 		return row ? artifactFromRow(row) : undefined;
 	}
 
 	listRuns(): StoredRun[] {
-		const rows = this.db.prepare("SELECT * FROM runs ORDER BY updated_at, id").all();
+		const rows = this.prepare("SELECT * FROM runs ORDER BY updated_at, id").all();
 		return rows.map((row) => runFromRow(row as unknown as RunRow));
 	}
 
 	listArtifacts(runId: string): StoredArtifact[] {
-		const rows = this.db.prepare("SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at, handle").all(runId);
+		const rows = this.prepare("SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at, handle").all(runId);
 		return rows.map((row) => artifactFromRow(row as unknown as ArtifactRow));
 	}
 
 	countArtifactPathReferences(path: string, excludingRunId?: string): number {
 		const row = (
 			excludingRunId
-				? this.db
-						.prepare("SELECT COUNT(*) AS count FROM artifacts WHERE path = ? AND run_id != ?")
-						.get(path, excludingRunId)
-				: this.db.prepare("SELECT COUNT(*) AS count FROM artifacts WHERE path = ?").get(path)
+				? this.prepare("SELECT COUNT(*) AS count FROM artifacts WHERE path = ? AND run_id != ?").get(
+						path,
+						excludingRunId,
+					)
+				: this.prepare("SELECT COUNT(*) AS count FROM artifacts WHERE path = ?").get(path)
 		) as { count: number };
 		return row.count;
 	}
 
 	reserveClosedRunForRetention(runId: string): boolean {
-		const result = this.db
-			.prepare(
-				"INSERT OR IGNORE INTO retention_runs(run_id, created_at) SELECT id, ? FROM runs WHERE id = ? AND status = 'closed'",
-			)
-			.run(now(), runId);
+		const result = this.prepare(
+			"INSERT OR IGNORE INTO retention_runs(run_id, created_at) SELECT id, ? FROM runs WHERE id = ? AND status = 'closed'",
+		).run(now(), runId);
 		return result.changes > 0;
 	}
 
 	releaseRetentionRun(runId: string): void {
-		this.db.prepare("DELETE FROM retention_runs WHERE run_id = ?").run(runId);
+		this.prepare("DELETE FROM retention_runs WHERE run_id = ?").run(runId);
 	}
 
 	deleteReservedRun(runId: string): boolean {
-		const result = this.db
-			.prepare(
-				"DELETE FROM runs WHERE id = ? AND status = 'closed' AND EXISTS (SELECT 1 FROM retention_runs WHERE run_id = ?)",
-			)
-			.run(runId, runId);
+		const result = this.prepare(
+			"DELETE FROM runs WHERE id = ? AND status = 'closed' AND EXISTS (SELECT 1 FROM retention_runs WHERE run_id = ?)",
+		).run(runId, runId);
 		return result.changes > 0;
 	}
 
 	close(): void {
+		this.statements.clear();
 		this.db.close();
 	}
 }

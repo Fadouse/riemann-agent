@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { FULL_FILESYSTEM, fileAccessPolicy } from "../src/riemann/access-policy.ts";
 import { ShellFunctions } from "../src/riemann/functions/shell.ts";
 import type { JsonValue } from "../src/riemann/kernel/types.ts";
@@ -136,6 +136,31 @@ describe("Riemann shell argument validation", () => {
 });
 
 describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
+	test("persists complete output parts without constructing a combined artifact string", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-artifact-parts-"));
+		roots.push(root);
+		const store = new RiemannStore(join(root, "agent"));
+		const run = store.openRun("shell-artifact-parts", root);
+		const artifacts = new ArtifactStore(store, run.id);
+		const shell = new ShellFunctions(fileAccessPolicy(root, FULL_FILESYSTEM), artifacts, 4, false);
+		const definition = shell.definitions().find((item) => item.name === "run");
+		if (!definition) throw new Error("shell.run is unavailable");
+		const putText = vi.spyOn(artifacts, "putText");
+		const script = "printf '完整😀stdout'; printf 'stderr😀完整' >&2";
+		try {
+			const result = record(await definition.handler({ script }, new AbortController().signal));
+			expect(result).toMatchObject({ exit_code: 0, stdout_truncated: true, stderr_truncated: true });
+			const artifact = record(result.artifact);
+			expect(await artifacts.readBuffer(String(artifact.handle))).toEqual(
+				Buffer.from(`$ ${script}\n\n[stdout]\n完整😀stdout\n\n[stderr]\nstderr😀完整`),
+			);
+			expect(putText).not.toHaveBeenCalled();
+		} finally {
+			putText.mockRestore();
+			store.close();
+		}
+	});
+
 	test("returns a structured command-not-found process result", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-missing-"));
 		roots.push(root);
