@@ -10,19 +10,25 @@
 ### Changed
 
 - Reused width-independent Markdown parsing and styling across terminal resizes while preserving width-dependent layout and cache invalidation.
-
 - Reduced repeated transcript line copies, long-input cursor movement and paste allocations, and immutable text duplication across editor undo snapshots.
 - Streamed complete fullscreen exit and image output through the shared terminal writer without retaining another full history copy.
 
 ### Fixed
 
 - Invalidated stale completions after editing and navigation, and preserved visual cursor columns across wide Unicode characters.
-- Fixed mouse hover changing selection and recentering autocomplete and settings lists, causing clicks to target a different item.
-
 - Fixed short width-cache keys retaining entire previous message strings and preserved surrogate pairs across terminal write chunks.
-
 - Fixed large Markdown list and table output exceeding JavaScript spread argument limits.
 - Keep autocomplete suggestions visible while a replacement request is in flight instead of collapsing the menu between keystrokes.
+
+## [0.85.1] - 2026-09-05
+
+### Added
+
+- Added five-times-faster mouse wheel scrolling while holding Alt in fullscreen mode ([#9166](https://github.com/earendil-works/pi/pull/9166) by [@xl0](https://github.com/xl0)).
+
+### Fixed
+
+- Fixed mouse hover changing selection and recentering autocomplete and settings lists, causing clicks to target a different item.
 
 ## [0.85.0] - 2026-09-04
 

@@ -6,6 +6,8 @@
 
 - Serialized tool progress delivery with bounded bookkeeping while preserving update ordering and completion waits.
 
+## [0.85.1] - 2026-09-05
+
 ## [0.85.0] - 2026-09-04
 
 ### Fixed

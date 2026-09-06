@@ -2,10 +2,6 @@
 
 ## [Unreleased]
 
-### Added
-
-- Added GPT-6 Astra for OpenAI API keys and OpenAI Codex subscriptions.
-
 ### Changed
 
 - Reduced streaming tool-argument parsing and queued frame catch-up work while preserving every partial update and malformed-JSON repair behavior.
@@ -14,8 +10,17 @@
 ### Fixed
 
 - Fixed Cloudflare AI Gateway API typing and retained Workers AI passthrough models when upstream catalog data omits them.
-
 - Fixed OpenAI Codex retrying non-retryable HTTP errors when retries are enabled.
+
+## [0.85.1] - 2026-09-05
+
+### Added
+
+- Added GPT-6 Astra for OpenAI API keys and OpenAI Codex subscriptions.
+
+### Fixed
+
+- Fixed long prompt-cache requests for GPT-5.6+ Responses models to use `prompt_cache_options.ttl: "30m"` instead of `prompt_cache_retention: "24h"`.
 
 ## [0.85.0] - 2026-09-04
 

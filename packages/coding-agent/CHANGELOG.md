@@ -48,24 +48,21 @@
 - Reduced interactive streaming work by coalescing assistant, shell, and Subagent display updates and caching Mermaid transforms, footer totals, session search text, and fullscreen transcript search.
 - Reduced IPython checkpoint serialization to one common-path pass while retaining automatic snapshots and per-variable fallback diagnostics.
 - Changed OpenAI Codex cloud compaction to persist opaque context records without provider/model metadata.
-
 - Reduced repeated session-context traversal, SQLite statement preparation and inbox sorting; agent patches no longer rewrite unchanged payload columns.
 - Reused stable assistant Markdown blocks for the built-in renderer while preserving refresh semantics for custom themes and transforms; compared IPython activity fields without serializing output for cache keys.
 - Reduced file-search line allocations, web-response copies, activity snapshot allocations, and Jupyter diagnostic-path construction; shell artifacts can be persisted in complete text parts without concatenating another full-sized output string.
-
 - Reduced context-cache metadata retention and reused IPython source/output summaries on status updates; existing collapsed previews no longer materialize a padded copy of the full output.
 - Unified collapsed tool rows onto one layout with default-color action titles, muted paths and search queries, shared result gutters, and unexpanded edit `+n -n` stats.
 - Removed the Subagent Fleet operation-hint row above agent list entries.
-
 - Reduced duplicate model catalog refreshes during startup and loaded `/resume` lists from streamed disk metadata indexes, without a process-wide history cache or a total index-record size cap.
 - Deferred session search-text loading until a query is entered and cancelled pending picker reads on close, while preventing selection of incomplete search results.
+- Enabled strict-prefer JSON-schema sampling by default for built-in `read`, `bash`, `powershell`, `edit`, and `write` tools, without requiring `PI_EXPERIMENTAL`. Extensions can re-register tool definitions with `constrainedSampling: false`.
 
 ### Fixed
 
 - Fixed Fleet focus isolation, child draft and navigation restoration, hidden settlement errors, and short-window controls; release confirmation now explains worktree deletion and saved artifacts.
 - Fixed empty final IPython results, cancellation, and timeouts retaining running or successful status indicators.
 - Preserved long pasted drafts and queued image multiplicity when messages return to the editor.
-- Fixed configurable save keybindings in the model and thinking selectors ([#8797](https://github.com/earendil-works/pi/issues/8797)).
 - Fixed models treating `fs`, `shell`, `web`, Agent, catalog, state, and MCP namespace calls as parallel native tools by declaring `ipython` as the sole callable tool across its schema, main/child prompts, operation headings, and MCP guidance.
 - Fixed managed Python startup on NixOS by resolving the host C++ runtime for ZeroMQ wheels while preserving existing library-path entries.
 - Fixed active IPython cells remaining uninterruptible behind non-cooperative host requests, including managed-Python startup on NixOS hosts.
@@ -80,12 +77,29 @@
 - Fixed Riemann and tool output decoding, grapheme-boundary previews, and trailing-newline expansion so Unicode streams render without mojibake or extra rows.
 - Fixed Bubblewrap launches to preserve host cwd, HOME, temporary and terminal environment values; validate same-path mount policies; keep private IPC writable through exclusions; and detach brokers from the terminal foreground group.
 - Fixed Riemann compaction configuration reloads, concurrent settings writes, async UI rollback, and truncated checkpoint rejection.
-
 - Fixed Python checkpoint and restore temporaries retaining deleted user objects, while preserving every checkpoint and object-graph recovery.
 - Fixed snapshot compaction context estimates omitting archive text and image blocks.
-
 - Fixed expanded IPython activity output exceeding JavaScript spread argument limits and released derived activity caches when a cell is hidden.
 - Show file-change addition and removal counts on collapsed Edited, Added, and Deleted headers.
+- Fixed premature missing-model errors after login by waiting for catalog discovery. Radius now defaults to `balanced`, falling back to the first available Radius model when needed.
+
+## [0.85.1] - 2026-09-05
+
+### New Features
+
+- **GPT-6 Astra** — Available through OpenAI API keys and OpenAI Codex subscriptions. See [API Keys](docs/providers.md#api-keys) and [OpenAI Codex](docs/providers.md#openai-codex).
+
+### Added
+
+- Added GPT-6 Astra for OpenAI API keys and OpenAI Codex subscriptions.
+- Added five-times-faster mouse wheel scrolling while holding Alt in fullscreen mode ([#9166](https://github.com/earendil-works/pi/pull/9166) by [@xl0](https://github.com/xl0)).
+
+### Fixed
+
+- Fixed configurable save keybindings in the model and thinking selectors ([#9149](https://github.com/earendil-works/pi/pull/9149) by [@rwachtler](https://github.com/rwachtler)).
+- Fixed SDK import failures caused by unintentionally publishing internal experimental code and dependencies in 0.85.0. The experimental `client` and `experimental/plugin` subpaths and server/client commands are now source-only through `pi-test.sh`; the supported local SDK and stdio RPC API are unchanged ([#9132](https://github.com/earendil-works/pi/issues/9132)).
+- Fixed mouse hover changing selection and recentering autocomplete and settings lists, causing clicks to target a different item.
+- Fixed long prompt-cache requests for GPT-5.6+ Responses models to use `prompt_cache_options.ttl: "30m"` instead of `prompt_cache_retention: "24h"`.
 
 ## [0.85.0] - 2026-09-04
 
