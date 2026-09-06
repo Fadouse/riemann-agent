@@ -67,7 +67,6 @@ describe("Riemann Subagent UI", () => {
 
 		const lines = renderSubagentFleet(agents, theme, Date.parse("2026-08-13T12:00:12.000Z"), 80, 6, true);
 		const rendered = stripAnsi(lines.join("\n"));
-		expect(rendered).toContain("select");
 		expect(rendered).toContain("● worker-6");
 		expect(rendered).toContain("○ worker-2");
 		expect(rendered).toContain("↑ 2 more");
@@ -76,6 +75,20 @@ describe("Riemann Subagent UI", () => {
 		expect(rendered).not.toContain("worker-0");
 		expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
 		expect(renderSubagentFleet([], theme)).toEqual([]);
+	});
+
+	test("uses a single Fleet row for the latest activity without task fallback or control hints", () => {
+		const agent = snapshot();
+		const now = Date.parse("2026-08-13T12:00:12.000Z");
+		const idlePreview = renderSubagentFleet([agent], theme, now, 80).map(stripAnsi);
+		expect(idlePreview).toHaveLength(1);
+		expect(idlePreview[0].trim()).toMatch(/^○ reviewer\s+12s$/);
+
+		const previews = new Map([[agent.id, "Reading src/parser.ts"]]);
+		const activePreview = renderSubagentFleet([agent], theme, now, 80, 0, true, previews).map(stripAnsi);
+		expect(activePreview).toHaveLength(1);
+		expect(activePreview[0].trim()).toMatch(/^● reviewer\s+Reading src\/parser\.ts\s+12s$/);
+		expect(visibleWidth(activePreview[0])).toBe(80);
 	});
 
 	test("renders child transcripts with the standard assistant and tool components", () => {
@@ -132,7 +145,6 @@ describe("Riemann Subagent UI", () => {
 		const collapsedLines = viewer.render(100).map((line) => stripAnsi(line));
 		const collapsed = collapsedLines.join("\n");
 		expect(collapsed).toContain("Found two concrete defects.");
-		expect(collapsed).toContain("● python");
 		expect(collapsed).not.toContain('"code"');
 		expect(collapsed).not.toContain("print(values)");
 		expect(collapsed).not.toContain("[Assistant]");

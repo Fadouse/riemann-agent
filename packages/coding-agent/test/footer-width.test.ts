@@ -88,25 +88,23 @@ describe("FooterComponent compact layout", () => {
 		initTheme(undefined, false);
 	});
 
-	it("shows cwd and branch on the left with model, thinking and context right-aligned in one wide row", () => {
+	it("keeps model and context on the left and the directory on the right", () => {
 		const footer = new FooterComponent(createSession({ reasoning: true, thinkingLevel: "high" }), createFooterData());
 		const lines = footer.render(80).map(stripAnsi);
 		expect(lines).toHaveLength(1);
-		expect(lines[0]).toMatch(/^\/tmp\/project \(main\) {2,}test-model • high/);
-		expect(lines[0]).toContain("12.3%/200k");
-		expect(lines[0]).toMatch(/test-model • high • 12\.3%\/200k \(auto\)$/);
+		expect(lines[0]).toMatch(/^test-model high • 12\.3%\/200k \(auto\)/);
+		expect(lines[0]).toMatch(/\/tmp\/project \(main\)$/);
 		expect(visibleWidth(lines[0])).toBe(80);
 	});
 
-	it("keeps model, thinking and context right-aligned without the path at 40 columns", () => {
+	it("keeps context visible without the path at 40 columns", () => {
 		const lines = new FooterComponent(createSession({ reasoning: true, thinkingLevel: "high" }), createFooterData())
 			.render(40)
 			.map(stripAnsi);
 		expect(lines).toHaveLength(1);
-		expect(lines[0]).toContain("test-model • high");
 		expect(lines[0]).toContain("12.3%/200k");
 		expect(lines[0]).not.toContain("/tmp");
-		expect(lines[0]).toMatch(/test-model • high • 12\.3%\/200k \(auto\)$/);
+		expect(lines[0]).toMatch(/^test-model high •/);
 		expect(visibleWidth(lines[0])).toBe(40);
 	});
 
@@ -126,13 +124,12 @@ describe("FooterComponent compact layout", () => {
 		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
 	});
 
-	it("fits a short session name alongside the directory on wide terminals", () => {
+	it("keeps a short named session in one bounded row on wide terminals", () => {
 		const lines = new FooterComponent(createSession({ sessionName: "release" }), createFooterData())
 			.render(120)
 			.map(stripAnsi);
 		expect(lines).toHaveLength(1);
-		expect(lines[0]).toMatch(/^\/tmp\/project \(main\) • release {2,}test-model/);
-		expect(lines[0]).toMatch(/12\.3%\/200k \(auto\)$/);
+		expect(lines[0]).toMatch(/\/tmp\/project \(main\) release$/);
 		expect(visibleWidth(lines[0])).toBe(120);
 	});
 
@@ -150,7 +147,7 @@ describe("FooterComponent compact layout", () => {
 		expect(narrow).toContain("12.3%/200k");
 	});
 
-	it("right-aligns provider and manual compaction alongside the model on wide terminals", () => {
+	it("bounds the footer with a provider and manual compaction on wide terminals", () => {
 		const footer = new FooterComponent(
 			createSession({ provider: "openai-codex", modelId: "gpt-6-astra", reasoning: true, thinkingLevel: "medium" }),
 			createFooterData(2),
@@ -158,9 +155,8 @@ describe("FooterComponent compact layout", () => {
 		footer.setAutoCompactEnabled(false);
 		const lines = footer.render(120).map(stripAnsi);
 		expect(lines).toHaveLength(1);
-		expect(lines[0]).toMatch(
-			/^\/tmp\/project \(main\) {2,}\(openai-codex\) gpt-6-astra • medium • 12\.3%\/200k \(manual\)$/,
-		);
+		expect(lines[0]).toMatch(/^\(openai-codex\) gpt-6-astra medium •/);
+		expect(lines[0]).toContain("12.3%/200k (manual)");
 		expect(visibleWidth(lines[0])).toBe(120);
 	});
 

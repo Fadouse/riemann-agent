@@ -111,14 +111,26 @@ describe("Riemann IPython transcript", () => {
 		}
 	});
 
-	test("keeps tool calls static until execution starts", async () => {
+	test("animates queued marker colors without changing source metadata or showing running controls", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(0);
 		try {
-			const component = new IPythonCellComponent({ code: "await work()", isPartial: true });
-			const queued = [...component.render(24)];
+			const component = new IPythonCellComponent({ code: "value = 1\nawait work(value)", isPartial: true });
+			const queued = [...component.render(80)];
+			const text = stripAnsi(queued.join("\n"));
+			expect(text).toContain("Python");
+			expect(text).toContain("2 lines");
+			expect(text).not.toContain("to interrupt");
+			expect(text).not.toContain("await work");
 			await vi.advanceTimersByTimeAsync(880);
-			expect(component.render(24)).toEqual(queued);
+			const next = [...component.render(80)];
+			expect(next).not.toEqual(queued);
+			expect(stripAnsi(next.join("\n"))).toBe(text);
+
+			component.update({ code: "value = 1\nawait work(value)", isPartial: true, executionStarted: true });
+			const running = stripAnsi(component.render(80).join("\n"));
+			expect(running).toContain("escape to interrupt");
+			expect(running).not.toContain("2 lines");
 		} finally {
 			vi.useRealTimers();
 		}
@@ -213,7 +225,6 @@ describe("Riemann IPython transcript", () => {
 		const collapsedLines = component.render(80);
 		expect(definitionless.render(80)).toEqual(collapsedLines);
 		const collapsed = stripAnsi(collapsedLines.join("\n"));
-		expect(collapsed).toContain("● python");
 		expect(collapsed).toContain("1.3s");
 		expect(collapsed).not.toContain("to expand");
 		expect(collapsed).not.toContain("print(values)");
@@ -245,9 +256,7 @@ describe("Riemann IPython transcript", () => {
 			expanded: false,
 		});
 
-		const collapsedLines = component.render(80);
-		const collapsed = stripAnsi(collapsedLines.join("\n"));
-		expect(collapsed).toContain("● python");
+		component.render(80);
 
 		component.update({
 			code: "print(results)",
@@ -492,7 +501,6 @@ describe("Riemann IPython transcript", () => {
 		});
 		const lines = component.render(24);
 		const rendered = stripAnsi(lines.join("\n"));
-		expect(rendered).toContain("● python");
 		expect(rendered).toContain("ValueError");
 		expect(lines.every((line) => visibleWidth(line) <= 24)).toBe(true);
 	});
