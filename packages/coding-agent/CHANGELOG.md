@@ -57,6 +57,9 @@
 - Unified collapsed tool rows onto one layout with default-color action titles, muted paths and search queries, shared result gutters, and unexpanded edit `+n -n` stats.
 - Removed the Subagent Fleet operation-hint row above agent list entries.
 
+- Reduced duplicate model catalog refreshes during startup and loaded `/resume` lists from streamed disk metadata indexes, without a process-wide history cache or a total index-record size cap.
+- Deferred session search-text loading until a query is entered and cancelled pending picker reads on close, while preventing selection of incomplete search results.
+
 ### Fixed
 
 - Fixed Fleet focus isolation, child draft and navigation restoration, hidden settlement errors, and short-window controls; release confirmation now explains worktree deletion and saved artifacts.

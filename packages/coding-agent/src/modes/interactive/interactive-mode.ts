@@ -5517,12 +5517,17 @@ export class InteractiveMode {
 	private showSessionSelector(): void {
 		this.showSelector((done) => {
 			const selector = new SessionSelectorComponent(
-				(onProgress) =>
-					SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress),
-				(onProgress) =>
+				(onProgress, options) =>
+					SessionManager.list(
+						this.sessionManager.getCwd(),
+						this.sessionManager.getSessionDir(),
+						onProgress,
+						options,
+					),
+				(onProgress, options) =>
 					this.sessionManager.usesDefaultSessionDir()
-						? SessionManager.listAll(onProgress)
-						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress),
+						? SessionManager.listAll(onProgress, options)
+						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress, options),
 				async (sessionPath) => {
 					done();
 					await this.handleResumeSession(sessionPath);
@@ -5548,7 +5553,7 @@ export class InteractiveMode {
 
 				this.sessionManager.getSessionFile(),
 			);
-			return { component: selector, focus: selector };
+			return { component: selector, focus: selector, dispose: () => selector.dispose() };
 		});
 	}
 

@@ -21,6 +21,7 @@ import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../
 import { openAICompactionProviderPayload } from "../riemann/openai-compaction-state.ts";
 import { getPreservedArchive, historyBlocks } from "../riemann/snapshot-compaction.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { graphemeSafePrefix } from "../utils/text.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -28,6 +29,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import { readSessionMetadata, SESSION_PREVIEW_LENGTH, writeSessionMetadata } from "./session-metadata.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -709,9 +711,25 @@ function getMessageActivityTime(entry: SessionMessageEntry): number | undefined 
 	return Number.isNaN(t) ? undefined : t;
 }
 
-async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+export interface SessionListOptions {
+	/** Load bounded display metadata; message history is read only for full-text search. */
+	metadataOnly?: boolean;
+	signal?: AbortSignal;
+}
+
+function sessionFileSignature(stats: Awaited<ReturnType<typeof stat>>): string {
+	return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`;
+}
+
+async function buildSessionInfo(filePath: string, options?: SessionListOptions): Promise<SessionInfo | null> {
 	try {
+		if (options?.signal?.aborted) return null;
 		const stats = await stat(filePath);
+		const signature = sessionFileSignature(stats);
+		if (options?.metadataOnly) {
+			const metadata = await readSessionMetadata(filePath, signature, options?.signal);
+			if (metadata) return metadata;
+		}
 		let header: SessionHeader | null = null;
 		let messageCount = 0;
 		let firstMessage = "";
@@ -719,46 +737,61 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 		let name: string | undefined;
 		let lastActivityTime: number | undefined;
 
-		const rl = createInterface({
-			input: createReadStream(filePath, { encoding: "utf8" }),
-			crlfDelay: Infinity,
+		const input = createReadStream(filePath, { encoding: "utf8", signal: options?.signal });
+		const rl = createInterface({ input, crlfDelay: Infinity });
+		let readError: Error | undefined;
+		input.on("error", (error) => {
+			readError = error;
+			rl.close();
 		});
+		try {
+			for await (const line of rl) {
+				if (options?.signal?.aborted) return null;
+				const entry = parseSessionEntryLine(line);
+				if (!entry) continue;
 
-		for await (const line of rl) {
-			const entry = parseSessionEntryLine(line);
-			if (!entry) continue;
+				if (!header) {
+					if (entry.type !== "session") return null;
+					header = entry;
+					continue;
+				}
 
-			if (!header) {
-				if (entry.type !== "session") return null;
-				header = entry;
-				continue;
+				// Extract session name (use latest, including explicit clears)
+				if (entry.type === "session_info") {
+					name = entry.name?.trim() || undefined;
+				}
+
+				if (entry.type !== "message") continue;
+				messageCount++;
+
+				const activityTime = getMessageActivityTime(entry);
+				if (typeof activityTime === "number") {
+					lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
+				}
+
+				const message = entry.message;
+				if (!isMessageWithContent(message)) continue;
+				if (message.role !== "user" && message.role !== "assistant") continue;
+
+				if (options?.metadataOnly && (firstMessage || message.role !== "user")) continue;
+				const textContent = extractTextContent(message);
+				if (!textContent) continue;
+
+				if (!options?.metadataOnly) allMessages.push(textContent);
+				if (!firstMessage && message.role === "user") {
+					// Detach the preview from a potentially history-sized V8 sliced string.
+					firstMessage = options?.metadataOnly
+						? Buffer.from(graphemeSafePrefix(textContent, SESSION_PREVIEW_LENGTH), "utf16le").toString("utf16le")
+						: textContent;
+				}
 			}
 
-			// Extract session name (use latest, including explicit clears)
-			if (entry.type === "session_info") {
-				name = entry.name?.trim() || undefined;
-			}
-
-			if (entry.type !== "message") continue;
-			messageCount++;
-
-			const activityTime = getMessageActivityTime(entry);
-			if (typeof activityTime === "number") {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
-			}
-
-			const message = entry.message;
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
-
-			allMessages.push(textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
-			}
+			if (readError) throw readError;
+		} finally {
+			rl.close();
+			input.destroy();
 		}
+		if (options?.signal?.aborted) return null;
 
 		if (!header) return null;
 
@@ -772,7 +805,7 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 					? new Date(headerTime)
 					: stats.mtime;
 
-		return {
+		const info: SessionInfo = {
 			path: filePath,
 			id: header.id,
 			cwd,
@@ -784,6 +817,11 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.join(" "),
 		};
+		// A writer may append or replace the file while it is being streamed.
+		// Return the observation, but only cache it if the file stayed unchanged.
+		if (sessionFileSignature(await stat(filePath)) === signature)
+			await writeSessionMetadata(filePath, signature, info, options?.signal);
+		return info;
 	} catch {
 		return null;
 	}
@@ -796,6 +834,7 @@ const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
 async function buildSessionInfosWithConcurrency(
 	files: string[],
 	onLoaded: () => void,
+	options?: SessionListOptions,
 ): Promise<(SessionInfo | null)[]> {
 	const results: (SessionInfo | null)[] = new Array(files.length).fill(null);
 	const inFlight = new Set<Promise<void>>();
@@ -807,7 +846,7 @@ async function buildSessionInfosWithConcurrency(
 		if (!file) return;
 
 		let task: Promise<void>;
-		task = buildSessionInfo(file)
+		task = buildSessionInfo(file, options)
 			.then((info) => {
 				results[index] = info;
 			})
@@ -822,6 +861,7 @@ async function buildSessionInfosWithConcurrency(
 	};
 
 	while (nextIndex < files.length || inFlight.size > 0) {
+		if (options?.signal?.aborted) nextIndex = files.length;
 		while (nextIndex < files.length && inFlight.size < MAX_CONCURRENT_SESSION_INFO_LOADS) {
 			startNext();
 		}
@@ -838,6 +878,7 @@ async function listSessionsFromDir(
 	onProgress?: SessionListProgress,
 	progressOffset = 0,
 	progressTotal?: number,
+	options?: SessionListOptions,
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
 	if (!existsSync(dir)) {
@@ -850,10 +891,14 @@ async function listSessionsFromDir(
 		const total = progressTotal ?? files.length;
 
 		let loaded = 0;
-		const results = await buildSessionInfosWithConcurrency(files, () => {
-			loaded++;
-			onProgress?.(progressOffset + loaded, total);
-		});
+		const results = await buildSessionInfosWithConcurrency(
+			files,
+			() => {
+				loaded++;
+				onProgress?.(progressOffset + loaded, total);
+			},
+			options,
+		);
 		for (const info of results) {
 			if (info) {
 				sessions.push(info);
@@ -1830,11 +1875,16 @@ export class SessionManager {
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
-	static async list(cwd: string, sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+	static async list(
+		cwd: string,
+		sessionDir?: string,
+		onProgress?: SessionListProgress,
+		options?: SessionListOptions,
+	): Promise<SessionInfo[]> {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
 		const resolvedCwd = resolvePath(cwd);
-		const sessions = (await listSessionsFromDir(dir, onProgress)).filter(
+		const sessions = (await listSessionsFromDir(dir, onProgress, 0, undefined, options)).filter(
 			(session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd),
 		);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
@@ -1845,17 +1895,28 @@ export class SessionManager {
 	 * List all sessions across all project directories.
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
-	static async listAll(onProgress?: SessionListProgress): Promise<SessionInfo[]>;
-	static async listAll(sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]>;
+	static async listAll(onProgress?: SessionListProgress, options?: SessionListOptions): Promise<SessionInfo[]>;
+	static async listAll(
+		sessionDir?: string,
+		onProgress?: SessionListProgress,
+		options?: SessionListOptions,
+	): Promise<SessionInfo[]>;
 	static async listAll(
 		sessionDirOrOnProgress?: string | SessionListProgress,
-		onProgress?: SessionListProgress,
+		onProgressOrOptions?: SessionListProgress | SessionListOptions,
+		options?: SessionListOptions,
 	): Promise<SessionInfo[]> {
 		const customSessionDir =
 			typeof sessionDirOrOnProgress === "string" ? normalizePath(sessionDirOrOnProgress) : undefined;
-		const progress = typeof sessionDirOrOnProgress === "function" ? sessionDirOrOnProgress : onProgress;
+		const progress =
+			typeof sessionDirOrOnProgress === "function"
+				? sessionDirOrOnProgress
+				: typeof onProgressOrOptions === "function"
+					? onProgressOrOptions
+					: undefined;
+		const listOptions = typeof onProgressOrOptions === "object" ? onProgressOrOptions : options;
 		if (customSessionDir) {
-			const sessions = await listSessionsFromDir(customSessionDir, progress);
+			const sessions = await listSessionsFromDir(customSessionDir, progress, 0, undefined, listOptions);
 			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 			return sessions;
 		}
@@ -1889,10 +1950,14 @@ export class SessionManager {
 			const sessions: SessionInfo[] = [];
 			const allFiles = dirFiles.flat();
 
-			const results = await buildSessionInfosWithConcurrency(allFiles, () => {
-				loaded++;
-				progress?.(loaded, totalFiles);
-			});
+			const results = await buildSessionInfosWithConcurrency(
+				allFiles,
+				() => {
+					loaded++;
+					progress?.(loaded, totalFiles);
+				},
+				listOptions,
+			);
 
 			for (const info of results) {
 				if (info) {

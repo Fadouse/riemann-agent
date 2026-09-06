@@ -5,16 +5,28 @@ Sessions are stored as JSONL (JSON Lines) files. Each line is a JSON object with
 ## File Location
 
 ```
-~/.pi/agent/sessions/--<path>--/<timestamp>_<uuid>.jsonl
+~/.riemann/agent/sessions/--<path>--/<timestamp>_<uuid>.jsonl
 ```
 
 Where `<path>` is the working directory with `/` replaced by `-`.
 
 ## Deleting Sessions
 
-Sessions can be removed by deleting their `.jsonl` files under `~/.pi/agent/sessions/`.
+Sessions can be removed by deleting their `.jsonl` files under `~/.riemann/agent/sessions/`.
 
 Pi also supports deleting sessions interactively from `/resume` (select a session and press `Ctrl+D`, then confirm). When available, pi uses the `trash` CLI to avoid permanent deletion.
+
+## Resume Metadata Index
+
+`/resume` and the `--resume` picker first load display metadata from `.metadata/` inside each session directory. JSONL session files remain authoritative. The first listing builds missing indexes; changed files and obsolete or corrupt indexes are rescanned. Index creation and rebuilds can take longer than opening an already-indexed list. Read-only directories remain usable without an index.
+
+Each index contains the session ID, name, paths, message count, timestamps, and a grapheme-safe first-message preview of up to 1024 UTF-16 code units. It does not contain the full message history. Index filenames are hashed, but their contents are not encrypted: treat these files as sensitive. New index directories use permissions `0700`, and files use `0600`, subject to platform support.
+
+Records are streamed in chunks without a total record-size ceiling. Listing uses at most ten concurrent file loads; this is not a limit on the number of sessions. There is no process-wide history cache. The visible list still requires memory for its metadata, including any large names or other fields.
+
+Entering a search query loads the full search text for the selected scope. Search results become selectable after loading completes. Closing the picker cancels pending loads and releases its data; full-text session search can therefore take longer and use more memory than opening the list.
+
+Deleting a session through the picker also removes its metadata index. Deleting JSONL files manually does not remove their derived indexes. The entire `.metadata/` directory can safely be deleted without deleting sessions; needed indexes are rebuilt on the next listing. The index format is internal and may change without migration.
 
 ## Session Version
 
@@ -395,8 +407,11 @@ Key methods for working with sessions programmatically.
 - `SessionManager.forkFrom(sourcePath, targetCwd, sessionDir?)` - Fork session from another project
 
 ### Static Listing Methods
-- `SessionManager.list(cwd, sessionDir?, onProgress?)` - List sessions for a directory
-- `SessionManager.listAll(onProgress?)` - List all sessions across all projects
+- `SessionManager.list(cwd, sessionDir?, onProgress?, options?)` - List sessions for a directory
+- `SessionManager.listAll(onProgress?, options?)` - List all sessions across all projects
+- `SessionManager.listAll(sessionDir, onProgress?, options?)` - List sessions in a custom flat directory
+
+`options.metadataOnly: true` uses the disk metadata index and returns an empty `allMessagesText` with the bounded `firstMessage` preview described above. Omit this option to read full search text. `options.signal` accepts an `AbortSignal` to stop queued and active reads; an aborted listing may return a partial result, which callers should discard.
 
 ### Instance Methods - Session Management
 - `newSession(options?)` - Start a new session (options: `{ parentSession?: string }`)

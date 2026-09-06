@@ -143,6 +143,8 @@ export async function createAgentSessionServices(
 			authPath: join(agentDir, "auth.json"),
 			modelsPath: join(agentDir, "models.json"),
 			signal: options.modelRuntimeSignal,
+			// Restore catalogs and availability once, after extension providers are registered below.
+			refreshOnCreate: false,
 		}));
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const resourceLoader = new DefaultResourceLoader({
