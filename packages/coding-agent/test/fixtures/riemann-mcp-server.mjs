@@ -2,6 +2,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+if (process.env.RIEMANN_TEST_MCP_STDERR) {
+	await new Promise((resolve, reject) => {
+		process.stderr.write(`BEGIN\n${"中😀".repeat(10000)}\nEND\n`, (error) => error ? reject(error) : resolve());
+	});
+	if (process.env.RIEMANN_TEST_MCP_STDERR === "fail") process.exit(1);
+}
+
 const server = new McpServer({ name: "riemann-test-server", version: "1.0.0" });
 const PIXEL_PNG =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";

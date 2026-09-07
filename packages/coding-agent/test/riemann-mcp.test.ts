@@ -62,7 +62,10 @@ describe("Riemann MCP tool bridge", () => {
 		const registry = new FunctionRegistry();
 		const capabilities = new Set(["mcp.*"]);
 		const manager = new RiemannMcpManager(
-			{ fixture: fixtureConfig() },
+			{
+				fixture: { ...fixtureConfig(), env: { RIEMANN_TEST_MCP_STDERR: "ready" } },
+				broken: { ...fixtureConfig(), env: { RIEMANN_TEST_MCP_STDERR: "fail" } },
+			},
 			import.meta.dirname,
 			registry,
 			artifacts,
@@ -115,6 +118,7 @@ describe("Riemann MCP tool bridge", () => {
 				registry.dispatch(request("fixture.fail", { input: {} }), capabilities, signal),
 			).rejects.toMatchObject({
 				code: "mcp_tool_error",
+				message: "fixture failure",
 				details: expect.objectContaining({ $riemann: "mcp_result" }),
 			});
 
@@ -153,6 +157,30 @@ describe("Riemann MCP tool bridge", () => {
 					artifact: expect.any(Object),
 				}),
 			});
+			const closed = await registry.dispatch(request("mcp.close", { server_name: "fixture" }), capabilities, signal);
+			expect(isKernelHostResult(closed)).toBe(true);
+			if (!isKernelHostResult(closed)) throw new Error("Expected retained stderr reference");
+			expect(closed.value).toBeNull();
+			const notice = closed.modelContent.find((item) => item.type === "text");
+			const stderrRef =
+				notice?.type === "text" ? /\[source mcp.stderr (r[0-9a-z]+)\]/.exec(notice.text)?.[1] : undefined;
+			expect(stderrRef).toBeDefined();
+			expect((await artifacts.readBuffer(stderrRef!)).toString("utf8")).toBe(
+				`BEGIN\n${"中😀".repeat(10000)}\nEND\n`,
+			);
+			await manager.open("broken", signal).then(
+				() => {
+					throw new Error("Expected failed startup");
+				},
+				async (error: RiemannHostError) => {
+					expect(error.code).toBe("mcp_error");
+					expect(error.message).not.toContain("BEGIN");
+					const diagnostic = objectValue(objectValue(error.details).stderr);
+					expect((await artifacts.readBuffer(String(diagnostic.handle))).toString("utf8")).toBe(
+						`BEGIN\n${"中😀".repeat(10000)}\nEND\n`,
+					);
+				},
+			);
 		} finally {
 			await manager.close();
 		}

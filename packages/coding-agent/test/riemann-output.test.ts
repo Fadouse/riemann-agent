@@ -58,6 +58,9 @@ test("retains omitted rows and only advances text that fits the final model mess
 	let cursor = first.more;
 	let combined = first.text;
 	const restored = new OutputViews(artifacts);
+	const repeated = await renderModelText(restored, [await restored.more(first.more!)]);
+	const repeatedAgain = await renderModelText(restored, [await restored.more(first.more!)]);
+	expect(repeatedAgain).toEqual(repeated);
 	for (let steps = 0; cursor && steps < 100; steps++) {
 		const next = await renderModelText(restored, [await restored.more(cursor)]);
 		expect(Buffer.byteLength(next.text)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);

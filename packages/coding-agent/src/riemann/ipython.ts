@@ -8,7 +8,7 @@ export const IPYTHON_TOOL_DESCRIPTION = `Execute Python code with top-level awai
 - Optional first line: # @exec: {"timeout_ms": 300000, "persist": false}
 - timeout_ms (1..86400000, default 300000) is the only execution deadline, covering the cell and its nested operations. Execution automatically yields while still running; waiting does not reset the deadline.
 - Each return contains at most 50 KB (51200 UTF-8 bytes) of text, including status and reference notices. Complete output is retained; read the remaining content with await output.more(ref="...").
-- A yielded call returns "Script running with cell ID ...". Continue it with ipython_wait; do not rerun its producer. Only one uncollected cell per agent is allowed.
+- A yielded call returns "running cell_id=...". Continue it with ipython_wait; do not rerun its producer. Only one uncollected cell per agent is allowed.
 - ipython_wait returns new output only. terminate=true cancels the cell and its host operations; prior filesystem/network side effects are not rolled back.
 - Await every operation. Tasks created by a cell are cancelled when it finishes. Runtime state may be lost after forced termination; retained checkpoints and artifact handles are the recovery path.`;
 

@@ -530,7 +530,7 @@ export class WebFunctions {
 						};
 					});
 					return kernelHostResult(await this.pages.create("web.search", items, { coverage: "unknown" }), [
-						{ type: "text", text: `Search response: ${retained.ref}` },
+						{ type: "text", text: `[source web.search ${retained.ref}]` },
 					]);
 				},
 			},
@@ -672,7 +672,7 @@ export class WebFunctions {
 							artifact,
 							trust: "untrusted",
 						},
-						[{ type: "text", text: `Raw response: ${ref}` }],
+						[{ type: "text", text: `[source web.fetch ${ref}]` }],
 					);
 				},
 			},

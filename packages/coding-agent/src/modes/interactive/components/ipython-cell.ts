@@ -71,18 +71,28 @@ function readDetails(value: unknown): IPythonDetails {
 function visiblePythonOutput(text: string, details: IPythonDetails): string {
 	if (
 		details.cellId &&
-		(text.startsWith(`Script running with cell ID ${details.cellId}`) || text.startsWith(`Cell ${details.cellId} `))
+		(text.startsWith(`Script running with cell ID ${details.cellId}`) ||
+			text.startsWith(`Cell ${details.cellId} `) ||
+			text.startsWith(`running cell_id=${details.cellId};`) ||
+			text === details.status ||
+			(details.status !== undefined && text.startsWith(`${details.status}\n`)))
 	) {
 		const newline = text.indexOf("\n");
 		text = newline === -1 ? "" : text.slice(newline + 1);
 	}
 	text = text
-		.replace(/^Unknown or already collected Python cell: \S+$/m, "Python cell is unavailable or already collected.")
 		.replace(
-			/^Collect cell \S+ with ipython_wait before starting another cell$/m,
+			/^(?:ipython(?:_wait)? \[\w+\]: )?Unknown or already collected Python cell: \S+$/m,
+			"Python cell is unavailable or already collected.",
+		)
+		.replace(
+			/^(?:ipython(?:_wait)? \[\w+\]: )?Collect cell \S+ with ipython_wait before starting another cell$/m,
 			"Collect the previous Python execution before starting another.",
 		)
-		.replace(/^Python cell \S+ already has an active wait$/m, "Python execution already has an active wait.");
+		.replace(
+			/^(?:ipython(?:_wait)? \[\w+\]: )?Python cell \S+ already has an active wait$/m,
+			"Python execution already has an active wait.",
+		);
 	return details.moreRef ? text.replaceAll(`[more ${details.moreRef}]`, "") : text;
 }
 

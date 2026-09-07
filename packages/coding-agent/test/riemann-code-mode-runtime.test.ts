@@ -33,6 +33,34 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 			runtime!.waitToolDefinition().execute("wait", { cell_id: id, terminate }, undefined, undefined, context);
 		const warmup = await execute('store("answer", 42)');
 		expect(warmup.details.status).toBe("ok");
+		expect(warmup.content).toEqual([{ type: "text", text: "ok" }]);
+		const compact = await execute(`result = await shell.run(script="printf payload; printf problem >&2; exit 7")
+assert result.exit_code == 7 and result.stdout == "payload" and result.stderr == "problem"
+assert result.duration_ms >= 0 and result.termination == "exited"
+preview = repr(result)
+assert "exit_code=7" in preview and "problem" in preview
+assert "duration_ms=" not in preview and "termination=" not in preview and "_truncated=False" not in preview
+assert result.stdout_artifact.size == 7 and result.stderr_artifact.size == 7
+assert "size=" not in preview and "mime_type=" not in preview
+await output.show(value=result, fields=["exit_code", "stdout", "stderr"])
+store("large", "中😀" * 10000)
+assert load("large") == "中😀" * 10000
+assert load("missing", False) is False`);
+		const compactText = compact.content
+			.filter((item) => item.type === "text")
+			.map((item) => item.text)
+			.join("");
+		expect(compactText).toContain('"exit_code":7');
+		expect(compactText).not.toContain("_truncated");
+		const explicit = await execute(`result = await shell.run(script="true")
+await output.show(value=result, fields=["stdout_truncated"])
+await output.show(value={"empty": [], "missing": None, "flag": False})`);
+		const explicitText = explicit.content
+			.filter((item) => item.type === "text")
+			.map((item) => item.text)
+			.join("");
+		expect(explicitText).toContain('"stdout_truncated":false');
+		expect(explicitText).toContain('"empty":[],"missing":null,"flag":false');
 		let page = await execute('print("中😀" * 70000, end="END")');
 		const recovered: string[] = [];
 		for (let count = 0; count < 20; count++) {
@@ -42,7 +70,7 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 				.join("");
 			expect(Buffer.byteLength(text)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);
 			expect(text).not.toContain("�");
-			recovered.push(text.replace(/^Cell c[0-9a-f]+ ok\.\n*/, "").replace(/\n\[more r[0-9a-z]+\]$/, ""));
+			recovered.push(text.replace(/^ok\n*/, "").replace(/\n\[more r[0-9a-z]+\]$/, ""));
 			if (!page.details.moreRef) break;
 			page = await execute(`await output.more(ref=${JSON.stringify(page.details.moreRef)})`);
 		}

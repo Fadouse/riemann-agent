@@ -79,7 +79,9 @@ describe("Riemann image routing", () => {
 			pendingRestoreNotice: undefined,
 			artifacts,
 			outputViews: views,
+			shared: { config: { limits: { maxPreviewBytes: 2048 } } },
 		};
+		Object.setPrototypeOf(fakeThis, RiemannRuntime.prototype);
 		const result: KernelExecuteResult = {
 			status: "error",
 			stdout: "中😀".repeat(10000),

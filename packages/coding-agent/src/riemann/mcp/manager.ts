@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
-import { isAbsolute, resolve } from "node:path";
+import { createReadStream } from "node:fs";
+import { type FileHandle, mkdtemp, open, rmdir, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -18,10 +21,16 @@ import {
 	type PythonFunctionSpecification,
 } from "../functions/registry.ts";
 import { storeModelImage } from "../images.ts";
-import type { JsonValue } from "../kernel/types.ts";
+import { type JsonValue, type KernelHostResult, kernelHostResult } from "../kernel/types.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
 
 type McpCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
+
+interface McpStderrCapture {
+	path: string;
+	file: FileHandle;
+	settled?: Promise<JsonValue>;
+}
 
 interface McpServerState {
 	name: string;
@@ -30,11 +39,11 @@ interface McpServerState {
 	client?: Client;
 	transport?: Transport;
 	error?: string;
-	stderr?: string;
+	stderr?: McpStderrCapture;
 	namespace?: string;
 	functionNames?: string[];
 	lifecycle?: object;
-	closing?: Promise<void>;
+	closing?: Promise<JsonValue>;
 }
 
 const RESERVED_NAMESPACES = new Set([
@@ -250,31 +259,72 @@ export class RiemannMcpManager {
 		}
 	}
 
-	private createTransport(name: string, config: McpServerConfig, state: McpServerState): Transport {
+	private async createTransport(
+		name: string,
+		config: McpServerConfig,
+	): Promise<{ transport: Transport; stderr?: McpStderrCapture }> {
 		this.validateConfig(name, config);
 		if (config.command) {
-			const transport = new StdioClientTransport({
-				command: expandConfigSecret(config.command) ?? config.command,
-				args: (config.args ?? []).map((value) => expandConfigSecret(value) ?? value),
-				env: {
-					...getDefaultEnvironment(),
-					...Object.fromEntries(
-						Object.entries(config.env ?? {}).map(([key, value]) => [key, expandConfigSecret(value) ?? value]),
-					),
-				},
-				cwd: config.cwd ? (isAbsolute(config.cwd) ? config.cwd : resolve(this.cwd, config.cwd)) : this.cwd,
-				stderr: "pipe",
-			});
-			transport.stderr?.on("data", (chunk: Buffer | string) => {
-				state.stderr = `${state.stderr ?? ""}${String(chunk)}`.slice(-16_000);
-			});
-			return transport;
+			const directory = await mkdtemp(join(tmpdir(), "riemann-mcp-stderr-"));
+			const path = join(directory, "stderr");
+			const file = await open(path, "wx", 0o600);
+			const stderr: McpStderrCapture = { path, file };
+			try {
+				const transport = new StdioClientTransport({
+					command: expandConfigSecret(config.command) ?? config.command,
+					args: (config.args ?? []).map((value) => expandConfigSecret(value) ?? value),
+					env: {
+						...getDefaultEnvironment(),
+						...Object.fromEntries(
+							Object.entries(config.env ?? {}).map(([key, value]) => [key, expandConfigSecret(value) ?? value]),
+						),
+					},
+					cwd: config.cwd ? (isAbsolute(config.cwd) ? config.cwd : resolve(this.cwd, config.cwd)) : this.cwd,
+					// The child writes directly to disk: no in-memory tail or UTF-8 chunk loss.
+					stderr: file.fd,
+				});
+				return { transport, stderr };
+			} catch (error) {
+				await this.retainStderr(stderr);
+				throw error;
+			}
 		}
 		const url = new URL(expandConfigSecret(config.url) ?? config.url ?? "");
 		const headers = Object.fromEntries(
 			Object.entries(config.headers ?? {}).map(([key, value]) => [key, expandConfigSecret(value) ?? value]),
 		);
-		return new StreamableHTTPClientTransport(url, { requestInit: { headers } });
+		return { transport: new StreamableHTTPClientTransport(url, { requestInit: { headers } }) };
+	}
+
+	private retainStderr(capture: McpStderrCapture | undefined): Promise<JsonValue> {
+		if (!capture) return Promise.resolve(null);
+		capture.settled ??= (async () => {
+			let artifact: JsonValue;
+			try {
+				await capture.file.sync();
+				const { size } = await capture.file.stat();
+				await capture.file.close();
+				artifact =
+					size === 0
+						? null
+						: await this.artifacts.putStream(createReadStream(capture.path), {
+								name: "mcp-stderr.txt",
+								mimeType: "application/octet-stream",
+								detectText: true,
+							});
+			} catch (error) {
+				await capture.file.close().catch(() => undefined);
+				throw new RiemannHostError("artifact_error", `MCP stderr retention failed: ${errorMessage(error)}`, {
+					retained_path: capture.path,
+					cause: error instanceof RiemannHostError ? (error.details ?? null) : null,
+				});
+			}
+			// Only remove the spool after the complete artifact has been registered.
+			await unlink(capture.path).catch(() => undefined);
+			await rmdir(dirname(capture.path)).catch(() => undefined);
+			return artifact;
+		})();
+		return capture.settled;
 	}
 
 	private async listTools(client: Client, signal: AbortSignal): Promise<Tool[]> {
@@ -369,7 +419,12 @@ export class RiemannMcpManager {
 				extensions: opaqueMcpJson(extensions),
 			};
 			if (result.isError) {
-				throw new RiemannHostError("mcp_tool_error", "MCP tool reported an error", normalized);
+				const message = protocolContent.find((item) => item.type === "text" && item.text.trim());
+				throw new RiemannHostError(
+					"mcp_tool_error",
+					message?.type === "text" ? message.text : "MCP tool reported an error",
+					normalized,
+				);
 			}
 			return normalized;
 		} catch (error) {
@@ -537,11 +592,11 @@ export class RiemannMcpManager {
 		};
 	}
 
-	async closeServer(serverName: string): Promise<void> {
+	async closeServer(serverName: string): Promise<JsonValue> {
 		return this.shutdown(this.requireServer(serverName));
 	}
 
-	private async shutdown(state: McpServerState): Promise<void> {
+	private async shutdown(state: McpServerState): Promise<JsonValue> {
 		const serverName = state.name;
 		state.lifecycle = {};
 		state.status = "closed";
@@ -549,6 +604,7 @@ export class RiemannMcpManager {
 		this.startups.delete(serverName);
 		startup?.controller.abort();
 		const client = state.client;
+		const stderr = state.stderr;
 		state.client = undefined;
 		state.transport = undefined;
 		if (state.namespace) this.registry.unregisterNamespace(state.namespace);
@@ -560,22 +616,29 @@ export class RiemannMcpManager {
 			...(previous ? [previous] : []),
 			...(client ? [client.close()] : []),
 			...(startup ? [startup.promise] : []),
-		]).then(() => undefined);
+		]).then(() => this.retainStderr(stderr));
 		state.closing = closing;
 		await closing;
 		if (state.closing === closing) state.closing = undefined;
+		return closing;
 	}
 
-	async refresh(serverName: string, signal: AbortSignal): Promise<JsonValue> {
+	async refresh(serverName: string, signal: AbortSignal): Promise<JsonValue | KernelHostResult> {
 		if (signal.aborted) throw new RiemannHostError("cancelled", "MCP refresh was cancelled");
 		if (this.closed) throw new RiemannHostError("closed", "MCP manager is closed");
 		const state = this.requireServer(serverName);
 		const closing = this.closeServer(serverName);
 		const lifecycle = state.lifecycle;
-		await closing;
+		const stderr = await closing;
 		if (this.closed || state.lifecycle !== lifecycle)
 			throw new RiemannHostError("closed", "MCP refresh was superseded by close");
-		return this.open(serverName, signal);
+		const opened = await this.open(serverName, signal);
+		return kernelHostResult(
+			opened,
+			stderr && typeof stderr === "object" && !Array.isArray(stderr) && typeof stderr.handle === "string"
+				? [{ type: "text", text: `[source mcp.stderr ${stderr.handle}]` }]
+				: [],
+		);
 	}
 
 	async open(serverName: string, signal: AbortSignal): Promise<JsonValue> {
@@ -637,9 +700,16 @@ export class RiemannMcpManager {
 		managerSignal: AbortSignal,
 	): Promise<McpServerState> {
 		let client: Client | undefined;
+		let stderr: McpStderrCapture | undefined;
 		try {
 			managerSignal.throwIfAborted();
-			const transport = this.createTransport(serverName, config, state);
+			const created = await this.createTransport(serverName, config);
+			const transport = created.transport;
+			stderr = created.stderr;
+			managerSignal.throwIfAborted();
+			if (this.closed || state.lifecycle !== lifecycle)
+				throw new RiemannHostError("closed", "MCP startup was closed");
+			state.stderr = stderr;
 			client = new Client({ name: "riemann-agent", version: "0.1.0" }, { capabilities: {} });
 			state.transport = transport;
 			state.client = client;
@@ -677,11 +747,13 @@ export class RiemannMcpManager {
 				state.error = errorMessage(error);
 			}
 			await client?.close().catch(() => undefined);
-			if (wasClosed) throw new RiemannHostError("closed", `MCP server ${serverName} startup was closed`);
+			const diagnostic = await this.retainStderr(stderr);
+			if (wasClosed)
+				throw new RiemannHostError("closed", `MCP server ${serverName} startup was closed`, { stderr: diagnostic });
 			throw new RiemannHostError(
 				"mcp_error",
-				`MCP server ${serverName} failed: ${state.error}${state.stderr ? `\n${state.stderr}` : ""}`,
-				undefined,
+				`MCP server ${serverName} failed: ${state.error}`,
+				{ stderr: diagnostic },
 				true,
 			);
 		}
@@ -789,8 +861,13 @@ export class RiemannMcpManager {
 				prompt: { inventory: "Close an MCP namespace.", example: "await server.close()" },
 				capability: "mcp.open",
 				handler: async (args) => {
-					await this.closeServer(args.server_name as string);
-					return null;
+					const stderr = await this.closeServer(args.server_name as string);
+					return kernelHostResult(
+						null,
+						stderr && typeof stderr === "object" && !Array.isArray(stderr) && typeof stderr.handle === "string"
+							? [{ type: "text", text: `[source mcp.stderr ${stderr.handle}]` }]
+							: [],
+					);
 				},
 			},
 		];
@@ -798,10 +875,10 @@ export class RiemannMcpManager {
 
 	async close(): Promise<void> {
 		if (this.closed) {
-			await Promise.allSettled([...this.states.values()].flatMap((state) => (state.closing ? [state.closing] : [])));
+			await Promise.all([...this.states.values()].flatMap((state) => (state.closing ? [state.closing] : [])));
 			return;
 		}
 		this.closed = true;
-		await Promise.allSettled([...this.states.values()].map((state) => this.shutdown(state)));
+		await Promise.all([...this.states.values()].map((state) => this.shutdown(state)));
 	}
 }

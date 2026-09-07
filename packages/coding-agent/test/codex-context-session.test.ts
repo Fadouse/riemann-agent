@@ -568,7 +568,7 @@ describe("Codex durable window and budget state", () => {
 		expect(restored.remaining([])).toBeNull();
 		const tool = restored.tools(() => []).find((tool) => tool.name === "get_context_remaining")!;
 		expect(await tool.execute("id", {})).toMatchObject({
-			content: [{ type: "text", text: "You have unknown tokens left in this context window." }],
+			content: [{ type: "text", text: "remaining_tokens: unknown" }],
 		});
 	});
 

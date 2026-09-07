@@ -63,7 +63,7 @@ import {
 } from "./kernel/types.ts";
 import { RiemannMcpManager } from "./mcp/manager.ts";
 import { createRiemannOpenAICompaction } from "./openai-compaction.ts";
-import { type OutputPart, OutputViews, renderModelText } from "./output.ts";
+import { type OutputPart, OutputViews, renderModelText, utf8Prefix } from "./output.ts";
 import { renderRiemannPrompt } from "./prompts.ts";
 import { ensureManagedPython } from "./python/runtime.ts";
 import { ArtifactStore } from "./state/artifacts.ts";
@@ -143,7 +143,7 @@ async function retainDisplay(artifacts: ArtifactStore, display: KernelDisplay): 
 	const handle = artifactHandle(
 		await artifacts.putJson({ data: display.data, metadata: display.metadata }, "python-display.json"),
 	);
-	const content: KernelModelContent[] = [{ type: "text", text: `Display source: ${handle}` }];
+	const content: KernelModelContent[] = [{ type: "text", text: `[source ${handle}]` }];
 	const text = textFromDisplay(display.data);
 	if (text) {
 		const retained = artifactHandle(await artifacts.putText(text, { name: "python-display.txt" }));
@@ -634,7 +634,7 @@ export class RiemannRuntime {
 							width: null,
 							height: null,
 						},
-						[{ type: "text", text: `Viewed image artifact [${image.reference.mimeType}]` }, image.reference],
+						[{ type: "text", text: `[image ${image.reference.artifactHandle}]` }, image.reference],
 					);
 				},
 			},
@@ -766,7 +766,11 @@ export class RiemannRuntime {
 					"Read the next budgeted portion of retained output or a text diagnostic using its short reference. Does not rerun commands or requests.",
 				inputSchema: Type.Object(
 					{
-						ref: Type.String({ minLength: 1, description: "Short reference returned in [more ...] or details=" }),
+						ref: Type.String({
+							minLength: 1,
+							description:
+								"Short text/JSON reference: more continues output; result is a full return; source is original data; details is diagnostics.",
+						}),
 					},
 					{ additionalProperties: false },
 				),
@@ -1240,7 +1244,7 @@ export class RiemannRuntime {
 					if (!ref) return result;
 					return kernelHostResult(isKernelHostResult(result) ? result.value : result, [
 						...(isKernelHostResult(result) ? result.modelContent : []),
-						{ type: "text", text: `[${request.operation} result ${ref}]` },
+						{ type: "text", text: `[result ${request.operation} ${ref}]` },
 					]);
 				},
 				snapshotPath: join(this.shared.store.snapshotsDir, this.agent.id, "kernel.dill"),
@@ -1276,7 +1280,6 @@ export class RiemannRuntime {
 	private async formatResult(
 		result: KernelExecuteResult,
 		header: string,
-		running = false,
 	): Promise<{
 		content: Array<TextContent | ImageContent>;
 		moreRef?: string;
@@ -1303,9 +1306,16 @@ export class RiemannRuntime {
 			modelContent.push(...(await retainDisplay(this.artifacts, display)));
 		}
 		modelContent.push(...result.modelContent);
+		const shownReferences = new Set<string>();
 		for (const content of modelContent) {
-			if (content.type === "text") sections.push(content.text);
-			else if (content.type === "output_ref") sections.push(content);
+			if (content.type === "text") {
+				// Only coalesce framework reference notices, never explicit output or payloads.
+				if (/^\[(?:source|result|image) (?:[\w.]+ )?r[0-9a-z]+\]$/.test(content.text)) {
+					if (shownReferences.has(content.text)) continue;
+					shownReferences.add(content.text);
+				}
+				sections.push(content.text);
+			} else if (content.type === "output_ref") sections.push(content);
 			else if (this.root) imageReferences.push(content);
 			else
 				sections.push(
@@ -1318,31 +1328,14 @@ export class RiemannRuntime {
 				? `${result.error.operation ?? "ipython"} [${result.error.code}]: `
 				: `${result.error.ename}: `;
 			const summary = result.error.evalue.startsWith(prefix) ? result.error.evalue : prefix + result.error.evalue;
-			const repair = result.error.repairCode ? `\nUse: ${result.error.repairCode}` : "";
-			try {
-				const traceback = stripAnsi(
-					result.error.traceback.length > 0 ? result.error.traceback.join("\n") : summary,
-				);
-				const diagnostic = await this.artifacts.putText(
-					result.error.details === undefined
-						? traceback
-						: `${traceback}\n\nHost details:\n${JSON.stringify(result.error.details, null, 2)}`,
-					{ name: "ipython-error.txt" },
-				);
-				diagnosticRef = artifactHandle(diagnostic);
-				sections.unshift(`${summary}${repair}\n[details=${diagnosticRef}]`);
-			} catch (error) {
-				sections.unshift(
-					`${summary}${repair}\n[Diagnostic unavailable: ${error instanceof Error ? error.message : String(error)}]`,
-				);
-			}
+			const traceback = stripAnsi(result.error.traceback.join("\n"));
+			const location = [...traceback.matchAll(/File ["']?<python-cell>["']?(?::|, line )(\d+)/g)].at(-1)?.[1];
+			const repair = `${location && !summary.includes("<python-cell>") ? `\nAt <python-cell>:${location}` : ""}${result.error.repairCode ? `\nUse: ${result.error.repairCode}` : ""}`;
+			const diagnostic = `${summary}${repair}\n${traceback}${result.error.details === undefined ? "" : `\nHost details:\n${JSON.stringify(result.error.details)}`}`;
+			const formatted = await this.errorOutput(summary, diagnostic, repair);
+			diagnosticRef = formatted.ref;
+			sections.unshift(formatted.text);
 		}
-		if (sections.length === 0)
-			sections.push(
-				running
-					? "No new explicit output."
-					: `Cell ${result.status === "ok" ? "completed" : result.status} in ${result.durationMs} ms. No explicit output.`,
-			);
 		const selectedImages: KernelImageReference[] = [];
 		const seenImages = new Set<string>();
 		let selectedImageBytes = 0;
@@ -1355,16 +1348,14 @@ export class RiemannRuntime {
 				selectedImageBytes + image.byteLength > MAX_MODEL_IMAGE_BYTES
 			) {
 				omittedImages += 1;
-				sections.push(
-					`Image retained: ${image.artifactHandle} (${image.mimeType}); open the artifact and call view() to display it.`,
-				);
+				sections.push(`[image ${image.artifactHandle}; deferred, use Artifact.view()]`);
 				continue;
 			}
 			selectedImages.push(image);
 			selectedImageBytes += image.byteLength;
 		}
 		if (omittedImages > 0) sections.push(`[${omittedImages} image(s) omitted by model-context budget]`);
-		const rendered = await renderModelText(this.outputViews, [`${header}\n`, ...sections]);
+		const rendered = await renderModelText(this.outputViews, [sections.length ? `${header}\n` : header, ...sections]);
 		const text = rendered.text;
 		const content: Array<TextContent | ImageContent> = [{ type: "text", text }];
 		for (const image of selectedImages) {
@@ -1404,54 +1395,59 @@ export class RiemannRuntime {
 				try {
 					options = parsePythonExec(params.code);
 				} catch (error) {
-					return runtime.toolFailure(error);
+					return runtime.toolFailure(error, "ipython", "invalid_arguments");
 				}
 				let observing = true;
-				const cellId = runtime.cells.start(options, async (cell) => {
-					const kernel = await raceWithAbortSignal(runtime.ensureKernel(), cell.signal);
-					cell.peek = () => kernel.peek();
-					const activityTracker = new RiemannActivityTracker(
-						runtime.agent.workspace,
-						(capability) => runtime.shared.store.getFileCapability(runtime.shared.run.id, capability)?.path,
-						(operation) => runtime.registry.get(operation)?.pythonReturnType === "McpResult",
-						(agentId) => {
-							const child = runtime.shared.store.getAgent(agentId);
-							return child?.runId === runtime.shared.run.id && child.parentId === runtime.agent.id
-								? child.name
-								: undefined;
-						},
-					);
-					let activities: IPythonToolDetails["activities"] = [];
-					// Exclude managed-Python/kernel startup. Keep the same dispatch timestamp
-					// through host updates and the final result; durationMs remains kernel-authoritative.
-					const startedAt = Date.now();
-					cell.details = { status: "running", startedAt, cellId: cell.id, activities };
-					if (observing) onUpdate?.({ content: [], details: { status: "running", startedAt, activities } });
-					const result = await kernel.execute(
-						`await _riemann_exec_source(${JSON.stringify(params.code)}, ${options.persist ? "True" : "False"})`,
-						{
-							signal: cell.signal,
-							outputOrder: "arrival",
-							onHostRequest: async (event) => {
-								const next = await activityTracker.observe(event);
-								if (!next) return;
-								activities = next;
-								cell.details.activities = activities;
-								if (observing)
-									onUpdate?.({
-										content: [],
-										details: {
-											status: "running",
-											startedAt,
-											durationMs: undefined,
-											activities,
-										},
-									});
+				let cellId: string;
+				try {
+					cellId = runtime.cells.start(options, async (cell) => {
+						const kernel = await raceWithAbortSignal(runtime.ensureKernel(), cell.signal);
+						cell.peek = () => kernel.peek();
+						const activityTracker = new RiemannActivityTracker(
+							runtime.agent.workspace,
+							(capability) => runtime.shared.store.getFileCapability(runtime.shared.run.id, capability)?.path,
+							(operation) => runtime.registry.get(operation)?.pythonReturnType === "McpResult",
+							(agentId) => {
+								const child = runtime.shared.store.getAgent(agentId);
+								return child?.runId === runtime.shared.run.id && child.parentId === runtime.agent.id
+									? child.name
+									: undefined;
 							},
-						},
-					);
-					return result;
-				});
+						);
+						let activities: IPythonToolDetails["activities"] = [];
+						// Exclude managed-Python/kernel startup. Keep the same dispatch timestamp
+						// through host updates and the final result; durationMs remains kernel-authoritative.
+						const startedAt = Date.now();
+						cell.details = { status: "running", startedAt, cellId: cell.id, activities };
+						if (observing) onUpdate?.({ content: [], details: { status: "running", startedAt, activities } });
+						const result = await kernel.execute(
+							`await _riemann_exec_source(${JSON.stringify(params.code)}, ${options.persist ? "True" : "False"})`,
+							{
+								signal: cell.signal,
+								outputOrder: "arrival",
+								onHostRequest: async (event) => {
+									const next = await activityTracker.observe(event);
+									if (!next) return;
+									activities = next;
+									cell.details.activities = activities;
+									if (observing)
+										onUpdate?.({
+											content: [],
+											details: {
+												status: "running",
+												startedAt,
+												durationMs: undefined,
+												activities,
+											},
+										});
+								},
+							},
+						);
+						return result;
+					});
+				} catch (error) {
+					return runtime.toolFailure(error);
+				}
 				try {
 					return await runtime.collectCell(cellId, false, signal);
 				} catch (error) {
@@ -1469,19 +1465,48 @@ export class RiemannRuntime {
 			...IPYTHON_WAIT_TOOL_METADATA,
 			execute: async (_id, params, signal) =>
 				this.collectCell(params.cell_id, params.terminate ?? false, signal).catch((error: unknown) =>
-					this.toolFailure(error),
+					this.toolFailure(error, "ipython_wait"),
 				),
 		};
 	}
 
-	private async toolFailure(error: unknown): Promise<never> {
+	private async errorOutput(
+		summary: string,
+		diagnostic: string,
+		repair = "",
+	): Promise<{ text: string; ref?: string }> {
+		try {
+			const ref = artifactHandle(await this.artifacts.putText(diagnostic, { name: "ipython-error.txt" }));
+			if (!ref) throw new Error("Diagnostic reference missing");
+			const firstLine = summary.split("\n", 1)[0];
+			const preview = utf8Prefix(firstLine, this.shared.config.limits.maxPreviewBytes);
+			return { text: `${preview}${preview === summary ? "" : "…"}${repair}\n[details=${ref}]`, ref };
+		} catch (error) {
+			// If archival fails, keep the original diagnostic in the final output path.
+			return {
+				text: `${diagnostic}\n[Diagnostic unavailable: ${error instanceof Error ? error.message : String(error)}]`,
+			};
+		}
+	}
+
+	private async toolFailure(error: unknown, operation = "ipython", code = "runtime_error"): Promise<never> {
 		if (error instanceof AgentToolExecutionError) throw error;
-		const rendered = await renderModelText(this.outputViews, [
-			error instanceof Error ? error.message : String(error),
-		]);
+		const summary =
+			error instanceof RiemannHostError
+				? `${operation} [${error.code}]: ${error.message}${error.recovery === "none" ? "" : ` (recovery=${error.recovery})`}`
+				: error instanceof Error
+					? `${operation} [${code}]: ${error.name === "Error" ? "" : `${error.name}: `}${error.message}`
+					: `${operation} [${code}]: ${String(error)}`;
+		const diagnostic = `${summary}\n${error instanceof Error ? (error.stack ?? "") : ""}${error instanceof RiemannHostError && error.details !== undefined ? `\nHost details:\n${JSON.stringify(error.details)}` : ""}`;
+		const formatted = await this.errorOutput(summary, diagnostic);
+		const rendered = await renderModelText(this.outputViews, [formatted.text]);
 		throw new AgentToolExecutionError({
 			content: [{ type: "text", text: rendered.text }],
-			details: { status: "error", ...(rendered.more ? { moreRef: rendered.more } : {}) },
+			details: {
+				status: "error",
+				...(formatted.ref ? { diagnosticRef: formatted.ref } : {}),
+				...(rendered.more ? { moreRef: rendered.more } : {}),
+			},
 		});
 	}
 
@@ -1493,10 +1518,8 @@ export class RiemannRuntime {
 			signal,
 			async (result, running, cell: PythonCell) => {
 				const status = result.status;
-				const header = running
-					? `Script running with cell ID ${cellId}. Continue with ipython_wait; do not rerun.`
-					: `Cell ${cellId} ${status}.`;
-				const formatted = await this.formatResult(result, header, running);
+				const header = running ? `running cell_id=${cellId}; use ipython_wait; do not rerun` : status;
+				const formatted = await this.formatResult(result, header);
 				return {
 					content: formatted.content,
 					details: {

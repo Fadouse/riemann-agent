@@ -364,7 +364,7 @@ export class CodexContextSession {
 						content: [
 							{
 								type: "text",
-								text: "A new context window will start without summarizing conversation history.",
+								text: "New context requested; no summary.",
 							},
 						],
 						details: undefined,
@@ -380,7 +380,7 @@ export class CodexContextSession {
 					content: [
 						{
 							type: "text",
-							text: `You have ${this.remaining(getMessages()) ?? "unknown"} tokens left in this context window.`,
+							text: `remaining_tokens: ${this.remaining(getMessages()) ?? "unknown"}`,
 						},
 					],
 					details: undefined,

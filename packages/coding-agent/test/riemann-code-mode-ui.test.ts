@@ -36,10 +36,7 @@ test.each([false, true])("exec and wait hide protocol IDs but retain output refe
 		);
 		component.setExpanded(expanded);
 		for (const status of ["running", "ok", "error"]) {
-			const header =
-				status === "running"
-					? "Script running with cell ID c1234abcd. Continue with ipython_wait; do not rerun."
-					: `Cell c1234abcd ${status}.`;
+			const header = status === "running" ? "running cell_id=c1234abcd; use ipython_wait; do not rerun" : status;
 			component.updateResult({
 				content: [{ type: "text", text: `${header}\nselected output\n[more r7]` }],
 				details: { status, cellId: "c1234abcd", moreRef: "r7" },
@@ -54,7 +51,12 @@ test.each([false, true])("exec and wait hide protocol IDs but retain output refe
 			expect(rendered.match(/\[more r7\]/g)).toHaveLength(1);
 		}
 		component.updateResult({
-			content: [{ type: "text", text: "Unknown or already collected Python cell: c1234abcd" }],
+			content: [
+				{
+					type: "text",
+					text: "ipython_wait [runtime_error]: Unknown or already collected Python cell: c1234abcd\n[details=r8]",
+				},
+			],
 			isError: true,
 		});
 		expect(component.render(100).map(stripAnsi).join("\n")).not.toContain("c1234abcd");

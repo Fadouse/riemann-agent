@@ -55,10 +55,11 @@ class RiemannError(RuntimeError):
             issue = self.details["errors"][0]
             if isinstance(issue, dict) and isinstance(issue.get("expected"), str) and issue["expected"] not in message:
                 message += f"; {issue.get('path') or '/'}: expected {issue['expected']}; received {issue.get('received', 'unknown')}"
-        return f"{self.operation or 'riemann'} [{self.code}]: {message} (recovery={self.recovery})"
+        recovery = f" (recovery={self.recovery})" if self.recovery != "none" else ""
+        return f"{self.operation or 'riemann'} [{self.code}]: {message}{recovery}"
 
     def __repr__(self) -> str:
-        return _bounded_object_repr({"operation": self.operation, "code": self.code, "message": super().__str__(), "recovery": self.recovery})
+        return _bounded_object_repr(str(self))
 
 
 class ConflictError(RiemannError):
@@ -96,6 +97,49 @@ class UnavailableError(RiemannError):
 _RIEMANN_CONTROL_FIELDS = {"run_id", "session_id", "request_id", "contract_fingerprint", "agent_id", "parent_id", "turn_id", "active_turn_id", "last_turn_id"}
 
 _RIEMANN_PREVIEW = {"maxPreviewBytes": 2048, "maxPreviewItems": 10, "maxPreviewDepth": 4, "maxPreviewNodes": 200}
+
+# Presentation only: never apply these defaults to user dictionaries or output.show.
+_RIEMANN_PREVIEW_DEFAULTS = {
+    "Artifact": {"name": None},
+    "TextSnapshot": {"kind": "text", "encoding": "utf-8"},
+    "ImageSnapshot": {"kind": "image", "path": None, "width": None, "height": None},
+    "ArtifactSlice": {"text": None, "base64": None},
+    "Page": {"skipped": []},
+    "ProcessResult": {"stdout": "", "stderr": "", "termination": "exited", "stdout_truncated": False, "stderr_truncated": False, "stdout_capture_truncated": False, "stderr_capture_truncated": False, "stdout_artifact": None, "stderr_artifact": None},
+    "SearchHit": {"published_at": None, "snippet_truncated": False},
+    "Document": {"title": None, "text_truncated": False, "artifact_kind": None, "artifact": None},
+    "AgentInfo": {"profile": None, "last_outcome": None, "output_preview": None},
+    "AgentResult": {"error": None, "transcript_handle": None, "patch_handle": None},
+}
+_RIEMANN_PREVIEW_HIDDEN = {
+    "ProcessResult": {"duration_ms"},
+    "AgentInfo": {"created_at", "updated_at", "profile", "model", "workspace", "network"},
+    "AgentResult": {"started_at", "completed_at"},
+    "RuntimeStatus": {"observed_at"},
+}
+
+
+def _preview_fields(item, depth):
+    name = type(item).__name__
+    defaults = _RIEMANN_PREVIEW_DEFAULTS.get(name, {})
+    hidden = _RIEMANN_PREVIEW_HIDDEN.get(name, set())
+    omit_empty = name in {"OperationSpec", "OperationSummary", "RuntimeStatus", "McpServerStatus", "McpResult"}
+    fields = _dataclasses.fields(item)
+    if isinstance(item, Page):
+        order = {"coverage": 0, "next_cursor": 1, "skipped": 2, "items": 3}
+        fields = sorted(fields, key=lambda field: order[field.name])
+    for field in fields:
+        key = field.name
+        if key.startswith("_") or key in _RIEMANN_CONTROL_FIELDS or key in hidden:
+            continue
+        if isinstance(item, Artifact) and depth > 0 and key != "handle":
+            continue
+        value = getattr(item, key)
+        if key in defaults and type(value) is type(defaults[key]) and value == defaults[key]:
+            continue
+        if omit_empty and (value is None or (type(value) in (dict, list, tuple) and not value)):
+            continue
+        yield key, value
 
 
 def _configure_runtime(config: dict):
@@ -192,12 +236,7 @@ def _bounded_object_repr(value, limit: int | None = None) -> str:
                         budget = [_RIEMANN_PREVIEW["maxPreviewNodes"] - nodes]
                         mcp_content = _mcp_preview_content(item, budget)
                         nodes = _RIEMANN_PREVIEW["maxPreviewNodes"] - budget[0]
-                    fields = _dataclasses.fields(item)
-                    if isinstance(item, Page):
-                        order = {"coverage": 0, "next_cursor": 1, "skipped": 2, "items": 3}
-                        fields = sorted(fields, key=lambda field: order[field.name])
-                    omit_none = type(item).__name__ in {"OperationSpec", "OperationSummary", "RuntimeStatus", "McpServerStatus", "McpResult"}
-                    entries = ((field.name, f"<{item.next_offset - item.offset} bytes>" if isinstance(item, ArtifactSlice) and field.name == "base64" and item.kind == "binary" else mcp_content if isinstance(item, McpResult) and field.name == "content" else getattr(item, field.name)) for field in fields if not field.name.startswith("_") and field.name not in _RIEMANN_CONTROL_FIELDS and not (omit_none and (getattr(item, field.name) is None or (type(getattr(item, field.name)) in (dict, list, tuple) and len(getattr(item, field.name)) == 0))))
+                    entries = ((key, f"<{item.next_offset - item.offset} bytes>" if isinstance(item, ArtifactSlice) and key == "base64" and item.kind == "binary" else mcp_content if isinstance(item, McpResult) and key == "content" else child) for key, child in _preview_fields(item, depth))
                     write(type(item).__name__ + "(")
                     closing = ")"
                 elif type(item) is dict:
@@ -263,7 +302,7 @@ def _project_show(value, *, fields=None, _seen=None, _path=(), _sources=None):
                 for name in list(names):
                     for suffix in ("_truncated", "_capture_truncated"):
                         companion = name + suffix
-                        if companion in available and companion not in names:
+                        if companion in available and companion not in names and getattr(value, companion):
                             names.append(companion)
                 result = {}
                 for name in names:
@@ -489,7 +528,7 @@ class _RiemannNamespace(_types.SimpleNamespace):
                 count += 1
                 if len(visible) < _RIEMANN_PREVIEW["maxPreviewItems"]:
                     visible.append(name)
-        return _bounded_object_repr({"namespace": self._riemann_name, "operations": visible, "omitted_operations": count - len(visible)})
+        return _bounded_object_repr({"namespace": self._riemann_name, "operations": visible, **({"omitted_operations": count - len(visible)} if count > len(visible) else {})})
 
 
 class _McpNamespace(_RiemannNamespace):
