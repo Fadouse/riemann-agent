@@ -255,7 +255,10 @@ export class CodexContextSession {
 	}
 
 	remaining(messages: AgentMessage[]): number | null {
-		const tokens = estimateCodexContextTokens(messages).tokens;
+		return this.remainingFromTokens(estimateCodexContextTokens(messages).tokens);
+	}
+
+	private remainingFromTokens(tokens: number): number | null {
 		this.prefill ??= tokens;
 		const budget = this.options.budget;
 		const scoped = budget.scope === "body_after_prefix" ? Math.max(0, tokens - this.prefill) : tokens;
@@ -269,7 +272,7 @@ export class CodexContextSession {
 	/** Returns model-only budget reminders once per window; capacity always wins over fallback grace. */
 	prepare(messages: AgentMessage[]): UserMessage[] {
 		const tokens = estimateCodexContextTokens(messages).tokens;
-		const remaining = this.remaining(messages);
+		const remaining = this.remainingFromTokens(tokens);
 		const budget = this.options.budget;
 		const scoped = budget.scope === "body_after_prefix" ? Math.max(0, tokens - (this.prefill ?? tokens)) : tokens;
 		const buffer = budget.fallbackPrompt ? (budget.fallbackBufferTokens ?? 0) : 0;

@@ -1,5 +1,5 @@
 import { fauxAssistantMessage, type ToolResultMessage, type UserMessage } from "@earendil-works/pi-ai";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { estimateCodexContextTokens } from "../src/core/codex-context-token-estimate.ts";
 
 const encrypted: ToolResultMessage = {
@@ -16,6 +16,74 @@ const wire = { type: "function_call_output", call_id: "call", id: "fco_test", ou
 const encryptedTokens = Math.ceil((Buffer.byteLength(JSON.stringify(wire)) - 1600 + Math.ceil((1600 * 9) / 16)) / 4);
 
 describe("Codex native context estimates", () => {
+	test("payload caches preserve escaping, caller mutations, framing, and image detail changes", () => {
+		const encryptedPart = { type: "encrypted_content", encrypted_content: 'a"\\\n\u0000\ud800上下文🌍' };
+		const item = { type: "function_call_output", output: [encryptedPart], label: "original" };
+		const message: UserMessage = {
+			role: "user",
+			content: [],
+			timestamp: 0,
+			providerPayload: { type: "openaiResponsesHistory", items: [item] },
+		};
+		for (const value of [encryptedPart.encrypted_content, "short", "x".repeat(2000)]) {
+			encryptedPart.encrypted_content = value;
+			item.label += "changed";
+			const encoded = Buffer.byteLength(value);
+			expect(estimateCodexContextTokens([message]).tokens).toBe(
+				Math.ceil((Buffer.byteLength(JSON.stringify(item)) - encoded + Math.ceil((encoded * 9) / 16)) / 4),
+			);
+			expect(encryptedPart.encrypted_content).toBe(value);
+		}
+		const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
+		const imagePart = { type: "input_image", detail: "auto", image_url: `data:image/png;base64,${png}` };
+		const imageItem = { type: "message", content: [imagePart] };
+		message.providerPayload = { type: "openaiResponsesHistory", items: [imageItem] };
+		for (const detail of ["auto", "original", "auto"]) {
+			imagePart.detail = detail;
+			expect(estimateCodexContextTokens([message]).tokens).toBe(
+				Math.ceil(
+					(Buffer.byteLength(JSON.stringify(imageItem)) - png.length + (detail === "original" ? 4 : 7373)) / 4,
+				),
+			);
+		}
+	});
+
+	test.each(["encrypted", "image"])("does not serialize large %s payloads for a footer estimate", (kind) => {
+		const payload = "A".repeat(16 * 1024 * 1024);
+		const part =
+			kind === "encrypted"
+				? { type: "encrypted_content", encrypted_content: payload }
+				: { type: "input_image", image_url: `data:image/png;base64,${payload}` };
+		const item = { type: "function_call_output", output: [part] };
+		const message: UserMessage = {
+			role: "user",
+			content: [],
+			timestamp: 0,
+			providerPayload: { type: "openaiResponsesHistory", items: [item] },
+		};
+		const expected = Math.ceil(
+			(Buffer.byteLength(JSON.stringify(item)) -
+				payload.length +
+				(kind === "encrypted" ? Math.ceil((payload.length * 9) / 16) : 7373)) /
+				4,
+		);
+		const stringify = vi.spyOn(JSON, "stringify");
+		try {
+			const started = performance.now();
+			for (let index = 0; index < 10; index++) expect(estimateCodexContextTokens([message]).tokens).toBe(expected);
+			console.info({ kind, payloadMiB: 16, estimate10Ms: performance.now() - started });
+			for (const [value] of stringify.mock.calls) {
+				if (value === null || typeof value !== "object" || !("output" in value) || !Array.isArray(value.output))
+					continue;
+				for (const output of value.output) {
+					expect(output.encrypted_content?.length ?? output.image_url?.length ?? 0).toBeLessThan(1024);
+				}
+			}
+		} finally {
+			stringify.mockRestore();
+		}
+	});
+
 	test("counts encrypted native outputs absent from the public tool content", () => {
 		expect(estimateCodexContextTokens([encrypted]).tokens).toBe(encryptedTokens);
 	});

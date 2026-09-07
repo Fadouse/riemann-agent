@@ -437,6 +437,40 @@ describe("Codex context through AgentSession", () => {
 });
 
 describe("Codex durable window and budget state", () => {
+	it("estimates native items only once per prepare without changing budget behavior", async () => {
+		const lifecycle = await CodexContextSession.create({
+			sessionManager: SessionManager.inMemory(),
+			agentName: "/root",
+			messages: [],
+			backend: {},
+			budget: { contextWindow: 1000, tokenLimit: 900 },
+			initialContext: async () => [],
+		});
+		const item = { type: "message", content: [{ type: "input_text", text: "sample" }] };
+		const messages: AgentMessage[] = [
+			{
+				role: "user",
+				content: [],
+				timestamp: 0,
+				providerPayload: { type: "openaiResponsesHistory", items: [item] },
+			},
+		];
+		const expected = 900 - Math.ceil(Buffer.byteLength(JSON.stringify(item)) / 4);
+		const stringify = vi.spyOn(JSON, "stringify");
+		try {
+			expect(lifecycle.prepare(messages)).toEqual([]);
+			expect(
+				stringify.mock.calls.filter(
+					([value]) => value && typeof value === "object" && "type" in value && value.type === "message",
+				),
+			).toHaveLength(1);
+		} finally {
+			stringify.mockRestore();
+		}
+		expect(lifecycle.remaining(messages)).toBe(expected);
+		expect(lifecycle.pendingReset).toBe(false);
+	});
+
 	it("restores the exact window and excludes all prior tails", async () => {
 		const manager = SessionManager.inMemory();
 		const options = {

@@ -2486,6 +2486,10 @@ describe("openai-codex streaming", () => {
 		const encoder = new TextEncoder();
 		const sse = buildSSEPayload({ status: "completed" });
 		let codexRequests = 0;
+		let markFirstRequest!: () => void;
+		const firstRequest = new Promise<void>((resolve) => {
+			markFirstRequest = resolve;
+		});
 
 		const fetchMock = vi.fn(async (input: string | URL) => {
 			const url = typeof input === "string" ? input : input.toString();
@@ -2495,6 +2499,7 @@ describe("openai-codex streaming", () => {
 
 			codexRequests++;
 			if (codexRequests === 1) {
+				markFirstRequest();
 				return new Response(JSON.stringify({ error: { code: "rate_limit_exceeded", message: "rate limited" } }), {
 					status: 429,
 					headers: makeHeaders(),
@@ -2535,6 +2540,8 @@ describe("openai-codex streaming", () => {
 			transport: "sse",
 			maxRetries: 1,
 		}).result();
+		// Compression completes on a worker, independently of the fake retry clock.
+		await firstRequest;
 		await vi.advanceTimersByTimeAsync(0);
 		expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), expectedDelay);
 
@@ -2665,6 +2672,10 @@ describe("openai-codex streaming", () => {
 		const encoder = new TextEncoder();
 		const sse = buildSSEPayload({ status: "completed" });
 		let codexRequests = 0;
+		let markFirstRequest!: () => void;
+		const firstRequest = new Promise<void>((resolve) => {
+			markFirstRequest = resolve;
+		});
 
 		const fetchMock = vi.fn(async (input: string | URL) => {
 			const url = typeof input === "string" ? input : input.toString();
@@ -2673,6 +2684,7 @@ describe("openai-codex streaming", () => {
 			}
 
 			codexRequests++;
+			markFirstRequest();
 			if (codexRequests <= 3) {
 				return new Response(JSON.stringify({ error: { code: "rate_limit_exceeded", message: "rate limited" } }), {
 					status: 429,
@@ -2719,6 +2731,7 @@ describe("openai-codex streaming", () => {
 			transport: "sse",
 			maxRetries: 3,
 		}).result();
+		await firstRequest;
 		await vi.advanceTimersByTimeAsync(0);
 		expect(retryTimeoutDelays()).toEqual([1000]);
 

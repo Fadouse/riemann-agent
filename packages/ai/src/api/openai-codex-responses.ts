@@ -29,6 +29,7 @@ import {
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { jsonValuesEqual } from "../utils/json-equal.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { uuidv7 } from "../utils/uuid.ts";
@@ -228,14 +229,20 @@ function loadNodeZlib(): typeof NodeZlib | null {
 // Returns the zstd-compressed body bytes, or null when compression is
 // unavailable (browser/Vite builds). Callers fall back to sending the
 // uncompressed JSON when this returns null.
-function compressRequestBodyZstd(bodyJson: string): Uint8Array | null {
+async function compressRequestBodyZstd(bodyJson: string): Promise<Uint8Array | null> {
 	const zlib = loadNodeZlib();
-	if (!zlib || typeof zlib.zstdCompressSync !== "function") {
+	if (!zlib || typeof zlib.zstdCompress !== "function") {
 		return null;
 	}
 	try {
-		const compressed = zlib.zstdCompressSync(bodyJson, {
-			params: { [zlib.constants.ZSTD_c_compressionLevel]: REQUEST_COMPRESSION_ZSTD_LEVEL },
+		const compressed = await new Promise<Uint8Array>((resolve, reject) => {
+			zlib.zstdCompress(
+				bodyJson,
+				{
+					params: { [zlib.constants.ZSTD_c_compressionLevel]: REQUEST_COMPRESSION_ZSTD_LEVEL },
+				},
+				(error, result) => (error ? reject(error) : resolve(result)),
+			);
 		});
 		return new Uint8Array(compressed.buffer, compressed.byteOffset, compressed.byteLength);
 	} catch {
@@ -308,7 +315,6 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					websocketHeaders.set(key, value);
 				}
 			}
-			const bodyJson = JSON.stringify(body);
 			const httpTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
 			const websocketConnectTimeoutMs = normalizeTimeoutMs(options?.websocketConnectTimeoutMs);
 			const transport = options?.transport || "auto";
@@ -380,7 +386,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 								fallbackTransport: websocketStarted ? undefined : "sse",
 								eventsEmitted: websocketStarted,
 								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+								requestBytes: new TextEncoder().encode(JSON.stringify(body)).byteLength,
 							}),
 						);
 						recordWebSocketFailure(cacheSessionId, error);
@@ -396,7 +402,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			// Compress the request body once for the SSE path. The Codex backend
 			// decodes Content-Encoding: zstd; the WebSocket transport above sends the
 			// uncompressed JSON frame, matching the official Codex client.
-			const compressedBody = compressRequestBodyZstd(bodyJson);
+			const bodyJson = JSON.stringify(body);
+			const compressedBody = await compressRequestBodyZstd(bodyJson);
 			if (compressedBody) {
 				sseHeaders.set("content-encoding", "zstd");
 			}
@@ -566,7 +573,7 @@ export async function compactOpenAICodexResponses(
 
 	const bodyJson = JSON.stringify(body);
 	const headers = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);
-	const compressedBody = compressRequestBodyZstd(bodyJson);
+	const compressedBody = await compressRequestBodyZstd(bodyJson);
 	if (compressedBody) headers.set("content-encoding", "zstd");
 	const requestBody: Uint8Array | string = compressedBody ?? bodyJson;
 	const requestTimeout = AbortSignal.timeout(options?.timeoutMs ?? 180_000);
@@ -1589,34 +1596,29 @@ function requestBodyWithoutInput(body: RequestBody): RequestBody {
 	return rest;
 }
 
-function responseInputsEqual(a: ResponseInput | undefined, b: ResponseInput | undefined): boolean {
-	return JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
-}
-
-function requestBodiesMatchExceptInput(a: RequestBody, b: RequestBody): boolean {
-	return JSON.stringify(requestBodyWithoutInput(a)) === JSON.stringify(requestBodyWithoutInput(b));
-}
-
 function getCachedWebSocketInputDelta(
 	body: RequestBody,
 	continuation: CachedWebSocketContinuationState,
 ): ResponseInput | undefined {
-	if (!requestBodiesMatchExceptInput(body, continuation.lastRequestBody)) {
+	if (!jsonValuesEqual(requestBodyWithoutInput(body), requestBodyWithoutInput(continuation.lastRequestBody))) {
 		return undefined;
 	}
 
 	const currentInput = body.input ?? [];
-	const baseline = [...(continuation.lastRequestBody.input ?? []), ...continuation.lastResponseItems];
-	if (currentInput.length < baseline.length) {
+	const previousInput = continuation.lastRequestBody.input ?? [];
+	const previousOutput = continuation.lastResponseItems;
+	const baselineLength = previousInput.length + previousOutput.length;
+	if (currentInput.length < baselineLength) {
 		return undefined;
 	}
 
-	const prefix = currentInput.slice(0, baseline.length);
-	if (!responseInputsEqual(prefix, baseline)) {
-		return undefined;
+	for (let index = 0; index < baselineLength; index++) {
+		const previous =
+			index < previousInput.length ? previousInput[index] : previousOutput[index - previousInput.length];
+		if (!jsonValuesEqual(currentInput[index], previous)) return undefined;
 	}
 
-	return currentInput.slice(baseline.length);
+	return currentInput.slice(baselineLength);
 }
 
 function buildCachedWebSocketRequestBody(entry: CachedWebSocketConnection, body: RequestBody): RequestBody {
