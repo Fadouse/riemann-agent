@@ -161,13 +161,13 @@ vim ~/.pi/agent/themes/my-theme.json
 
 - `name` is required, must be unique, and must not contain `/`.
 - `vars` is optional. Define reusable colors here, then reference them in `colors`.
-- `colors` must define all 53 required tokens. `thinkingMax` and the two search highlight tokens are optional and use the fallbacks listed below.
+- `colors` must define all 51 required tokens. Scrollbar, thinkingMax, search highlight, tool semantic, diff body/background, and syntaxText tokens are optional and use the fallbacks listed below.
 
 The `$schema` field enables editor auto-completion and validation.
 
 ## Color Tokens
 
-Every theme must define all 53 required color tokens. The optional tokens preserve compatibility with existing themes: `thinkingMax` falls back to `thinkingXhigh`, `searchMatchBg` falls back to `selectedBg`, and `searchMatchText` falls back to `text`. Other search matches use `searchMatchText` on `searchMatchBg` with an underline; the current match reverses that foreground/background pair and uses bold text.
+Every theme must define all 51 required color tokens. The optional tokens preserve compatibility with existing themes: `thinkingMax` falls back to `thinkingXhigh`, `searchMatchBg` falls back to `selectedBg`, and `searchMatchText` falls back to `text`. Other search matches use `searchMatchText` on `searchMatchBg` with an underline; the current match reverses that foreground/background pair and uses bold text.
 
 ### Core UI (13 colors)
 
@@ -184,8 +184,8 @@ Every theme must define all 53 required color tokens. The optional tokens preser
 | `dim` | Tertiary text |
 | `text` | Default text (usually `""`) |
 | `thinkingText` | Thinking block text |
-| `scrollbarTrack` | Fullscreen scrollbar track foreground |
-| `scrollbarThumb` | Fullscreen scrollbar thumb foreground, shared by normal and expanded states |
+| `scrollbarTrack` | Fullscreen scrollbar track foreground; optional, falls back to `muted` |
+| `scrollbarThumb` | Fullscreen scrollbar thumb foreground, shared by normal and expanded states; optional, falls back to `text` |
 
 ### Backgrounds & Content (11 required, 2 optional)
 
@@ -205,6 +205,19 @@ Every theme must define all 53 required color tokens. The optional tokens preser
 | `toolTitle` | Tool title |
 | `toolOutput` | Tool output text |
 
+### Tool semantic foregrounds (optional)
+
+Built-in themes use terminal-default foreground (`""`) for bold action titles, including completion titles, as well as `toolOutput`, file paths, and `toolDiffContext`. These tool-only tokens do not change global UI colors.
+
+| Token | Purpose and fallback |
+|-------|----------------------|
+| `toolEntity` | Entity names; ANSI index 6 (cyan) |
+| `toolSubAction` | Nested exploration actions; falls back to `accent` |
+| `toolStatusSuccess` | Successful status text; ANSI index 2 (green). Successful tool icons use `success` |
+| `toolStatusError` | Failed status; ANSI index 1 (red) |
+| `toolStatusWarning` | Warning status; ANSI index 3 (yellow) |
+| `toolMetadata` | Metadata; ANSI index 5 (magenta) |
+
 ### Markdown (10 colors)
 
 | Token | Purpose |
@@ -220,18 +233,25 @@ Every theme must define all 53 required color tokens. The optional tokens preser
 | `mdHr` | Horizontal rule |
 | `mdListBullet` | List bullets |
 
-### Tool Diffs (3 colors)
+### Tool Diffs (3 required, 4 optional)
 
 | Token | Purpose |
 |-------|---------|
-| `toolDiffAdded` | Added lines |
-| `toolDiffRemoved` | Removed lines |
+| `toolDiffAdded` | Added signs and line numbers |
+| `toolDiffRemoved` | Removed signs and line numbers |
 | `toolDiffContext` | Context lines |
+| `toolDiffAddedText` | Plain added body foreground; optional, falls back to `toolDiffAdded` |
+| `toolDiffRemovedText` | Plain removed body foreground; optional, falls back to `toolDiffRemoved` |
+| `toolDiffAddedBg` | Added background; optional, falls back to `toolSuccessBg` |
+| `toolDiffRemovedBg` | Removed background; optional, falls back to `toolErrorBg` |
 
-### Syntax Highlighting (9 colors)
+Built-in added/removed signs use ANSI indices 2/1. Plain diff bodies use indices 2/1 in dark and terminal-default foreground (`""`) in light, independently of signs. Their backgrounds are `#213a2b`/`#4a221d` (dark) and `#dafbe1`/`#ffebe9` (light).
+
+### Syntax Highlighting (9 required, 1 optional)
 
 | Token | Purpose |
 |-------|---------|
+| `syntaxText` | Unclassified code in recognized languages; optional, falls back to `text` |
 | `syntaxComment` | Comments |
 | `syntaxKeyword` | Keywords |
 | `syntaxFunction` | Function names |
@@ -241,6 +261,8 @@ Every theme must define all 53 required color tokens. The optional tokens preser
 | `syntaxType` | Types |
 | `syntaxOperator` | Operators |
 | `syntaxPunctuation` | Punctuation |
+
+Built-in themes retain Riemann’s default syntax palettes. Unclassified spans use terminal-default `syntaxText` (`""`) without overriding highlighted tokens, so commands keep their normal syntax highlighting. Unknown-language Markdown blocks retain `mdCodeBlock`.
 
 ### Thinking Level Borders (6 required, 1 optional)
 

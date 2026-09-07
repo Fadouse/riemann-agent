@@ -10,8 +10,10 @@ import {
 	appendToolResult,
 	previewToolOutput,
 	toolAction,
+	toolDim,
+	toolEntity,
+	toolOutput,
 	toolPath,
-	toolTarget,
 } from "./tool-display.ts";
 import {
 	type RunningToolHeader,
@@ -209,7 +211,7 @@ export class IPythonCellComponent implements Component {
 			? now - (startedAt ?? now)
 			: (details.durationMs ??
 				(startedAt === undefined || this.endedAt === undefined ? undefined : this.endedAt - startedAt));
-		const marker = animated ? runningToolMarker(now) : theme.fg("muted", "●");
+		const marker = animated ? runningToolMarker(now) : toolDim("●");
 		this.cachedRunningMarker = marker;
 		const failed = this.statusKind(details) === "error" || this.statusKind(details) === "aborted";
 		const hasRunningActivity =
@@ -235,14 +237,15 @@ export class IPythonCellComponent implements Component {
 				: interruptKey
 					? `${interruptKey} to interrupt`
 					: undefined;
+		const styledMetadata = metadata ? toolDim(metadata) : undefined;
 		const lines: string[] = showWrapper
-			? [renderToolHeader(label, this.marker(details), safeWidth, durationMs, running, metadata)]
+			? [renderToolHeader(label, this.marker(details), safeWidth, durationMs, running, styledMetadata)]
 			: [];
 		if (running && showWrapper)
 			this.headerClocks.push({
 				row: 0,
 				label,
-				metadata,
+				metadata: styledMetadata,
 				startedAt: startedAt ?? now,
 				seconds: Math.floor(Math.max(0, durationMs ?? 0) / 1_000),
 			});
@@ -270,21 +273,21 @@ export class IPythonCellComponent implements Component {
 		const parts = [toolAction("Python")];
 		if (!this.state.expanded) {
 			const status = this.statusKind(details);
-			if (details.status === "timeout") parts.push(theme.fg("error", "Timed out"));
-			else if (status === "aborted") parts.push(theme.fg("warning", "Cancelled"));
-			else if (status === "error") parts.push(theme.fg("error", details.errorName ?? "Error"));
+			if (details.status === "timeout") parts.push(theme.fg("toolStatusError", "Timed out"));
+			else if (status === "aborted") parts.push(theme.fg("toolStatusWarning", "Cancelled"));
+			else if (status === "error") parts.push(theme.fg("toolStatusError", details.errorName ?? "Error"));
 			return parts.join(" ");
 		}
 		const inputSummary = this.codeSummary();
 
 		const counts = this.lineCounts(inputSummary.lines);
-		if (counts) parts.push(theme.fg("muted", counts));
-		if (details.errorName && !this.state.isPartial) parts.push(theme.fg("error", details.errorName));
+		if (counts) parts.push(toolDim(counts));
+		if (details.errorName && !this.state.isPartial) parts.push(theme.fg("toolStatusError", details.errorName));
 		else if (
 			this.state.isPartial &&
 			(this.state.activities?.some((activity) => activity.status === "running") ?? false)
 		)
-			parts.push(theme.fg("muted", "working"));
+			parts.push(toolDim("working"));
 		return parts.join(" ");
 	}
 
@@ -303,9 +306,9 @@ export class IPythonCellComponent implements Component {
 	private marker(details: IPythonDetails): string {
 		switch (this.statusKind(details)) {
 			case "error":
-				return theme.fg("error", "●");
+				return theme.fg("toolStatusError", "●");
 			case "aborted":
-				return theme.fg("warning", "●");
+				return theme.fg("toolStatusWarning", "●");
 			case "done":
 				return theme.fg("success", "●");
 			case "running":
@@ -388,7 +391,7 @@ export class IPythonCellComponent implements Component {
 		}
 		appendToolResult(
 			lines,
-			this.compactOutputCache!.lines.map((line) => theme.fg(failed ? "error" : "toolOutput", line)),
+			this.compactOutputCache!.lines.map((line) => (failed ? theme.fg("toolStatusError", line) : toolOutput(line))),
 			width,
 		);
 	}
@@ -467,7 +470,7 @@ export class IPythonCellComponent implements Component {
 		const rows: string[] = [];
 		for (let index = 0; index < group.length; ) {
 			if (rows.length === 4) {
-				rows.push(theme.fg("dim", `… ${group.length - index} more operations`));
+				rows.push(toolDim(`… ${group.length - index} more operations`));
 				break;
 			}
 			const activity = group[index]!;
@@ -494,10 +497,10 @@ export class IPythonCellComponent implements Component {
 				index++;
 			} else {
 				verb = "search";
-				detail = `${toolPath((activity.query ?? "").replace(/[\r\n\t]/g, " "))} in ${toolPath(activity.target.replace(/[\r\n\t]/g, " "))}`;
+				detail = `${toolPath((activity.query ?? "").replace(/[\r\n\t]/g, " "))}${toolDim(" in ")}${toolPath(activity.target.replace(/[\r\n\t]/g, " "))}`;
 				index++;
 			}
-			rows.push(`${verb} ${detail}`);
+			rows.push(`${theme.fg("toolSubAction", verb)} ${detail}`);
 		}
 		appendToolOutput(lines, rows.join("\n"), width, false, true);
 	}
@@ -513,13 +516,13 @@ export class IPythonCellComponent implements Component {
 		this.pushGroupHeader(
 			lines,
 			width,
-			`${toolAction(active ? "Calling" : "Called")} ${toolTarget(group[0]!.operation)}`,
+			`${toolAction(active ? "Calling" : "Called")} ${toolEntity(group[0]!.operation)}`,
 			group,
 			active && running,
-			`${group.length} calls`,
+			toolDim(`${group.length} calls`),
 		);
 		const latest = group[group.length - 1]!;
-		if (latest.output) appendToolOutput(lines, theme.fg("toolOutput", latest.output), width);
+		if (latest.output) appendToolOutput(lines, toolOutput(latest.output), width);
 	}
 
 	private pushGroupHeader(
@@ -575,7 +578,7 @@ export class IPythonCellComponent implements Component {
 	private renderOutput(lines: string[], width: number, details: IPythonDetails): void {
 		const output = textFromBlocks(this.state.content);
 		if (!output) return;
-		const color = this.statusKind(details) === "error" ? "error" : "toolOutput";
-		appendToolOutput(lines, theme.fg(color, output), width, true);
+		const rendered = this.statusKind(details) === "error" ? theme.fg("toolStatusError", output) : toolOutput(output);
+		appendToolOutput(lines, rendered, width, true);
 	}
 }

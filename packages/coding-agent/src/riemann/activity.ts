@@ -155,16 +155,19 @@ export class RiemannActivityTracker {
 	private readonly workspace: string;
 	private readonly resolveFileCapability: FileCapabilityPathResolver;
 	private readonly isMcpOperation?: (operation: string) => boolean;
+	private readonly resolveAgentName?: (agentId: string) => string | undefined;
 	private readonly tracked = new Map<string, TrackedActivity>();
 
 	constructor(
 		workspace: string,
 		resolveFileCapability: FileCapabilityPathResolver,
 		isMcpOperation?: (operation: string) => boolean,
+		resolveAgentName?: (agentId: string) => string | undefined,
 	) {
 		this.workspace = resolve(workspace);
 		this.resolveFileCapability = resolveFileCapability;
 		this.isMcpOperation = isMcpOperation;
+		this.resolveAgentName = resolveAgentName;
 	}
 
 	async observe(event: KernelHostRequestEvent): Promise<IPythonActivity[] | undefined> {
@@ -250,13 +253,15 @@ export class RiemannActivityTracker {
 
 		if (type.startsWith("agents.")) {
 			const operation = type.slice("agents.".length);
+			const agentId = stringValue(args.agent_id);
+			const name = stringValue(args.name) || (agentId ? this.resolveAgentName?.(agentId) : undefined);
 			const activity: IPythonAgentActivity = {
 				id,
 				kind: "agent",
 				status: "running",
 				operation,
-				...(stringValue(args.agent_id) ? { agentId: stringValue(args.agent_id) } : {}),
-				...(stringValue(args.name) ? { name: stringValue(args.name) } : {}),
+				...(agentId ? { agentId } : {}),
+				...(name ? { name } : {}),
 				...(stringValue(args.task) ? { task: stringValue(args.task) } : {}),
 				...(stringValue(args.message) ? { message: stringValue(args.message) } : {}),
 				...(stringValue(args.profile) ? { profile: stringValue(args.profile) } : {}),
@@ -365,7 +370,7 @@ export class RiemannActivityTracker {
 			activity = {
 				...activity,
 				...(stringValue(info?.id) ? { agentId: stringValue(info?.id) } : {}),
-				...(stringValue(info?.name) ? { name: stringValue(info?.name) } : {}),
+				...(!activity.name && stringValue(info?.name) ? { name: stringValue(info?.name) } : {}),
 				...(agentStatus ? { agentStatus } : activity.operation === "start" ? { agentStatus: "running" } : {}),
 				...(agentOutcome ? { agentOutcome } : {}),
 				...(failed ? { status: "error", error: "Agent failed" } : {}),

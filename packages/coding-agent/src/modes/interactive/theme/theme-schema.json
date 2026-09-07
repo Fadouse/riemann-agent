@@ -34,7 +34,7 @@
 		},
 		"colors": {
 			"type": "object",
-			"description": "Theme color definitions (scrollbar, thinkingMax, and search highlight colors are optional and use compatible fallbacks)",
+			"description": "Theme color definitions (optional tokens use documented fallbacks)",
 			"required": [
 				"accent",
 				"border",
@@ -193,6 +193,42 @@
 					"$ref": "#/$defs/colorValue",
 					"description": "Tool execution box output text color"
 				},
+				"toolEntity": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Tool foreground; optional, defaults to ANSI index 6"
+				},
+				"toolSubAction": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Exploration sub-action foreground; optional, defaults to accent"
+				},
+				"toolStatusSuccess": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Tool foreground; optional, defaults to ANSI index 2"
+				},
+				"toolStatusError": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Tool foreground; optional, defaults to ANSI index 1"
+				},
+				"toolStatusWarning": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Tool foreground; optional, defaults to ANSI index 3"
+				},
+				"toolMetadata": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Tool foreground; optional, defaults to ANSI index 5"
+				},
+				"syntaxText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Unclassified syntax foreground; optional, falls back to text"
+				},
+				"toolDiffAddedBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Added diff background; optional, falls back to toolSuccessBg"
+				},
+				"toolDiffRemovedBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Removed diff background; optional, falls back to toolErrorBg"
+				},
 				"mdHeading": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Markdown heading text"
@@ -235,11 +271,19 @@
 				},
 				"toolDiffAdded": {
 					"$ref": "#/$defs/colorValue",
-					"description": "Added lines in tool diffs"
+					"description": "Added signs and line numbers in tool diffs"
 				},
 				"toolDiffRemoved": {
 					"$ref": "#/$defs/colorValue",
-					"description": "Removed lines in tool diffs"
+					"description": "Removed signs and line numbers in tool diffs"
+				},
+				"toolDiffAddedText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Plain added diff body foreground; optional, falls back to toolDiffAdded"
+				},
+				"toolDiffRemovedText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Plain removed diff body foreground; optional, falls back to toolDiffRemoved"
 				},
 				"toolDiffContext": {
 					"$ref": "#/$defs/colorValue",

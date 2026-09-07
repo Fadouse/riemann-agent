@@ -21,6 +21,55 @@ import swift from "highlight.js/lib/languages/swift.js";
 import typescript from "highlight.js/lib/languages/typescript.js";
 import { decodeHtmlEntityAt } from "./html.ts";
 
+// Highlight external executables only in command position. Bash's stock
+// highlight.js grammar recognizes built-ins, but leaves git/rg/node unstyled.
+function shellLanguage(api: Parameters<typeof bash>[0]): ReturnType<typeof bash> {
+	const language = bash(api);
+	const reserved = new Set<string>();
+	if (language.keywords && typeof language.keywords === "object") {
+		for (const words of Object.values(language.keywords)) {
+			if (typeof words === "string") {
+				for (const word of words.split(/\s+/)) reserved.add(word.split("|")[0]!);
+			}
+		}
+	}
+	const prefix =
+		/(?:^|(?<!\\)[;&|\n(])[\t ]*(?:(?:if|then|elif|else|while|until|do|!|command|exec|builtin|env|sudo|nohup|time)[\t ]+|[A-Za-z_]\w*\+?=(?:\\.|"(?:\\.|[^"\\])*"|'[^']*'|[^\s;&|"'\\])+[\t ]+)*$/;
+	const command: (typeof language.contains)[number] = {
+		className: "title",
+		begin: /[A-Za-z0-9_./][A-Za-z0-9_./:+-]*/,
+		relevance: 0,
+		"on:begin": (match, response) => {
+			const index = match.index ?? 0;
+			let before = match.input?.slice(0, index) ?? "";
+			const lineStart = before.lastIndexOf("\n") + 1;
+			if (lineStart > 0 && before[lineStart - 2] !== "\\") before = before.slice(lineStart);
+			if (
+				reserved.has(match[0]) ||
+				match.input?.[index + match[0].length] === "=" ||
+				before.endsWith("((") ||
+				!prefix.test(before)
+			)
+				response.ignoreMatch();
+		},
+	};
+	// Command substitutions inside quoted strings have their own nested mode.
+	// Leave the original quote/comment/variable rules intact and ahead of this rule.
+	const pending = [...language.contains];
+	const seen = new Set<(typeof language.contains)[number]>();
+	while (pending.length > 0) {
+		const mode = pending.pop()!;
+		if (seen.has(mode)) continue;
+		seen.add(mode);
+		if (mode.className === "subst") mode.contains = [...(mode.contains ?? []), command];
+		for (const child of mode.contains ?? []) {
+			if (child !== "self") pending.push(child);
+		}
+	}
+	language.contains.push(command);
+	return language;
+}
+
 const eagerLanguages = {
 	python,
 	java,
@@ -33,7 +82,7 @@ const eagerLanguages = {
 	c,
 	csharp,
 	nix,
-	bash,
+	bash: shellLanguage,
 	rust,
 	scala,
 	kotlin,
@@ -55,7 +104,10 @@ export function loadAllHighlightLanguages(): Promise<void> {
 		allLanguagesPromise = new Promise((resolve) => {
 			setImmediate(() => {
 				void import("highlight.js/lib/index.js").then(
-					() => resolve(),
+					() => {
+						hljs.registerLanguage("bash", shellLanguage);
+						resolve();
+					},
 					() => {
 						// Eager languages and plaintext fallback remain available.
 						resolve();

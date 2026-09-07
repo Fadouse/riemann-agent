@@ -34,6 +34,7 @@
 
 ### Changed
 
+- Aligned tool colors with Codex: terminal-default action titles and paths, Cyan entities, DIM output, ANSI status text, and tinted syntax-aware diffs; retained Riemann syntax palettes, exploration accents, and green success icons.
 - Condensed collapsed IPython transcripts into structured exploration, command, file-change, and MCP summaries; adjacent exploration and repeated MCP calls are grouped within each cell, while expanded code and output remain available.
 - Removed redundant running/tool labels from Subagent Fleet rows; the middle now shows only the latest available activity summary, without falling back to the original task.
 - Simplified the main composer and Fleet rows; removed the prompt arrow, its reserved indentation, and the shortcut hint row, with the working directory on the left and model/context on the right. Detailed statistics remain in `/session`.
@@ -58,8 +59,14 @@
 - Deferred session search-text loading until a query is entered and cancelled pending picker reads on close, while preventing selection of incomplete search results.
 - Enabled strict-prefer JSON-schema sampling by default for built-in `read`, `bash`, `powershell`, `edit`, and `write` tools, without requiring `PI_EXPERIMENTAL`. Extensions can re-register tool definitions with `constrainedSampling: false`.
 
+- Limited collapsed shell command previews to five visual rows aligned with output; expanded views retain complete commands and results.
+
 ### Fixed
 
+- Fixed diff word emphasis swapping syntax colors into bright blocks; collapsed previews retain both sides of the first replacement while expanded diffs remain complete.
+- Fixed subagent creation labels to show Spawning/Spawned and restored muted task and interaction prompts.
+- Fixed subagent interaction headers briefly displaying full IDs instead of names; missing names use short IDs with full IDs available when expanded.
+- Unified first-level tool action capitalization and separated ordinary targets from action titles using terminal foreground.
 - Fixed Fleet focus isolation, child draft and navigation restoration, hidden settlement errors, and short-window controls; release confirmation now explains worktree deletion and saved artifacts.
 - Fixed empty final IPython results, cancellation, and timeouts retaining running or successful status indicators.
 - Preserved long pasted drafts and queued image multiplicity when messages return to the editor.
@@ -82,6 +89,10 @@
 - Fixed expanded IPython activity output exceeding JavaScript spread argument limits and released derived activity caches when a cell is hidden.
 - Show file-change addition and removal counts on collapsed Edited, Added, and Deleted headers.
 - Fixed premature missing-model errors after login by waiting for catalog discovery. Radius now defaults to `balanced`, falling back to the first available Radius model when needed.
+- Fixed shell command highlighting by parsing complete scripts before wrapping and recognizing external command names.
+- Fixed tool output gutters to use vertical continuations and a final corner; successful shell commands with empty output now show `(no output)`.
+- Fixed tool header metadata spacing to use a single space before parentheses.
+
 
 ## [0.85.1] - 2026-09-05
 

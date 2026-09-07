@@ -143,6 +143,91 @@ describe("Riemann IPython activity tracking", () => {
 		});
 	});
 
+	test.each(["wait", "info", "steer", "stop", "release"])(
+		"resolves %s names in a fresh cell and retains them through completion and errors",
+		async (operation) => {
+			for (const fail of [false, true]) {
+				const resolveAgentName = vi.fn((id: string) => (id === "child-1" ? "Reviewer" : undefined));
+				const tracker = new RiemannActivityTracker(process.cwd(), () => undefined, undefined, resolveAgentName);
+				const agentRequest = request(`agents.${operation}`, { agent_id: "child-1" });
+				const running = await observe(tracker, {
+					phase: "start",
+					requestId: "agent-1",
+					request: agentRequest,
+					startedAt: 1,
+				});
+				expect(running[0]).toMatchObject({
+					kind: "agent",
+					status: "running",
+					agentId: "child-1",
+					name: "Reviewer",
+				});
+				expect(resolveAgentName).toHaveBeenCalledWith("child-1");
+				resolveAgentName.mockReturnValue(undefined);
+				const finished = await observe(tracker, {
+					phase: "end",
+					requestId: "agent-1",
+					request: agentRequest,
+					durationMs: 2,
+					...(fail
+						? {
+								error: {
+									code: "not_found",
+									message: "Agent unavailable",
+									operation: agentRequest.operation,
+									requestId: "agent-1",
+									retryable: false,
+								},
+							}
+						: { result: null }),
+				});
+				expect(finished[0]).toMatchObject({ status: fail ? "error" : "ok", agentId: "child-1", name: "Reviewer" });
+				expect(running[0].status).toBe("running");
+			}
+		},
+	);
+
+	test("keeps an established name instead of replacing it with returned identity text", async () => {
+		const tracker = new RiemannActivityTracker(process.cwd(), () => undefined);
+		const agentRequest = request("agents.start", { name: "Reviewer", task: "Review" });
+		await observe(tracker, { phase: "start", requestId: "agent-1", request: agentRequest, startedAt: 1 });
+		const finished = await observe(tracker, {
+			phase: "end",
+			requestId: "agent-1",
+			request: agentRequest,
+			durationMs: 2,
+			result: { id: "child-1", name: "child-1" },
+		});
+		expect(finished[0]).toMatchObject({ agentId: "child-1", name: "Reviewer" });
+	});
+
+	test.each(["Reviewer", "", null])("uses returned names when unresolved: %s", async (name) => {
+		const tracker = new RiemannActivityTracker(
+			process.cwd(),
+			() => undefined,
+			undefined,
+			() => undefined,
+		);
+		const agentRequest = request("agents.wait", { agent_id: "child-1" });
+		const running = await observe(tracker, {
+			phase: "start",
+			requestId: "agent-1",
+			request: agentRequest,
+			startedAt: 1,
+		});
+		expect(running[0]).not.toHaveProperty("name");
+		const finished = await observe(tracker, {
+			phase: "end",
+			requestId: "agent-1",
+			request: agentRequest,
+			durationMs: 2,
+			result: { agent: { id: "child-1", name }, outcome: "ok" },
+		});
+		expect(finished[0]).toMatchObject({ agentId: "child-1", agentOutcome: "ok" });
+		if (name) expect(finished[0]).toHaveProperty("name", name);
+		else expect(finished[0]).not.toHaveProperty("name");
+	});
+
 	test("keeps bounded stream and error text on grapheme boundaries", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-activity-unicode-"));
 		roots.push(root);

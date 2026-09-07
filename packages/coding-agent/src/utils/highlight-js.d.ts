@@ -7,8 +7,18 @@ interface HighlightJsOptions {
 	ignoreIllegals?: boolean;
 }
 
-interface HighlightJsLanguageDefinition {
+interface HighlightJsMode {
+	className?: string;
+	begin?: string | RegExp;
+	relevance?: number;
+	contains?: Array<HighlightJsMode | "self">;
+	"on:begin"?: (match: RegExpMatchArray, response: { ignoreMatch(): void }) => void;
+}
+
+interface HighlightJsLanguageDefinition extends HighlightJsMode {
 	readonly name?: string;
+	keywords?: string | Record<string, unknown>;
+	contains: HighlightJsMode[];
 }
 
 type HighlightJsLanguageFactory = (hljs: HighlightJsApi) => HighlightJsLanguageDefinition;

@@ -58,6 +58,15 @@ export type ThemeColor =
 	| "customMessageLabel"
 	| "toolTitle"
 	| "toolOutput"
+	| "toolEntity"
+	| "toolSubAction"
+	| "toolStatusSuccess"
+	| "toolStatusError"
+	| "toolStatusWarning"
+	| "toolMetadata"
+	| "toolDiffAddedText"
+	| "toolDiffRemovedText"
+	| "syntaxText"
 	| "mdHeading"
 	| "mdLink"
 	| "mdLinkUrl"
@@ -96,10 +105,25 @@ export type ThemeBg =
 	| "customMessageBg"
 	| "toolPendingBg"
 	| "toolSuccessBg"
-	| "toolErrorBg";
+	| "toolErrorBg"
+	| "toolDiffAddedBg"
+	| "toolDiffRemovedBg";
 
-type OptionalThemeColor = "scrollbarTrack" | "scrollbarThumb" | "thinkingMax" | "searchMatchText";
-type OptionalThemeBg = "searchMatchBg";
+type OptionalThemeColor =
+	| "scrollbarTrack"
+	| "scrollbarThumb"
+	| "thinkingMax"
+	| "searchMatchText"
+	| "toolEntity"
+	| "toolSubAction"
+	| "toolStatusSuccess"
+	| "toolStatusError"
+	| "toolStatusWarning"
+	| "toolMetadata"
+	| "toolDiffAddedText"
+	| "toolDiffRemovedText"
+	| "syntaxText";
+type OptionalThemeBg = "searchMatchBg" | "toolDiffAddedBg" | "toolDiffRemovedBg";
 
 type ColorMode = "truecolor" | "256color";
 
@@ -258,13 +282,7 @@ function resolveThemeColors<T extends Record<string, ColorValue>>(
 	return resolved as Record<keyof T, string | number>;
 }
 
-function withThemeColorFallbacks(colors: ThemeJson["colors"]): ThemeJson["colors"] & {
-	scrollbarTrack: ColorValue;
-	scrollbarThumb: ColorValue;
-	thinkingMax: ColorValue;
-	searchMatchBg: ColorValue;
-	searchMatchText: ColorValue;
-} {
+function withThemeColorFallbacks(colors: ThemeJson["colors"]): Required<ThemeJson["colors"]> {
 	return {
 		...colors,
 		scrollbarTrack: colors.scrollbarTrack ?? colors.muted,
@@ -272,6 +290,17 @@ function withThemeColorFallbacks(colors: ThemeJson["colors"]): ThemeJson["colors
 		thinkingMax: colors.thinkingMax ?? colors.thinkingXhigh,
 		searchMatchBg: colors.searchMatchBg ?? colors.selectedBg,
 		searchMatchText: colors.searchMatchText ?? colors.text,
+		toolEntity: colors.toolEntity ?? 6,
+		toolSubAction: colors.toolSubAction ?? colors.accent,
+		toolStatusSuccess: colors.toolStatusSuccess ?? 2,
+		toolStatusError: colors.toolStatusError ?? 1,
+		toolStatusWarning: colors.toolStatusWarning ?? 3,
+		toolMetadata: colors.toolMetadata ?? 5,
+		syntaxText: colors.syntaxText ?? colors.text,
+		toolDiffAddedText: colors.toolDiffAddedText ?? colors.toolDiffAdded,
+		toolDiffRemovedText: colors.toolDiffRemovedText ?? colors.toolDiffRemoved,
+		toolDiffAddedBg: colors.toolDiffAddedBg ?? colors.toolSuccessBg,
+		toolDiffRemovedBg: colors.toolDiffRemovedBg ?? colors.toolErrorBg,
 	};
 }
 
@@ -306,6 +335,15 @@ export class Theme {
 			scrollbarThumb: fgColors.scrollbarThumb ?? fgColors.text,
 			thinkingMax: fgColors.thinkingMax ?? fgColors.thinkingXhigh,
 			searchMatchText: fgColors.searchMatchText ?? fgColors.text,
+			toolEntity: fgColors.toolEntity ?? 6,
+			toolSubAction: fgColors.toolSubAction ?? fgColors.accent,
+			toolStatusSuccess: fgColors.toolStatusSuccess ?? 2,
+			toolStatusError: fgColors.toolStatusError ?? 1,
+			toolStatusWarning: fgColors.toolStatusWarning ?? 3,
+			toolMetadata: fgColors.toolMetadata ?? 5,
+			syntaxText: fgColors.syntaxText ?? fgColors.text,
+			toolDiffAddedText: fgColors.toolDiffAddedText ?? fgColors.toolDiffAdded,
+			toolDiffRemovedText: fgColors.toolDiffRemovedText ?? fgColors.toolDiffRemoved,
 		};
 		for (const [key, value] of Object.entries(colors) as [ThemeColor, string | number][]) {
 			this.fgColors.set(key, fgAnsi(value, mode));
@@ -314,6 +352,8 @@ export class Theme {
 		const backgrounds = {
 			...bgColors,
 			searchMatchBg: bgColors.searchMatchBg ?? bgColors.selectedBg,
+			toolDiffAddedBg: bgColors.toolDiffAddedBg ?? bgColors.toolSuccessBg,
+			toolDiffRemovedBg: bgColors.toolDiffRemovedBg ?? bgColors.toolErrorBg,
 		};
 		for (const [key, value] of Object.entries(backgrounds) as [ThemeBg, string | number][]) {
 			this.bgColors.set(key, bgAnsi(value, mode));
@@ -538,6 +578,8 @@ function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string
 		"toolPendingBg",
 		"toolSuccessBg",
 		"toolErrorBg",
+		"toolDiffAddedBg",
+		"toolDiffRemovedBg",
 	]);
 	for (const [key, value] of Object.entries(resolvedColors)) {
 		if (bgColorKeys.has(key)) {
@@ -1038,6 +1080,7 @@ let cachedCliHighlightTheme: CliHighlightTheme | undefined;
 
 function buildCliHighlightTheme(t: Theme): CliHighlightTheme {
 	return {
+		default: (s: string) => t.fg("syntaxText", s),
 		keyword: (s: string) => t.fg("syntaxKeyword", s),
 		built_in: (s: string) => t.fg("syntaxType", s),
 		literal: (s: string) => t.fg("syntaxNumber", s),

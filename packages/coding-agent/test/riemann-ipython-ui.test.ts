@@ -344,7 +344,7 @@ describe("Riemann IPython transcript", () => {
 		const collapsed = stripAnsi(component.render(90).join("\\n"));
 		expect(collapsed).toContain("npm test");
 		expect(collapsed).toContain("Tests 12 passed");
-		expect(collapsed).toContain("spawn Reviewer");
+		expect(collapsed).toContain("Spawn Reviewer");
 		expect(collapsed).toContain("src/new.ts");
 		expect(collapsed).toContain("src/main.ts");
 		expect(collapsed).toContain("+1");

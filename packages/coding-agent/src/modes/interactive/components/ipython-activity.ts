@@ -11,7 +11,20 @@ import type {
 import { stripAnsi } from "../../../utils/ansi.ts";
 import { highlightCode, theme } from "../theme/theme.ts";
 import { renderDiff } from "./diff.ts";
-import { appendToolCode, appendToolOutput, toolAction, toolPath, toolTarget } from "./tool-display.ts";
+import { previewIPythonDiff } from "./ipython-diff-preview.ts";
+import {
+	appendToolCode,
+	appendToolOutput,
+	appendToolResult,
+	TOOL_BODY_COLUMNS,
+	TOOL_PREVIEW_ROWS,
+	toolAction,
+	toolAgentName,
+	toolDim,
+	toolEntity,
+	toolOutput,
+	toolTarget,
+} from "./tool-display.ts";
 import {
 	formatAgentCompletion,
 	type RunningToolHeader,
@@ -23,8 +36,9 @@ import {
 
 function marker(activity: IPythonActivity, runningMarker: string): string {
 	if (activity.status === "running") return runningMarker;
-	if (activity.status === "error") return theme.fg("error", "●");
-	return theme.fg("success", "●");
+	if (activity.status === "ok") return theme.fg("success", "●");
+	if (activity.kind !== "shell" && activity.kind !== "mcp") return toolDim(toolTarget("●"));
+	return theme.fg("toolStatusError", "●");
 }
 
 function replaceTabs(text: string): string {
@@ -173,17 +187,13 @@ export class IPythonActivityComponent implements Component {
 	}
 
 	private renderShell(lines: string[], width: number, activity: IPythonShellActivity): void {
-		const newline = activity.command.search(/[\r\n]/);
-		const firstLine = replaceTabs(newline < 0 ? activity.command : activity.command.slice(0, newline));
-		const multiline = newline < 0 ? "" : theme.fg("dim", " [multiline]");
-		const command = truncateToWidth(firstLine, Math.max(1, width), "…");
-		const highlighted = highlightCode(command, "bash")[0] ?? command;
 		const action = toolAction(activity.status === "running" ? "Running" : "Ran");
-		this.pushHeader(lines, width, activity, this.expanded ? action : `${action}${multiline} ${highlighted}`);
-		if (this.expanded) {
-			const cwd = activity.cwd ? theme.fg("dim", `cd ${activity.cwd} && `) : "";
-			appendToolCode(lines, cwd + highlightCode(activity.command, "bash").join("\n"), width);
-		}
+		this.pushHeader(lines, width, activity, action);
+		// Parse the complete script before wrapping: clipping first loses quote,
+		// substitution, and here-document context and can change highlighting.
+		const highlighted = highlightCode(activity.command, "bash").join("\n");
+		const cwd = this.expanded && activity.cwd ? toolDim(`cd ${activity.cwd} && `) : "";
+		appendToolCode(lines, replaceTabs(cwd + highlighted), width, this.expanded);
 		// stdout may already end with a newline. Never insert a second separator.
 		let output = activity.stdout ?? "";
 		if (activity.stderr) {
@@ -205,24 +215,26 @@ export class IPythonActivityComponent implements Component {
 					: activity.exitCode !== undefined && activity.exitCode !== null
 						? `Exit ${activity.exitCode}`
 						: "Command failed");
-			parts.push(theme.fg("error", reason));
+			parts.push(theme.fg("toolStatusError", reason));
 		}
-		if (output) parts.push(theme.fg("toolOutput", replaceTabs(output)));
+		if (output) parts.push(toolOutput(replaceTabs(output)));
 		for (const stream of ["stdout", "stderr"] as const) {
 			const captured = activity[`${stream}CaptureTruncated`];
 			if (!captured && !activity[`${stream}Truncated`]) continue;
 			const handle = activity[`${stream}ArtifactHandle`];
 			parts.push(
-				theme.fg(
-					"dim",
+				toolDim(
 					`[${stream} ${captured ? "capture incomplete" : "preview omitted"}${this.expanded && handle ? `; ${handle}` : ""}]`,
 				),
 			);
 		}
+		if (activity.status === "ok" && !failed && !parts.some((part) => stripAnsi(part).trim())) {
+			parts.push(toolDim("(no output)"));
+		}
 		if (this.expanded && !failed && activity.exitCode !== undefined && activity.exitCode !== null) {
 			if (parts.length > 0 && /[\r\n]$/.test(stripAnsi(parts[parts.length - 1]!))) {
-				parts[parts.length - 1] += theme.fg("dim", `exit ${activity.exitCode}`);
-			} else parts.push(theme.fg("dim", `exit ${activity.exitCode}`));
+				parts[parts.length - 1] += toolDim(`exit ${activity.exitCode}`);
+			} else parts.push(toolDim(`exit ${activity.exitCode}`));
 		}
 		appendToolOutput(lines, parts.join("\n"), width, this.expanded);
 	}
@@ -231,28 +243,28 @@ export class IPythonActivityComponent implements Component {
 		const path = activity.target.replace(/[\r\n\t]/g, " ");
 		const detail =
 			activity.operation === "search" && activity.query
-				? `${toolPath(activity.query.replace(/[\r\n\t]/g, " "))} in ${toolPath(path)}`
-				: toolPath(path);
-		this.pushHeader(lines, width, activity, `${activity.operation} ${detail}`);
-		if (activity.error) appendToolOutput(lines, theme.fg("error", activity.error), width, this.expanded);
+				? `${toolTarget(activity.query.replace(/[\r\n\t]/g, " "))} in ${toolTarget(path)}`
+				: toolTarget(path);
+		this.pushHeader(lines, width, activity, `${toolAction(activity.operation)} ${detail}`);
+		if (activity.error) appendToolOutput(lines, theme.fg("toolStatusError", activity.error), width, this.expanded);
 	}
 
 	private renderMcp(lines: string[], width: number, activity: IPythonMcpActivity): void {
 		const verb = activity.status === "running" ? "Calling" : "Called";
-		this.pushHeader(lines, width, activity, `${toolAction(verb)} ${toolTarget(activity.operation)}`);
+		this.pushHeader(lines, width, activity, `${toolAction(verb)} ${toolEntity(activity.operation)}`);
 		if (this.expanded && activity.input !== undefined) {
-			appendToolCode(lines, theme.fg("dim", `Input:\n${replaceTabs(activity.input)}`), width);
+			appendToolCode(lines, toolDim(`Input:\n${replaceTabs(activity.input)}`), width);
 		}
 		const parts: string[] = [];
 		if (activity.error || activity.status === "error")
-			parts.push(theme.fg("error", `Error: ${activity.error ?? "MCP call failed"}`));
-		if (activity.output !== undefined) parts.push(theme.fg("toolOutput", replaceTabs(activity.output)));
+			parts.push(toolOutput(`Error: ${activity.error ?? "MCP call failed"}`));
+		if (activity.output !== undefined) parts.push(toolOutput(replaceTabs(activity.output)));
 		appendToolOutput(lines, parts.join("\n"), width, this.expanded);
 	}
 
 	private renderAgent(lines: string[], width: number, activity: IPythonAgentActivity): void {
 		if (activity.operation === "list" && activity.status !== "error" && !activity.error) return;
-		const name = activity.name ?? activity.agentId ?? "agents";
+		const name = activity.name?.trim() || (activity.agentId ? `Agent ${activity.agentId.slice(0, 8)}` : "agents");
 		const outcome = activity.agentOutcome;
 		if (
 			activity.operation === "wait" &&
@@ -262,16 +274,36 @@ export class IPythonActivityComponent implements Component {
 		) {
 			lines.push(truncateToWidth(` ${formatAgentCompletion(name, outcome)}`, width, "…"));
 		} else {
-			const metadata = [activity.modelRole ?? activity.profile, activity.workspace]
+			const modelRole = activity.modelRole ?? activity.profile;
+			const metadata = [
+				modelRole ? theme.fg("toolMetadata", modelRole) : undefined,
+				activity.workspace ? toolDim(activity.workspace) : undefined,
+			]
 				.filter((value): value is string => Boolean(value))
-				.join(", ");
-			const operation = activity.status === "error" ? `${activity.operation} failed` : activity.operation;
-			this.pushHeader(lines, width, activity, `${toolAction(operation)} ${toolTarget(name)}`, metadata || undefined);
+				.join(toolDim(", "));
+			const operation =
+				activity.operation === "start"
+					? activity.status === "running"
+						? "Spawning"
+						: activity.status === "error"
+							? "Spawn failed"
+							: "Spawned"
+					: activity.status === "error"
+						? `${activity.operation} failed`
+						: activity.operation;
+			this.pushHeader(
+				lines,
+				width,
+				activity,
+				`${toolAction(operation)} ${toolAgentName(name)}`,
+				metadata || undefined,
+			);
 		}
 		const parts: string[] = [];
-		if (activity.error) parts.push(theme.fg("error", activity.error));
+		if (activity.error) parts.push(theme.fg("toolStatusError", activity.error));
+		if (this.expanded && activity.agentId) parts.push(toolDim(`ID: ${activity.agentId}`));
 		const body = activity.task ?? activity.message;
-		if (body) parts.push(theme.fg("toolOutput", body));
+		if (body) parts.push(theme.fg("muted", body));
 		appendToolOutput(lines, parts.join("\n"), width, this.expanded);
 	}
 
@@ -286,7 +318,7 @@ export class IPythonActivityComponent implements Component {
 			lines,
 			width,
 			activity,
-			`${toolAction(verb)} ${toolPath(activity.path)}`,
+			`${activity.status === "error" ? theme.bold(theme.fg("toolMetadata", verb)) : toolAction(verb)} ${toolTarget(activity.path)}`,
 			this.changeStats(activity),
 		);
 		this.renderFileResult(lines, width, activity);
@@ -298,7 +330,7 @@ export class IPythonActivityComponent implements Component {
 			lines,
 			width,
 			activity,
-			`${toolAction(verb)} ${toolPath(activity.path)}`,
+			`${activity.status === "error" ? theme.bold(theme.fg("toolMetadata", verb)) : toolAction(verb)} ${toolTarget(activity.path)}`,
 			this.changeStats(activity),
 		);
 		this.renderFileResult(lines, width, activity);
@@ -308,7 +340,7 @@ export class IPythonActivityComponent implements Component {
 		const stats: string[] = [];
 		if (activity.additions) stats.push(theme.fg("toolDiffAdded", `+${activity.additions}`));
 		if (activity.removals) stats.push(theme.fg("toolDiffRemoved", `-${activity.removals}`));
-		if (activity.diffTruncated) stats.push("diff truncated");
+		if (activity.diffTruncated) stats.push(toolDim("diff truncated"));
 		return stats.length > 0 ? stats.join(" ") : undefined;
 	}
 
@@ -318,19 +350,22 @@ export class IPythonActivityComponent implements Component {
 		activity: IPythonFileActivity | IPythonPatchActivity,
 	): void {
 		const parts: string[] = [];
-		if (activity.error) parts.push(theme.fg("error", activity.error));
-		if (activity.diff) {
-			let diff = activity.diff;
-			if (!this.expanded) {
-				const rows = diff.split("\n");
-				const firstChange = rows.findIndex((row) => /^[+-]\s*\d/.test(row));
-				const start = Math.max(0, firstChange - 1);
-				if (start > 0) parts.push(theme.fg("dim", `… ${start} context lines omitted`));
-				diff = rows.slice(start).join("\n");
-			}
-			parts.push(renderDiff(diff));
+		if (!this.expanded && activity.diff) {
+			const bodyWidth = Math.max(1, width - TOOL_BODY_COLUMNS);
+			if (activity.error)
+				parts.push(
+					truncateToWidth(theme.fg("toolStatusError", activity.error.replace(/[\r\n]/g, " ")), bodyWidth, "…"),
+				);
+			parts.push(...previewIPythonDiff(activity.diff, activity.path, bodyWidth, TOOL_PREVIEW_ROWS - parts.length));
+			appendToolResult(lines, parts, width);
+			return;
 		}
-		// Keep the first changed region together instead of splicing unrelated diff tails.
+		if (activity.error) parts.push(theme.fg("toolStatusError", activity.error));
+		if (activity.diff) {
+			parts.push(
+				renderDiff(activity.diff, { filePath: activity.path, width: Math.max(1, width - TOOL_BODY_COLUMNS) }),
+			);
+		}
 		appendToolOutput(lines, parts.join("\n"), width, this.expanded, true);
 	}
 }

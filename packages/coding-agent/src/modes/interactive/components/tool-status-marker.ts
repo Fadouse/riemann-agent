@@ -1,6 +1,6 @@
 import { type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../theme/theme.ts";
-import { toolAction, toolTarget } from "./tool-display.ts";
+import { toolAction, toolAgentName, toolDim } from "./tool-display.ts";
 
 export const TOOL_STATUS_FRAME_MS = 80;
 const PERIOD_MS = 2_000;
@@ -29,7 +29,8 @@ export function runningToolMarker(now = Date.now()): string {
 				);
 				return `\x1b[38;2;${rgb.join(";")}m●\x1b[39m`;
 			}
-			return theme.fg(intensity < 0.2 ? "dim" : intensity < 0.6 ? "muted" : "text", "●");
+			const marker = theme.fg("text", "●");
+			return intensity < 0.6 ? `${toolDim(marker)}\x1b[39m` : marker;
 		});
 		palette = { dim, text, mode, frames };
 		palettes.set(theme, palette);
@@ -88,16 +89,16 @@ export function renderToolHeader(
 	width: number,
 	durationMs?: number,
 	running = false,
+	// Caller-styled metadata; durations and separators are dimmed here.
 	metadata?: string,
 ): string {
 	const details = [
 		metadata,
-		durationMs === undefined || durationMs < 1_000 ? undefined : formatToolDuration(durationMs, running),
+		durationMs === undefined || durationMs < 1_000 ? undefined : toolDim(formatToolDuration(durationMs, running)),
 	]
 		.filter((value): value is string => Boolean(value))
-		.map((value) => theme.fg("dim", value))
-		.join(theme.fg("dim", ", "));
-	const suffix = details ? `${theme.fg("dim", "  (")}${details}${theme.fg("dim", ")")}` : "";
+		.join(toolDim(", "));
+	const suffix = details ? `${toolDim(" (")}${details}${toolDim(")")}` : "";
 	const available = width - visibleWidth(suffix);
 	if (available < 4) return truncateToWidth(` ${marker} ${label}${suffix}`, width, "");
 	return truncateToWidth(` ${truncateToWidth(`${marker} ${label}`, available - 1, "…")}${suffix}`, width, "");
@@ -126,7 +127,10 @@ export function formatAgentCompletion(
 	outcome: "ok" | "error" | "cancelled",
 	colors: Theme = theme,
 ): string {
-	const label = outcome === "ok" ? "completed" : outcome === "error" ? "failed" : "cancelled";
-	const color = outcome === "ok" ? "success" : outcome === "error" ? "error" : "dim";
-	return `${colors.fg(color, outcome === "cancelled" ? "■" : "●")} ${toolAction(label, colors)} ${toolTarget(name.replace(/[\r\n\t]/g, " "), colors)}`;
+	const label = outcome === "ok" ? "Completed" : outcome === "error" ? "Failed" : "Cancelled";
+	const marker = colors.fg(
+		outcome === "ok" ? "success" : outcome === "error" ? "toolStatusError" : "toolStatusWarning",
+		outcome === "cancelled" ? "■" : "●",
+	);
+	return `${marker} ${toolAction(label, colors)} ${toolAgentName(name.replace(/[\r\n\t]/g, " "), colors)}`;
 }

@@ -1342,6 +1342,12 @@ export class RiemannRuntime {
 					runtime.agent.workspace,
 					(capability) => runtime.shared.store.getFileCapability(runtime.shared.run.id, capability)?.path,
 					(operation) => runtime.registry.get(operation)?.pythonReturnType === "McpResult",
+					(agentId) => {
+						const child = runtime.shared.store.getAgent(agentId);
+						return child?.runId === runtime.shared.run.id && child.parentId === runtime.agent.id
+							? child.name
+							: undefined;
+					},
 				);
 				let activities: IPythonToolDetails["activities"] = [];
 				// Exclude managed-Python/kernel startup. Keep the same dispatch timestamp
