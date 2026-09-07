@@ -27,27 +27,29 @@ export function toolAgentName(text: string, colors: Theme = theme): string {
 	return colors.bold(toolEntity(text, colors));
 }
 
-/** Apply terminal faint intensity, retaining log colors even across embedded style resets. */
-export function toolDim(text: string): string {
+/** Former faint regions use theme gray; explicit syntax and log colors remain intact. */
+export function toolDim(text: string, colors: Theme = theme): string {
+	const gray = colors.getFgAnsi("muted");
 	const content = text.replace(/\x1b\[([\d;:]*)m/g, (sequence: string, parameters: string) => {
 		const codes = parameters.split(";");
-		let reset = false;
+		let resetForeground = false;
 		for (let index = 0; index < codes.length; index++) {
-			const code = Number(codes[index]);
-			if (code === 0 || code === 22) reset = true;
-			// Extended-color channel values are not SGR commands (including 0 and 22).
+			const code = Number(codes[index]!.split(":")[0]);
+			if (code === 0 || code === 39) resetForeground = true;
+			if ((code >= 30 && code <= 38) || (code >= 90 && code <= 97)) resetForeground = false;
+			// Extended-color channels are values, not foreground reset commands.
 			if (code === 38 || code === 48 || code === 58) {
 				if (codes[index + 1] === "2") index += 4;
 				else if (codes[index + 1] === "5") index += 2;
 			}
 		}
-		return reset ? `${sequence}\x1b[2m` : sequence;
+		return resetForeground ? `${sequence}${gray}` : sequence;
 	});
-	return `\x1b[2m${content}\x1b[22m`;
+	return colors.fg("muted", content);
 }
 
 export function toolOutput(text: string, colors: Theme = theme): string {
-	return toolDim(colors.fg("toolOutput", text));
+	return toolDim(colors.fg("toolOutput", text), colors);
 }
 
 /** Bounded visual-row preview; only preview-edge blank rows are discarded. */
