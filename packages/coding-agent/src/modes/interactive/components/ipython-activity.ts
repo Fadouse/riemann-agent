@@ -36,9 +36,9 @@ import {
 
 function marker(activity: IPythonActivity, runningMarker: string): string {
 	if (activity.status === "running") return runningMarker;
-	if (activity.status === "ok") return theme.fg("success", "●");
-	if (activity.kind !== "shell" && activity.kind !== "mcp") return toolDim(toolTarget("●"));
-	return theme.fg("toolStatusError", "●");
+	if (activity.status === "ok") return theme.fg("success", "•");
+	if (activity.kind !== "shell" && activity.kind !== "mcp") return toolDim(toolTarget("•"));
+	return theme.fg("toolStatusError", "•");
 }
 
 function replaceTabs(text: string): string {

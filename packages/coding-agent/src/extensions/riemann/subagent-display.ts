@@ -78,7 +78,7 @@ export function renderSubagentFleet(
 				? theme.fg("accent", "●")
 				: agent.status === "running"
 					? theme.fg("accent", "○")
-					: subagentStatusIcon(agent, theme);
+					: subagentStatusIcon(agent, theme, "●");
 		const left = `  ${icon} ${styledName}`;
 		const elapsed = theme.fg("dim", formatFleetElapsed(agent, now));
 		// Keep the Agent name visible before adding its latest activity and timing.
@@ -105,12 +105,12 @@ export function subagentStatusText(agent: SubagentUiSnapshot): string {
 	return "Idle";
 }
 
-export function subagentStatusIcon(agent: SubagentUiSnapshot, theme: Theme): string {
-	if (agent.status === "running") return theme.fg("accent", "●");
+export function subagentStatusIcon(agent: SubagentUiSnapshot, theme: Theme, dot: "•" | "●" = "•"): string {
+	if (agent.status === "running") return theme.fg("accent", dot);
 	if (agent.status === "queued") return theme.fg("dim", "○");
 	if (agent.status === "stopped" || agent.lastOutcome === "cancelled") return theme.fg("dim", "■");
-	if (agent.lastOutcome === "error") return theme.fg("error", "●");
-	if (agent.lastOutcome === "ok") return theme.fg("success", "●");
+	if (agent.lastOutcome === "error") return theme.fg("error", dot);
+	if (agent.lastOutcome === "ok") return theme.fg("success", dot);
 	return theme.fg("warning", "Ⅱ");
 }
 

@@ -211,7 +211,7 @@ export class IPythonCellComponent implements Component {
 			? now - (startedAt ?? now)
 			: (details.durationMs ??
 				(startedAt === undefined || this.endedAt === undefined ? undefined : this.endedAt - startedAt));
-		const marker = animated ? runningToolMarker(now) : toolDim("●");
+		const marker = animated ? runningToolMarker(now) : toolDim("•");
 		this.cachedRunningMarker = marker;
 		const failed = this.statusKind(details) === "error" || this.statusKind(details) === "aborted";
 		const hasRunningActivity =
@@ -306,11 +306,11 @@ export class IPythonCellComponent implements Component {
 	private marker(details: IPythonDetails): string {
 		switch (this.statusKind(details)) {
 			case "error":
-				return theme.fg("toolStatusError", "●");
+				return theme.fg("toolStatusError", "•");
 			case "aborted":
-				return theme.fg("toolStatusWarning", "●");
+				return theme.fg("toolStatusWarning", "•");
 			case "done":
-				return theme.fg("success", "●");
+				return theme.fg("success", "•");
 			case "running":
 			case "queued":
 				return this.cachedRunningMarker;
@@ -553,7 +553,7 @@ export class IPythonCellComponent implements Component {
 		lines.push(
 			renderToolHeader(
 				label,
-				running ? this.cachedRunningMarker : theme.fg("success", "●"),
+				running ? this.cachedRunningMarker : theme.fg("success", "•"),
 				width,
 				durationMs,
 				running,

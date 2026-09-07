@@ -27,9 +27,9 @@ export function runningToolMarker(now = Date.now()): string {
 				const rgb = low.map((channel, index) =>
 					Math.round(channel + ((high[index] ?? channel) - channel) * intensity),
 				);
-				return `\x1b[38;2;${rgb.join(";")}m●\x1b[39m`;
+				return `\x1b[38;2;${rgb.join(";")}m•\x1b[39m`;
 			}
-			const marker = theme.fg("text", "●");
+			const marker = theme.fg("text", "•");
 			return intensity < 0.6 ? `${toolDim(marker)}\x1b[39m` : marker;
 		});
 		palette = { dim, text, mode, frames };
@@ -130,7 +130,7 @@ export function formatAgentCompletion(
 	const label = outcome === "ok" ? "Completed" : outcome === "error" ? "Failed" : "Cancelled";
 	const marker = colors.fg(
 		outcome === "ok" ? "success" : outcome === "error" ? "toolStatusError" : "toolStatusWarning",
-		outcome === "cancelled" ? "■" : "●",
+		outcome === "cancelled" ? "■" : "•",
 	);
 	return `${marker} ${toolAction(label, colors)} ${toolAgentName(name.replace(/[\r\n\t]/g, " "), colors)}`;
 }
