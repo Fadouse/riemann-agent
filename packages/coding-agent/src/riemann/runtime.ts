@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { AgentToolExecutionError } from "@earendil-works/pi-agent-core";
+import { type AgentMessage, AgentToolExecutionError } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { getPackageDir, isBunBinary } from "../config.ts";
@@ -1052,7 +1052,11 @@ export class RiemannRuntime {
 			getSystemPrompt: context.getSystemPrompt,
 			thinkingLevel: context.thinkingLevel,
 		};
-		const resolution = resolveCompactionStrategy(configured, dispatchContext.model);
+		const resolution = resolveCompactionStrategy(configured, dispatchContext.model, {
+			usingOAuth: dispatchContext.model ? dispatchContext.modelRegistry.isUsingOAuth(dispatchContext.model) : false,
+			// Experimental resets are owned by AgentSession, before ordinary compaction preparation.
+			supportsExperimentalContext: false,
+		});
 		const dispatch: CompactionDispatch = {
 			...resolution,
 			reason:
@@ -1100,6 +1104,30 @@ export class RiemannRuntime {
 				? result.details
 				: {};
 		return { ...result, details: { ...resultDetails, ...dispatch } };
+	}
+
+	/** Rebuild live host context without summarizing or altering the kernel/environment. */
+	async initialCodexContext(): Promise<{ systemPrompt: string; messages: AgentMessage[] }> {
+		const configured = (await loadRiemannConfig(this.shared.configLoadOptions)).compaction.strategy;
+		const state = this.durableState({ configured, effective: "experimental", reason: "configured" });
+		const text = `<riemann_state>\n${JSON.stringify(state, null, 2)}\n</riemann_state>`;
+		return {
+			systemPrompt: this.systemPrompt(this.root ? "main" : "child").replace(
+				"Emit model tool calls only with the name `ipython`.",
+				"Use `ipython` for Python operations. Native model-only `history`, `notes`, `new_context`, and `get_context_remaining` tools are also available directly; never call them through Python.",
+			),
+			messages: [
+				{
+					role: "user",
+					content: [],
+					timestamp: Date.now(),
+					providerPayload: {
+						type: "openaiResponsesHistory",
+						items: [{ type: "message", role: "developer", content: [{ type: "input_text", text }] }],
+					},
+				},
+			],
+		};
 	}
 
 	systemPrompt(kind: "main" | "child"): string {
@@ -1404,6 +1432,7 @@ export class RiemannRuntime {
 		return {
 			tool: this.toolDefinition(),
 			systemPrompt: this.systemPrompt("child"),
+			initialCodexContext: () => this.initialCodexContext(),
 			compact: (preparation, customInstructions, signal, context) =>
 				this.compact(preparation, customInstructions, signal, context),
 			snapshot: async () => {

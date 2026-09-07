@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Codex experimental-context capability discovery, native encrypted history/notes tools, and history-ingestion metadata.
+
 ### Changed
 
 - Reduced streaming tool-argument parsing and queued frame catch-up work while preserving every partial update and malformed-JSON repair behavior.

@@ -380,6 +380,8 @@ export interface ToolCall {
 	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
 	/** OpenAI Responses namespace for calls to dynamically loaded or namespaced tools. */
 	namespace?: string;
+	/** Codex opaque argument field names, including an explicitly empty list. */
+	encryptedFunctionArgs?: string[];
 }
 
 export interface Usage {
@@ -432,7 +434,17 @@ export interface OpenAIResponsesHistoryPayload {
 
 export type ProviderPayload = OpenAIResponsesHistoryPayload;
 
+export interface OpenAICodexItemMetadata {
+	turn_id?: string;
+	create_time?: number;
+	content_item_kinds?: string[];
+}
+
 export interface UserMessage {
+	/** Native Codex history metadata, assigned before persistence. */
+	openaiCodexMetadata?: OpenAICodexItemMetadata;
+	/** Stable native Codex history item identity. */
+	openaiCodexItemId?: string;
 	role: "user";
 	content: string | (TextContent | ImageContent)[];
 	/** Provider-native history replayed by compatible transports and ignored by others. */
@@ -441,6 +453,8 @@ export interface UserMessage {
 }
 
 export interface AssistantMessage {
+	/** Native Codex history metadata, assigned before persistence. */
+	openaiCodexMetadata?: OpenAICodexItemMetadata;
 	role: "assistant";
 	content: (TextContent | ThinkingContent | ToolCall)[];
 	api: Api;
@@ -465,9 +479,21 @@ export interface AssistantMessage {
 }
 
 export interface ToolResultMessage<TDetails = any> {
+	/** Native Codex history metadata, assigned before persistence. */
+	openaiCodexMetadata?: OpenAICodexItemMetadata;
+	/** Stable native Codex history item identity. */
+	openaiCodexItemId?: string;
 	role: "toolResult";
 	toolCallId: string;
 	toolName: string;
+	/** Native model-only Codex output. Never rendered or forwarded to another provider. */
+	openaiCodexOutput?:
+		| string
+		| (
+				| { type: "encrypted_content"; encrypted_content: string }
+				| { type: "input_text"; text: string }
+				| { type: "input_image"; image_url: string; detail?: "auto" | "low" | "high" | "original" }
+		  )[];
 	content: (TextContent | ImageContent)[]; // Supports text and images
 	details?: TDetails;
 	/** Usage from the tool execution itself, if available. Not part of main LLM context accounting. */

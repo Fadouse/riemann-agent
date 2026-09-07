@@ -13,6 +13,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { SessionTreeNode } from "../../../core/session-manager.ts";
+import { ModelOnlyToolPresentation } from "../../../utils/model-only-tools.ts";
 import { graphemeSafePrefix } from "../../../utils/text.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
@@ -113,6 +114,7 @@ class TreeList implements Component {
 	private filterMode: FilterMode = "default";
 	private searchQuery = "";
 	private toolCallMap: Map<string, ToolCallInfo> = new Map();
+	private hiddenEntryIds = new Set<string>();
 	private multipleRoots = false;
 	private showLabelTimestamps = false;
 	private activePathIds: Set<string> = new Set();
@@ -325,7 +327,26 @@ class TreeList implements Component {
 			}
 		}
 
-		return result;
+		const presentation = new ModelOnlyToolPresentation();
+		this.hiddenEntryIds.clear();
+		for (const { node } of result) {
+			if (node.entry.type === "message" && node.entry.message.role === "assistant") {
+				presentation.message(node.entry.message);
+			}
+		}
+		return result.map((flatNode) => {
+			const entry = flatNode.node.entry;
+			if (entry.type === "custom" && entry.customType === "codex-context-window") {
+				this.hiddenEntryIds.add(entry.id);
+			}
+			if (entry.type !== "message") return flatNode;
+			const message = presentation.message(entry.message);
+			if (!message || (message !== entry.message && "content" in message && message.content.length === 0)) {
+				this.hiddenEntryIds.add(entry.id);
+				return flatNode;
+			}
+			return { ...flatNode, node: { ...flatNode.node, entry: { ...entry, message } } };
+		});
 	}
 
 	private applyFilter(): void {
@@ -339,6 +360,7 @@ class TreeList implements Component {
 
 		this.filteredNodes = this.flatNodes.filter((flatNode) => {
 			const entry = flatNode.node.entry;
+			if (this.hiddenEntryIds.has(entry.id)) return false;
 			const isCurrentLeaf = entry.id === this.currentLeafId;
 
 			// Skip assistant messages with only tool calls (no text) unless error/aborted

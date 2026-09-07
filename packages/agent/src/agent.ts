@@ -17,6 +17,7 @@ import type {
 	AgentLoopConfig,
 	AgentLoopTurnUpdate,
 	AgentMessage,
+	AgentNativeTools,
 	AgentState,
 	AgentTool,
 	BeforeToolCallContext,
@@ -96,6 +97,12 @@ function createMutableAgentState(
 
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
+	prepareRequest?: (
+		context: AgentContext,
+		incomingMessages: readonly AgentMessage[],
+		signal?: AbortSignal,
+	) => Promise<AgentContext>;
+	nativeTools?: AgentNativeTools;
 	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>;
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -171,6 +178,12 @@ type ActiveRun = {
  * and exposes queueing APIs for steering and follow-up messages.
  */
 export class Agent {
+	public prepareRequest?: (
+		context: AgentContext,
+		incomingMessages: readonly AgentMessage[],
+		signal?: AbortSignal,
+	) => Promise<AgentContext>;
+	public nativeTools?: AgentNativeTools;
 	private _state: MutableAgentState;
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 	private readonly steeringQueue: PendingMessageQueue;
@@ -216,6 +229,8 @@ export class Agent {
 	constructor(options: AgentOptions) {
 		// Older compiled consumers may omit options or streamFn even though the current API requires them.
 		const runtimeOptions: Partial<AgentOptions> = options ?? {};
+		this.prepareRequest = runtimeOptions.prepareRequest;
+		this.nativeTools = runtimeOptions.nativeTools;
 		this._state = createMutableAgentState(runtimeOptions.initialState);
 		this.convertToLlm = runtimeOptions.convertToLlm ?? defaultConvertToLlm;
 		this.transformContext = runtimeOptions.transformContext;
@@ -455,6 +470,10 @@ export class Agent {
 			thinkingBudgets: this.thinkingBudgets,
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
+			nativeTools: this.nativeTools,
+			prepareRequest: this.prepareRequest
+				? (context, incoming) => this.prepareRequest!(context, incoming, this.signal)
+				: undefined,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			shouldStopAfterTurn: shouldStopAfterTurn

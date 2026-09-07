@@ -182,6 +182,10 @@ export function convertResponsesMessages<TApi extends Api>(
 
 	let msgIndex = 0;
 	for (const msg of transformedMessages) {
+		const nativeMetadata =
+			model.api === "openai-codex-responses" && msg.openaiCodexMetadata
+				? { internal_chat_message_metadata_passthrough: msg.openaiCodexMetadata }
+				: {};
 		if (msg.role === "user") {
 			const providerPayload = msg.providerPayload;
 			if (
@@ -196,6 +200,10 @@ export function convertResponsesMessages<TApi extends Api>(
 			if (typeof msg.content === "string") {
 				messages.push({
 					role: "user",
+					...nativeMetadata,
+					...(model.api === "openai-codex-responses" && msg.openaiCodexItemId
+						? { id: msg.openaiCodexItemId }
+						: {}),
 					content: [{ type: "input_text", text: sanitizeSurrogates(msg.content) }],
 				});
 			} else {
@@ -215,6 +223,10 @@ export function convertResponsesMessages<TApi extends Api>(
 				if (content.length === 0) continue;
 				messages.push({
 					role: "user",
+					...nativeMetadata,
+					...(model.api === "openai-codex-responses" && msg.openaiCodexItemId
+						? { id: msg.openaiCodexItemId }
+						: {}),
 					content,
 				});
 			}
@@ -242,7 +254,10 @@ export function convertResponsesMessages<TApi extends Api>(
 					let msgId = parsedSignature?.id;
 					if (!msgId) {
 						msgId = fallbackMessageId;
-					} else if (msgId.length > 64) {
+					} else if (
+						msgId.length > 64 &&
+						!(model.api === "openai-codex-responses" && assistantMsg.openaiCodexMetadata)
+					) {
 						msgId = `msg_${shortHash(msgId)}`;
 					}
 					output.push({
@@ -265,13 +280,16 @@ export function convertResponsesMessages<TApi extends Api>(
 					// When replaying custom-tool calls as a function_call, also drop non-fc_* ids such as
 					// ctc_* custom-tool ids because function_call item ids must be fc_*.
 					if (
-						(isDifferentModel && itemId?.startsWith("fc_")) ||
+						(isDifferentModel && !assistantMsg.openaiCodexMetadata && itemId?.startsWith("fc_")) ||
 						(customInputProperty === undefined && !itemId?.startsWith("fc_"))
 					) {
 						itemId = undefined;
 					}
 
-					const canReplayNamespace = isSameModel || options?.deferredTools?.has(toolCall.name) === true;
+					const canReplayNamespace =
+						isSameModel ||
+						(isSameProviderAndApi && model.api === "openai-codex-responses") ||
+						options?.deferredTools?.has(toolCall.name) === true;
 
 					if (customInputProperty !== undefined) {
 						output.push({
@@ -293,6 +311,11 @@ export function convertResponsesMessages<TApi extends Api>(
 							call_id: callId,
 							name: toolCall.name,
 							arguments: JSON.stringify(toolCall.arguments),
+							...(isSameProviderAndApi &&
+							model.api === "openai-codex-responses" &&
+							toolCall.encryptedFunctionArgs !== undefined
+								? { encrypted_function_args: toolCall.encryptedFunctionArgs }
+								: {}),
 							...(canReplayNamespace && toolCall.namespace !== undefined
 								? { namespace: toolCall.namespace }
 								: {}),
@@ -301,10 +324,13 @@ export function convertResponsesMessages<TApi extends Api>(
 				}
 			}
 			if (output.length === 0) continue;
-			messages.push(...output);
+			messages.push(...output.map((item) => ({ ...item, ...nativeMetadata })));
 		} else if (msg.role === "toolResult") {
 			const [callId] = msg.toolCallId.split("|");
-			const output = convertToolResultOutput(model, msg.content);
+			const output =
+				model.api === "openai-codex-responses" && model.provider === "openai-codex" && msg.openaiCodexOutput
+					? (msg.openaiCodexOutput as unknown as ToolResultOutputContent)
+					: convertToolResultOutput(model, msg.content);
 
 			if (options?.grammarToolInputProperties?.has(msg.toolName)) {
 				messages.push({
@@ -315,6 +341,10 @@ export function convertResponsesMessages<TApi extends Api>(
 			} else {
 				messages.push({
 					type: "function_call_output",
+					...nativeMetadata,
+					...(model.api === "openai-codex-responses" && msg.openaiCodexItemId
+						? { id: msg.openaiCodexItemId }
+						: {}),
 					call_id: callId,
 					output,
 				});
@@ -492,6 +522,7 @@ export async function processResponsesStream<TApi extends Api>(
 			return slot;
 		}
 		if (item.type === "function_call") {
+			const encrypted = (item as typeof item & { encrypted_function_args?: string[] }).encrypted_function_args;
 			const block: StreamingToolCall = {
 				type: "toolCall",
 				id: `${item.call_id}|${item.id}`,
@@ -499,6 +530,9 @@ export async function processResponsesStream<TApi extends Api>(
 				arguments: {},
 				...(item.namespace !== undefined ? { namespace: item.namespace } : {}),
 				partialJson: item.arguments || "",
+				...(model.api === "openai-codex-responses" && encrypted !== undefined
+					? { encryptedFunctionArgs: encrypted }
+					: {}),
 			};
 			toolJsonParsers.set(block, new StreamingJsonParser(block.partialJson));
 			output.content.push(block);
@@ -723,6 +757,9 @@ export async function processResponsesStream<TApi extends Api>(
 				slot.block.partialJson !== undefined
 			) {
 				slot.block.arguments = parseStreamingJson(item.arguments || slot.block.partialJson || "{}");
+				const encrypted = (item as typeof item & { encrypted_function_args?: string[] }).encrypted_function_args;
+				if (model.api === "openai-codex-responses" && encrypted !== undefined)
+					slot.block.encryptedFunctionArgs = encrypted;
 				if (item.namespace !== undefined) slot.block.namespace = item.namespace;
 				// Finalize in-place and strip the scratch buffer so replay only
 				// carries parsed arguments.

@@ -2,10 +2,17 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { access, mkdir, readFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import type { AgentSessionEventListener, SessionStats } from "../../core/agent-session.ts";
 import { AuthStorage } from "../../core/auth-storage.ts";
+import {
+	type CodexContextHost,
+	getCodexContextIdentity,
+	isCodexContextActive,
+	registerCodexContextHost,
+} from "../../core/codex-context-session.ts";
 import type { CompactionPreparation, CompactionResult } from "../../core/compaction/index.ts";
 import { execCommand } from "../../core/exec.ts";
 import {
@@ -54,6 +61,7 @@ import type {
 export interface ChildRiemannRuntime {
 	tool: ToolDefinition<typeof IPythonSchema, IPythonToolDetails>;
 	systemPrompt: string;
+	initialCodexContext(): Promise<{ systemPrompt?: string; messages: AgentMessage[] }>;
 	compact(
 		preparation: CompactionPreparation,
 		customInstructions: string | undefined,
@@ -71,6 +79,7 @@ export interface ChildAgentSession {
 	readonly model: Model<any> | undefined;
 	readonly sessionManager: Pick<SessionManager, "getBranch">;
 	readonly isStreaming: boolean;
+	readonly codexContextActive?: boolean;
 	prompt(text: string, options: { source: "rpc" }): Promise<void>;
 	steer(text: string): Promise<void>;
 	abort(): Promise<void>;
@@ -189,12 +198,18 @@ async function warnForChildCompactionEvent(
 ): Promise<void> {
 	try {
 		const configured = (await loadRiemannConfig(location)).compaction.strategy;
-		const resolution = resolveCompactionStrategy(configured, input.model);
+		const resolution = resolveCompactionStrategy(configured, input.model, {
+			usingOAuth: input.model ? ctx.modelRegistry.isUsingOAuth(input.model) : false,
+			supportsExperimentalContext: isCodexContextActive(ctx.sessionManager.getSessionId()),
+		});
 		const supportsOpenAICompaction =
 			input.model?.provider === "openai-codex" && input.model.api === "openai-codex-responses";
 		const previousEffectiveStrategy =
 			input.trigger === "model-change"
-				? resolveCompactionStrategy(configured, input.previousModel).effective
+				? resolveCompactionStrategy(configured, input.previousModel, {
+						usingOAuth: input.previousModel ? ctx.modelRegistry.isUsingOAuth(input.previousModel) : false,
+						supportsExperimentalContext: isCodexContextActive(ctx.sessionManager.getSessionId()),
+					}).effective
 				: input.hasEncryptedOpenAIContext
 					? "openai"
 					: resolution.effective;
@@ -223,7 +238,19 @@ export function registerChildCompactionHooks(
 	runtime: ChildRiemannRuntime,
 	location: ChildCompactionWarningConfigLocation,
 	warningSink?: CompactionWarningSink,
+	codexContextHost?: CodexContextHost,
 ): void {
+	let unregisterHost: (() => void) | undefined;
+	if (codexContextHost) {
+		pi.on("session_start", async (_event, ctx) => {
+			unregisterHost?.();
+			unregisterHost = registerCodexContextHost(ctx.sessionManager.getSessionId(), codexContextHost);
+		});
+		pi.on("session_shutdown", async () => {
+			unregisterHost?.();
+			unregisterHost = undefined;
+		});
+	}
 	pi.on("model_select", async (event, ctx) => {
 		if (event.source === "restore") return;
 		await warnForChildCompactionEvent(ctx, location, warningSink, {
@@ -234,6 +261,8 @@ export function registerChildCompactionHooks(
 		});
 	});
 	pi.on("session_before_compact", async (event, ctx) => {
+		// AgentSession owns native window resets; this hook must not invoke a summarizer.
+		if (isCodexContextActive(ctx.sessionManager.getSessionId())) return;
 		await warnForChildCompactionEvent(ctx, location, warningSink, {
 			trigger: "compaction-dispatch",
 			hasEncryptedOpenAIContext: childPreparationHasEncryptedOpenAIContext(event.preparation),
@@ -399,6 +428,7 @@ export interface AgentSupervisorOptions {
 export class AgentSupervisor {
 	private readonly events = new EventEmitter();
 	private readonly live = new Map<string, LiveChild>();
+	private readonly codexThreadIds = new Map<string, string>();
 	private readonly queue: Admission[] = [];
 	private readonly launches = new Set<Promise<void>>();
 	private readonly cancelled = new Set<string>();
@@ -447,8 +477,14 @@ export class AgentSupervisor {
 				const warnings = detectCompactionWarnings({
 					trigger: "strategy-change",
 					hasEncryptedOpenAIContext: latestActiveCompactionHasOpenAIContext(session.sessionManager.getBranch()),
-					previousEffectiveStrategy: resolveCompactionStrategy(commit.previousStrategy, model).effective,
-					effectiveStrategy: resolveCompactionStrategy(commit.committedStrategy, model).effective,
+					previousEffectiveStrategy: resolveCompactionStrategy(commit.previousStrategy, model, {
+						usingOAuth: model ? this.options.rootContext.modelRegistry.isUsingOAuth(model) : false,
+						supportsExperimentalContext: session.codexContextActive,
+					}).effective,
+					effectiveStrategy: resolveCompactionStrategy(commit.committedStrategy, model, {
+						usingOAuth: model ? this.options.rootContext.modelRegistry.isUsingOAuth(model) : false,
+						supportsExperimentalContext: session.codexContextActive,
+					}).effective,
 					currentModel: {
 						supportsImageInput: model?.input.includes("image") ?? false,
 						supportsOpenAICompaction,
@@ -846,7 +882,10 @@ export class AgentSupervisor {
 				})
 			).compaction.strategy;
 			const model = session.model;
-			const resolution = resolveCompactionStrategy(configured, model);
+			const resolution = resolveCompactionStrategy(configured, model, {
+				usingOAuth: model ? this.options.rootContext.modelRegistry.isUsingOAuth(model) : false,
+				supportsExperimentalContext: session.codexContextActive,
+			});
 			const hasEncryptedOpenAIContext = latestActiveCompactionHasOpenAIContext(session.sessionManager.getBranch());
 			const supportsOpenAICompaction = model?.provider === "openai-codex" && model.api === "openai-codex-responses";
 			const warnings = detectCompactionWarnings({
@@ -891,6 +930,48 @@ export class AgentSupervisor {
 		}
 		await mkdir(sessionDir, { recursive: true, mode: 0o700 });
 		const settingsManager = SettingsManager.create(agent.workspace, this.options.agentDir, { projectTrusted: true });
+		const run = this.options.store.listRuns().find((candidate) => candidate.id === this.options.runId);
+		if (!run) throw new Error("Cannot resolve the Codex context session identity");
+		const names: string[] = [];
+		let ancestor: StoredAgent | undefined = agent;
+		const seen = new Set<string>();
+		while (ancestor.parentId !== null) {
+			if (seen.has(ancestor.id)) throw new Error("Invalid Codex context agent lineage");
+			seen.add(ancestor.id);
+			// Riemann names permit characters excluded by Codex AgentPath. Hex encoding is collision-free.
+			names.unshift(`agent_${Buffer.from(ancestor.name, "utf8").toString("hex")}`);
+			ancestor = this.options.store
+				.listAgents(this.options.runId)
+				.find((candidate) => candidate.id === ancestor?.parentId);
+			if (!ancestor) throw new Error("Missing Codex context parent agent");
+		}
+		const parentThreadId =
+			agent.parentId === this.options.rootAgent.id
+				? run.sessionId
+				: agent.parentId
+					? this.codexThreadIds.get(agent.parentId)
+					: undefined;
+		if (!parentThreadId) throw new Error("Missing Codex context parent thread");
+		const codexContextHost: CodexContextHost = {
+			agentName: `/root/${names.join("/")}`,
+			sharedSessionId: run.sessionId,
+			parentThreadId,
+			get parentTurnId() {
+				return getCodexContextIdentity(parentThreadId)?.turn_id;
+			},
+			get rootTurnId() {
+				return getCodexContextIdentity(run.sessionId)?.turn_id;
+			},
+			compactionStrategy: async () =>
+				(
+					await loadRiemannConfig({
+						cwd: this.options.rootContext.cwd,
+						agentDir: this.options.agentDir,
+						projectTrusted: this.options.projectTrusted ?? true,
+					})
+				).compaction.strategy,
+			initialContext: () => runtime.initialCodexContext(),
+		};
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: agent.workspace,
 			agentDir: this.options.agentDir,
@@ -913,6 +994,7 @@ export class AgentSupervisor {
 								projectTrusted: this.options.projectTrusted ?? true,
 							},
 							this.options.warningSink,
+							codexContextHost,
 						),
 				},
 			],
@@ -935,6 +1017,7 @@ export class AgentSupervisor {
 			settingsManager,
 			sessionStartEvent: { type: "session_start", reason: resume ? "resume" : "new" },
 		});
+		this.codexThreadIds.set(agent.id, sessionManager.getSessionId());
 		await this.warnForStartedChild(created.session);
 		return created.session;
 	}

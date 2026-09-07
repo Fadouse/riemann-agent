@@ -5,7 +5,6 @@ import type {
 	ResponseInput,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
-
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -34,6 +33,12 @@ import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
+import {
+	getOpenAICodexContextIdentity,
+	openAICodexContextMetadata,
+	openAICodexContextTools,
+	supportsOpenAICodexContextBackend,
+} from "./openai-codex-context.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
@@ -274,6 +279,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				throw new Error(`No API key for provider: ${model.provider}`);
 			}
 
+			const identity = getOpenAICodexContextIdentity(options?.metadata);
+			if (identity) output.openaiCodexMetadata = { turn_id: identity.turn_id, create_time: output.timestamp / 1000 };
 			const accountId = extractAccountId(apiKey);
 			const grammarToolInputProperties = createGrammarToolInputProperties(
 				context.tools,
@@ -295,6 +302,12 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				apiKey,
 				websocketRequestId,
 			);
+			if (identity) {
+				for (const [key, value] of Object.entries(openAICodexContextMetadata(identity).headers)) {
+					sseHeaders.set(key, value);
+					websocketHeaders.set(key, value);
+				}
+			}
 			const bodyJson = JSON.stringify(body);
 			const httpTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
 			const websocketConnectTimeoutMs = normalizeTimeoutMs(options?.websocketConnectTimeoutMs);
@@ -764,6 +777,13 @@ function buildRequestBody(
 		}
 	}
 
+	const identity = getOpenAICodexContextIdentity(options?.metadata);
+	if (identity) {
+		if (!supportsOpenAICodexContextBackend(model))
+			throw new Error("Experimental Codex context requires the first-party ChatGPT backend");
+		body.client_metadata = openAICodexContextMetadata(identity).clientMetadata;
+		body.tools = [...(body.tools ?? []), ...openAICodexContextTools];
+	}
 	return body;
 }
 

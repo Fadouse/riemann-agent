@@ -1,4 +1,5 @@
 import { truncateToWidth } from "@earendil-works/pi-tui";
+import { isCodexContextActive, registerCodexContextHost } from "../../core/codex-context-session.ts";
 import type { BuildSystemPromptOptions, ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
 import { formatAgentCompletion } from "../../modes/interactive/components/tool-status-marker.ts";
 import type { AgentEventDelivery } from "../../riemann/agents/supervisor.ts";
@@ -70,12 +71,18 @@ async function warnForCompactionEvent(ctx: ExtensionContext, input: CompactionWa
 				projectTrusted: ctx.isProjectTrusted(),
 			})
 		).compaction.strategy;
-		const resolution = resolveCompactionStrategy(configured, input.model);
+		const resolution = resolveCompactionStrategy(configured, input.model, {
+			usingOAuth: input.model ? ctx.modelRegistry.isUsingOAuth(input.model) : false,
+			supportsExperimentalContext: isCodexContextActive(ctx.sessionManager.getSessionId()),
+		});
 		const supportsOpenAICompaction =
 			input.model?.provider === "openai-codex" && input.model.api === "openai-codex-responses";
 		const previousEffectiveStrategy =
 			input.trigger === "model-change"
-				? resolveCompactionStrategy(configured, input.previousModel).effective
+				? resolveCompactionStrategy(configured, input.previousModel, {
+						usingOAuth: input.previousModel ? ctx.modelRegistry.isUsingOAuth(input.previousModel) : false,
+						supportsExperimentalContext: isCodexContextActive(ctx.sessionManager.getSessionId()),
+					}).effective
 				: input.hasEncryptedOpenAIContext
 					? "openai"
 					: resolution.effective;
@@ -234,6 +241,8 @@ const riemannExtension: ExtensionFactory = (pi) => {
 	let runtime: RiemannRuntime | undefined;
 	let closing: Promise<void> | undefined;
 	let subagentUi: SubagentUiController | undefined;
+	let unregisterCodexContextHost: (() => void) | undefined;
+	let systemPromptOptions: BuildSystemPromptOptions | undefined;
 
 	const getRuntime = async (ctx: ExtensionContext): Promise<RiemannRuntime> => {
 		if (runtime) {
@@ -248,10 +257,27 @@ const riemannExtension: ExtensionFactory = (pi) => {
 				} catch {}
 			},
 		});
+		const current = runtime;
+		unregisterCodexContextHost = registerCodexContextHost(ctx.sessionManager.getSessionId(), {
+			agentName: "/root",
+			sharedSessionId: ctx.sessionManager.getSessionId(),
+			initialContext: async () => {
+				const context = await current.initialCodexContext();
+				return {
+					...context,
+					systemPrompt: systemPromptOptions
+						? appendProjectContext(context.systemPrompt, systemPromptOptions)
+						: context.systemPrompt,
+				};
+			},
+		});
 		return runtime;
 	};
 
 	const closeRuntime = async (): Promise<void> => {
+		unregisterCodexContextHost?.();
+		unregisterCodexContextHost = undefined;
+		systemPromptOptions = undefined;
 		subagentUi?.dispose();
 		subagentUi = undefined;
 		if (!runtime) return;
@@ -303,12 +329,15 @@ const riemannExtension: ExtensionFactory = (pi) => {
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		systemPromptOptions = event.systemPromptOptions;
 		const current = await getRuntime(ctx);
 		if (pi.getActiveTools().length !== 1 || pi.getActiveTools()[0] !== "ipython") pi.setActiveTools(["ipython"]);
 		return { systemPrompt: appendProjectContext(current.systemPrompt("main"), event.systemPromptOptions) };
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
+		// AgentSession owns native window resets; this hook must not invoke a summarizer.
+		if (isCodexContextActive(ctx.sessionManager.getSessionId())) return;
 		await warnForCompactionEvent(ctx, {
 			trigger: "compaction-dispatch",
 			hasEncryptedOpenAIContext: preparationHasEncryptedOpenAIContext(event.preparation),

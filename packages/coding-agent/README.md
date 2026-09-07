@@ -2,7 +2,7 @@
 
 Riemann Agent is a persistent, IPython-first agentic system built on the Pi coding-agent runtime.
 
-The model sees one tool: `ipython`. Workspace I/O, shell processes, web access, MCP tools, artifacts, and child agents are typed asynchronous Python functions installed into the persistent kernel. This keeps intermediate results in variables instead of repeatedly serializing them through model context.
+Workspace operations use one tool: `ipython`. Eligible Codex experimental-context sessions additionally expose native, model-only context-management tools. Workspace I/O, shell processes, web access, MCP tools, artifacts, and child agents are typed asynchronous Python functions installed into the persistent kernel. This keeps intermediate results in variables instead of repeatedly serializing them through model context.
 
 ## Runtime properties
 
@@ -14,7 +14,7 @@ The model sees one tool: `ipython`. Workspace I/O, shell processes, web access, 
 - Lazy MCP activation; discovered tools use a Python/catalog namespace derived from the configured server name, with collision-safe fallback.
 - Asynchronous reusable child Agents with durable handles, automatic completion delivery, steering, default-model selection, bounded run slots, shared/worktree topology, and per-Agent filesystem/capability policies.
 - A `pi-subagents`-style Fleet below the editor plus an `/agents` hub for standard live transcripts, messaging, scrolling, stop, and slot-release controls.
-- Strictly configured context compaction: subscription-backed OpenAI Codex, OMP snapshot archives, or Riemann semantic checkpoints.
+- Context management: Codex experimental windows with native history/notes, subscription-backed cloud compaction, OMP snapshot archives, or Riemann semantic checkpoints.
 - Pi's TUI, session management, model providers, authentication, settings, RPC mode, and extension ecosystem.
 
 ## Quick start
@@ -90,19 +90,21 @@ compaction:
   strategy: automatic # automatic | default | openai | snapshot
 ```
 
-`automatic` is used when the setting is omitted. It resolves to `openai` for an active `openai-codex` Responses model and to `default` for every other provider. The strategy is resolved from the model active when each compaction starts. Explicit `default`, `openai`, and `snapshot` values remain literal overrides.
+`automatic` is used when the setting is omitted. For an `openai-codex` Responses model authenticated with ChatGPT OAuth, it discovers the model's experimental-context capability. Eligible Plus, Pro, and Pro Lite sessions use native experimental context management; unsupported models or ineligible plans use `openai` cloud compaction. Other providers and non-OAuth sessions use `default` semantic checkpoints. Failed or unknown capability discovery does not enable experimental context. Explicit `default`, `openai`, and `snapshot` values remain literal overrides.
+
+Experimental context management is initialized before generation. It sends stable session, thread, window, and history-ingestion metadata, and exposes native `history`, `notes`, `new_context`, and `get_context_remaining` tools separately from `ipython`. Model-owned token-budget guidance prompts the model to save notes before resetting a window. A reset rebuilds host context without generating a summary or resetting the Python kernel or workspace. Window checkpoints survive session resume; history and notes are served by the Codex backend. Native context-tool calls and attachments are excluded from public transcript presentation and HTML exports.
 
 `default` creates a model-generated semantic checkpoint. `openai` uses Codex Responses V2 cloud compaction and requires an active `openai-codex` OAuth model. It sends compacted context to `https://chatgpt.com/backend-api/codex/responses`, persists the returned opaque compaction item in session state, and includes that item in subsequent OpenAI Responses history.
 
 The Codex subscription endpoint is a private first-party ChatGPT backend, not the documented public OpenAI API contract. Data handling follows the active ChatGPT workspace policy. `openai` does not use an `OPENAI_API_KEY`; start Riemann, run `/login`, and select OpenAI Codex (ChatGPT Plus/Pro).
 
-`snapshot` requires an image-capable model and stores OMP bitmap archives. All four strategies remain selectable in `/settings`, and a successful change applies to the next compaction in the current runtime. Custom `/compact <instructions>` requires an effective `default` strategy.
+`snapshot` requires an image-capable model and stores OMP bitmap archives. All four strategies remain selectable in `/settings`. Automatic activation is checked before generation; explicit compaction changes apply to the next compaction in the current runtime. Custom `/compact <instructions>` requires an effective `default` strategy.
 
 Riemann displays non-blocking warnings when encrypted OpenAI context may be unavailable after a model or strategy change, when Snapshot is selected with a model that lacks image input, or when OpenAI compaction lacks a compatible Codex model or OAuth. Warnings do not change the selected model or strategy.
 
 ## One tool, persistent Python namespaces
 
-The provider receives exactly one callable model tool: `ipython`. Its `code` field executes persistent Python. The displayed `fs`, `shell`, `web`, `artifacts`, `agents`, `mcp`, `catalog`, and `state` signatures are preinstalled Python namespaces available only inside that code field; they are never separate model tools. Namespace calls use normal Python and top-level `await`. Use `help(fs.edit)` or `await catalog.describe(name="fs.edit")` inside an IPython cell only when the compact signature is insufficient.
+Workspace operations are exposed through `ipython`. Codex experimental-context sessions also receive native model-only context-management tools; these are not Python namespaces. Its `code` field executes persistent Python. The displayed `fs`, `shell`, `web`, `artifacts`, `agents`, `mcp`, `catalog`, and `state` signatures are preinstalled Python namespaces available only inside that code field; they are never separate model tools. Namespace calls use normal Python and top-level `await`. Use `help(fs.edit)` or `await catalog.describe(name="fs.edit")` inside an IPython cell only when the compact signature is insufficient.
 
 ```python
 # This entire block is code executed by the single `ipython` model tool.
@@ -368,7 +370,7 @@ Use `/session` in interactive mode to see the current session ID before reusing 
 
 ### Compaction
 
-Long sessions can exhaust context windows. `compaction.strategy` defaults to `automatic`, which uses subscription-backed Codex cloud compaction for `openai-codex` models and Riemann's semantic `default` checkpoint otherwise. Explicit `default`, `openai`, and `snapshot` selections remain available.
+Long sessions can exhaust context windows. `compaction.strategy` defaults to `automatic`: eligible supported Codex OAuth models use experimental context windows, other Codex OAuth models use cloud compaction, and other sessions use Riemann's semantic `default` checkpoint. Explicit `default`, `openai`, and `snapshot` selections remain available.
 
 **Manual:** `/compact` uses the strategy resolved when compaction starts. `/compact <custom instructions>` requires an effective `default` strategy; other strategies return an explicit error.
 

@@ -159,6 +159,9 @@ function fakeRuntime(close: () => Promise<void> = async () => undefined): ChildR
 			},
 		},
 		systemPrompt: "child system prompt",
+		async initialCodexContext() {
+			return { systemPrompt: "child system prompt", messages: [] };
+		},
 		async compact(preparation) {
 			return {
 				summary: "compacted",

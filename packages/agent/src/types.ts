@@ -146,7 +146,17 @@ export interface AgentLoopTurnUpdate {
 
 export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
+/** Model-only provider tools bypass user tool lookup and JSON argument validation. */
+export interface AgentNativeTools {
+	matches: (call: AgentToolCall) => boolean;
+	supportsParallel?: (call: AgentToolCall) => boolean;
+	execute: (call: AgentToolCall, signal?: AbortSignal) => Promise<ToolResultMessage>;
+}
+
 export interface AgentLoopConfig extends SimpleStreamOptions {
+	/** Runs after queued input has arrived, immediately before each provider request. */
+	prepareRequest?: (context: AgentContext, incomingMessages: readonly AgentMessage[]) => Promise<AgentContext>;
+	nativeTools?: AgentNativeTools;
 	model: Model<any>;
 
 	/**

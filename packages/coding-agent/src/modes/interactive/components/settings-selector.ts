@@ -554,7 +554,7 @@ function contextSettingItems(config: RiemannConfig): SettingItem[] {
 			label: "Compaction strategy",
 			description: project
 				? "Read-only because the trusted project config overrides this value."
-				: "Automatic uses OpenAI Codex for compatible OpenAI Codex models and Default for all other providers. Snapshot is an advanced image archive for image-capable models. Active for the next compaction.",
+				: "Automatic uses experimental context for eligible OpenAI Codex models, cloud compaction for other Codex OAuth models, and Default otherwise. Snapshot is an advanced image archive for image-capable models. Checked before generation.",
 			currentValue: project ? `${strategyLabel} · project` : strategyLabel,
 			values: project ? undefined : COMPACTION_STRATEGY_CHOICES,
 		},

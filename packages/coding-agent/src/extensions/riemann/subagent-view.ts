@@ -18,6 +18,7 @@ import { getMarkdownTheme, type Theme } from "../../modes/interactive/theme/them
 import type { SubagentUiSnapshot } from "../../riemann/agents/supervisor.ts";
 import type { RiemannRuntime } from "../../riemann/runtime.ts";
 import { stripAnsi } from "../../utils/ansi.ts";
+import { isModelOnlyToolCall } from "../../utils/model-only-tools.ts";
 import {
 	fitSubagentHints,
 	formatFleetElapsed,
@@ -482,7 +483,7 @@ export class SubagentConversationViewer implements Component, Focusable {
 				),
 			);
 			for (const content of assistant.content) {
-				if (content.type !== "toolCall") continue;
+				if (content.type !== "toolCall" || isModelOnlyToolCall(assistant, content)) continue;
 				const tool = new ToolExecutionComponent(
 					content.name,
 					content.id,

@@ -25,7 +25,17 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText } from "@earendil-works/pi-ai";
+import { contentText, uuidv7 } from "@earendil-works/pi-ai";
+import {
+	discoverOpenAICodexContext,
+	executeOpenAICodexContextTool,
+	getOpenAICodexThreadHint,
+	isOpenAICodexContextTool,
+	type OpenAICodexContextIdentity,
+	type OpenAICodexContextModel,
+	openAICodexContextToolSupportsParallelCalls,
+	supportsOpenAICodexContextBackend,
+} from "@earendil-works/pi-ai/api/openai-codex-context";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -48,17 +58,33 @@ import {
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
+import { resolveCompactionStrategy } from "../riemann/compaction-strategy.ts";
+import { getRiemannAgentDir, loadRiemannConfig } from "../riemann/config.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
+import { assignCodexContextIds } from "./codex-context-item-ids.ts";
+import {
+	CodexContextSession,
+	type CodexContextWindow,
+	getCodexContextHost,
+	getCodexInstallationId,
+	isCodexContextActive,
+	resolveCodexContextBudget,
+	setCodexContextActive,
+	setCodexContextIdentity,
+} from "./codex-context-session.ts";
+import { CODEX_CONTEXT_STATE, isCodexContextWindow } from "./codex-context-state.ts";
+import { estimateCodexContextTokens } from "./codex-context-token-estimate.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	createFileOps,
 	estimateContextTokens,
 	estimateTokens,
 	generateBranchSummary,
@@ -374,6 +400,15 @@ export class AgentSession {
 	private _extensionErrorUnsubscriber?: () => void;
 
 	private _modelRuntime: ModelRuntime;
+	private _codexContext?: CodexContextSession;
+	private _codexModel?: OpenAICodexContextModel;
+	private _codexDiscoveryKey?: string;
+	private _codexTurnId = uuidv7();
+	private _codexTurnStartedAt = Date.now();
+	private _codexStreamInstalled = false;
+	private _codexBaseStream?: Agent["streamFunction"];
+	private _codexSummarizing = false;
+	private _codexResetOnActivation = false;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -407,6 +442,16 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
+		const prepareRequest = this.agent.prepareRequest;
+		this.agent.prepareRequest = async (context, incoming, signal) => {
+			const prepared = (await prepareRequest?.(context, incoming, signal)) ?? context;
+			if (!this._codexContext) return prepared;
+			return {
+				...prepared,
+				messages: await this._prepareCodexContext(prepared.messages, signal, incoming),
+				systemPrompt: this._systemPromptOverride ?? prepared.systemPrompt,
+			};
+		};
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -416,6 +461,343 @@ export class AgentSession {
 
 	get modelRuntime(): ModelRuntime {
 		return this._modelRuntime;
+	}
+
+	get codexContextActive(): boolean {
+		return this._codexContext !== undefined;
+	}
+
+	private _codexIdentity(window = this._codexContext?.state): OpenAICodexContextIdentity {
+		if (!window) throw new Error("Codex context has not been initialized");
+		const host = getCodexContextHost(this.sessionId);
+		const identity: OpenAICodexContextIdentity = {
+			installation_id: window.installationId,
+			session_id: host?.sharedSessionId ?? this.sessionId,
+			thread_id: this.sessionId,
+			agent_name: host?.agentName ?? "/root",
+			turn_id: this._codexTurnId,
+			window_id: `${this.sessionId}:${window.windowNumber}`,
+			context_window_id: window.windowId,
+			window_number: window.windowNumber,
+			turn_started_at_unix_ms: this._codexTurnStartedAt,
+			forked_from_thread_id: window.forkedFromThreadId,
+			// Copied session forks have no canonical rollout ordinal (Codex ForkPersistence::Copied).
+			parent_thread_id: host?.parentThreadId,
+			parent_turn_id: host?.parentTurnId,
+			root_turn_id: host?.rootTurnId,
+		};
+		setCodexContextIdentity(identity);
+		return identity;
+	}
+
+	private _deactivateCodexContext(): void {
+		if (!this._codexContext) {
+			setCodexContextActive(this.sessionId, false);
+			return;
+		}
+		this._codexContext = undefined;
+		this.agent.nativeTools = undefined;
+		this.agent.state.tools = this.agent.state.tools.filter(
+			(tool) => tool.name !== "new_context" && tool.name !== "get_context_remaining",
+		);
+		this._systemPromptOverride = undefined;
+		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		setCodexContextActive(this.sessionId, false);
+	}
+
+	private async _ensureCodexContext(): Promise<void> {
+		const model = this.model;
+		const usingOAuth = model ? this._modelRuntime.isUsingOAuth(model.provider) : false;
+		if (!model || model.provider !== "openai-codex" || model.api !== "openai-codex-responses" || !usingOAuth) {
+			this._deactivateCodexContext();
+			return;
+		}
+		const config = await loadRiemannConfig({
+			cwd: this._cwd,
+			agentDir: getRiemannAgentDir(),
+			projectTrusted: this.settingsManager.isProjectTrusted(),
+		});
+		const configured =
+			(await getCodexContextHost(this.sessionId)?.compactionStrategy?.()) ?? config.compaction.strategy;
+		if (
+			resolveCompactionStrategy(configured, model, { usingOAuth, supportsExperimentalContext: true }).effective !==
+			"experimental"
+		) {
+			this._deactivateCodexContext();
+			return;
+		}
+		const request = await this._getRequiredRequestAuth(model);
+		if (!supportsOpenAICodexContextBackend(request.model)) {
+			this._deactivateCodexContext();
+			return;
+		}
+		const key = `${model.id}\0${request.model.baseUrl}\0${request.apiKey}`;
+		const parentThreadId = getCodexContextHost(this.sessionId)?.parentThreadId;
+		const continuesExperimental =
+			this._codexContext ||
+			(parentThreadId && isCodexContextActive(parentThreadId)) ||
+			this.sessionManager
+				.getBranch()
+				.some(
+					(entry) =>
+						entry.type === "custom" &&
+						entry.customType === CODEX_CONTEXT_STATE &&
+						isCodexContextWindow(entry.data),
+				);
+		if (this._codexDiscoveryKey !== key) {
+			try {
+				const discovered = await discoverOpenAICodexContext(request.model, {
+					apiKey: request.apiKey,
+					headers: request.headers,
+				});
+				const savedModel = [...this.sessionManager.getBranch()]
+					.reverse()
+					.find((entry) => entry.type === "custom" && entry.customType === "codex-context-model");
+				const savedHash =
+					savedModel?.type === "custom" &&
+					savedModel.data &&
+					typeof savedModel.data === "object" &&
+					"compHash" in savedModel.data &&
+					typeof savedModel.data.compHash === "string"
+						? savedModel.data.compHash
+						: undefined;
+				const previousHash = this._codexModel?.comp_hash ?? savedHash;
+				if (
+					continuesExperimental &&
+					previousHash &&
+					discovered.model?.comp_hash &&
+					previousHash !== discovered.model.comp_hash
+				) {
+					if (this._codexContext) this._codexContext.requestReset();
+					else if (!parentThreadId) this._codexResetOnActivation = true;
+				}
+				this._codexDiscoveryKey = key;
+				this._codexModel =
+					discovered.eligible ||
+					(continuesExperimental && ["plus", "pro", "prolite"].includes(discovered.planType ?? ""))
+						? discovered.model
+						: undefined;
+				if (this._codexModel)
+					this.sessionManager.appendCustomEntry("codex-context-model", {
+						modelId: model.id,
+						compHash: this._codexModel.comp_hash,
+					});
+			} catch {
+				if (continuesExperimental && !this._codexModel)
+					throw new Error(
+						"Could not refresh experimental context model metadata. Retry when model discovery is available.",
+					);
+				// A transient discovery failure must not downgrade an established history-backed session.
+				if (!this._codexContext) this._codexModel = undefined;
+			}
+		}
+		if (!this._codexModel) {
+			this._deactivateCodexContext();
+			return;
+		}
+		const budget = resolveCodexContextBudget(this._codexModel, model.contextWindow);
+		if (this._codexContext) this._codexContext.updateBudget(budget);
+		else {
+			const host = getCodexContextHost(this.sessionId);
+			const turn = [...this.sessionManager.getBranch()]
+				.reverse()
+				.find((entry) => entry.type === "custom" && entry.customType === "codex-context-turn");
+			if (turn?.type === "custom" && turn.data && typeof turn.data === "object") {
+				const identity = turn.data as Record<string, unknown>;
+				if (typeof identity.turnId === "string") this._codexTurnId = identity.turnId;
+				if (typeof identity.startedAt === "number") this._codexTurnStartedAt = identity.startedAt;
+			}
+			this._codexContext = await CodexContextSession.create({
+				sessionManager: this.sessionManager,
+				installationId: getCodexInstallationId(getRiemannAgentDir()),
+				agentName: host?.agentName ?? "/root",
+				messages: this.agent.state.messages,
+				budget,
+				backend: {
+					threadHint: async (window: Readonly<CodexContextWindow>, signal) => {
+						const auth = await this._getRequiredRequestAuth(this.model!);
+						return getOpenAICodexThreadHint(auth.model, this._codexIdentity(window), {
+							apiKey: auth.apiKey,
+							headers: auth.headers,
+							signal,
+						});
+					},
+				},
+				initialContext: async () => {
+					const initial = await getCodexContextHost(this.sessionId)?.initialContext();
+					if (initial?.systemPrompt !== undefined) {
+						this._systemPromptOverride = initial.systemPrompt;
+						this.agent.state.systemPrompt = initial.systemPrompt;
+					}
+					return initial?.messages ?? [];
+				},
+			});
+			this.agent.state.messages = this._codexContext.restoreMessages();
+			if (this._codexResetOnActivation) {
+				this._codexContext.requestReset();
+				this._codexResetOnActivation = false;
+			}
+		}
+		this.agent.nativeTools = {
+			matches: (call) =>
+				this.codexContextActive &&
+				(isOpenAICodexContextTool(call) ||
+					(!call.namespace && (call.name === "new_context" || call.name === "get_context_remaining"))),
+			supportsParallel: (call) => !call.namespace || openAICodexContextToolSupportsParallelCalls(call),
+			execute: async (call, signal) => {
+				if (!call.namespace && (call.name === "new_context" || call.name === "get_context_remaining")) {
+					const tool = this._codexContext!.tools(() => this.agent.state.messages).find(
+						(tool) => tool.name === call.name,
+					)!;
+					const result = await tool.execute(call.id, {}, signal);
+					return {
+						role: "toolResult",
+						toolCallId: call.id,
+						toolName: call.name,
+						content: result.content,
+						isError: false,
+						timestamp: Date.now(),
+					};
+				}
+				const auth = await this._getRequiredRequestAuth(this.model!);
+				return executeOpenAICodexContextTool(
+					auth.model,
+					call,
+					this._codexIdentity(),
+					this._codexModel!.truncation_policy,
+					{ apiKey: auth.apiKey, headers: auth.headers, signal },
+				);
+			},
+		};
+		if (!this._codexStreamInstalled) {
+			const stream = this.agent.streamFunction;
+			this._codexBaseStream = stream;
+			this.agent.streamFunction = (requestModel, context, options) =>
+				stream(requestModel, context, {
+					...options,
+					...(this._codexContext && !this._codexSummarizing
+						? { metadata: { ...options?.metadata, openaiCodexContext: this._codexIdentity() } }
+						: {}),
+				});
+			this._codexStreamInstalled = true;
+		}
+		this.agent.state.tools = [
+			...this.agent.state.tools.filter(
+				(tool) => tool.name !== "new_context" && tool.name !== "get_context_remaining",
+			),
+			...this._codexContext.tools(() => this.agent.state.messages),
+		];
+		setCodexContextActive(this.sessionId, true);
+	}
+
+	private async _resetCodexContext(
+		messages: AgentMessage[],
+		reason: "manual" | "threshold",
+		signal?: AbortSignal,
+		customInstructions?: string,
+		incoming: readonly AgentMessage[] = [],
+	): Promise<CompactionResult | undefined> {
+		const lifecycle = this._codexContext;
+		if (!lifecycle) return undefined;
+		const controller = new AbortController();
+		const resetSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+		if (reason === "manual") this._compactionAbortController = controller;
+		else this._autoCompactionAbortController = controller;
+		this._emit({ type: "compaction_start", reason });
+		try {
+			const tokensBefore = estimateCodexContextTokens(messages).tokens;
+			const preparation: CompactionPreparation = {
+				firstKeptEntryId: this.sessionManager.getLeafId()!,
+				messagesToSummarize: messages,
+				turnPrefixMessages: [],
+				recentMessages: [],
+				isSplitTurn: false,
+				tokensBefore,
+				fileOps: createFileOps(),
+				settings: this.settingsManager.getCompactionSettings(),
+			};
+			const hook = await this._extensionRunner.emit({
+				type: "session_before_compact",
+				preparation,
+				branchEntries: this.sessionManager.getBranch(),
+				customInstructions,
+				reason,
+				willRetry: false,
+				signal: resetSignal,
+			});
+			if (hook?.cancel) {
+				lifecycle.cancelReset();
+				this._emit({ type: "compaction_end", reason, result: undefined, aborted: true, willRetry: false });
+				return undefined;
+			}
+			resetSignal.throwIfAborted();
+			lifecycle.requestReset();
+			this.agent.state.messages = await lifecycle.advance(messages, resetSignal, incoming);
+			const boundary = this.sessionManager.getLeafEntry()!;
+			const result: CompactionResult = {
+				summary: "",
+				firstKeptEntryId: boundary.id,
+				tokensBefore,
+				estimatedTokensAfter: estimateCodexContextTokens(this.agent.state.messages).tokens,
+				details: { strategy: "experimental", contextWindowId: lifecycle.state.windowId },
+			};
+			// Legacy hook payload is metadata only. The durable boundary is a custom entry, never a summary.
+			await this._extensionRunner.emit({
+				type: "session_compact",
+				reason,
+				fromExtension: false,
+				willRetry: false,
+				compactionEntry: {
+					...boundary,
+					type: "compaction",
+					summary: "",
+					firstKeptEntryId: boundary.id,
+					tokensBefore,
+					details: result.details,
+				},
+			});
+			this._compactionAbortController = undefined;
+			this._autoCompactionAbortController = undefined;
+			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry: false });
+			return result;
+		} catch (error) {
+			const aborted = resetSignal.aborted;
+			const errorMessage = aborted ? undefined : error instanceof Error ? error.message : String(error);
+			this._emit({ type: "compaction_end", reason, result: undefined, aborted, willRetry: false, errorMessage });
+			await this._emitSessionCompactFailed({
+				reason,
+				aborted,
+				willRetry: false,
+				fromExtension: false,
+				errorMessage,
+			});
+			throw error;
+		} finally {
+			this._compactionAbortController = undefined;
+			this._autoCompactionAbortController = undefined;
+			this._resolveIdleWaitIfIdle();
+		}
+	}
+
+	private async _prepareCodexContext(
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		incoming: readonly AgentMessage[] = [],
+	): Promise<AgentMessage[]> {
+		const lifecycle = this._codexContext;
+		if (!lifecycle) return messages;
+		const additions = lifecycle.prepare(messages);
+		if (lifecycle.pendingReset) {
+			const result = await this._resetCodexContext(messages, "threshold", signal, undefined, incoming);
+			return result ? this.agent.state.messages.slice() : messages;
+		}
+		for (const message of additions) {
+			assignCodexContextIds([message], this._codexTurnId);
+			this.sessionManager.appendMessage(message);
+		}
+		const next = [...messages, ...additions];
+		this.agent.state.messages = next;
+		return next;
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -461,7 +843,7 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		env?: Record<string, string>;
 	}> {
-		if (this.agent.streamFunction === streamSimple) {
+		if ((this._codexBaseStream ?? this.agent.streamFunction) === streamSimple) {
 			return this._getRequiredRequestAuth(model);
 		}
 
@@ -545,6 +927,10 @@ export class AgentSession {
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+		await this._ensureCodexContext();
+		if (this._codexContext) {
+			return context; // Native preflight runs after pending input arrives, immediately before sampling.
+		}
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings();
 
@@ -646,6 +1032,8 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (this._codexContext && (event.type === "message_start" || event.type === "message_end"))
+			assignCodexContextIds([event.message], this._codexTurnId);
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -682,6 +1070,10 @@ export class AgentSession {
 					event.message.content,
 					event.message.display,
 					event.message.details,
+					{
+						openaiCodexItemId: event.message.openaiCodexItemId,
+						openaiCodexMetadata: event.message.openaiCodexMetadata,
+					},
 				);
 			} else if (
 				event.message.role === "user" ||
@@ -695,6 +1087,9 @@ export class AgentSession {
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
+				this._codexContext?.observeInputTokens(
+					event.message.usage.input + event.message.usage.cacheRead + event.message.usage.cacheWrite,
+				);
 				this._lastAssistantMessage = event.message;
 
 				const assistantMsg = event.message as AssistantMessage;
@@ -897,6 +1292,7 @@ export class AgentSession {
 		);
 		this._disconnectFromAgent();
 		this._eventListeners = [];
+		setCodexContextActive(this.sessionId, false);
 		cleanupSessionResources(this.sessionId);
 	}
 
@@ -1106,6 +1502,21 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		await this._ensureCodexContext();
+		this._codexTurnId = uuidv7();
+		this._codexTurnStartedAt = Date.now();
+		if (this._codexContext)
+			this.sessionManager.appendCustomEntry("codex-context-turn", {
+				turnId: this._codexTurnId,
+				startedAt: this._codexTurnStartedAt,
+			});
+		if (this._codexContext) {
+			this.agent.state.systemPrompt = this.agent.state.systemPrompt.replace(
+				"Emit model tool calls only with the name `ipython`.",
+				"Use `ipython` for Python operations. Native model-only `history`, `notes`, `new_context`, and `get_context_remaining` tools are also available directly; never call them through Python.",
+			);
+			this._systemPromptOverride = this.agent.state.systemPrompt;
+		}
 		this._isAgentRunActive = true;
 		try {
 			await this.agent.prompt(messages);
@@ -1248,6 +1659,8 @@ export class AgentSession {
 				}
 				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 			}
+
+			await this._ensureCodexContext();
 
 			// Check if we need to compact before sending (catches aborted responses).
 			// The user's new prompt is sent below, so do not call agent.continue() here.
@@ -1517,12 +1930,14 @@ export class AgentSession {
 	}
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
+		if (this._codexContext) assignCodexContextIds([appMessage], this._codexTurnId);
 		this.agent.state.messages.push(appMessage);
 		this.sessionManager.appendCustomMessageEntry(
 			appMessage.customType,
 			appMessage.content,
 			appMessage.display,
 			appMessage.details,
+			{ openaiCodexItemId: appMessage.openaiCodexItemId, openaiCodexMetadata: appMessage.openaiCodexMetadata },
 		);
 		this._emit({ type: "message_start", message: appMessage });
 		this._emit({ type: "message_end", message: appMessage });
@@ -1956,6 +2371,17 @@ export class AgentSession {
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		await this.abort();
+		await this._ensureCodexContext();
+		if (this._codexContext) {
+			const result = await this._resetCodexContext(
+				this.agent.state.messages,
+				"manual",
+				undefined,
+				customInstructions,
+			);
+			if (!result) throw new Error("Compaction cancelled");
+			return result;
+		}
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
 		let fromExtension = false;
@@ -2153,6 +2579,11 @@ export class AgentSession {
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+		if (this._codexContext) {
+			// Codex does not compact-and-retry overflow. Return the error; reset at the next preflight.
+			if (isContextOverflow(assistantMessage, this.model?.contextWindow ?? 0)) this._codexContext.requestReset();
+			return false;
+		}
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
@@ -3066,6 +3497,8 @@ export class AgentSession {
 			excludeFromContext: options?.excludeFromContext,
 		};
 
+		if (this._codexContext) assignCodexContextIds([bashMessage], this._codexTurnId);
+
 		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
 		if (this.isStreaming) {
 			// Queue for later - will be flushed on agent_end
@@ -3237,6 +3670,7 @@ export class AgentSession {
 				const model = this.model!;
 				const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
+				this._codexSummarizing = true;
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model: requestModel,
 					apiKey,
@@ -3250,6 +3684,7 @@ export class AgentSession {
 					retry: this.settingsManager.getRetrySettings(),
 					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
 				});
+				this._codexSummarizing = false;
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };
 				}
@@ -3320,6 +3755,9 @@ export class AgentSession {
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 
+			this._codexContext = undefined;
+			await this._ensureCodexContext();
+
 			// Emit session_tree event
 			await this._extensionRunner.emit({
 				type: "session_tree",
@@ -3333,6 +3771,7 @@ export class AgentSession {
 
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
+			this._codexSummarizing = false;
 			this._branchSummaryAbortController = undefined;
 			this._resolveIdleWaitIfIdle();
 		}
@@ -3451,7 +3890,9 @@ export class AgentSession {
 			}
 		}
 
-		const estimate = estimateContextTokens(this.messages);
+		const estimate = this._codexContext
+			? estimateCodexContextTokens(this.messages)
+			: estimateContextTokens(this.messages);
 		const percent = (estimate.tokens / contextWindow) * 100;
 
 		return {

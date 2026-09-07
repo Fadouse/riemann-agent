@@ -15,13 +15,15 @@
 - Renamed `web.search` arguments `num_results`/`include_domains`/`start_published_date` to `limit`/`domains`/`since`, aligning the search `limit` vocabulary across `fs.glob`, `fs.search`, and `catalog.search`.
 - Renamed the `fs.search` file-filter argument `pattern` to `glob`, removing the `query`/`pattern` ambiguity.
 - Filesystem policies now require every configured root and exclusion to exist, require write roots to be covered by read roots, and treat `readExclude` as denying both reads and writes.
-- Omitted Riemann `compaction.strategy` now resolves automatically: OpenAI Codex models use cloud compaction and all other providers use the semantic default strategy; set `default` explicitly to force semantic compaction on Codex.
+- Omitted Riemann `compaction.strategy` now resolves automatically: eligible supported Codex OAuth models use experimental context, other Codex OAuth models use cloud compaction, and other sessions use the semantic default strategy; set `default` explicitly to force semantic compaction on Codex.
 - Replaced the Riemann Python operation bridge with strict lockstep schemas, keyword-only calls, discriminated result tags, normalized errors, and a single `agents.start()`/`mcp.open()` lifecycle surface; removed `agents.run()`, `agents.spawn()`, `AgentHandle.send()`, and `mcp.activate()`.
 - Replaced `fs.search(regex=...)` with `fs.search(mode="literal" | "regex")`, defined edit offsets as Unicode code points, and changed Shell, Web, Artifact, and MCP result records to exact named shapes.
 - Replaced the separate `shell.network` capability with `agents.main/defaults/profiles.network: allow | deny | inherit`; the effective policy now controls both IPython and `shell.run`, while Web and MCP host operations remain unaffected.
 - Removed embedded Riemann config, bridge, result-tag, compaction-state, and managed-Python layout version markers; these lockstep contracts now reject stale shapes without compatibility aliases.
 
 ### Added
+
+- Added native Codex context windows, budget reminders, encrypted history/notes recovery, and private transcript presentation.
 
 - Added theme-aware, color-only running-tool dots with shared, bounded animation frames and cached tool-body rendering.
 - Added configurable reusable Agent slots and default child-model selection to the settings panel.
@@ -62,6 +64,8 @@
 - Limited collapsed shell command previews to five visual rows aligned with output; expanded views retain complete commands and results.
 
 ### Fixed
+
+- Fixed TUI streaming stalls with native Codex history by retaining footer context estimates across display-only deltas instead of reserializing unchanged encrypted and image payloads on each frame.
 
 - Fixed diff word emphasis swapping syntax colors into bright blocks; collapsed previews retain both sides of the first replacement while expanded diffs remain complete.
 - Fixed subagent creation labels to show Spawning/Spawned and restored muted task and interaction prompts.

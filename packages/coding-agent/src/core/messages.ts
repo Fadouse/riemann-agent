@@ -6,7 +6,9 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Message, ProviderPayload, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, ProviderPayload, TextContent, UserMessage } from "@earendil-works/pi-ai";
+
+type CodexItemIdentity = Pick<UserMessage, "openaiCodexItemId" | "openaiCodexMetadata">;
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -26,7 +28,7 @@ export const BRANCH_SUMMARY_SUFFIX = `</summary>`;
 /**
  * Message type for bash executions via the ! command.
  */
-export interface BashExecutionMessage {
+export interface BashExecutionMessage extends CodexItemIdentity {
 	role: "bashExecution";
 	command: string;
 	output: string;
@@ -43,7 +45,7 @@ export interface BashExecutionMessage {
  * Message type for extension-injected messages via sendMessage().
  * These are custom messages that extensions can inject into the conversation.
  */
-export interface CustomMessage<T = unknown> {
+export interface CustomMessage<T = unknown> extends CodexItemIdentity {
 	role: "custom";
 	customType: string;
 	content: string | (TextContent | ImageContent)[];
@@ -52,14 +54,14 @@ export interface CustomMessage<T = unknown> {
 	timestamp: number;
 }
 
-export interface BranchSummaryMessage {
+export interface BranchSummaryMessage extends CodexItemIdentity {
 	role: "branchSummary";
 	summary: string;
 	fromId: string | null;
 	timestamp: number;
 }
 
-export interface CompactionSummaryMessage {
+export interface CompactionSummaryMessage extends CodexItemIdentity {
 	role: "compactionSummary";
 	summary: string;
 	tokensBefore: number;
@@ -164,6 +166,8 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					}
 					return {
 						role: "user",
+						openaiCodexItemId: m.openaiCodexItemId,
+						openaiCodexMetadata: m.openaiCodexMetadata,
 						content: [{ type: "text", text: bashExecutionToText(m) }],
 						timestamp: m.timestamp,
 					};
@@ -171,6 +175,8 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
 					return {
 						role: "user",
+						openaiCodexItemId: m.openaiCodexItemId,
+						openaiCodexMetadata: m.openaiCodexMetadata,
 						content,
 						timestamp: m.timestamp,
 					};
@@ -178,12 +184,16 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "branchSummary":
 					return {
 						role: "user",
+						openaiCodexItemId: m.openaiCodexItemId,
+						openaiCodexMetadata: m.openaiCodexMetadata,
 						content: [{ type: "text" as const, text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }],
 						timestamp: m.timestamp,
 					};
 				case "compactionSummary":
 					return {
 						role: "user",
+						openaiCodexItemId: m.openaiCodexItemId,
+						openaiCodexMetadata: m.openaiCodexMetadata,
 						content:
 							m.blocks !== undefined
 								? [{ type: "text" as const, text: m.summary }, ...m.blocks]

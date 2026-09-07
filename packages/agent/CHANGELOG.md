@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added model-only native tool dispatch with separate execution, parallelism, and private tool-result handling.
+
 ### Changed
 
 - Serialized tool progress delivery with bounded bookkeeping while preserving update ordering and completion waits.

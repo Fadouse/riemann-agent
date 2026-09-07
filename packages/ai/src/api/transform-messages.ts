@@ -95,7 +95,8 @@ export function transformMessages<TApi extends Api>(
 			const isSameModel =
 				assistantMsg.provider === model.provider &&
 				assistantMsg.api === model.api &&
-				assistantMsg.model === model.id;
+				(assistantMsg.model === model.id ||
+					(model.api === "openai-codex-responses" && assistantMsg.openaiCodexMetadata !== undefined));
 
 			const transformedContent = assistantMsg.content.flatMap((block) => {
 				if (block.type === "thinking") {

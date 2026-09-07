@@ -309,6 +309,7 @@ describe("SettingsSelectorComponent", () => {
 
 		expect(selector.render(120).join("\n")).toContain("Automatic");
 		expect(selector.render(120).join("\n")).toContain("OpenAI Codex models");
+		expect(selector.render(120).join("\n")).toContain("experimental context");
 		expect(selector.render(120).join("\n")).toContain("advanced image archive");
 		for (const [label, literal] of [
 			["Default", "default"],

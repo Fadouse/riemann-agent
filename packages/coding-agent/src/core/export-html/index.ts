@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "fs";
 import { basename, join } from "path";
 import { APP_NAME, getExportTemplateDir } from "../../config.ts";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/interactive/theme/theme.ts";
+import { ModelOnlyToolPresentation } from "../../utils/model-only-tools.ts";
 import { normalizePath, resolvePath } from "../../utils/paths.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import type { SessionEntry } from "../session-manager.ts";
@@ -137,6 +138,49 @@ interface SessionData {
 	renderedTools?: Record<string, RenderedToolHtml>;
 }
 
+/** Remove model-only data from the exported copy, reconnecting public tree nodes. */
+function presentationEntries(
+	entries: SessionEntry[],
+	leafId: string | null,
+): { entries: SessionEntry[]; leafId: string | null } {
+	const presentation = new ModelOnlyToolPresentation();
+	// Pre-index calls across branches before considering results.
+	for (const entry of entries) {
+		if (entry.type === "message" && entry.message.role === "assistant") presentation.message(entry.message);
+	}
+	const parents = new Map<string, string | null>();
+	const projected: SessionEntry[] = [];
+	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === "codex-context-window") {
+			parents.set(entry.id, entry.parentId);
+			continue;
+		}
+		if (entry.type !== "message") {
+			projected.push(entry);
+			continue;
+		}
+		let message = presentation.message(entry.message);
+		if (message?.role === "user" && message.providerPayload) {
+			const { providerPayload: _providerPayload, ...visible } = message;
+			message = visible;
+		}
+		if (!message || (message !== entry.message && "content" in message && message.content.length === 0)) {
+			parents.set(entry.id, entry.parentId);
+			continue;
+		}
+		projected.push({ ...entry, message });
+	}
+	while (leafId !== null && parents.has(leafId)) leafId = parents.get(leafId) ?? null;
+	return {
+		leafId,
+		entries: projected.map((entry) => {
+			let parentId = entry.parentId;
+			while (parentId !== null && parents.has(parentId)) parentId = parents.get(parentId) ?? null;
+			return parentId === entry.parentId ? entry : { ...entry, parentId };
+		}),
+	};
+}
+
 /**
  * Core HTML generation logic shared by both export functions.
  */
@@ -248,7 +292,7 @@ export async function exportSessionToHtml(
 		throw new Error("Nothing to export yet - start a conversation first");
 	}
 
-	const entries = sm.getEntries();
+	const { entries, leafId } = presentationEntries(sm.getEntries(), sm.getLeafId());
 
 	// Pre-render custom tools if a tool renderer is provided
 	let renderedTools: Record<string, RenderedToolHtml> | undefined;
@@ -263,7 +307,7 @@ export async function exportSessionToHtml(
 	const sessionData: SessionData = {
 		header: sm.getHeader(),
 		entries,
-		leafId: sm.getLeafId(),
+		leafId,
 		systemPrompt: state?.systemPrompt,
 		tools: state?.tools?.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
 		renderedTools,
@@ -297,8 +341,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 
 	const sessionData: SessionData = {
 		header: sm.getHeader(),
-		entries: sm.getEntries(),
-		leafId: sm.getLeafId(),
+		...presentationEntries(sm.getEntries(), sm.getLeafId()),
 		systemPrompt: undefined,
 		tools: undefined,
 	};

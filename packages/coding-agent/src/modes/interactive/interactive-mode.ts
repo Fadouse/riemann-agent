@@ -112,6 +112,7 @@ import { copyToClipboard, readClipboardText } from "../../utils/clipboard.ts";
 import { readClipboardImage } from "../../utils/clipboard-image.ts";
 import { parseGitUrl } from "../../utils/git.ts";
 import { processImage } from "../../utils/image-process.ts";
+import { isModelOnlyToolCall } from "../../utils/model-only-tools.ts";
 import { getCwdRelativePath } from "../../utils/paths.ts";
 import { getPiUserAgent } from "../../utils/pi-user-agent.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
@@ -273,7 +274,7 @@ const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 
 export function formatRiemannSettingSaveStatus(path: RiemannSettingPath): string {
 	return path === "compaction.strategy"
-		? "Saved compaction.strategy; active for next compaction"
+		? "Saved compaction.strategy; checked before next model request or compaction"
 		: `Saved ${path}; applies to new runs`;
 }
 
@@ -3243,7 +3244,15 @@ export class InteractiveMode {
 			await this.init();
 		}
 
-		this.footer.invalidate();
+		// Streaming deltas only change the in-progress display, not committed context usage.
+		// Re-estimating native history here can serialize large encrypted/image payloads on every frame.
+		if (
+			event.type !== "message_update" &&
+			event.type !== "tool_execution_update" &&
+			event.type !== "bash_execution_update"
+		) {
+			this.footer.invalidate();
+		}
 
 		switch (event.type) {
 			case "agent_start":
@@ -3325,7 +3334,7 @@ export class InteractiveMode {
 					queueAssistantMessageComponentUpdate(this.streamingComponent, this.streamingMessage, true);
 
 					for (const content of this.streamingMessage.content) {
-						if (content.type === "toolCall") {
+						if (content.type === "toolCall" && !isModelOnlyToolCall(this.streamingMessage, content)) {
 							if (!this.pendingTools.has(content.id)) {
 								const component = new ToolExecutionComponent(
 									content.name,
@@ -3491,6 +3500,15 @@ export class InteractiveMode {
 					} else {
 						this.showStatus("Auto-compaction cancelled");
 					}
+				} else if (
+					event.result &&
+					typeof event.result.details === "object" &&
+					event.result.details !== null &&
+					"strategy" in event.result.details &&
+					event.result.details.strategy === "experimental"
+				) {
+					// Native resets persist window checkpoints, not summary entries. Keep the visible transcript.
+					this.showStatus("Context compacted");
 				} else if (event.result) {
 					const entries = this.sessionManager.buildContextEntries();
 					if (entries[0]?.type !== "compaction") {
@@ -3797,7 +3815,7 @@ export class InteractiveMode {
 				this.addMessageToChat(message);
 				// Render tool call components
 				for (const content of message.content) {
-					if (content.type === "toolCall") {
+					if (content.type === "toolCall" && !isModelOnlyToolCall(message, content)) {
 						const component = new ToolExecutionComponent(
 							content.name,
 							content.id,
@@ -4682,18 +4700,23 @@ export class InteractiveMode {
 	): void {
 		const model = this.session.model;
 		const supportsOpenAICompaction = model?.provider === "openai-codex" && model.api === "openai-codex-responses";
+		const capabilities = {
+			usingOAuth:
+				model !== undefined && supportsOpenAICompaction
+					? this.session.modelRuntime.isUsingOAuth(model.provider)
+					: false,
+			supportsExperimentalContext: this.session.codexContextActive,
+		};
 		const warnings = detectCompactionWarnings({
 			trigger: "strategy-change",
 			hasEncryptedOpenAIContext: latestActiveCompactionHasOpenAIContext(this.sessionManager.getBranch()),
-			previousEffectiveStrategy: resolveCompactionStrategy(previousConfiguredStrategy, model).effective,
-			effectiveStrategy: resolveCompactionStrategy(nextConfiguredStrategy, model).effective,
+			previousEffectiveStrategy: resolveCompactionStrategy(previousConfiguredStrategy, model, capabilities)
+				.effective,
+			effectiveStrategy: resolveCompactionStrategy(nextConfiguredStrategy, model, capabilities).effective,
 			currentModel: {
 				supportsImageInput: model?.input.includes("image") ?? false,
 				supportsOpenAICompaction,
-				usingOAuth:
-					model !== undefined && supportsOpenAICompaction
-						? this.session.modelRuntime.isUsingOAuth(model.provider)
-						: false,
+				usingOAuth: capabilities.usingOAuth,
 			},
 		});
 		for (const warning of warnings) this.showWarning(warning.message);

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { getCodexContextHost, setCodexContextActive } from "../src/core/codex-context-session.ts";
 import type { CompactionPreparation, CompactionResult } from "../src/core/compaction/index.ts";
 import type { ExtensionContext } from "../src/core/extensions/types.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";
@@ -284,4 +285,99 @@ describe("Riemann compaction warning extension hooks", () => {
 		expect(compact).toHaveBeenCalledWith(input, undefined, signal, ctx);
 		expect(result && (result as { compaction: CompactionResult }).compaction).toBe(expected);
 	});
+});
+
+test("child context host is registered before generation and removed on shutdown", async () => {
+	const { root, agentDir } = await configRoot("automatic");
+	const handlers = new Map<string, Handler>();
+	const ctx = context({ cwd: root, model: codexModel, notify: vi.fn(), usingOAuth: true });
+	const host = {
+		agentName: "/root/worker",
+		sharedSessionId: "shared-root-session",
+		parentThreadId: "parent-thread",
+		initialContext: vi.fn(async () => ({ messages: [] })),
+	};
+	registerChildCompactionHooks(
+		extensionApi(handlers) as never,
+		{} as ChildRiemannRuntime,
+		{ cwd: root, agentDir, projectTrusted: true },
+		undefined,
+		host,
+	);
+	try {
+		await handlers.get("session_start")?.({ reason: "new" }, ctx);
+		expect(getCodexContextHost("warning-session")).toBe(host);
+		await getCodexContextHost("warning-session")?.initialContext();
+		expect(host.initialContext).toHaveBeenCalledOnce();
+	} finally {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	}
+	expect(getCodexContextHost("warning-session")).toBeUndefined();
+});
+
+test.each(["root", "child"])("%s hook never summarizes an active experimental reset", async (kind) => {
+	const { root, agentDir } = await configRoot("automatic");
+	process.env.RIEMANN_CODING_AGENT_DIR = agentDir;
+	const ctx = context({ cwd: root, model: codexModel, notify: vi.fn(), usingOAuth: true });
+	const compact = vi.fn(async () => ({
+		summary: "unexpected cloud call",
+		firstKeptEntryId: "first",
+		tokensBefore: 100,
+	}));
+	const runtime = { compact };
+	const handlers = new Map<string, Handler>();
+	if (kind === "root") {
+		vi.spyOn(RiemannRuntime, "createRoot").mockResolvedValue(runtime as unknown as RiemannRuntime);
+		riemannExtension(extensionApi(handlers) as never);
+	} else {
+		registerChildCompactionHooks(extensionApi(handlers) as never, runtime as unknown as ChildRiemannRuntime, {
+			cwd: root,
+			agentDir,
+			projectTrusted: true,
+		});
+	}
+	setCodexContextActive("warning-session", true);
+	try {
+		const result = await handlers.get("session_before_compact")?.(
+			{
+				preparation: preparation(),
+				signal: new AbortController().signal,
+				reason: "threshold",
+			},
+			ctx,
+		);
+		expect(compact).not.toHaveBeenCalled();
+		expect(result).toBeUndefined();
+	} finally {
+		setCodexContextActive("warning-session", false);
+	}
+});
+
+test("root reset context preserves native tool guidance and current project instructions", async () => {
+	const { root, agentDir } = await configRoot("automatic");
+	process.env.RIEMANN_CODING_AGENT_DIR = agentDir;
+	const handlers = new Map<string, Handler>();
+	const ctx = context({ cwd: root, model: codexModel, notify: vi.fn(), usingOAuth: true });
+	const runtime = {
+		systemPrompt: () => "Emit model tool calls only with the name `ipython`.",
+		initialCodexContext: async () => ({ systemPrompt: "Native context tools are available.", messages: [] }),
+		close: vi.fn(async () => {}),
+	};
+	vi.spyOn(RiemannRuntime, "createRoot").mockResolvedValue(runtime as unknown as RiemannRuntime);
+	riemannExtension(extensionApi(handlers) as never);
+	await handlers.get("before_agent_start")?.(
+		{
+			systemPromptOptions: { cwd: root, contextFiles: [{ path: "AGENTS.md", content: "Project rule marker" }] },
+		},
+		ctx,
+	);
+	try {
+		const initial = await getCodexContextHost("warning-session")?.initialContext();
+		expect(initial?.systemPrompt).toContain("Native context tools are available.");
+		expect(initial?.systemPrompt).toContain("Project rule marker");
+		expect(initial?.systemPrompt).not.toContain("Emit model tool calls only");
+	} finally {
+		await handlers.get("session_shutdown")?.({}, ctx);
+	}
+	expect(getCodexContextHost("warning-session")).toBeUndefined();
 });

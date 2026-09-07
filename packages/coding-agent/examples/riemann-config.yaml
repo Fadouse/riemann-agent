@@ -1,7 +1,7 @@
 compaction:
-  # automatic uses OpenAI cloud compaction for OpenAI Codex models and default
-  # semantic checkpoints for every other provider. Explicit default, openai,
-  # and snapshot overrides remain available.
+  # automatic uses experimental context for eligible supported Codex OAuth models,
+  # Codex cloud compaction for other Codex OAuth models, and semantic checkpoints
+  # otherwise. Explicit default, openai, and snapshot overrides remain available.
   strategy: automatic
 
 agents:

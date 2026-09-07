@@ -22,6 +22,7 @@ import { openAICompactionProviderPayload } from "../riemann/openai-compaction-st
 import { getPreservedArchive, historyBlocks } from "../riemann/snapshot-compaction.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { graphemeSafePrefix } from "../utils/text.ts";
+import { CODEX_CONTEXT_STATE, isCodexContextWindow } from "./codex-context-state.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -138,7 +139,9 @@ export interface SessionInfoEntry extends SessionEntryBase {
  * - false: hidden entirely
  * - true: rendered with distinct styling (different from user messages)
  */
-export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
+export interface CustomMessageEntry<T = unknown>
+	extends SessionEntryBase,
+		Pick<CustomMessage, "openaiCodexItemId" | "openaiCodexMetadata"> {
 	type: "custom_message";
 	customType: string;
 	content: string | (TextContent | ImageContent)[];
@@ -388,6 +391,8 @@ function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "
  * Plain custom entries are display/state entries and do not participate in context.
  */
 export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage[] {
+	if (entry.type === "custom" && entry.customType === CODEX_CONTEXT_STATE && isCodexContextWindow(entry.data))
+		return entry.data.initialMessages.slice();
 	if (entry.type === "message") {
 		const message = entry.message;
 		// Session files are parsed without validation; old versions, forks, or
@@ -402,7 +407,17 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 	}
 	if (entry.type === "custom_message") {
 		return [
-			createCustomMessage(entry.customType, entry.content ?? [], entry.display, entry.details, entry.timestamp),
+			{
+				...createCustomMessage(
+					entry.customType,
+					entry.content ?? [],
+					entry.display,
+					entry.details,
+					entry.timestamp,
+				),
+				openaiCodexItemId: entry.openaiCodexItemId,
+				openaiCodexMetadata: entry.openaiCodexMetadata,
+			},
 		];
 	}
 	if (entry.type === "branch_summary" && entry.summary) {
@@ -426,6 +441,13 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 
 /** Resolve compaction against an already-built root-to-leaf path. */
 function buildContextEntriesFromPath(path: SessionEntry[]): SessionEntry[] {
+	for (let i = path.length - 1; i >= 0; i--) {
+		const entry = path[i];
+		if (entry.type === "custom" && entry.customType === CODEX_CONTEXT_STATE && isCodexContextWindow(entry.data)) {
+			path = path.slice(i);
+			break;
+		}
+	}
 	let compaction: CompactionEntry | null = null;
 
 	for (const entry of path) {
@@ -1143,7 +1165,10 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		if (!this.hasAssistantMessage) {
+		if (
+			!this.hasAssistantMessage &&
+			!(entry.type === "custom" && entry.customType === CODEX_CONTEXT_STATE && isCodexContextWindow(entry.data))
+		) {
 			if (this.flushed) {
 				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
 			} else {
@@ -1176,7 +1201,12 @@ export class SessionManager {
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		const cache = this.contextCache;
-		if (cache && cache.leafId === entry.parentId && entry.type !== "compaction") {
+		if (
+			cache &&
+			cache.leafId === entry.parentId &&
+			entry.type !== "compaction" &&
+			!(entry.type === "custom" && entry.customType === CODEX_CONTEXT_STATE)
+		) {
 			cache.leafId = entry.id;
 			const index = cache.path.length % CONTEXT_ENTRIES_PER_METADATA_BLOCK;
 			let metadata = cache.metadataBlocks[Math.floor(cache.path.length / CONTEXT_ENTRIES_PER_METADATA_BLOCK)];
@@ -1320,8 +1350,10 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		codexIdentity?: Pick<CustomMessage, "openaiCodexItemId" | "openaiCodexMetadata">,
 	): string {
 		const entry: CustomMessageEntry<T> = {
+			...codexIdentity,
 			type: "custom_message",
 			customType,
 			content,

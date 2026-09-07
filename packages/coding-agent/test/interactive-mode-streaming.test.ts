@@ -1,13 +1,14 @@
-import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
 import { Container, type TUI } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
-import type { AgentSessionEvent } from "../src/core/agent-session.ts";
+import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.ts";
 import type { FullscreenExitOutput } from "../src/core/settings-manager.ts";
 import {
 	AssistantMessageComponent,
 	flushAssistantMessageComponentUpdate,
 	queueAssistantMessageComponentUpdate,
 } from "../src/modes/interactive/components/assistant-message.ts";
+import { FooterComponent } from "../src/modes/interactive/components/footer.ts";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -163,6 +164,68 @@ describe("InteractiveMode assistant streaming display", () => {
 		expect(transformed).toEqual(["stream state 100"]);
 	});
 
+	test("does not reserialize unchanged native history on streaming redraws", async () => {
+		const { context } = createStreamingContext();
+		const imageUrl = `data:image/png;base64,${"A".repeat(1024 * 1024)}`;
+		const serializeImage = vi.fn(() => ({ type: "input_image", image_url: imageUrl }));
+		const image = { type: "input_image" as const, image_url: imageUrl, toJSON: serializeImage };
+		const nativeResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "native-history",
+			toolName: "read_item",
+			content: [],
+			openaiCodexOutput: [image],
+			isError: false,
+			timestamp: 0,
+		};
+		const previous = createAssistantMessage([]);
+		previous.usage = { ...EMPTY_USAGE, input: 1000, totalTokens: 1000 };
+		const messages = [previous, nativeResult];
+		const model = { id: "codex-fixture", provider: "openai-codex", contextWindow: 272000 };
+		const session = {
+			model,
+			state: { model },
+			messages,
+			_codexContext: {},
+			sessionManager: { getBranch: () => [], getCwd: () => "/tmp", getSessionName: () => undefined },
+			getContextUsage: AgentSession.prototype.getContextUsage,
+		} as unknown as AgentSession;
+		const readUsage = vi.spyOn(session, "getContextUsage");
+		const footer = new FooterComponent(session, {
+			getGitBranch: () => null,
+			getExtensionStatuses: () => new Map(),
+			getAvailableProviderCount: () => 1,
+			onBranchChange: () => () => {},
+		});
+		context.footer = footer;
+		footer.render(120);
+		for (let index = 0; index < 5; index++) {
+			await interactiveModePrototype.handleEvent.call(
+				context,
+				asEvent({
+					type: "message_update",
+					message: createAssistantMessage([{ type: "text", text: `part ${index}` }]),
+				}),
+			);
+			await interactiveModePrototype.handleEvent.call(
+				context,
+				asEvent({ type: "tool_execution_update", toolCallId: "pending" }),
+			);
+			await interactiveModePrototype.handleEvent.call(context, asEvent({ type: "bash_execution_update" }));
+			render(context.chatContainer);
+			footer.render(120);
+		}
+		expect(readUsage).toHaveBeenCalledTimes(1);
+		expect(serializeImage).toHaveBeenCalledTimes(1);
+		const final = createAssistantMessage([{ type: "text", text: "done" }]);
+		final.usage = { ...EMPTY_USAGE, input: 2000, totalTokens: 2000 };
+		messages.push(final);
+		await interactiveModePrototype.handleEvent.call(context, asEvent({ type: "message_end", message: final }));
+		footer.render(120);
+		expect(readUsage).toHaveBeenCalledTimes(2);
+		expect(readUsage.mock.results[1].value).toMatchObject({ tokens: 2000 });
+	});
+
 	test("reconciles the final message synchronously at message_end", async () => {
 		const { context, component } = createStreamingContext();
 		const reconcile = vi.spyOn(component, "updateContent");
@@ -184,6 +247,30 @@ describe("InteractiveMode assistant streaming display", () => {
 		expect(render(component)).toContain("complete answer");
 		expect(context.streamingComponent).toBeUndefined();
 		expect(context.streamingMessage).toBeUndefined();
+	});
+
+	test.each([
+		{ namespace: "history", name: "search_contents" },
+		{ namespace: "notes", name: "write_file" },
+		{ name: "new_context" },
+		{ name: "get_context_remaining" },
+	])("does not create native Codex $name cards during streaming", async (call) => {
+		const { context } = createStreamingContext();
+		const message: AssistantMessage = {
+			...createAssistantMessage([
+				{ type: "text", text: "Public answer" },
+				{ type: "toolCall", id: "private", ...call, arguments: { secret: "private payload" } },
+			]),
+			provider: "openai-codex",
+			api: "openai-codex-responses",
+		};
+		const original = JSON.stringify(message);
+		await interactiveModePrototype.handleEvent.call(context, asEvent({ type: "message_update", message }));
+		expect(context.pendingTools.size).toBe(0);
+		expect(render(context.chatContainer)).toContain("Public answer");
+		expect(render(context.chatContainer)).not.toContain("private payload");
+		await interactiveModePrototype.handleEvent.call(context, asEvent({ type: "message_end", message }));
+		expect(JSON.stringify(message)).toBe(original);
 	});
 
 	test("creates tool components immediately and preserves final arguments and lifecycle", async () => {

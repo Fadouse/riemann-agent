@@ -74,7 +74,10 @@ describe("Riemann runtime compaction dispatch", () => {
 		});
 		const context = {
 			model,
-			modelRegistry: { complete },
+			modelRegistry: {
+				complete,
+				isUsingOAuth: (selected: { provider: string }) => selected.provider === "openai-codex",
+			},
 			getSystemPrompt: () => "Riemann system",
 			thinkingLevel: "off",
 		} as unknown as Pick<ExtensionContext, "model" | "modelRegistry" | "getSystemPrompt" | "thinkingLevel">;
@@ -150,7 +153,10 @@ describe("Riemann runtime compaction dispatch", () => {
 		const complete = vi.fn(async () => fauxAssistantMessage("project summary"));
 		const context = {
 			model,
-			modelRegistry: { complete },
+			modelRegistry: {
+				complete,
+				isUsingOAuth: (selected: { provider: string }) => selected.provider === "openai-codex",
+			},
 			getSystemPrompt: () => "Riemann system",
 			thinkingLevel: "off",
 		} as unknown as Pick<ExtensionContext, "model" | "modelRegistry" | "getSystemPrompt" | "thinkingLevel">;

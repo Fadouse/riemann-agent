@@ -1,6 +1,7 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
+import type { AgentSessionEvent } from "../src/core/agent-session.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";
 import { formatRiemannSettingSaveStatus, InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -8,7 +9,7 @@ import { stripAnsi } from "../src/utils/ansi.ts";
 
 test("reports when saved Riemann settings become active", () => {
 	expect(formatRiemannSettingSaveStatus("compaction.strategy")).toBe(
-		"Saved compaction.strategy; active for next compaction",
+		"Saved compaction.strategy; checked before next model request or compaction",
 	);
 	expect(formatRiemannSettingSaveStatus("agents.maxAgents")).toBe("Saved agents.maxAgents; applies to new runs");
 });
@@ -410,4 +411,37 @@ describe("InteractiveMode compaction events", () => {
 		expect(fakeThis.compactionQueuedMessages).toEqual([]);
 		expect(fakeThis.showError).not.toHaveBeenCalled();
 	});
+});
+
+test("renders native context reset completion without a stored summary", async () => {
+	const fakeThis = {
+		isInitialized: true,
+		settingsManager: { getShowTerminalProgress: () => false },
+		clearStatusIndicator: vi.fn(),
+		sessionManager: { buildContextEntries: vi.fn(() => []) },
+		footer: { invalidate: vi.fn() },
+		showStatus: vi.fn(),
+		flushCompactionQueue: vi.fn(async () => {}),
+		ui: { requestRender: vi.fn() },
+	};
+	const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
+		this: typeof fakeThis,
+		event: AgentSessionEvent,
+	) => Promise<void>;
+	await handleEvent.call(fakeThis, {
+		type: "compaction_end",
+		reason: "threshold",
+		aborted: false,
+		willRetry: false,
+		result: {
+			summary: "",
+			firstKeptEntryId: "window-boundary",
+			tokensBefore: 100,
+			details: { strategy: "experimental", contextWindowId: "new-window" },
+		},
+	});
+	expect(fakeThis.sessionManager.buildContextEntries).not.toHaveBeenCalled();
+	expect(fakeThis.showStatus).toHaveBeenCalledWith("Context compacted");
+	expect(fakeThis.footer.invalidate).toHaveBeenCalledOnce();
+	expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
 });
