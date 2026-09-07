@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AgentToolExecutionError } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ExtensionContext, ToolDefinition } from "../src/core/extensions/types.ts";
@@ -97,6 +98,10 @@ describe("Riemann session extension", () => {
 			join(agentDir, "config.yaml"),
 			[
 				"agents:",
+				"  defaults:",
+				"    filesystem:",
+				"      readExclude: []",
+				"      writeExclude: []",
 				"  profiles:",
 				"    researcher:",
 				"      description: Research public sources without modifying files.",
@@ -196,21 +201,23 @@ describe("Riemann session extension", () => {
 						"assert hasattr(catalog, 'search')",
 						"assert hasattr(state, 'status')",
 						"runtime_status = await state.status()",
-						"assert runtime_status['agent_slots']['used'] == 0, runtime_status",
-						"assert runtime_status['network'] == {'configured': 'inherit', 'effective': 'deny', 'source': 'builtin'}, runtime_status",
+						"assert runtime_status.agent_slots.used == 0, runtime_status",
+						"assert runtime_status.subagent_defaults.filesystem.read_exclude == [] and runtime_status.subagent_defaults.filesystem.write_exclude == [], runtime_status",
+						"assert runtime_status.network.configured == 'inherit' and runtime_status.network.effective == 'deny' and runtime_status.network.source == 'builtin', runtime_status",
 						"assert hasattr(agents, 'start')",
 						"assert not hasattr(agents, 'result')",
 						"assert not hasattr(agents, 'inbox')",
 						"assert not hasattr(agents, 'park')",
 						"assert not hasattr(agents, 'revive')",
 						"mesh = await agents.list()",
-						"assert mesh == [], mesh",
+						"assert mesh.items == [] and mesh.coverage == 'complete', mesh",
 						"snap = await fs.create(path='value.txt', text='before\\n')",
 						"snap = await fs.edit(snapshot=snap, operations=[{'kind':'replace','start':0,'end':6,'text':'after'}])",
 						"image = await fs.read(path='pixel.png')",
 						"assert isinstance(image, ImageSnapshot), image",
 						"reopened = await artifacts.open(handle=image.artifact.handle)",
 						"assert isinstance(reopened, Artifact) and reopened.handle == image.artifact.handle, reopened",
+						"assert reopened.handle.startswith('r') and len(reopened.handle) <= 12, reopened",
 						"viewed = await image.artifact.view()",
 						"assert isinstance(viewed, ImageSnapshot), viewed",
 						`display({"image/png": "${pixelBase64}"}, raw=True)`,
@@ -220,15 +227,20 @@ describe("Riemann session extension", () => {
 						"mcp_status = await public_docs.status()",
 						"assert mcp_status.status == 'ready' and mcp_status.tool_count == 6, mcp_status",
 						"matches = await catalog.search(query='sum values')",
-						"assert matches[0]['name'] == 'public_docs.sum_values', matches",
-						"contract = await catalog.describe(name=matches[0]['name'])",
-						"assert contract['name'] == 'public_docs.sum_values', contract",
+						"assert matches.items[0].name == 'public_docs.sum_values', matches",
+						"contract = await catalog.describe(name=matches.items[0].name)",
+						"assert contract.name == 'public_docs.sum_values', contract",
 						"mcp_result = await public_docs.sum_values(input={'left': 19, 'right': 23})",
 						"assert mcp_result.structured_content['total'] == 42, mcp_result",
 						"mcp_image = await public_docs.show_pixel(input={})",
 						"assert mcp_image.artifacts[0].mime_type == 'image/png', mcp_image",
 						"await public_docs.close()",
 						"assert not hasattr(public_docs, 'sum_values')",
+						"scan = await fs.glob(pattern='*', max_items=1)",
+						"assert scan.next_cursor is not None, scan",
+						"await output.show(value=matches, fields=['name'], max_items=1)",
+						"read_contract = await catalog.describe(name='Artifact.read')",
+						"assert read_contract.signature and read_contract.python_return_type == 'ArtifactSlice', read_contract",
 						"durable_value = 42",
 						"durable_value",
 					].join("\n"),
@@ -252,6 +264,57 @@ describe("Riemann session extension", () => {
 			expect(modelVisibleText).toContain("42");
 			expect(modelVisibleText).not.toContain("[stderr]");
 			expect(modelVisibleText).not.toContain("DeprecationWarning");
+			expect(modelVisibleText).not.toContain("artifact://");
+			let displayFailure: AgentToolExecutionError | undefined;
+			try {
+				await ipython.execute(
+					"invalid-display",
+					{
+						code: "r2 = await shell.run(script=\"printf one >> show-count.txt; printf retained\")\nawait output.show(value=r2, fields=['stdout', 'stderr'], max_items=30000)",
+					},
+					undefined,
+					undefined,
+					ctx,
+				);
+			} catch (error) {
+				if (!(error instanceof AgentToolExecutionError)) throw error;
+				displayFailure = error;
+			}
+			expect(displayFailure).toBeDefined();
+			const failureBody = JSON.stringify(displayFailure?.result.content);
+			expect(failureBody).toContain("max_items");
+			expect(failureBody).toContain("30000");
+			expect(failureBody).toContain("1000");
+			expect(failureBody).not.toContain("artifact://");
+			expect(failureBody).not.toContain("details=");
+			let unknownFailure: AgentToolExecutionError | undefined;
+			try {
+				await ipython.execute(
+					"unknown-display-argument",
+					{ code: "await output.show(value=r2, fields=['stdout', 'stderr'], limit=30000)" },
+					undefined,
+					undefined,
+					ctx,
+				);
+			} catch (error) {
+				if (!(error instanceof AgentToolExecutionError)) throw error;
+				unknownFailure = error;
+			}
+			expect(unknownFailure).toBeDefined();
+			const unknownBody = JSON.stringify(unknownFailure?.result.content);
+			expect(unknownBody).toContain("30000");
+			expect(unknownBody).toContain("not text length");
+			expect(unknownBody).toContain("output.more");
+			expect(unknownBody).not.toContain("details=");
+			const repaired = await ipython.execute(
+				"repair-display",
+				{ code: "await output.show(value=r2, fields=['stdout', 'stderr'])" },
+				undefined,
+				undefined,
+				ctx,
+			);
+			expect(JSON.stringify(repaired.content)).toContain("retained");
+			expect(await readFile(join(root, "show-count.txt"), "utf8")).toBe("one");
 			const modelVisibleImages = executed.content.filter((item) => item.type === "image");
 			expect(modelVisibleImages).toHaveLength(2);
 			expect(modelVisibleImages.every((item) => item.mimeType === "image/png")).toBe(true);
@@ -281,6 +344,25 @@ describe("Riemann session extension", () => {
 			expect(snapshotNames).toHaveLength(1);
 			const snapshot = await readFile(join(agentDir, "state", "snapshots", snapshotNames[0], "kernel.dill"));
 			expect(snapshot.byteLength).toBeGreaterThan(0);
+			await shutdown?.({}, ctx);
+			await sessionStart?.({}, sessionStartContext);
+			const restored = await ipython.execute(
+				"restored-cell",
+				{
+					code: [
+						"assert durable_value == 42",
+						"assert snap.text == 'after\\n'",
+						"following = await scan.next()",
+						"assert following.items and following.items != scan.items, following",
+						"assert runtime_status.agent_slots.used == 0",
+						"print('restored records and cursor')",
+					].join("\n"),
+				},
+				undefined,
+				undefined,
+				ctx,
+			);
+			expect(restored.details, JSON.stringify(restored.content)).toMatchObject({ status: "ok" });
 		} finally {
 			await shutdown?.({}, ctx);
 			if (previousAgentDir === undefined) delete process.env.RIEMANN_CODING_AGENT_DIR;

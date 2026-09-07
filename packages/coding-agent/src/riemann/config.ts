@@ -68,8 +68,19 @@ const McpServerSchema = Type.Object(
 	},
 	{ additionalProperties: false },
 );
+const OutputLimitsSchema = Type.Object(
+	{
+		maxModelTextBytes: Type.Optional(Type.Integer({ minimum: 1024, maximum: 1_048_576 })),
+		maxPreviewBytes: Type.Optional(Type.Integer({ minimum: 128, maximum: 65_536 })),
+		maxPreviewItems: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+		maxPreviewDepth: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
+		maxPreviewNodes: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+	},
+	{ additionalProperties: false },
+);
 const ConfigSchema = Type.Object(
 	{
+		limits: Type.Optional(OutputLimitsSchema),
 		compaction: Type.Optional(
 			Type.Object({ strategy: Type.Optional(CompactionStrategySchema) }, { additionalProperties: false }),
 		),
@@ -146,8 +157,11 @@ export interface RiemannConfig {
 	maxAgents: number;
 	maxConcurrentAgents: number;
 	limits: {
-		maxCellOutputChars: number;
-		maxArtifactPreviewChars: number;
+		maxModelTextBytes: number;
+		maxPreviewBytes: number;
+		maxPreviewItems: number;
+		maxPreviewDepth: number;
+		maxPreviewNodes: number;
 	};
 	retention: {
 		maxAgeDays: number;
@@ -182,8 +196,11 @@ const DEFAULTS: Omit<RiemannConfig, "files"> = {
 	maxAgents: 4,
 	maxConcurrentAgents: 4,
 	limits: {
-		maxCellOutputChars: 100_000,
-		maxArtifactPreviewChars: 12_000,
+		maxModelTextBytes: 16_384,
+		maxPreviewBytes: 2_048,
+		maxPreviewItems: 10,
+		maxPreviewDepth: 4,
+		maxPreviewNodes: 200,
 	},
 	retention: {
 		maxAgeDays: 30,
@@ -206,6 +223,7 @@ function mergeConfig(base: RiemannConfig, next: RiemannConfigFile, path: string)
 		...base,
 		maxAgents,
 		maxConcurrentAgents: Math.min(maxAgents, 4),
+		limits: { ...base.limits, ...next.limits },
 		compaction: { ...base.compaction, ...next.compaction },
 		mainAgent: { ...base.mainAgent, ...next.agents?.main },
 		agentDefaults: { ...base.agentDefaults, ...next.agents?.defaults },

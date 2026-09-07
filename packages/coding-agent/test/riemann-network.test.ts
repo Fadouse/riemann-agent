@@ -53,7 +53,7 @@ except OSError:
     pass
 shell_result = await shell.run(script="printf ping > /dev/tcp/127.0.0.1/${port}", timeout=5)
 status = await state.status()
-(ipython_connected, shell_result.exit_code == 0, status["network"], hasattr(web, "fetch"), hasattr(mcp, "open"))`,
+(ipython_connected, shell_result.exit_code == 0, (status.network.configured, status.network.effective, status.network.source), hasattr(web, "fetch"), hasattr(mcp, "open"))`,
 			},
 			undefined,
 			undefined,
@@ -90,13 +90,9 @@ test.skipIf(process.platform !== "linux" || !existsSync(bwrap))(
 		if (!address || typeof address === "string") throw new Error("Missing TCP test address");
 		try {
 			const allowed = (await executePolicy("allow", address.port)).replace(/\s+/g, " ");
-			expect(allowed).toContain(
-				"(True, True, {'configured': 'allow', 'effective': 'allow', 'source': 'main'}, True, True)",
-			);
+			expect(allowed).toContain("(True, True, ('allow', 'allow', 'main'), True, True)");
 			const denied = (await executePolicy("deny", address.port)).replace(/\s+/g, " ");
-			expect(denied).toContain(
-				"(False, False, {'configured': 'deny', 'effective': 'deny', 'source': 'main'}, True, True)",
-			);
+			expect(denied).toContain("(False, False, ('deny', 'deny', 'main'), True, True)");
 		} finally {
 			for (const socket of sockets) socket.destroy();
 			await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));

@@ -380,6 +380,9 @@ describe("Riemann IPython transcript", () => {
 		const longLine = "wrapped-output ".repeat(20);
 		const activity = {
 			id: "shell-wrapped",
+			stdoutTruncated: true,
+			stdoutCaptureTruncated: true,
+			stdoutArtifactHandle: "artifact://stdout",
 			kind: "shell",
 			status: "ok",
 			operation: "run",
@@ -400,6 +403,9 @@ describe("Riemann IPython transcript", () => {
 		const collapsedLength = component.render(32).length;
 		component.update(activity, true);
 		expect(component.render(32).length).toBeGreaterThan(collapsedLength);
+		const expanded = stripAnsi(component.render(80).join("\n"));
+		expect(expanded).toContain("stdout capture incomplete");
+		expect(expanded).toContain("artifact://stdout");
 	});
 
 	test("checks an activity render cache without serializing full output", () => {

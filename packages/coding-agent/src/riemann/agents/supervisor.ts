@@ -40,6 +40,7 @@ import type { IPythonSchema, IPythonToolDetails } from "../ipython.ts";
 import type { JsonValue } from "../kernel/types.ts";
 import { getPreservedOpenAICompaction } from "../openai-compaction-state.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
+import { PageStore, pageSchema } from "../state/pages.ts";
 import type {
 	AgentDeliveryMethod,
 	AgentDeliveryMode,
@@ -84,6 +85,8 @@ interface LiveChild {
 	session?: ChildAgentSession;
 	runtime?: ChildRiemannRuntime;
 	requestedStop: boolean;
+	turnOutput?: string;
+	previousMessages?: ReadonlySet<unknown>;
 	unsubscribeUi?: () => void;
 	statsRefreshTimer?: NodeJS.Timeout;
 }
@@ -313,24 +316,22 @@ function assistantText(message: unknown): string | undefined {
 		.trim();
 }
 
-function finalAssistantText(messages: readonly unknown[]): string {
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const text = assistantText(messages[index]);
-		if (text !== undefined) return text;
-	}
-	return "";
-}
-
-function currentAssistantText(messages: readonly unknown[], streamingMessage: unknown): string {
-	const streamingText = assistantText(streamingMessage);
-	if (streamingText) return streamingText;
+function finalAssistantText(messages: readonly unknown[], previousMessages: ReadonlySet<unknown>): string {
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
 		const message = messages[index];
+		if (previousMessages.has(message)) break;
 		if (typeof message === "object" && message !== null && "role" in message && message.role === "user") break;
 		const text = assistantText(message);
 		if (text !== undefined) return text;
 	}
 	return "";
+}
+
+function currentAssistantText(live: LiveChild | undefined): string {
+	if (!live?.previousMessages) return "";
+	const streamingText = assistantText(live.session?.state.streamingMessage);
+	if (streamingText) return streamingText;
+	return live.turnOutput ?? finalAssistantText(live.session?.state.messages ?? [], live.previousMessages);
 }
 
 function outputPreview(value: string): string | null {
@@ -404,6 +405,7 @@ export class AgentSupervisor {
 	private readonly subagentUi = new Map<string, SubagentRuntimeUi>();
 	private readonly persistedMessages = new Map<string, readonly unknown[]>();
 	private readonly waiters = new Map<string, number>();
+	private readonly turnFailures = new Map<string, RiemannHostError>();
 	private readonly options: AgentSupervisorOptions;
 	private readonly unsubscribeCompactionStrategySettingCommits: () => void;
 	private running = 0;
@@ -580,10 +582,7 @@ export class AgentSupervisor {
 
 	private agentInfoWire(agent: StoredAgent): JsonValue {
 		const turn = this.latestTurn(agent);
-		const liveSession = this.live.get(agent.id)?.session;
-		const latestOutput = agent.activeTurnId
-			? currentAssistantText(liveSession?.state.messages ?? [], liveSession?.state.streamingMessage)
-			: (turn.result ?? "");
+		const latestOutput = agent.activeTurnId ? currentAssistantText(this.live.get(agent.id)) : (turn.result ?? "");
 		return {
 			$riemann: "agent_info",
 			id: agent.id,
@@ -605,10 +604,17 @@ export class AgentSupervisor {
 		};
 	}
 
-	private agentResultWire(agent: StoredAgent, turn: StoredAgentTurn): JsonValue {
+	private agentResultWire(callerId: string, agent: StoredAgent, turn: StoredAgentTurn): JsonValue {
+		this.ownedTurn(callerId, agent.id, turn.id);
 		if (turn.status !== "settled" || !turn.outcome) {
 			throw new RiemannHostError("conflict", `Agent Turn has not settled: ${agent.name}/${turn.id}`);
 		}
+		const artifacts = this.options.artifacts;
+		const transcriptHandle = turn.transcriptHandle === null ? null : artifacts.reference(turn.transcriptHandle);
+		const patchHandle = turn.patchHandle === null ? null : artifacts.reference(turn.patchHandle);
+		if (transcriptHandle !== null) artifacts.grant(transcriptHandle, callerId);
+		if (patchHandle !== null) artifacts.grant(patchHandle, callerId);
+		artifacts.grantFromAgent(agent.id, callerId);
 		return {
 			$riemann: "agent_result",
 			id: agent.id,
@@ -618,8 +624,8 @@ export class AgentSupervisor {
 			outcome: turn.outcome,
 			output: turn.result ?? "",
 			error: turn.error,
-			transcript_handle: turn.transcriptHandle ?? "",
-			patch_handle: turn.patchHandle,
+			transcript_handle: transcriptHandle,
+			patch_handle: patchHandle,
 			started_at: turn.startedAt ?? turn.createdAt,
 			completed_at: turn.completedAt ?? turn.updatedAt,
 		};
@@ -972,6 +978,10 @@ export class AgentSupervisor {
 		live: LiveChild,
 		event: Parameters<AgentSessionEventListener>[0],
 	): void {
+		if (event.type === "message_end") {
+			const text = assistantText(event.message);
+			if (text !== undefined) live.turnOutput = text;
+		}
 		const runtime = this.subagentUi.get(agentId);
 		if (!runtime) return;
 		if (event.type === "turn_start") runtime.turnCount += 1;
@@ -999,9 +1009,29 @@ export class AgentSupervisor {
 		}
 	}
 
-	private trackBackground(promise: Promise<void>): void {
-		this.launches.add(promise);
-		void promise.catch(() => undefined).finally(() => this.launches.delete(promise));
+	private recordTurnFailure(agent: StoredAgent, turnId: string, error: unknown): RiemannHostError {
+		const existing = this.turnFailures.get(turnId);
+		if (existing) return existing;
+		const failure = new RiemannHostError(
+			"persistence_error",
+			`Agent Turn could not be finalized: ${agent.name}/${turnId}: ${error instanceof Error ? error.message : String(error)}`,
+			{ agent_id: agent.id, turn_id: turnId },
+		);
+		this.turnFailures.set(turnId, failure);
+		this.notifyTurn(agent.id, turnId);
+		try {
+			const warning = this.options.warningSink?.(failure.message);
+			if (warning) void warning.catch(() => undefined);
+		} catch {}
+		return failure;
+	}
+
+	private trackBackground(promise: Promise<void>, agent: StoredAgent, turnId: string): void {
+		const tracked = promise.catch((error: unknown) => {
+			this.recordTurnFailure(agent, turnId, error);
+		});
+		this.launches.add(tracked);
+		void tracked.finally(() => this.launches.delete(tracked));
 	}
 
 	private startLaunch(
@@ -1011,7 +1041,7 @@ export class AgentSupervisor {
 		resume: boolean,
 		prompt: string,
 	): void {
-		this.trackBackground(this.launch(agent, turn, model, resume, prompt));
+		this.trackBackground(this.launch(agent, turn, model, resume, prompt), agent, turn.id);
 	}
 
 	private async launch(
@@ -1064,6 +1094,8 @@ export class AgentSupervisor {
 				? await this.options.createChildSession(runningAgent, model, runtime, resume)
 				: await this.createDefaultSession(runningAgent, model, runtime, resume);
 			live.session = session;
+			// Session events belong to this launch even if compaction replaces message history.
+			live.turnOutput = session.subscribe ? "" : undefined;
 			live.unsubscribeUi = session.subscribe?.((event) => this.observeSubagentEvent(agent.id, live, event));
 			this.refreshSubagentStats(agent.id, live);
 			this.notifySubagentUi(agent.id);
@@ -1076,6 +1108,7 @@ export class AgentSupervisor {
 				(message) => `[Agent message ${message.id} from ${this.findAgent(message.senderId).name}]\n${message.body}`,
 			);
 			const effectivePrompt = [prompt, ...incoming].filter(Boolean).join("\n\n");
+			live.previousMessages = new Set(session.state.messages);
 			await session.prompt(effectivePrompt, { source: "rpc" });
 			await runtime.snapshot();
 			if (live.requestedStop) outcome = "cancelled";
@@ -1090,7 +1123,7 @@ export class AgentSupervisor {
 					runningAgent,
 					turn.id,
 					outcome,
-					finalAssistantText(messages),
+					live.turnOutput ?? (live.previousMessages ? finalAssistantText(messages, live.previousMessages) : ""),
 					executionError,
 					messages,
 				);
@@ -1144,7 +1177,7 @@ export class AgentSupervisor {
 		const patch = sections.join("").trim();
 		if (!patch) return null;
 		return artifactHandle(
-			await this.options.artifacts.putText(`${patch}\n`, {
+			await this.options.artifacts.forAgent(agent.id).putText(`${patch}\n`, {
 				name: `${agent.name}-${agent.id.slice(0, 8)}-${turnId.slice(0, 8)}.patch`,
 				mimeType: "text/x-diff; charset=utf-8",
 			}),
@@ -1159,55 +1192,69 @@ export class AgentSupervisor {
 		error: string | null,
 		messages: readonly unknown[],
 	): Promise<StoredAgentTurn> {
-		const currentTurn = this.options.store.getAgentTurn(turnId);
-		if (!currentTurn || currentTurn.agentId !== agent.id) {
-			throw new RiemannHostError("not_found", `Agent Turn not found: ${agent.name}/${turnId}`);
-		}
-		if (currentTurn.status === "settled") return currentTurn;
-		const transcriptHandle = artifactHandle(
-			await this.options.artifacts.putText(`${JSON.stringify(messages, null, 2)}\n`, {
-				name: `${agent.name}-${agent.id.slice(0, 8)}-${turnId.slice(0, 8)}-transcript.json`,
-				mimeType: "application/json",
-			}),
-		);
-		let outcome = requestedOutcome;
-		let settlementError = error;
-		let patchHandle: string | null = null;
 		try {
-			patchHandle = await this.captureWorktreePatch(agent, turnId);
-		} catch (patchError) {
-			outcome = "error";
-			settlementError = `Patch capture failed: ${patchError instanceof Error ? patchError.message : String(patchError)}`;
-		}
-		this.persistedMessages.set(agent.id, messages);
-		const delivery: AgentDeliveryMethod =
-			currentTurn.deliveryMode === "return" ? "return" : (this.waiters.get(turnId) ?? 0) > 0 ? "wait" : "notify";
-		const settlement = this.options.store.settleAgentTurn({
-			agentId: agent.id,
-			turnId,
-			outcome,
-			result,
-			error: settlementError,
-			transcriptHandle,
-			patchHandle,
-			delivery,
-			...(delivery === "notify"
-				? {
-						event: {
-							recipientId: agent.parentId ?? this.options.rootAgent.id,
-							payload: {
-								agentId: agent.id,
-								name: agent.name,
-								turnId,
-								outcome,
+			const currentTurn = this.options.store.getAgentTurn(turnId);
+			if (!currentTurn || currentTurn.agentId !== agent.id) {
+				throw new RiemannHostError("not_found", `Agent Turn not found: ${agent.name}/${turnId}`);
+			}
+			if (currentTurn.status === "settled") return currentTurn;
+			let outcome = requestedOutcome;
+			const errors: string[] = error === null ? [] : [error];
+			let transcriptHandle: string | null = null;
+			try {
+				transcriptHandle = artifactHandle(
+					await this.options.artifacts.forAgent(agent.id).putText(`${JSON.stringify(messages, null, 2)}\n`, {
+						name: `${agent.name}-${agent.id.slice(0, 8)}-${turnId.slice(0, 8)}-transcript.json`,
+						mimeType: "application/json",
+					}),
+				);
+			} catch (transcriptError) {
+				outcome = "error";
+				errors.push(
+					`Transcript persistence failed: ${transcriptError instanceof Error ? transcriptError.message : String(transcriptError)}`,
+				);
+			}
+			let patchHandle: string | null = null;
+			try {
+				patchHandle = await this.captureWorktreePatch(agent, turnId);
+			} catch (patchError) {
+				outcome = "error";
+				errors.push(
+					`Patch capture failed: ${patchError instanceof Error ? patchError.message : String(patchError)}`,
+				);
+			}
+			this.persistedMessages.set(agent.id, messages);
+			const delivery: AgentDeliveryMethod =
+				currentTurn.deliveryMode === "return" ? "return" : (this.waiters.get(turnId) ?? 0) > 0 ? "wait" : "notify";
+			const settlement = this.options.store.settleAgentTurn({
+				agentId: agent.id,
+				turnId,
+				outcome,
+				result,
+				error: errors.length > 0 ? errors.join("\n") : null,
+				transcriptHandle,
+				patchHandle,
+				delivery,
+				...(delivery === "notify"
+					? {
+							event: {
+								recipientId: agent.parentId ?? this.options.rootAgent.id,
+								payload: {
+									agentId: agent.id,
+									name: agent.name,
+									turnId,
+									outcome,
+								},
 							},
-						},
-					}
-				: {}),
-		});
-		if (delivery === "notify") this.scheduleAgentEventDelivery();
-		this.notifyTurn(agent.id, turnId);
-		return settlement.turn;
+						}
+					: {}),
+			});
+			if (delivery === "notify") this.scheduleAgentEventDelivery();
+			this.notifyTurn(agent.id, turnId);
+			return settlement.turn;
+		} catch (error) {
+			throw this.recordTurnFailure(agent, turnId, error);
+		}
 	}
 
 	private startQueuedCancellation(agent: StoredAgent, turnId: string): void {
@@ -1215,6 +1262,8 @@ export class AgentSupervisor {
 			this.settleAgent(agent, turnId, "cancelled", "", null, this.persistedMessages.get(agent.id) ?? []).then(
 				() => undefined,
 			),
+			agent,
+			turnId,
 		);
 	}
 
@@ -1488,6 +1537,8 @@ export class AgentSupervisor {
 			const turn = this.options.store.claimAgentTurnForWait(agentId, turnId);
 			return { agent: this.ownedChild(callerId, agentId), turn };
 		}
+		const failure = this.turnFailures.get(turnId);
+		if (failure) throw failure;
 		this.waiters.set(turnId, (this.waiters.get(turnId) ?? 0) + 1);
 		try {
 			await new Promise<void>((resolve, reject) => {
@@ -1502,7 +1553,24 @@ export class AgentSupervisor {
 					operation();
 				};
 				const onTurn = () => {
-					if (this.options.store.getAgentTurn(turnId)?.status === "settled") settle(resolve);
+					const failure = this.turnFailures.get(turnId);
+					if (failure) {
+						settle(() => reject(failure));
+						return;
+					}
+					try {
+						if (this.options.store.getAgentTurn(turnId)?.status === "settled") settle(resolve);
+					} catch (error) {
+						settle(() =>
+							reject(
+								new RiemannHostError(
+									"persistence_error",
+									`Could not read Agent Turn settlement: ${error instanceof Error ? error.message : String(error)}`,
+									{ agent_id: agentId, turn_id: turnId },
+								),
+							),
+						);
+					}
 				};
 				const onAbort = () =>
 					settle(() =>
@@ -1538,7 +1606,7 @@ export class AgentSupervisor {
 		const agentId = requiredString(args, "agent_id");
 		const turnId = requiredString(args, "turn_id");
 		const settled = await this.waitForTurn(callerId, agentId, turnId, signal, optionalTimeout(args));
-		return this.agentResultWire(settled.agent, settled.turn);
+		return this.agentResultWire(callerId, settled.agent, settled.turn);
 	}
 
 	async steerMessage(
@@ -1608,7 +1676,7 @@ export class AgentSupervisor {
 		const completion = this.waitForTurn(callerId, agentId, turnId, signal, timeout);
 		this.requestStop(callerId, agentId, turnId);
 		const settled = await completion;
-		return this.agentResultWire(settled.agent, settled.turn);
+		return this.agentResultWire(callerId, settled.agent, settled.turn);
 	}
 
 	async releaseAgent(callerId: string, selector: string, expectedTurnId: string): Promise<void> {
@@ -1645,7 +1713,7 @@ export class AgentSupervisor {
 			.join("\n");
 	}
 
-	definitions(callerId: string): FunctionDefinition[] {
+	definitions(callerId: string, pages = new PageStore(this.options.artifacts, callerId)): FunctionDefinition[] {
 		const caller = this.findAgent(callerId);
 		if (caller.depth >= 1) return [];
 		const profileNames = this.availableProfileEntries(caller).map(([name]) => name);
@@ -1710,7 +1778,7 @@ export class AgentSupervisor {
 				outcome: outcomeSchema,
 				output: Type.String(),
 				error: Type.Union([Type.String(), Type.Null()]),
-				transcript_handle: Type.String(),
+				transcript_handle: Type.Union([Type.String(), Type.Null()]),
 				patch_handle: Type.Union([Type.String(), Type.Null()]),
 				started_at: Type.String(),
 				completed_at: Type.String(),
@@ -1766,12 +1834,30 @@ export class AgentSupervisor {
 			{
 				name: "list",
 				namespace: "agents",
-				description: "List this Agent's reusable child identities, current activity, and latest outcomes.",
-				inputSchema: Type.Object({}, { additionalProperties: false }),
-				outputSchema: Type.Array(agentInfoSchema),
-				pythonReturnType: "list[AgentInfo]",
-				errors: [],
-				effects: [{ kind: "read", resource: "agent-state" }],
+				description:
+					"Snapshot this Agent's reusable child identities, current activity, and latest outcomes as a page.",
+				inputSchema: Type.Object(
+					{ max_items: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, default: 20 })) },
+					{ additionalProperties: false },
+				),
+				outputSchema: pageSchema(agentInfoSchema),
+				pythonReturnType: "Page[AgentInfo]",
+				errors: [
+					{
+						code: "response_too_large",
+						description: "The Agent snapshot exceeds the page storage limit.",
+						retryable: false,
+					},
+					{
+						code: "artifact_error",
+						description: "The Agent page snapshot could not be stored.",
+						retryable: false,
+					},
+				],
+				effects: [
+					{ kind: "read", resource: "agent-state" },
+					{ kind: "write", resource: "page-snapshot" },
+				],
 				idempotency: "idempotent",
 				cancellation: noCancellation,
 				visibility: "public",
@@ -1780,11 +1866,16 @@ export class AgentSupervisor {
 					example: "await agents.list()",
 				},
 				capability: "agents.list",
-				handler: async () =>
-					this.options.store
+				handler: async (args) => {
+					const snapshot = this.options.store
 						.listAgents(this.options.runId)
 						.filter((agent) => agent.parentId === callerId)
-						.map((agent) => this.agentInfoWire(agent)),
+						.map((agent) => this.agentInfoWire(agent));
+					return pages.create("agents.list", snapshot, {
+						limit: typeof args.max_items === "number" ? args.max_items : 20,
+						coverage: "complete",
+					});
+				},
 			},
 			{
 				name: "start",
@@ -1873,6 +1964,7 @@ export class AgentSupervisor {
 						description: "The child is not directly owned by the caller.",
 						retryable: false,
 					},
+					{ code: "persistence_error", description: "The Turn could not be durably finalized.", retryable: false },
 					{ code: "timeout", description: "The Turn did not settle before the timeout.", retryable: true },
 					{ code: "cancelled", description: "The originating cell was interrupted.", retryable: true },
 				],
@@ -1944,6 +2036,7 @@ export class AgentSupervisor {
 						retryable: false,
 					},
 					{ code: "conflict", description: "The identity has advanced to another Turn.", retryable: false },
+					{ code: "persistence_error", description: "The Turn could not be durably finalized.", retryable: false },
 					{ code: "timeout", description: "The stopped Turn did not settle before the timeout.", retryable: true },
 					{ code: "cancelled", description: "The settlement wait was interrupted.", retryable: true },
 				],

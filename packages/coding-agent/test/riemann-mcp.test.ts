@@ -1,7 +1,8 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { RiemannHostError } from "../src/riemann/errors.ts";
 import { FunctionRegistry } from "../src/riemann/functions/registry.ts";
 import {
@@ -26,6 +27,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	store.close();
 	await rm(root, { recursive: true, force: true });
 });
@@ -57,7 +59,7 @@ function fixtureConfig() {
 	};
 }
 
-describe("Riemann MCP ABI v2 bridge", () => {
+describe("Riemann MCP tool bridge", () => {
 	test("opens a server lazily and installs one-input-schema functions with stable results", async () => {
 		const registry = new FunctionRegistry();
 		const capabilities = new Set(["mcp.*"]);
@@ -89,11 +91,11 @@ describe("Riemann MCP ABI v2 bridge", () => {
 				true,
 			);
 			expect(manager.serverStatus("fixture")).toMatchObject({ status: "ready", tool_count: 6 });
-			const sum = registry.describe("fixture.sum_values", capabilities);
+			const sum = registry.describe("fixture.sum_values", capabilities, "schema");
 			expect(sum).toMatchObject({
 				name: "fixture.sum_values",
-				pythonReturnType: "McpResult",
-				inputSchema: {
+				python_return_type: "McpResult",
+				input_schema: {
 					type: "object",
 					required: ["input"],
 					properties: { input: expect.objectContaining({ type: "object" }) },
@@ -127,7 +129,12 @@ describe("Riemann MCP ABI v2 bridge", () => {
 				expect.objectContaining({ type: "image", mimeType: "image/png", artifact: expect.any(Object) }),
 			);
 			const imageArtifact = objectValue(Array.isArray(imageWire.artifacts) ? imageWire.artifacts[0] : undefined);
-			expect(typeof imageArtifact.handle).toBe("string");
+			expect(imageArtifact.handle).toMatch(/^r[0-9a-z]+$/);
+			expect(objectValue(imageContent ?? undefined).artifact).toEqual(imageArtifact);
+			const materialized = objectValue(
+				await artifacts.materialize(String(imageArtifact.handle), join(root, "materialized.png")),
+			);
+			expect(materialized.handle).toBe(imageArtifact.handle);
 			expect((await artifacts.readBuffer(String(imageArtifact.handle))).byteLength).toBeGreaterThan(0);
 
 			const resourceWire = objectValue(
@@ -167,6 +174,35 @@ describe("Riemann MCP ABI v2 bridge", () => {
 			await expect(manager.open("hidden_docs", new AbortController().signal)).rejects.toMatchObject({
 				code: "permission_denied",
 			} satisfies Partial<RiemannHostError>);
+		} finally {
+			await manager.close();
+		}
+	});
+
+	test("reserves built-in result types and namespaces", async () => {
+		const names = [
+			"output",
+			"pages",
+			"MaterializedArtifact",
+			"Page",
+			"PathEntry",
+			"ArtifactSlice",
+			"SearchMatch",
+			"OperationSpec",
+			"OperationSummary",
+			"RuntimeStatus",
+			"McpNamespace",
+			"FileSnapshot",
+		];
+		const manager = new RiemannMcpManager(
+			Object.fromEntries(names.map((name) => [name, fixtureConfig()])),
+			root,
+			new FunctionRegistry(),
+			artifacts,
+			new Set(["mcp.*"]),
+		);
+		try {
+			for (const name of names) expect(objectValue(manager.serverStatus(name)).namespace).not.toBe(name);
 		} finally {
 			await manager.close();
 		}
@@ -217,4 +253,168 @@ describe("Riemann MCP ABI v2 bridge", () => {
 			await second.close();
 		}
 	}, 30_000);
+});
+
+describe("MCP startup concurrency", () => {
+	function setup() {
+		const registry = new FunctionRegistry();
+		const manager = new RiemannMcpManager(
+			{ fixture: fixtureConfig() },
+			root,
+			registry,
+			artifacts,
+			new Set(["mcp.*"]),
+		);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const connect = vi.spyOn(Client.prototype, "connect").mockImplementation(async (_transport, options) => {
+			await gate;
+			options?.signal?.throwIfAborted();
+		});
+		vi.spyOn(Client.prototype, "close").mockResolvedValue();
+		vi.spyOn(Client.prototype, "listTools").mockResolvedValue({
+			tools: [
+				{
+					name: "probe",
+					inputSchema: { type: "object" },
+					outputSchema: { type: "object", properties: { value: { type: "number" } }, required: ["value"] },
+				},
+			],
+		});
+		return { manager, registry, release, connect };
+	}
+
+	test("isolates the first caller cancellation from a shared startup", async () => {
+		const { manager, registry, release, connect } = setup();
+		const first = new AbortController();
+		const opened = manager.open("fixture", first.signal);
+		const cancelled = expect(opened).rejects.toMatchObject({ code: "cancelled" });
+		const second = manager.open("fixture", new AbortController().signal);
+		await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
+		first.abort();
+		release();
+		try {
+			await cancelled;
+			expect(objectValue(await second).namespace).toBe("fixture");
+			expect(connect).toHaveBeenCalledOnce();
+			expect(registry.describe("fixture.probe", undefined, "schema")).toMatchObject({
+				remote_output_schema: { required: ["value"] },
+			});
+		} finally {
+			await manager.close();
+		}
+	});
+
+	test("pre-cancelled open has no startup side effect", async () => {
+		const { manager, connect, release } = setup();
+		const controller = new AbortController();
+		controller.abort();
+		try {
+			await expect(manager.open("fixture", controller.signal)).rejects.toMatchObject({ code: "cancelled" });
+			expect(connect).not.toHaveBeenCalled();
+		} finally {
+			release();
+			await manager.close();
+		}
+	});
+
+	test.each(["server", "manager"])("closing %s prevents a pending startup from installing tools", async (scope) => {
+		const { manager, registry, release, connect } = setup();
+		const opening = manager.open("fixture", new AbortController().signal);
+		const rejected = expect(opening).rejects.toMatchObject({ code: expect.stringMatching(/closed|cancelled/) });
+		await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
+		const closing = scope === "server" ? manager.closeServer("fixture") : manager.close();
+		release();
+		await closing;
+		await rejected;
+		expect(manager.serverStatus("fixture")).toMatchObject({ status: "closed", tool_count: 0 });
+		expect(registry.get("fixture.probe")).toBeUndefined();
+		await manager.close();
+	});
+
+	test("does not publish a late tools/list result after close", async () => {
+		const { manager, registry, release } = setup();
+		release();
+		let resolveList!: (value: { tools: [] }) => void;
+		const list = vi.spyOn(Client.prototype, "listTools").mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolveList = resolve;
+				}),
+		);
+		const opening = manager.open("fixture", new AbortController().signal);
+		const rejected = expect(opening).rejects.toMatchObject({ code: "closed" });
+		await vi.waitFor(() => expect(list).toHaveBeenCalledOnce());
+		await manager.close();
+		await rejected;
+		resolveList({ tools: [] });
+		await Promise.resolve();
+		expect(manager.serverStatus("fixture")).toMatchObject({ status: "closed", tool_count: 0 });
+		expect(registry.get("fixture.probe")).toBeUndefined();
+	});
+
+	test("refresh replaces tools and explicit open can follow a settled server close", async () => {
+		const { manager, registry, release, connect } = setup();
+		release();
+		try {
+			await manager.open("fixture", new AbortController().signal);
+			await manager.refresh("fixture", new AbortController().signal);
+			expect(connect).toHaveBeenCalledTimes(2);
+			expect(registry.get("fixture.probe")).toBeDefined();
+			await manager.closeServer("fixture");
+			expect(registry.get("fixture.probe")).toBeUndefined();
+			await manager.open("fixture", new AbortController().signal);
+			expect(connect).toHaveBeenCalledTimes(3);
+		} finally {
+			await manager.close();
+		}
+	});
+
+	test("a close after refresh starts prevents refresh from reviving the server", async () => {
+		const { manager, registry, release } = setup();
+		const refreshing = manager.refresh("fixture", new AbortController().signal);
+		const rejected = expect(refreshing).rejects.toMatchObject({ code: expect.stringMatching(/closed|cancelled/) });
+		await manager.closeServer("fixture");
+		release();
+		await rejected;
+		expect(registry.get("fixture.probe")).toBeUndefined();
+		await manager.close();
+	});
+
+	test("maps asynchronous result normalization failures to MCP errors", async () => {
+		const { manager, registry, release } = setup();
+		release();
+		await manager.open("fixture", new AbortController().signal);
+		vi.spyOn(Client.prototype, "callTool").mockResolvedValue({
+			content: [
+				{
+					type: "image",
+					data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+					mimeType: "image/png",
+				},
+			],
+		});
+		const remote = { uri: "artifact://remote/original", handle: "artifact://remote/opaque", $riemann: "artifact" };
+		const call = vi.spyOn(Client.prototype, "callTool");
+		call.mockResolvedValueOnce({
+			content: [{ type: "text", text: remote.uri }],
+			structuredContent: remote,
+			_meta: remote,
+		});
+		const opaque = objectValue(
+			await registry.get("fixture.probe")!.handler({ input: {} }, new AbortController().signal),
+		);
+		expect(mcpJson(opaque.structured_content)).toEqual(remote);
+		expect(mcpJson(opaque.metadata)).toEqual(remote);
+		vi.spyOn(artifacts, "putBuffer").mockRejectedValue(new Error("artifact unavailable"));
+		try {
+			await expect(
+				registry.get("fixture.probe")!.handler({ input: {} }, new AbortController().signal),
+			).rejects.toMatchObject({ code: "mcp_error" });
+		} finally {
+			await manager.close();
+		}
+	});
 });

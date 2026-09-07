@@ -1,12 +1,15 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { AgentToolExecutionError } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { getPackageDir, isBunBinary } from "../config.ts";
 import type { CompactionPreparation, CompactionResult } from "../core/compaction/index.ts";
 import type { ExtensionContext, ToolDefinition } from "../core/extensions/types.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
+import { stripAnsi } from "../utils/ansi.ts";
 import { assertWritable, fileAccessPolicy, resolveFilesystemSnapshot } from "./access-policy.ts";
 import { RiemannActivityTracker } from "./activity.ts";
 import {
@@ -28,7 +31,13 @@ import {
 import { formatEnvironmentContext } from "./environment.ts";
 import { RiemannHostError } from "./errors.ts";
 import { FileFunctions } from "./functions/fs.ts";
-import { type FunctionDefinition, FunctionRegistry, hasCapability } from "./functions/registry.ts";
+import {
+	type FunctionDefinition,
+	FunctionRegistry,
+	hasCapability,
+	OperationSpecSchema,
+	OperationSummarySchema,
+} from "./functions/registry.ts";
 import { ShellFunctions } from "./functions/shell.ts";
 import { WebFunctions } from "./functions/web.ts";
 import { storeModelImage } from "./images.ts";
@@ -43,9 +52,11 @@ import {
 } from "./kernel/types.ts";
 import { RiemannMcpManager } from "./mcp/manager.ts";
 import { createRiemannOpenAICompaction } from "./openai-compaction.ts";
+import { type OutputPart, OutputViews, renderModelText } from "./output.ts";
 import { renderRiemannPrompt } from "./prompts.ts";
 import { ensureManagedPython } from "./python/runtime.ts";
 import { ArtifactStore } from "./state/artifacts.ts";
+import { PageStore, pageSchema } from "./state/pages.ts";
 import { applyRetention, type RetentionReport } from "./state/retention.ts";
 import { RiemannStore, type StoredAgent, type StoredRun } from "./state/store.ts";
 
@@ -92,6 +103,7 @@ function artifactHandle(value: JsonValue): string | undefined {
 }
 
 function textFromDisplay(data: Record<string, JsonValue>): string | undefined {
+	if (data["application/vnd.riemann.error+json"] !== undefined) return undefined;
 	const plain = data["text/plain"];
 	if (typeof plain === "string") return plain;
 	const markdown = data["text/markdown"];
@@ -149,9 +161,13 @@ export class RiemannRuntime {
 	private readonly policy: ReturnType<typeof fileAccessPolicy>;
 	private readonly mcp: RiemannMcpManager;
 	private readonly web: WebFunctions;
+	private readonly pages: PageStore;
+	private readonly artifacts: ArtifactStore;
+	private readonly outputViews: OutputViews;
 	private kernel?: IPythonKernelManager;
 	private kernelStartup?: Promise<IPythonKernelManager>;
 	private pendingRestoreNotice?: string;
+	private checkpointIncompatible = false;
 	private closed = false;
 	private readonly shared: SharedRun;
 	readonly agent: StoredAgent;
@@ -164,17 +180,23 @@ export class RiemannRuntime {
 		this.capabilities = new Set(agent.capabilities);
 		this.policy = fileAccessPolicy(agent.workspace, agent.filesystem);
 		const policy = this.policy;
-		const files = new FileFunctions(policy, shared.run.id, shared.store, shared.artifacts);
+		this.artifacts = shared.artifacts.forAgent(agent.id);
+		this.outputViews = new OutputViews(this.artifacts);
+		this.pages = new PageStore(this.artifacts, agent.id);
+		const files = new FileFunctions(policy, shared.run.id, shared.store, this.artifacts, this.pages);
 		const shell = new ShellFunctions(
 			policy,
-			shared.artifacts,
-			shared.config.limits.maxArtifactPreviewChars,
+			this.artifacts,
+			shared.config.limits.maxPreviewBytes,
 			agent.network === "allow",
 		);
 		this.web = new WebFunctions(
 			shared.config.web.searchBackend === "exa" ? exaApiKey : undefined,
-			shared.artifacts,
-			shared.config.limits.maxArtifactPreviewChars,
+			this.artifacts,
+			shared.config.limits.maxPreviewBytes,
+			undefined,
+			undefined,
+			this.pages,
 		);
 		for (const definition of [...files.definitions(), ...shell.definitions(), ...this.web.definitions()])
 			this.registry.register(definition);
@@ -182,11 +204,11 @@ export class RiemannRuntime {
 			shared.config.mcpServers,
 			agent.workspace,
 			this.registry,
-			shared.artifacts,
+			this.artifacts,
 			this.capabilities,
 		);
 		for (const definition of this.mcp.definitions()) this.registry.register(definition);
-		for (const definition of shared.supervisor.definitions(agent.id)) this.registry.register(definition);
+		for (const definition of shared.supervisor.definitions(agent.id, this.pages)) this.registry.register(definition);
 		for (const definition of this.utilityDefinitions()) this.registry.register(definition);
 	}
 
@@ -312,19 +334,6 @@ export class RiemannRuntime {
 			supported: false,
 			description: "The operation completes synchronously or does not observe cancellation.",
 		} as const;
-		const errorSchema = Type.Object(
-			{ code: Type.String(), description: Type.String(), retryable: Type.Boolean() },
-			{ additionalProperties: false },
-		);
-		const effectSchema = Type.Object(
-			{ kind: Type.String(), resource: Type.String() },
-			{ additionalProperties: false },
-		);
-		const cancellationSchema = Type.Object(
-			{ supported: Type.Boolean(), description: Type.String() },
-			{ additionalProperties: false },
-		);
-		const jsonObjectSchema = Type.Object({}, { additionalProperties: true });
 		const artifactSchema = Type.Object(
 			{
 				$riemann: Type.Literal("artifact"),
@@ -336,20 +345,21 @@ export class RiemannRuntime {
 			{ additionalProperties: false },
 		);
 		const artifactSliceProperties = {
+			$riemann: Type.Literal("artifact_slice"),
 			handle: Type.String(),
 			mime_type: Type.String(),
 			size: Type.Integer({ minimum: 0 }),
 			offset: Type.Integer({ minimum: 0 }),
 			next_offset: Type.Integer({ minimum: 0 }),
-			truncated: Type.Boolean(),
+			eof: Type.Boolean(),
 		};
 		const filesystemFieldSchema = Type.Union([Type.Array(Type.String()), Type.Literal("inherit")]);
 		const filesystemConfigSchema = Type.Object(
 			{
 				read: Type.Optional(filesystemFieldSchema),
-				readExclude: Type.Optional(filesystemFieldSchema),
+				read_exclude: Type.Optional(filesystemFieldSchema),
 				write: Type.Optional(filesystemFieldSchema),
-				writeExclude: Type.Optional(filesystemFieldSchema),
+				write_exclude: Type.Optional(filesystemFieldSchema),
 			},
 			{ additionalProperties: false },
 		);
@@ -361,41 +371,37 @@ export class RiemannRuntime {
 				inputSchema: Type.Object(
 					{
 						query: Type.String({ description: "Capability or task query" }),
-						limit: Type.Optional(
+						max_items: Type.Optional(
 							Type.Integer({ minimum: 1, maximum: 50, default: 8, description: "Maximum matches" }),
 						),
 					},
 					{ additionalProperties: false },
 				),
-				outputSchema: Type.Array(
-					Type.Object(
-						{
-							name: Type.String(),
-							description: Type.String(),
-							pythonReturnType: Type.String(),
-							capability: Type.Union([Type.String(), Type.Null()]),
-						},
-						{ additionalProperties: false },
-					),
-				),
-				pythonReturnType: "list[OperationSummary]",
+				outputSchema: pageSchema(OperationSummarySchema),
+				pythonReturnType: "Page[OperationSummary]",
 				errors: [{ code: "invalid_arguments", description: "The query or limit is invalid.", retryable: false }],
-				effects: [{ kind: "read", resource: "function-registry" }],
+				effects: [
+					{ kind: "read", resource: "function-registry" },
+					{ kind: "write", resource: "artifact-store" },
+				],
 				idempotency: "idempotent",
 				cancellation: noCancellation,
 				visibility: "public",
 				prompt: {
 					inventory: "Search available functions by task or capability.",
-					example: 'await catalog.search(query="workspace write", limit=8)',
+					example: 'await catalog.search(query="workspace write", max_items=8)',
 				},
 				handler: async (args) => {
 					if (typeof args.query !== "string")
 						throw new RiemannHostError("invalid_arguments", "query must be a string");
-					const limit = args.limit === undefined || args.limit === null ? 8 : args.limit;
+					const limit = args.max_items === undefined || args.max_items === null ? 8 : args.max_items;
 					if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 50) {
-						throw new RiemannHostError("invalid_arguments", "limit must be an integer from 1 to 50");
+						throw new RiemannHostError("invalid_arguments", "max_items must be an integer from 1 to 50");
 					}
-					return this.registry.search(args.query, limit, this.capabilities);
+					return this.pages.create("catalog.search", this.registry.searchAll(args.query, this.capabilities), {
+						limit,
+						coverage: "complete",
+					});
 				},
 			},
 			{
@@ -404,30 +410,15 @@ export class RiemannRuntime {
 				description:
 					"Describe one exact registered function, including schemas, defaults, errors, effects, and execution semantics.",
 				inputSchema: Type.Object(
-					{ name: Type.String({ minLength: 1, description: "Qualified function name" }) },
-					{ additionalProperties: false },
-				),
-				outputSchema: Type.Object(
 					{
-						name: Type.String(),
-						description: Type.String(),
-						inputSchema: jsonObjectSchema,
-						outputSchema: jsonObjectSchema,
-						defaults: jsonObjectSchema,
-						pythonReturnType: Type.String(),
-						errors: Type.Array(errorSchema),
-						effects: Type.Array(effectSchema),
-						idempotency: Type.Union([
-							Type.Literal("idempotent"),
-							Type.Literal("non-idempotent"),
-							Type.Literal("conditional"),
-						]),
-						cancellation: cancellationSchema,
-						capability: Type.Union([Type.String(), Type.Null()]),
-						example: Type.String(),
+						name: Type.String({ minLength: 1, description: "Qualified operation, type, or handle method" }),
+						detail: Type.Optional(
+							Type.Union([Type.Literal("usage"), Type.Literal("schema")], { default: "usage" }),
+						),
 					},
 					{ additionalProperties: false },
 				),
+				outputSchema: OperationSpecSchema,
 				pythonReturnType: "OperationSpec",
 				errors: [
 					{ code: "not_found", description: "The function is hidden, unavailable, or unknown.", retryable: false },
@@ -443,7 +434,11 @@ export class RiemannRuntime {
 				handler: async (args) => {
 					if (typeof args.name !== "string")
 						throw new RiemannHostError("invalid_arguments", "name must be a string");
-					return this.registry.describe(args.name, this.capabilities);
+					return this.registry.describe(
+						args.name,
+						this.capabilities,
+						args.detail === "schema" ? "schema" : "usage",
+					);
 				},
 			},
 			{
@@ -464,20 +459,13 @@ export class RiemannRuntime {
 				visibility: "public",
 				prompt: {
 					inventory: "Resolve a durable artifact handle.",
-					example: 'artifact = await artifacts.open(handle="artifact://...")',
+					example: 'artifact = await artifacts.open(handle="r1")',
 				},
 				handler: async (args) => {
 					if (typeof args.handle !== "string") {
 						throw new RiemannHostError("invalid_arguments", "handle must be a string");
 					}
-					const artifact = this.shared.artifacts.getMetadata(args.handle);
-					return {
-						$riemann: "artifact",
-						handle: artifact.handle,
-						mime_type: artifact.mimeType,
-						size: artifact.size,
-						name: artifact.name,
-					};
+					return this.artifacts.open(args.handle);
 				},
 			},
 			{
@@ -487,20 +475,27 @@ export class RiemannRuntime {
 				inputSchema: Type.Object(
 					{
 						handle: Type.String({ minLength: 1, description: "Artifact handle" }),
-						offset: Type.Optional(
+						offset_bytes: Type.Optional(
 							Type.Union([Type.Integer({ minimum: 0 }), Type.Null()], { description: "Byte offset" }),
 						),
-						limit: Type.Optional(
+						max_bytes: Type.Optional(
 							Type.Union([Type.Integer({ minimum: 1, maximum: 1_048_576 }), Type.Null()], {
-								description: "Maximum bytes; defaults to 65536",
+								description:
+									"Maximum bytes; defaults to 65536. Text requires at least 4 bytes and a UTF-8 boundary offset.",
 							}),
 						),
 					},
 					{ additionalProperties: false },
 				),
 				outputSchema: Type.Union([
-					Type.Object({ ...artifactSliceProperties, content: Type.String() }, { additionalProperties: false }),
-					Type.Object({ ...artifactSliceProperties, base64: Type.String() }, { additionalProperties: false }),
+					Type.Object(
+						{ ...artifactSliceProperties, kind: Type.Literal("text"), text: Type.String() },
+						{ additionalProperties: false },
+					),
+					Type.Object(
+						{ ...artifactSliceProperties, kind: Type.Literal("binary"), base64: Type.String() },
+						{ additionalProperties: false },
+					),
 				]),
 				pythonReturnType: "ArtifactSlice",
 				errors: [{ code: "not_found", description: "The artifact handle does not exist.", retryable: false }],
@@ -510,14 +505,14 @@ export class RiemannRuntime {
 				visibility: "handle-method",
 				prompt: {
 					inventory: "Read a slice of a durable artifact.",
-					example: "await artifact.read(offset=0, limit=4096)",
+					example: "await artifact.read(offset_bytes=0, max_bytes=4096)",
 				},
 				handler: async (args) => {
 					if (typeof args.handle !== "string")
 						throw new RiemannHostError("invalid_arguments", "handle must be a string");
-					const offset = typeof args.offset === "number" ? args.offset : undefined;
-					const limit = typeof args.limit === "number" ? args.limit : undefined;
-					return this.shared.artifacts.get(args.handle, { offset, limit });
+					const offset = typeof args.offset_bytes === "number" ? args.offset_bytes : undefined;
+					const limit = typeof args.max_bytes === "number" ? args.max_bytes : undefined;
+					return this.artifacts.get(args.handle, { offset, limit });
 				},
 			},
 			{
@@ -565,10 +560,10 @@ export class RiemannRuntime {
 				handler: async (args) => {
 					if (typeof args.handle !== "string")
 						throw new RiemannHostError("invalid_arguments", "handle must be a string");
-					const source = this.shared.artifacts.getMetadata(args.handle);
+					const source = this.artifacts.assertPublic(args.handle);
 					const image = await storeModelImage({
-						artifacts: this.shared.artifacts,
-						bytes: await this.shared.artifacts.readBuffer(args.handle),
+						artifacts: this.artifacts,
+						bytes: await this.artifacts.readBuffer(args.handle),
 						claimedMimeType: source.mimeType,
 						...(source.name ? { name: source.name } : {}),
 					});
@@ -600,7 +595,12 @@ export class RiemannRuntime {
 					{ additionalProperties: false },
 				),
 				outputSchema: Type.Object(
-					{ path: Type.String(), size: Type.Integer({ minimum: 0 }), handle: Type.String() },
+					{
+						$riemann: Type.Literal("materialized_artifact"),
+						path: Type.String(),
+						size: Type.Integer({ minimum: 0 }),
+						handle: Type.String(),
+					},
 					{ additionalProperties: false },
 				),
 				pythonReturnType: "MaterializedArtifact",
@@ -625,7 +625,132 @@ export class RiemannRuntime {
 						throw new RiemannHostError("invalid_arguments", "handle and path must be strings");
 					}
 					const destination = await this.resolveArtifactDestination(args.path);
-					return this.shared.artifacts.materialize(args.handle, destination);
+					return this.artifacts.materialize(args.handle, destination);
+				},
+			},
+			{
+				name: "next",
+				namespace: "pages",
+				description: "Read the next retained page from a durable result snapshot.",
+				inputSchema: Type.Object({ cursor: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+				outputSchema: pageSchema(Type.Unknown()),
+				pythonReturnType: "Page",
+				errors: [
+					{
+						code: "invalid_arguments",
+						description: "The cursor is invalid or belongs to another agent.",
+						retryable: false,
+					},
+				],
+				effects: [
+					{ kind: "read", resource: "result-snapshot" },
+					{ kind: "write", resource: "artifact-store" },
+				],
+				idempotency: "idempotent",
+				cancellation: noCancellation,
+				visibility: "handle-method",
+				prompt: { inventory: "Continue a result snapshot.", example: "page = await page.next()" },
+				handler: async (args) => {
+					if (typeof args.cursor !== "string")
+						throw new RiemannHostError("invalid_arguments", "cursor must be a string");
+					return this.pages.next(args.cursor, (operation) => {
+						const definition = this.registry.get(operation);
+						if (
+							!definition ||
+							(definition.capability &&
+								!hasCapability(this.capabilities, definition.capability, definition.namespace))
+						) {
+							throw new RiemannHostError("permission_denied", "The source operation is no longer available");
+						}
+					});
+				},
+			},
+			{
+				name: "show",
+				namespace: "output",
+				description:
+					"Send selected fields to the model. max_items counts collection entries, never characters. More text is read with output.more; producers are not repeated.",
+				inputSchema: Type.Object(
+					{
+						value: Type.Unknown(),
+						fields: Type.Optional(Type.Union([Type.Array(Type.String({ minLength: 1 })), Type.Null()])),
+						max_items: Type.Optional(
+							Type.Integer({
+								minimum: 1,
+								maximum: 1000,
+								default: 10,
+								description:
+									"Collection entries, not text length. Omit for scalar fields; read more text with output.more.",
+							}),
+						),
+					},
+					{ additionalProperties: false },
+				),
+				outputSchema: Type.Null(),
+				pythonReturnType: "None",
+				errors: [
+					{
+						code: "invalid_arguments",
+						description: "A selected field or item count is invalid.",
+						retryable: false,
+					},
+				],
+				effects: [
+					{ kind: "write", resource: "model-context" },
+					{ kind: "write", resource: "artifact-store" },
+				],
+				idempotency: "idempotent",
+				cancellation: noCancellation,
+				visibility: "public",
+				prompt: {
+					inventory: "Send selected fields to the model without expanding intermediate data.",
+					example: 'await output.show(value=result, fields=["stdout", "stderr"])',
+					guidelines: [
+						"Built-in records use attributes; raw JSON and schemas remain dictionaries. Page iteration/indexing/len cover only the current page; await page.next() reads the next retained page. Use await output.more(ref=...) for a returned more reference; it never reruns the producer. Reuse snapshots when reading another slice of the same inspected file.",
+					],
+				},
+				handler: async (args) => {
+					if (typeof args.max_items !== "number")
+						throw new RiemannHostError("invalid_arguments", "max_items must be an integer from 1 to 1000");
+					return kernelHostResult(null, [
+						await this.outputViews.prepare(
+							args.value,
+							args.max_items,
+							this.shared.config.limits.maxModelTextBytes,
+						),
+					]);
+				},
+			},
+			{
+				name: "more",
+				namespace: "output",
+				description:
+					"Read the next budgeted portion of retained output or a text diagnostic using its short reference. Does not rerun commands or requests.",
+				inputSchema: Type.Object(
+					{ ref: Type.String({ minLength: 1, description: "Short reference returned in more= or details=" }) },
+					{ additionalProperties: false },
+				),
+				outputSchema: Type.Null(),
+				pythonReturnType: "None",
+				errors: [
+					{
+						code: "unsupported_media_type",
+						description: "The reference is not retained text or an output view.",
+						retryable: false,
+					},
+				],
+				effects: [
+					{ kind: "read", resource: "artifact-store" },
+					{ kind: "write", resource: "model-context" },
+				],
+				idempotency: "idempotent",
+				cancellation: noCancellation,
+				visibility: "public",
+				prompt: { inventory: "Continue retained output.", example: 'await output.more(ref="r1")' },
+				handler: async (args) => {
+					if (typeof args.ref !== "string")
+						throw new RiemannHostError("invalid_arguments", "ref must be a short resource reference");
+					return kernelHostResult(null, [await this.outputViews.more(args.ref)]);
 				},
 			},
 			{
@@ -636,6 +761,17 @@ export class RiemannRuntime {
 				outputSchema: Type.Object(
 					{
 						observed_at: Type.String(),
+						contract_fingerprint: Type.Union([Type.String(), Type.Null()]),
+						checkpoint: Type.Object(
+							{
+								state: Type.Union([
+									Type.Literal("not_started"),
+									Type.Literal("ready"),
+									Type.Literal("incompatible"),
+								]),
+							},
+							{ additionalProperties: false },
+						),
 						run_id: Type.String(),
 						session_id: Type.String(),
 						agent_id: Type.String(),
@@ -697,13 +833,13 @@ export class RiemannRuntime {
 						),
 						retention: Type.Object(
 							{
-								removedRunIds: Type.Array(Type.String()),
-								freedArtifactBytes: Type.Integer({ minimum: 0 }),
-								freedSnapshotBytes: Type.Integer({ minimum: 0 }),
-								freedWorktreeBytes: Type.Integer({ minimum: 0 }),
+								removed_run_ids: Type.Array(Type.String()),
+								freed_artifact_bytes: Type.Integer({ minimum: 0 }),
+								freed_snapshot_bytes: Type.Integer({ minimum: 0 }),
+								freed_worktree_bytes: Type.Integer({ minimum: 0 }),
 								errors: Type.Array(
 									Type.Object(
-										{ runId: Type.String(), message: Type.String() },
+										{ run_id: Type.String(), message: Type.String() },
 										{ additionalProperties: false },
 									),
 								),
@@ -730,8 +866,14 @@ export class RiemannRuntime {
 					const children = this.shared.store
 						.listAgents(this.shared.run.id)
 						.filter((agent) => agent.parentId !== null);
+					const defaults = this.shared.config.agentDefaults;
+					const filesystem = defaults.filesystem;
 					return {
 						observed_at: new Date().toISOString(),
+						contract_fingerprint: this.kernel?.contractFingerprint ?? null,
+						checkpoint: {
+							state: !this.kernel ? "not_started" : this.checkpointIncompatible ? "incompatible" : "ready",
+						},
 						run_id: this.shared.run.id,
 						session_id: this.shared.run.sessionId,
 						agent_id: this.agent.id,
@@ -757,7 +899,21 @@ export class RiemannRuntime {
 								same_path_mounts: true,
 							},
 						},
-						subagent_defaults: this.shared.config.agentDefaults,
+						subagent_defaults: {
+							workspace: defaults.workspace,
+							network: defaults.network,
+							...(defaults.model === undefined ? {} : { model: defaults.model }),
+							...(filesystem
+								? {
+										filesystem: {
+											...(filesystem.read ? { read: filesystem.read } : {}),
+											...(filesystem.readExclude ? { read_exclude: filesystem.readExclude } : {}),
+											...(filesystem.write ? { write: filesystem.write } : {}),
+											...(filesystem.writeExclude ? { write_exclude: filesystem.writeExclude } : {}),
+										},
+									}
+								: {}),
+						},
 						agent_slots: {
 							max: this.shared.config.maxAgents,
 							max_concurrent: this.shared.config.maxConcurrentAgents,
@@ -765,7 +921,16 @@ export class RiemannRuntime {
 							running: children.filter((agent) => agent.status === "running").length,
 							queued: children.filter((agent) => agent.status === "queued").length,
 						},
-						retention: this.shared.retentionReport as unknown as JsonValue,
+						retention: {
+							removed_run_ids: this.shared.retentionReport.removedRunIds,
+							freed_artifact_bytes: this.shared.retentionReport.freedArtifactBytes,
+							freed_snapshot_bytes: this.shared.retentionReport.freedSnapshotBytes,
+							freed_worktree_bytes: this.shared.retentionReport.freedWorktreeBytes,
+							errors: this.shared.retentionReport.errors.map((error) => ({
+								run_id: error.runId,
+								message: error.message,
+							})),
+						},
 					};
 				},
 			},
@@ -830,6 +995,18 @@ export class RiemannRuntime {
 	private durableState(compaction: CompactionDispatch): JsonValue {
 		const agents = this.shared.store.listAgents(this.shared.run.id);
 		const pendingEvents = this.shared.store.listPendingAgentEvents(this.agent.id);
+		const accessibleReference = (handle: string | null): string | null => {
+			if (!handle) return null;
+			try {
+				const ref = this.shared.artifacts.reference(handle);
+				this.artifacts.getMetadata(ref);
+				return ref;
+			} catch (error) {
+				if (error instanceof RiemannHostError && ["not_found", "permission_denied"].includes(error.code))
+					return null;
+				throw error;
+			}
+		};
 		return {
 			run: {
 				id: this.shared.run.id,
@@ -849,8 +1026,8 @@ export class RiemannRuntime {
 				last_turn_id: agent.lastTurnId,
 				last_outcome: agent.lastOutcome,
 				result_available: agent.result !== null,
-				transcript_handle: agent.transcriptHandle,
-				patch_handle: agent.patchHandle,
+				transcript_handle: accessibleReference(agent.transcriptHandle),
+				patch_handle: accessibleReference(agent.patchHandle),
 			})),
 			pending_agent_events: pendingEvents.map((event) => event.id),
 			compaction: {
@@ -966,19 +1143,21 @@ export class RiemannRuntime {
 			const { python, environment } = await ensureManagedPython();
 			const prelude = await readFile(preludePath(), "utf8");
 			const specifications = JSON.stringify(this.registry.pythonSpecifications(undefined, this.capabilities));
-			const bootstrapCode = `${prelude}\n\n_install_functions(_json.loads(${JSON.stringify(specifications)}))`;
+			const bootstrapCode = `${prelude}\n\n_configure_runtime(_json.loads(${JSON.stringify(JSON.stringify(this.shared.config.limits))}))\n_install_functions(_json.loads(${JSON.stringify(specifications)}))`;
 			const kernel = new IPythonKernelManager({
 				python,
 				env: environment,
 				cwd: this.agent.workspace,
 				sessionId: this.agent.id,
 				bootstrapCode,
+				contractFingerprint: createHash("sha256").update(prelude).update(specifications).digest("hex"),
 				hostRequest: (request, signal, onUpdate) =>
 					this.registry.dispatch(request, this.capabilities, signal, onUpdate),
 				snapshotPath: join(this.shared.store.snapshotsDir, this.agent.id, "kernel.dill"),
 				sandbox: { policy: this.policy, networkAllowed: this.agent.network === "allow" },
-				maxOutputChars: Math.max(this.shared.config.limits.maxCellOutputChars * 4, 400_000),
+				maxOutputChars: Math.max(this.shared.config.limits.maxModelTextBytes * 4, 400_000),
 				onRestore: (result) => {
+					this.checkpointIncompatible = result.incompatible === true;
 					this.pendingRestoreNotice = restoreNotice(result);
 				},
 			});
@@ -998,11 +1177,19 @@ export class RiemannRuntime {
 
 	private async formatResult(result: KernelExecuteResult): Promise<{
 		content: Array<TextContent | ImageContent>;
-		artifactHandle?: string;
+		moreRef?: string;
+		diagnosticRef?: string;
+		error?: string;
 		media?: IPythonToolDetails["media"];
 	}> {
-		const sections: string[] = [];
+		const sections: OutputPart[] = [];
 		const imageReferences: KernelImageReference[] = [];
+		if (result.captureTruncated) {
+			const streams = Object.entries(result.captureTruncated)
+				.filter(([, truncated]) => truncated)
+				.map(([kind]) => kind);
+			sections.push(`[Capture incomplete: ${streams.join(", ")}; recovery contains retained output only]`);
+		}
 		if (this.pendingRestoreNotice) {
 			sections.push(this.pendingRestoreNotice);
 			this.pendingRestoreNotice = undefined;
@@ -1021,7 +1208,7 @@ export class RiemannRuntime {
 				}
 				displayIndex += 1;
 				const image = await storeModelImage({
-					artifacts: this.shared.artifacts,
+					artifacts: this.artifacts,
 					bytes: rawImage.bytes,
 					claimedMimeType: rawImage.mimeType,
 					name: `ipython-display-${result.executionCount ?? "internal"}-${displayIndex}`,
@@ -1039,7 +1226,7 @@ export class RiemannRuntime {
 					sections.push(`Returned image [${rawImage.mimeType}; omitted from child Agent context]`);
 				} else {
 					const image = await storeModelImage({
-						artifacts: this.shared.artifacts,
+						artifacts: this.artifacts,
 						bytes: rawImage.bytes,
 						claimedMimeType: rawImage.mimeType,
 						name: `ipython-result-${result.executionCount ?? "internal"}`,
@@ -1051,15 +1238,45 @@ export class RiemannRuntime {
 		}
 		for (const content of result.modelContent) {
 			if (content.type === "text") sections.push(content.text);
+			else if (content.type === "output_ref") sections.push(content);
 			else if (this.root) imageReferences.push(content);
 			else sections.push(`Image content [${content.mimeType}; omitted from child Agent context]`);
 		}
+		let diagnosticRef: string | undefined;
 		if (result.error) {
-			const traceback =
-				result.error.traceback.length > 0
-					? result.error.traceback.join("\n")
-					: `${result.error.ename}: ${result.error.evalue}`;
-			sections.push(traceback);
+			const prefix = result.error.code
+				? `${result.error.operation ?? "ipython"} [${result.error.code}]: `
+				: `${result.error.ename}: `;
+			const summary = result.error.evalue.startsWith(prefix) ? result.error.evalue : prefix + result.error.evalue;
+			const repair = result.error.repairCode ? `\nUse: ${result.error.repairCode}` : "";
+			const actionable = new Set([
+				"invalid_arguments",
+				"unawaited_operation",
+				"not_found",
+				"permission_denied",
+				"conflict",
+			]);
+			if (result.error.code && actionable.has(result.error.code)) {
+				sections.unshift(summary + repair);
+			} else {
+				try {
+					const traceback = stripAnsi(
+						result.error.traceback.length > 0 ? result.error.traceback.join("\n") : summary,
+					);
+					const diagnostic = await this.artifacts.putText(
+						result.error.details === undefined
+							? traceback
+							: `${traceback}\n\nHost details:\n${JSON.stringify(result.error.details, null, 2)}`,
+						{ name: "ipython-error.txt" },
+					);
+					diagnosticRef = artifactHandle(diagnostic);
+					sections.unshift(`${summary}${repair}\n[details=${diagnosticRef}]`);
+				} catch (error) {
+					sections.unshift(
+						`${summary}${repair}\n[Diagnostic unavailable: ${error instanceof Error ? error.message : String(error)}]`,
+					);
+				}
+			}
 		}
 		if (sections.length === 0)
 			sections.push(
@@ -1083,20 +1300,11 @@ export class RiemannRuntime {
 			selectedImageBytes += image.byteLength;
 		}
 		if (omittedImages > 0) sections.push(`[${omittedImages} image(s) omitted by model-context budget]`);
-		const full = sections.join("\n\n");
-		const limit = this.shared.config.limits.maxCellOutputChars;
-		let text = full;
-		let artifactHandleValue: string | undefined;
-		if (full.length > limit) {
-			const artifact = await this.shared.artifacts.putText(full, {
-				name: `ipython-cell-${result.executionCount ?? "internal"}.txt`,
-			});
-			artifactHandleValue = artifactHandle(artifact);
-			text = `${full.slice(0, limit)}\n\n[Cell output truncated. Recover with: artifact = await artifacts.open(handle=${JSON.stringify(artifactHandleValue ?? "artifact unavailable")}); chunk = await artifact.read(offset=0, limit=65536)]`;
-		}
+		const rendered = await renderModelText(this.outputViews, sections, this.shared.config.limits.maxModelTextBytes);
+		const text = rendered.text;
 		const content: Array<TextContent | ImageContent> = [{ type: "text", text }];
 		for (const image of selectedImages) {
-			const bytes = await this.shared.artifacts.readBuffer(image.artifactHandle);
+			const bytes = await this.artifacts.readBuffer(image.artifactHandle);
 			content.push({
 				type: "image",
 				data: bytes.toString("base64"),
@@ -1106,7 +1314,9 @@ export class RiemannRuntime {
 		}
 		return {
 			content,
-			...(artifactHandleValue ? { artifactHandle: artifactHandleValue } : {}),
+			...(rendered.more ? { moreRef: rendered.more } : {}),
+			...(diagnosticRef ? { diagnosticRef } : {}),
+			...(rendered.error ? { error: rendered.error } : {}),
 			...(selectedImages.length > 0
 				? {
 						media: selectedImages.map((image) => ({
@@ -1160,19 +1370,26 @@ export class RiemannRuntime {
 					if (snapshot.error) runtime.pendingRestoreNotice = `[Checkpoint warning] ${snapshot.error}`;
 				}
 				const formatted = await runtime.formatResult(result);
-				return {
+				const status = formatted.error && result.status === "ok" ? "error" : result.status;
+				const outcome = {
 					content: formatted.content,
 					details: {
-						status: result.status,
+						status,
 						startedAt,
 						durationMs: result.durationMs,
-						...(result.error ? { errorName: result.error.ename } : {}),
+						...(result.captureTruncated ? { captureTruncated: result.captureTruncated } : {}),
+						...(result.error
+							? { errorName: result.error.ename, ...(result.error.code ? { errorCode: result.error.code } : {}) }
+							: {}),
 						...(result.executionCount === undefined ? {} : { executionCount: result.executionCount }),
-						...(formatted.artifactHandle ? { artifactHandle: formatted.artifactHandle } : {}),
+						...(formatted.moreRef ? { moreRef: formatted.moreRef } : {}),
+						...(formatted.diagnosticRef ? { diagnosticRef: formatted.diagnosticRef } : {}),
 						...(formatted.media ? { media: formatted.media } : {}),
 						...(activities.length > 0 ? { activities } : {}),
 					},
 				};
+				if (status !== "ok") throw new AgentToolExecutionError(outcome);
+				return outcome;
 			},
 		};
 	}

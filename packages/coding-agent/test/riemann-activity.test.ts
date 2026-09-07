@@ -53,12 +53,22 @@ describe("Riemann IPython activity tracking", () => {
 				stderr: "",
 				duration_ms: 40,
 				termination: "exited",
-				stdout_truncated: false,
+				stdout_truncated: true,
 				stderr_truncated: false,
-				artifact: null,
+				stdout_capture_truncated: true,
+				stderr_capture_truncated: false,
+				stdout_artifact: { handle: "artifact://stdout" },
+				stderr_artifact: null,
 			},
 		});
-		expect(activities[0]).toMatchObject({ status: "ok", exitCode: 0, durationMs: 40 });
+		expect(activities[0]).toMatchObject({
+			status: "ok",
+			exitCode: 0,
+			durationMs: 40,
+			stdoutTruncated: true,
+			stdoutCaptureTruncated: true,
+			stdoutArtifactHandle: "artifact://stdout",
+		});
 	});
 
 	test("derives actual file and patch diffs from atomic file operations", async () => {

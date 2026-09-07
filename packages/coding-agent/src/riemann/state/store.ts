@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { type FilesystemSnapshot, FULL_FILESYSTEM, parseFilesystemSnapshot } from "../access-policy.ts";
 import type { EffectiveAgentNetwork } from "../config.ts";
 import { DatabaseSync, type RiemannDatabase } from "./database.ts";
+import { ReferenceStore } from "./references.ts";
 
 export type AgentStatus = "queued" | "running" | "idle" | "stopped";
 export type AgentOutcome = "ok" | "error" | "cancelled";
@@ -130,7 +131,7 @@ export interface AgentTurnSettlementInput {
 	outcome: AgentOutcome;
 	result: string;
 	error: string | null;
-	transcriptHandle: string;
+	transcriptHandle: string | null;
 	patchHandle: string | null;
 	delivery: AgentDeliveryMethod | "notify";
 	event?: {
@@ -369,6 +370,7 @@ export class RiemannStore {
 	readonly root: string;
 	readonly snapshotsDir: string;
 	readonly artifactsDir: string;
+	readonly references: ReferenceStore;
 	private readonly db: RiemannDatabase;
 	private readonly statements = new Map<string, ReturnType<RiemannDatabase["prepare"]>>();
 
@@ -383,6 +385,7 @@ export class RiemannStore {
 			"PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;",
 		);
 		this.migrate();
+		this.references = new ReferenceStore(this.db);
 	}
 
 	private prepare(sql: string): ReturnType<RiemannDatabase["prepare"]> {
@@ -1083,7 +1086,7 @@ export class RiemannStore {
 				"UPDATE agent_turns SET status = 'settled', delivered_via = COALESCE(delivered_via, 'return'), outcome = 'cancelled', error = COALESCE(error, 'host process interrupted'), completed_at = COALESCE(completed_at, ?), delivered_at = COALESCE(delivered_at, ?), updated_at = ? WHERE run_id = ? AND status IN ('queued','running')",
 			).run(timestamp, timestamp, timestamp, runId);
 			this.prepare(
-				"UPDATE agents SET status = 'stopped', active_turn_id = NULL, last_outcome = 'cancelled', error = COALESCE(error, 'host process interrupted'), updated_at = ? WHERE run_id = ? AND status IN ('queued','running') AND parent_id IS NOT NULL",
+				"UPDATE agents SET status = 'stopped', active_turn_id = NULL, last_outcome = 'cancelled', error = COALESCE(error, 'host process interrupted'), updated_at = ? WHERE run_id = ? AND (status IN ('queued','running') OR (status = 'stopped' AND active_turn_id IS NOT NULL)) AND parent_id IS NOT NULL",
 			).run(timestamp, runId);
 			this.db.exec("COMMIT");
 		} catch (error) {
@@ -1223,7 +1226,7 @@ export class RiemannStore {
 
 	putArtifact(artifact: StoredArtifact): void {
 		this.prepare(
-			"INSERT OR REPLACE INTO artifacts(handle, run_id, hash, mime_type, size, name, path, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+			"INSERT INTO artifacts(handle, run_id, hash, mime_type, size, name, path, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(handle) DO UPDATE SET run_id = excluded.run_id, hash = excluded.hash, mime_type = excluded.mime_type, size = excluded.size, name = excluded.name, path = excluded.path, created_at = excluded.created_at",
 		).run(
 			artifact.handle,
 			artifact.runId,

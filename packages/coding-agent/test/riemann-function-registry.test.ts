@@ -1,7 +1,8 @@
 import { Type } from "typebox";
+import { Value } from "typebox/value";
 import { describe, expect, test } from "vitest";
 import { RiemannHostError } from "../src/riemann/errors.ts";
-import { type FunctionDefinition, FunctionRegistry } from "../src/riemann/functions/registry.ts";
+import { type FunctionDefinition, FunctionRegistry, OperationSpecSchema } from "../src/riemann/functions/registry.ts";
 import { type JsonValue, type KernelHostRequest, kernelHostResult } from "../src/riemann/kernel/types.ts";
 
 const NEVER_ABORTED = new AbortController().signal;
@@ -100,6 +101,104 @@ async function expectHostError(promise: Promise<unknown>, code: string): Promise
 }
 
 describe("Riemann function registry", () => {
+	test("renders executable Python literals and preserves explicit null defaults", async () => {
+		const registry = new FunctionRegistry();
+		registry.register({
+			...readDefinition(async (args) => args),
+			inputSchema: Type.Object(
+				{ flag: Type.Optional(Type.Union([Type.Boolean(), Type.Null()], { default: false })) },
+				{ additionalProperties: false },
+			),
+			outputSchema: Type.Object(
+				{ flag: Type.Union([Type.Boolean(), Type.Null()]) },
+				{ additionalProperties: false },
+			),
+		});
+		expect(registry.promptInventory(new Set(["fs.read"]))).toContain("flag=False");
+		expect(await registry.dispatch(request("fs.read"), new Set(["fs.read"]), NEVER_ABORTED)).toEqual({ flag: false });
+		expect(await registry.dispatch(request("fs.read", { flag: null }), new Set(["fs.read"]), NEVER_ABORTED)).toEqual({
+			flag: null,
+		});
+		registry.register({
+			...readDefinition(async (args) => args),
+			namespace: "quantity",
+			pythonReturnType: "dict",
+			inputSchema: Type.Object(
+				{
+					max_items: Type.Optional(
+						Type.Integer({ minimum: 1, maximum: 3, default: 2, description: "Maximum returned entries" }),
+					),
+				},
+				{ additionalProperties: false },
+			),
+			outputSchema: Type.Object({ max_items: Type.Integer() }, { additionalProperties: false }),
+		});
+		expect(registry.describe("quantity.read")).toMatchObject({
+			parameters: [
+				{
+					name: "max_items",
+					type: "integer",
+					required: false,
+					description: "Maximum returned entries",
+					default: 2,
+					constraints: { minimum: 1, maximum: 3 },
+				},
+			],
+		});
+		expect(await registry.dispatch(request("quantity.read"), new Set(["fs.read"]), NEVER_ABORTED)).toEqual({
+			max_items: 2,
+		});
+		await expect(
+			registry.dispatch(request("quantity.read", { max_items: 4 }), new Set(["fs.read"]), NEVER_ABORTED),
+		).rejects.toMatchObject({
+			code: "invalid_arguments",
+			message: expect.stringContaining("maximum"),
+			details: {
+				errors: [
+					{
+						path: "/max_items",
+						received: "integer (4)",
+						expected: expect.stringContaining("3"),
+						message: expect.any(String),
+					},
+				],
+			},
+		});
+	});
+
+	test("does not execute pre-cancelled calls or override instance recovery", async () => {
+		let calls = 0;
+		const registry = new FunctionRegistry();
+		registry.register(
+			readDefinition(async () => {
+				calls += 1;
+				throw new RiemannHostError("not_found", "gone", undefined, true);
+			}),
+		);
+		const controller = new AbortController();
+		controller.abort();
+		await expectHostError(
+			registry.dispatch(request("fs.read", { path: "x" }), new Set(["fs.read"]), controller.signal),
+			"cancelled",
+		);
+		expect(calls).toBe(0);
+		const cancelled = new FunctionRegistry();
+		const during = new AbortController();
+		cancelled.register(
+			readDefinition(async () => {
+				during.abort();
+				throw during.signal.reason;
+			}),
+		);
+		await expect(
+			cancelled.dispatch(request("fs.read", { path: "x" }), new Set(["fs.read"]), during.signal),
+		).rejects.toMatchObject({ code: "cancelled", recovery: "none" });
+
+		await expect(
+			registry.dispatch(request("fs.read", { path: "x" }), new Set(["fs.read"]), NEVER_ABORTED),
+		).rejects.toMatchObject({ retryable: true });
+	});
+
 	test("rejects Python keywords in namespaces, names, and parameters", () => {
 		const keywordName = { ...readDefinition(), name: "class" };
 		expect(() => new FunctionRegistry().register(keywordName)).toThrow("Invalid Python function name");
@@ -135,6 +234,23 @@ describe("Riemann function registry", () => {
 			"invalid_arguments",
 		);
 		expect(invoked).toBe(false);
+		await expect(
+			registry.dispatch(
+				request("fs.read", { path: "README.md", unexpected: true }),
+				new Set(["fs.read"]),
+				NEVER_ABORTED,
+			),
+		).rejects.toMatchObject({
+			details: {
+				errors: expect.arrayContaining([
+					expect.objectContaining({
+						path: "/unexpected",
+						received: "boolean",
+						expected: expect.stringContaining("path"),
+					}),
+				]),
+			},
+		});
 	});
 
 	test("search indexes capability names and respects capability visibility", () => {
@@ -143,9 +259,11 @@ describe("Riemann function registry", () => {
 
 		expect(registry.search("workspace.write", 8, new Set(["workspace.write"]))).toEqual([
 			{
+				$riemann: "operation_summary",
 				name: "fs.edit",
+				signature: "fs.edit(*, snapshot=..., operations=...) -> str",
 				description: "Edit a file snapshot.",
-				pythonReturnType: "str",
+				python_return_type: "str",
 				capability: "workspace.write",
 			},
 		]);
@@ -157,27 +275,26 @@ describe("Riemann function registry", () => {
 		const registry = new FunctionRegistry();
 		registry.register(readDefinition());
 
-		expect(registry.describe("fs.read", new Set(["fs.read"]))).toEqual({
+		const described = registry.describe("fs.read", new Set(["fs.read"]), "schema");
+		expect(Value.Check(OperationSpecSchema, described)).toBe(true);
+		expect(described).toMatchObject({
 			name: "fs.read",
 			description: "Read a file.",
-			inputSchema: {
-				type: "object",
-				required: ["path"],
-				properties: {
-					path: { type: "string", minLength: 1, description: "Path to read" },
-					encoding: { type: "string", default: "utf-8", description: "Text encoding" },
-				},
-				additionalProperties: false,
-			},
-			outputSchema: { type: "string" },
+			input_schema: readDefinition().inputSchema,
+			output_schema: { type: "string" },
 			defaults: { encoding: "utf-8" },
-			pythonReturnType: "str",
-			errors: [{ code: "not_found", description: "The path does not exist.", retryable: false }],
-			effects: [{ kind: "read", resource: "filesystem" }],
-			idempotency: "idempotent",
-			cancellation: { supported: true, description: "Stops the pending file read." },
-			capability: "fs.read",
-			example: 'await fs.read(path="README.md")',
+			python_return_type: "str",
+			errors: expect.arrayContaining([
+				{ code: "not_found", description: "The path does not exist.", retryable: false, recovery: "refresh" },
+			]),
+		});
+		const usage = registry.describe("fs.read", new Set(["fs.read"]));
+		expect(Value.Check(OperationSpecSchema, usage)).toBe(true);
+		expect(usage).not.toHaveProperty("input_schema");
+		expect(usage).not.toHaveProperty("output_schema");
+		expect(usage).toMatchObject({
+			execution: "host",
+			cancellation: { before_start: "reject", during_execution: "cooperative", side_effects_may_remain: false },
 		});
 	});
 
@@ -202,24 +319,89 @@ describe("Riemann function registry", () => {
 		registerFixtureFunctions(registry);
 		const readOnly = new Set(["fs.read"]);
 
-		expect(registry.pythonSpecifications(undefined, readOnly)).toEqual([
-			{
-				name: "read",
-				namespace: "fs",
-				qualified_name: "fs.read",
-				description: "Read a file.",
-				input_schema: {
-					type: "object",
-					required: ["path"],
-					properties: {
-						path: { type: "string", minLength: 1, description: "Path to read" },
-						encoding: { type: "string", default: "utf-8", description: "Text encoding" },
+		expect(registry.pythonSpecifications(undefined, readOnly).filter((item) => item.visibility === "public")).toEqual(
+			[
+				{
+					name: "read",
+					namespace: "fs",
+					qualified_name: "fs.read",
+					description: "Read a file.",
+					input_schema: {
+						type: "object",
+						required: ["path"],
+						properties: {
+							path: { type: "string", minLength: 1, description: "Path to read" },
+							encoding: { type: "string", default: "utf-8", description: "Text encoding" },
+						},
+						additionalProperties: false,
 					},
-					additionalProperties: false,
+					return_type: "str",
+					output_schema: { type: "string" },
+					visibility: "public",
 				},
-				return_type: "str",
-			},
-		]);
+			],
+		);
+	});
+
+	test("describes permission-filtered handle methods and schema-derived result types", () => {
+		const registry = new FunctionRegistry();
+		registerFixtureFunctions(registry);
+		expect(registry.describe("Artifact.read")).toMatchObject({
+			name: "Artifact.read",
+			signature: "Artifact.read() -> str",
+		});
+		registry.register({
+			...readDefinition(),
+			namespace: "records",
+			outputSchema: Type.Object({ path: Type.String() }, { additionalProperties: false, $id: "TextSnapshot" }),
+			pythonReturnType: "TextSnapshot",
+		});
+		expect(registry.describe("TextSnapshot", new Set(["fs.read"]), "schema")).toMatchObject({
+			output_schema: { $id: "TextSnapshot" },
+		});
+		expect(() => registry.describe("TextSnapshot", new Set())).toThrow(RiemannHostError);
+		expect(registry.describe("TextSnapshot.lines", new Set(["fs.read"]))).toMatchObject({
+			execution: "local",
+			example: "snapshot.lines(start=1, end=10)",
+		});
+		const inventory = registry.promptInventory(new Set(["fs.read"]));
+		expect(inventory).toContain('read(*, path=..., encoding="utf-8") -> TextSnapshot');
+		expect(inventory).toContain("Return types:");
+		expect(inventory.match(/TextSnapshot\(path/g)).toHaveLength(1);
+
+		registry.register({ ...readDefinition(), namespace: "hidden", visibility: "internal" });
+		expect(() => registry.describe("hidden.read", new Set(["*"]))).toThrow(RiemannHostError);
+	});
+
+	test("validates updates without throwing through callbacks and preserves native error diagnostics", async () => {
+		const registry = new FunctionRegistry();
+		let delivered = false;
+		registry.register({
+			...readDefinition(async (_args, _signal, update) => {
+				expect(() => update?.({ unexpected: true })).not.toThrow();
+				return "contents";
+			}),
+			updateSchema: Type.Object({ text: Type.String() }, { additionalProperties: false }),
+		});
+		await expect(
+			registry.dispatch(request("fs.read", { path: "x" }), new Set(["fs.read"]), NEVER_ABORTED, () => {
+				delivered = true;
+			}),
+		).rejects.toMatchObject({ code: "invalid_output" });
+		expect(delivered).toBe(false);
+		const failing = new FunctionRegistry();
+		failing.register(
+			readDefinition(async () => {
+				throw new Error("disk failed", { cause: new Error("native cause") });
+			}),
+		);
+		await expect(
+			failing.dispatch(request("fs.read", { path: "x" }), new Set(["fs.read"]), NEVER_ABORTED),
+		).rejects.toMatchObject({
+			code: "internal_error",
+			recovery: "none",
+			details: { message: "disk failed", stack: expect.any(String), cause: { message: "native cause" } },
+		});
 	});
 
 	test("normalizes unknown registry lookups to host not-found errors", async () => {

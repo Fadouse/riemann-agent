@@ -1,4 +1,5 @@
 import type { TObject, TSchema } from "typebox";
+import type { ErrorRecovery } from "../errors.ts";
 import type { JsonValue, KernelHostResult } from "../kernel/types.ts";
 
 export type FunctionUpdateCallback = (update: JsonValue) => void;
@@ -10,6 +11,7 @@ export interface FunctionErrorSpecification {
 	code: string;
 	description: string;
 	retryable: boolean;
+	recovery?: ErrorRecovery;
 }
 
 export interface FunctionEffectSpecification {
@@ -34,6 +36,8 @@ export interface FunctionDefinition {
 	description: string;
 	inputSchema: TObject;
 	outputSchema: TSchema;
+	updateSchema?: TSchema;
+	remoteOutputSchema?: TSchema;
 	pythonReturnType: string;
 	errors: readonly FunctionErrorSpecification[];
 	effects: readonly FunctionEffectSpecification[];

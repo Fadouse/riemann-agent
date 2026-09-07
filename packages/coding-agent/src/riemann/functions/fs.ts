@@ -11,6 +11,7 @@ import { RiemannHostError } from "../errors.ts";
 import { type StoredModelImage, storeModelImage } from "../images.ts";
 import type { JsonValue } from "../kernel/types.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
+import { PageStore, pageSchema } from "../state/pages.ts";
 import type { RiemannStore } from "../state/store.ts";
 import type { FunctionDefinition } from "./registry.ts";
 
@@ -39,6 +40,15 @@ const artifactSchema = Type.Object(
 		name: Type.Union([Type.String(), Type.Null()]),
 	},
 	{ additionalProperties: false, $id: "Artifact" },
+);
+
+const pathEntrySchema = Type.Object(
+	{
+		$riemann: Type.Literal("path_entry"),
+		path: Type.String(),
+		kind: Type.Union([Type.Literal("file"), Type.Literal("directory")]),
+	},
+	{ additionalProperties: false, $id: "PathEntry" },
 );
 
 const textSnapshotSchema = Type.Object(
@@ -206,12 +216,20 @@ export class FileFunctions {
 	private readonly runId: string;
 	private readonly store: RiemannStore;
 	private readonly artifacts: ArtifactStore;
+	private readonly pages: PageStore;
 
-	constructor(policy: FileAccessPolicy, runId: string, store: RiemannStore, artifacts: ArtifactStore) {
+	constructor(
+		policy: FileAccessPolicy,
+		runId: string,
+		store: RiemannStore,
+		artifacts: ArtifactStore,
+		pages?: PageStore,
+	) {
 		this.policy = policy;
 		this.runId = runId;
 		this.store = store;
 		this.artifacts = artifacts;
+		this.pages = pages ?? new PageStore(artifacts, runId);
 	}
 
 	/** Resolves an existing readable path, rejecting symlink escapes into unreadable locations. */
@@ -434,27 +452,17 @@ export class FileFunctions {
 		}
 	}
 
-	private async globMatches(pattern: string, includeHidden: boolean): Promise<string[]> {
+	private async globMatches(pattern: string, includeHidden: boolean, onlyFiles: boolean): Promise<string[]> {
 		return glob(pattern, {
 			cwd: this.policy.cwd,
 			dot: includeHidden,
-			nodir: true,
+			nodir: onlyFiles,
 			ignore: [".git/**", "node_modules/**"],
 		});
 	}
 
 	private displayPath(path: string): string {
 		return isInside(this.policy.cwd, path) ? globPath(relative(this.policy.cwd, path)) : globPath(path);
-	}
-
-	/** Validates one glob result and returns its canonical display path, or undefined when filtered out. */
-	private async visiblePath(match: string): Promise<string | undefined> {
-		try {
-			return this.displayPath(await this.resolveExisting(match));
-		} catch {
-			// Glob patterns may match unreadable paths or symlink escapes.
-			return undefined;
-		}
 	}
 
 	definitions(): FunctionDefinition[] {
@@ -472,6 +480,11 @@ export class FileFunctions {
 				outputSchema: fileSnapshotSchema,
 				pythonReturnType: "FileSnapshot",
 				errors: [
+					{
+						code: "limit_exceeded",
+						description: "The run has exhausted its resource reference numbers.",
+						retryable: false,
+					},
 					{ code: "invalid_arguments", description: "The path is empty or invalid.", retryable: false },
 					{ code: "not_found", description: "The path does not exist.", retryable: false },
 					{
@@ -480,13 +493,26 @@ export class FileFunctions {
 						retryable: false,
 					},
 					{ code: "response_too_large", description: "The file exceeds the read limit.", retryable: false },
+					{ code: "image_too_large", description: "The source image exceeds 20 MiB.", retryable: false },
+					{ code: "image_decode_failed", description: "The image cannot be decoded.", retryable: false },
+					{ code: "artifact_error", description: "Image artifact metadata is invalid.", retryable: false },
+					{
+						code: "conflict",
+						description: "The readable path changed while opening.",
+						retryable: false,
+						recovery: "refresh",
+					},
 					{
 						code: "unsupported_media_type",
 						description: "The file is neither valid UTF-8 text nor a supported image.",
 						retryable: false,
 					},
 				],
-				effects: [{ kind: "read", resource: "filesystem" }],
+				effects: [
+					{ kind: "read", resource: "filesystem" },
+					{ kind: "write", resource: "artifact-store" },
+					{ kind: "write", resource: "capability-store" },
+				],
 				idempotency: "idempotent",
 				cancellation: noCancellation,
 				visibility: "public",
@@ -538,44 +564,101 @@ export class FileFunctions {
 			{
 				name: "glob",
 				namespace: "fs",
-				description: "List readable files matching a glob pattern without reading their contents.",
+				description: "List readable files and directories matching a glob pattern as PathEntry records.",
 				inputSchema: Type.Object(
 					{
 						pattern: Type.String({ minLength: 1, description: "Glob pattern" }),
 						include_hidden: Type.Optional(Type.Boolean({ default: false, description: "Include dotfiles" })),
-						limit: Type.Optional(
-							Type.Integer({ minimum: 1, maximum: 5_000, default: 200, description: "Maximum paths" }),
+						kind: Type.Optional(
+							Type.Union([Type.Literal("any"), Type.Literal("file"), Type.Literal("directory")], {
+								default: "any",
+								description: "Entry kinds to include",
+							}),
+						),
+						max_items: Type.Optional(
+							Type.Integer({
+								minimum: 1,
+								maximum: 5_000,
+								default: 200,
+								description: "Paths per page; the snapshot contains at most 5000 paths",
+							}),
 						),
 					},
 					{ additionalProperties: false },
 				),
-				outputSchema: Type.Array(Type.String()),
-				pythonReturnType: "list[str]",
+				outputSchema: pageSchema(pathEntrySchema),
+				pythonReturnType: "Page[PathEntry]",
 				errors: [
+					{
+						code: "limit_exceeded",
+						description: "The run has exhausted its resource reference numbers.",
+						retryable: false,
+					},
+					{
+						code: "response_too_large",
+						description: "The retained result snapshot exceeds its byte limit.",
+						retryable: false,
+					},
+					{ code: "artifact_error", description: "The result snapshot artifact is invalid.", retryable: false },
 					{ code: "invalid_arguments", description: "The pattern or options are invalid.", retryable: false },
 				],
-				effects: [{ kind: "read", resource: "filesystem-metadata" }],
+				effects: [
+					{ kind: "read", resource: "filesystem-metadata" },
+					{ kind: "write", resource: "artifact-store" },
+				],
 				idempotency: "idempotent",
 				cancellation: noCancellation,
 				visibility: "public",
 				prompt: {
-					inventory: "Find readable files without reading their contents.",
-					example: 'await fs.glob(pattern="src/**/*.ts", limit=200)',
+					inventory: "Find readable file and directory entries without reading file contents.",
+					example:
+						'entries = await fs.glob(pattern="src/*", max_items=20); output.show(value=entries, fields=["path", "kind"])',
 				},
 				capability: "fs.read",
 				handler: async (args) => {
+					const kind = optionalString(args, "kind", "any");
+					if (kind !== "any" && kind !== "file" && kind !== "directory")
+						throw new RiemannHostError("invalid_arguments", "kind must be any, file, or directory");
+					const limit = optionalInteger(args, "max_items", 200, 1, 5_000);
 					const matches = await this.globMatches(
 						requiredString(args, "pattern"),
 						optionalBoolean(args, "include_hidden", false),
+						kind === "file",
 					);
-					const limit = optionalInteger(args, "limit", 200, 1, 5_000);
-					const visible: string[] = [];
+					const visible: JsonValue[] = [];
+					let skippedFiles = 0;
+					let capped = false;
 					for (const match of matches.sort()) {
-						if (visible.length >= limit) break;
-						const path = await this.visiblePath(match);
-						if (path) visible.push(path);
+						let path: string;
+						let entryKind: "file" | "directory";
+						try {
+							path = await this.resolveExisting(match);
+							const info = await stat(path);
+							if (!info.isFile() && !info.isDirectory()) {
+								skippedFiles += 1;
+								continue;
+							}
+							entryKind = info.isDirectory() ? "directory" : "file";
+						} catch {
+							// Glob patterns may match unreadable paths or symlink escapes.
+							skippedFiles += 1;
+							continue;
+						}
+						if (kind !== "any" && kind !== entryKind) continue;
+						if (visible.length >= 5_000) {
+							capped = true;
+							break;
+						}
+						visible.push({ $riemann: "path_entry", path: this.displayPath(path) || ".", kind: entryKind });
 					}
-					return visible;
+					const skipped = [];
+					if (skippedFiles) skipped.push({ reason: "unreadable_or_unavailable_file", count: skippedFiles });
+					if (capped) skipped.push({ reason: "result_limit", count: 1 });
+					return this.pages.create("fs.glob", visible, {
+						limit,
+						coverage: skipped.length ? "limited" : "complete",
+						skipped,
+					});
 				},
 			},
 			{
@@ -595,15 +678,21 @@ export class FileFunctions {
 						case_sensitive: Type.Optional(
 							Type.Boolean({ default: true, description: "Use case-sensitive matching" }),
 						),
-						limit: Type.Optional(
-							Type.Integer({ minimum: 1, maximum: 2_000, default: 100, description: "Maximum matches" }),
+						max_items: Type.Optional(
+							Type.Integer({
+								minimum: 1,
+								maximum: 2_000,
+								default: 100,
+								description: "Matches per page; the snapshot contains at most 2000 matches",
+							}),
 						),
 					},
 					{ additionalProperties: false },
 				),
-				outputSchema: Type.Array(
+				outputSchema: pageSchema(
 					Type.Object(
 						{
+							$riemann: Type.Literal("search_match"),
 							path: Type.String(),
 							line: Type.Integer({ minimum: 1 }),
 							text: Type.String(),
@@ -612,21 +701,36 @@ export class FileFunctions {
 						{ additionalProperties: false },
 					),
 				),
-				pythonReturnType: "list[SearchMatch]",
+				pythonReturnType: "Page[SearchMatch]",
 				errors: [
+					{
+						code: "limit_exceeded",
+						description: "The run has exhausted its resource reference numbers.",
+						retryable: false,
+					},
+					{
+						code: "response_too_large",
+						description: "The retained result snapshot exceeds its byte limit.",
+						retryable: false,
+					},
+					{ code: "artifact_error", description: "The result snapshot artifact is invalid.", retryable: false },
 					{
 						code: "invalid_arguments",
 						description: "The query, regular expression, or options are invalid.",
 						retryable: false,
 					},
 				],
-				effects: [{ kind: "read", resource: "filesystem" }],
+				effects: [
+					{ kind: "read", resource: "filesystem" },
+					{ kind: "write", resource: "artifact-store" },
+				],
 				idempotency: "idempotent",
 				cancellation: noCancellation,
 				visibility: "public",
 				prompt: {
 					inventory: "Search file text with canonical paths and line numbers.",
-					example: 'await fs.search(query="needle", glob="src/**/*.ts")',
+					example:
+						'matches = await fs.search(query="needle", glob="src/**/*.ts", max_items=20); output.show(value=matches)',
 				},
 				capability: "fs.read",
 				handler: async (args) => {
@@ -645,11 +749,16 @@ export class FileFunctions {
 						}
 					}
 					const needle = caseSensitive ? query : query.toLowerCase();
-					const files = await this.globMatches(optionalString(args, "glob", "**/*"), false);
-					const limit = optionalInteger(args, "limit", 100, 1, 2_000);
+					const files = await this.globMatches(optionalString(args, "glob", "**/*"), false, true);
+					const limit = optionalInteger(args, "max_items", 100, 1, 2_000);
 					const hits: JsonValue[] = [];
+					const skippedCounts = new Map<string, number>();
+					const skip = (reason: string) => skippedCounts.set(reason, (skippedCounts.get(reason) ?? 0) + 1);
 					for (const file of files.sort()) {
-						if (hits.length >= limit) break;
+						if (hits.length >= 2_000) {
+							skip("result_limit");
+							break;
+						}
 						let data: Buffer;
 						let displayPath: string;
 						try {
@@ -660,32 +769,43 @@ export class FileFunctions {
 							} finally {
 								await opened.file.close();
 							}
-						} catch {
+						} catch (error) {
 							// Glob results can be unreadable or escape through a symlink.
+							skip(
+								error instanceof RiemannHostError && error.code === "response_too_large"
+									? "file_size_limit"
+									: "unreadable_or_unavailable_file",
+							);
 							continue;
 						}
-						if (data.includes(0)) continue;
+						if (data.includes(0)) {
+							skip("binary_file");
+							continue;
+						}
 						let text: string;
 						try {
 							text = new TextDecoder("utf-8", { fatal: true }).decode(data);
 						} catch {
+							skip("invalid_utf8_file");
 							continue;
 						}
 						// Visit lines without retaining a second, whole-file array of strings.
 						// Include the final empty line and strip CR only when it precedes LF.
 						let start = 0;
-						for (let lineNumber = 1; start <= text.length && hits.length < limit; lineNumber += 1) {
+						for (let lineNumber = 1; start <= text.length && hits.length < 2_000; lineNumber += 1) {
 							const newline = text.indexOf("\n", start);
 							const end = newline === -1 ? text.length : newline;
 							const line = text.slice(start, newline !== -1 && text.charCodeAt(end - 1) === 13 ? end - 1 : end);
 							start = newline === -1 ? text.length + 1 : newline + 1;
 							const searchableLine = matcher ? graphemeSafePrefix(line, MAX_SEARCH_LINE_CHARS) : line;
+							if (matcher && searchableLine.length < line.length) skip("regex_line_scan_limit");
 							if (matcher) matcher.lastIndex = 0;
 							const matched = matcher
 								? matcher.test(searchableLine)
 								: (caseSensitive ? line : line.toLowerCase()).includes(needle);
 							if (matched) {
 								hits.push({
+									$riemann: "search_match",
 									path: displayPath,
 									line: lineNumber,
 									text: graphemeSafePrefix(line, MAX_SEARCH_LINE_CHARS),
@@ -693,8 +813,14 @@ export class FileFunctions {
 								});
 							}
 						}
+						if (start <= text.length && hits.length >= 2_000) skip("result_limit");
 					}
-					return hits;
+					const skipped = [...skippedCounts].map(([reason, count]) => ({ reason, count }));
+					return this.pages.create("fs.search", hits, {
+						limit,
+						coverage: skipped.length ? "limited" : "complete",
+						skipped,
+					});
 				},
 			},
 			{
@@ -726,11 +852,17 @@ export class FileFunctions {
 						description: "The file is outside writable policy roots.",
 						retryable: false,
 					},
-					{ code: "conflict", description: "The file changed after the snapshot was created.", retryable: true },
+					{
+						code: "conflict",
+						description:
+							"The file changed after the snapshot was created. Read a fresh snapshot before editing or removing.",
+						retryable: false,
+					},
 				],
 				effects: [
 					{ kind: "read", resource: "filesystem" },
 					{ kind: "write", resource: "filesystem" },
+					{ kind: "write", resource: "capability-store" },
 				],
 				idempotency: "conditional",
 				cancellation: noCancellation,
@@ -783,7 +915,7 @@ export class FileFunctions {
 			{
 				name: "create",
 				namespace: "fs",
-				description: "Create a new UTF-8 file atomically. Refuses to overwrite an existing path.",
+				description: "Exclusively create a new UTF-8 file. Refuses to overwrite an existing path.",
 				inputSchema: Type.Object(
 					{
 						path: Type.String({ minLength: 1, description: pathDescription }),
@@ -802,12 +934,15 @@ export class FileFunctions {
 					},
 					{ code: "conflict", description: "The destination already exists.", retryable: false },
 				],
-				effects: [{ kind: "write", resource: "filesystem" }],
+				effects: [
+					{ kind: "write", resource: "filesystem" },
+					{ kind: "write", resource: "capability-store" },
+				],
 				idempotency: "non-idempotent",
 				cancellation: noCancellation,
 				visibility: "public",
 				prompt: {
-					inventory: "Create a new UTF-8 file atomically; never overwrite.",
+					inventory: "Exclusively create a new UTF-8 file; never overwrite.",
 					example: 'await fs.create(path="src/new.ts", text="export {};\\n")',
 				},
 				capability: "fs.write",
@@ -851,7 +986,12 @@ export class FileFunctions {
 						description: "The file is outside writable policy roots.",
 						retryable: false,
 					},
-					{ code: "conflict", description: "The file changed after the snapshot was created.", retryable: true },
+					{
+						code: "conflict",
+						description:
+							"The file changed after the snapshot was created. Read a fresh snapshot before editing or removing.",
+						retryable: false,
+					},
 				],
 				effects: [
 					{ kind: "read", resource: "filesystem" },

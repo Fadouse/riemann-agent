@@ -7,6 +7,7 @@ import { FULL_FILESYSTEM, fileAccessPolicy, resolveFilesystemSnapshot } from "..
 import { FileFunctions } from "../src/riemann/functions/fs.ts";
 import { isKernelHostResult, type JsonValue, type KernelHostResult } from "../src/riemann/kernel/types.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
+import { PageStore } from "../src/riemann/state/pages.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
 
 const roots: string[] = [];
@@ -27,6 +28,153 @@ function fullPolicy(cwd: string) {
 }
 
 describe("Riemann fs capabilities", () => {
+	test("returns a real page instead of silently discarding glob results at the page limit", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-fs-page-"));
+		roots.push(root);
+		await writeFile(join(root, "a.txt"), "hit");
+		await writeFile(join(root, "b.txt"), "hit");
+		await mkdir(join(root, "folder"));
+		await mkdir(join(root, ".hidden"));
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("fs-page", root);
+		const artifacts = new ArtifactStore(store, run.id);
+		const pages = new PageStore(artifacts, "owner");
+		try {
+			const definitions = new FileFunctions(fullPolicy(root), run.id, store, artifacts, pages).definitions();
+			const glob = definitions.find((definition) => definition.name === "glob");
+			const search = definitions.find((definition) => definition.name === "search");
+			if (!glob || !search) throw new Error("fs definitions unavailable");
+			const signal = new AbortController().signal;
+			// User trace #4: directory patterns must not silently return an empty page.
+			const directories = objectValue(await glob.handler({ pattern: "*/" }, signal));
+			expect(directories.items).toEqual([{ $riemann: "path_entry", path: "folder", kind: "directory" }]);
+			for (const kind of ["any", "file", "directory"]) {
+				const mixed = objectValue(await glob.handler({ pattern: "*", kind }, signal));
+				const expected = [
+					{ $riemann: "path_entry", path: "a.txt", kind: "file" },
+					{ $riemann: "path_entry", path: "b.txt", kind: "file" },
+					{ $riemann: "path_entry", path: "folder", kind: "directory" },
+				].filter((entry) => kind === "any" || entry.kind === kind);
+				expect(mixed.items).toEqual(expected);
+				expect(Value.Check(glob.outputSchema, mixed)).toBe(true);
+			}
+			expect(
+				objectValue(await glob.handler({ pattern: "*/", include_hidden: true, kind: "directory" }, signal)).items,
+			).toEqual(expect.arrayContaining([{ $riemann: "path_entry", path: ".hidden", kind: "directory" }]));
+			const allSearch = objectValue(await search.handler({ query: "hit" }, signal));
+			expect(allSearch.coverage).toBe("complete");
+			expect(allSearch.skipped).toEqual([]);
+
+			const first = objectValue(await glob.handler({ pattern: "*.txt", max_items: 1 }, signal));
+			expect(first).toEqual({
+				$riemann: "page",
+				items: [{ $riemann: "path_entry", path: "a.txt", kind: "file" }],
+				next_cursor: expect.any(String),
+				coverage: "complete",
+				skipped: [],
+			});
+			expect(Value.Check(glob.outputSchema, first)).toBe(true);
+			const searchFirst = objectValue(await search.handler({ query: "hit", glob: "*.txt", max_items: 1 }, signal));
+			expect(Value.Check(search.outputSchema, searchFirst)).toBe(true);
+			await rm(join(root, "b.txt"));
+			await writeFile(join(root, "c.txt"), "changed");
+			const authorize = vi.fn();
+			const second = await pages.next(String(first.next_cursor), authorize);
+			expect(second).toEqual({
+				$riemann: "page",
+				items: [{ $riemann: "path_entry", path: "b.txt", kind: "file" }],
+				next_cursor: null,
+				coverage: "complete",
+				skipped: [],
+			});
+			expect(await pages.next(String(first.next_cursor), authorize)).toEqual(second);
+			expect(authorize).toHaveBeenCalledWith("fs.glob");
+			expect(objectValue(await pages.next(String(searchFirst.next_cursor), authorize)).items).toEqual([
+				{ $riemann: "search_match", path: "b.txt", line: 1, text: "hit", truncated: false },
+			]);
+			expect(authorize).toHaveBeenCalledWith("fs.search");
+		} finally {
+			store.close();
+		}
+	});
+	test("caps glob snapshots at 5000 paths rather than storing every match", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-fs-glob-cap-"));
+		roots.push(root);
+		for (let start = 0; start < 5_001; start += 100) {
+			await Promise.all(
+				Array.from({ length: Math.min(100, 5_001 - start) }, (_, index) =>
+					writeFile(join(root, `${String(start + index).padStart(4, "0")}.txt`), ""),
+				),
+			);
+		}
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("fs-glob-cap", root);
+		const artifacts = new ArtifactStore(store, run.id);
+		const pages = new PageStore(artifacts, "owner");
+		const glob = new FileFunctions(fullPolicy(root), run.id, store, artifacts, pages)
+			.definitions()
+			.find((definition) => definition.name === "glob");
+		if (!glob) throw new Error("fs.glob unavailable");
+		try {
+			const first = objectValue(
+				await glob.handler({ pattern: "*.txt", max_items: 2_500 }, new AbortController().signal),
+			);
+			expect(first.items).toHaveLength(2_500);
+			expect(first.coverage).toBe("limited");
+			expect(first.skipped).toEqual([{ reason: "result_limit", count: 1 }]);
+			const last = objectValue(await pages.next(String(first.next_cursor), () => {}));
+			expect(last.items).toHaveLength(2_500);
+			expect(last.next_cursor).toBeNull();
+			expect(last.items).not.toContainEqual(expect.objectContaining({ path: "5000.txt" }));
+		} finally {
+			store.close();
+		}
+	});
+
+	test("bounds search snapshots and reports regex scan and skipped file limits", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-fs-coverage-"));
+		roots.push(root);
+		await writeFile(join(root, "hits.txt"), "hit\n".repeat(2_001));
+		await writeFile(join(root, "long.txt"), `${"x".repeat(4_001)}hit`);
+		await writeFile(join(root, "binary.txt"), Buffer.from([0]));
+		await writeFile(join(root, "invalid.txt"), Buffer.from([0xff]));
+		const store = new RiemannStore(join(root, ".agent"));
+		const run = store.openRun("fs-coverage", root);
+		const artifacts = new ArtifactStore(store, run.id);
+		const pages = new PageStore(artifacts, "owner");
+		const search = new FileFunctions(fullPolicy(root), run.id, store, artifacts, pages)
+			.definitions()
+			.find((definition) => definition.name === "search");
+		if (!search) throw new Error("fs.search unavailable");
+		try {
+			const signal = new AbortController().signal;
+			const first = objectValue(await search.handler({ query: "hit", glob: "hits.txt", max_items: 1_000 }, signal));
+			expect(first.items).toHaveLength(1_000);
+			expect(first.coverage).toBe("limited");
+			expect(first.skipped).toEqual([{ reason: "result_limit", count: 1 }]);
+			const last = objectValue(await pages.next(String(first.next_cursor), () => {}));
+			expect(last.items).toHaveLength(1_000);
+			expect(last.next_cursor).toBeNull();
+			const regex = objectValue(
+				await search.handler({ query: "hit", mode: "regex", glob: "{long,binary,invalid}.txt" }, signal),
+			);
+			expect(regex.items).toEqual([]);
+			expect(regex.coverage).toBe("limited");
+			expect(regex.skipped).toEqual(
+				expect.arrayContaining([
+					{ reason: "regex_line_scan_limit", count: 1 },
+					{ reason: "binary_file", count: 1 },
+					{ reason: "invalid_utf8_file", count: 1 },
+				]),
+			);
+			const literal = objectValue(await search.handler({ query: "hit", glob: "long.txt" }, signal));
+			expect(literal.coverage).toBe("complete");
+			expect(literal.items).toHaveLength(1);
+		} finally {
+			store.close();
+		}
+	});
+
 	test("scans all lines without allocating a whole-file split, preserving newline and match semantics", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-fs-search-lines-"));
 		roots.push(root);
@@ -51,29 +199,39 @@ describe("Riemann fs capabilities", () => {
 		try {
 			for (const mode of ["literal", "regex"]) {
 				expect(
-					await search.handler(
-						{ query: "NEEDLE", mode, case_sensitive: false, glob: "*.txt", limit: 2_000 },
-						signal,
-					),
+					objectValue(
+						await search.handler(
+							{ query: "NEEDLE", mode, case_sensitive: false, glob: "*.txt", max_items: 2_000 },
+							signal,
+						),
+					).items,
 				).toEqual([
-					{ path: "lines.txt", line: 4_097, text: "needle😀", truncated: false },
-					{ path: "lines.txt", line: 4_099, text: "x\rneedle", truncated: false },
-					{ path: "lines.txt", line: 4_100, text: longLine.slice(0, 4_000), truncated: true },
-					{ path: "lines.txt", line: 4_101, text: "needle", truncated: false },
+					{ $riemann: "search_match", path: "lines.txt", line: 4_097, text: "needle😀", truncated: false },
+					{ $riemann: "search_match", path: "lines.txt", line: 4_099, text: "x\rneedle", truncated: false },
+					{
+						$riemann: "search_match",
+						path: "lines.txt",
+						line: 4_100,
+						text: longLine.slice(0, 4_000),
+						truncated: true,
+					},
+					{ $riemann: "search_match", path: "lines.txt", line: 4_101, text: "needle", truncated: false },
 				]);
 			}
-			expect(await search.handler({ query: "^$", mode: "regex", glob: "*.txt" }, signal)).toEqual([
-				{ path: "empty.txt", line: 1, text: "", truncated: false },
-				{ path: "lines.txt", line: 4_098, text: "", truncated: false },
-				{ path: "lines.txt", line: 4_102, text: "", truncated: false },
-			]);
-			expect(await search.handler({ query: "^\\r$", mode: "regex", glob: "cr.txt" }, signal)).toEqual([
-				{ path: "cr.txt", line: 1, text: "\r", truncated: false },
-			]);
-			expect(await glob.handler({ pattern: "*.txt", limit: 5_000 }, signal)).toEqual([
-				"cr.txt",
-				"empty.txt",
-				"lines.txt",
+			expect(objectValue(await search.handler({ query: "^$", mode: "regex", glob: "*.txt" }, signal)).items).toEqual(
+				[
+					{ $riemann: "search_match", path: "empty.txt", line: 1, text: "", truncated: false },
+					{ $riemann: "search_match", path: "lines.txt", line: 4_098, text: "", truncated: false },
+					{ $riemann: "search_match", path: "lines.txt", line: 4_102, text: "", truncated: false },
+				],
+			);
+			expect(
+				objectValue(await search.handler({ query: "^\\r$", mode: "regex", glob: "cr.txt" }, signal)).items,
+			).toEqual([{ $riemann: "search_match", path: "cr.txt", line: 1, text: "\r", truncated: false }]);
+			expect(objectValue(await glob.handler({ pattern: "*.txt", max_items: 5_000 }, signal)).items).toEqual([
+				{ $riemann: "path_entry", path: "cr.txt", kind: "file" },
+				{ $riemann: "path_entry", path: "empty.txt", kind: "file" },
+				{ $riemann: "path_entry", path: "lines.txt", kind: "file" },
 			]);
 			// Count the allocation, not elapsed time: this must fail if the eager line array returns.
 			expect(split.mock.contexts.filter((receiver) => String(receiver) === content)).toHaveLength(0);
@@ -129,7 +287,7 @@ describe("Riemann fs capabilities", () => {
 					},
 					signal,
 				),
-			).rejects.toMatchObject({ code: "conflict" });
+			).rejects.toMatchObject({ code: "conflict", retryable: false, recovery: "refresh" });
 			expect(await readFile(join(root, "src", "value.txt"), "utf8")).toBe("concurrent change\n");
 		} finally {
 			store.close();
@@ -234,15 +392,21 @@ describe("Riemann fs capabilities", () => {
 		const signal = new AbortController().signal;
 		try {
 			await writeFile(join(privateDir, "key.txt"), "private\n");
+			if (process.platform !== "win32") await symlink(privateDir, join(root, "private-link"), "dir");
 			await expect(read.handler({ path: join(privateDir, "key.txt") }, signal)).rejects.toMatchObject({
 				code: "permission_denied",
 			});
 			await expect(
 				create.handler({ path: join(root, "frozen", "blocked.txt"), text: "blocked" }, signal),
 			).rejects.toMatchObject({ code: "permission_denied" });
-			const matches = (await glob.handler({ pattern: "**/*", include_hidden: true }, signal)) as string[];
-			expect(matches).toEqual(expect.arrayContaining(["public.txt"]));
-			expect(matches.some((path) => path.includes("private"))).toBe(false);
+			const page = objectValue(await glob.handler({ pattern: "**/*", include_hidden: true }, signal));
+			const matches = page.items as { path: string; kind: string }[];
+			expect(page.coverage).toBe("limited");
+			expect(matches).toEqual(
+				expect.arrayContaining([{ $riemann: "path_entry", path: "public.txt", kind: "file" }]),
+			);
+			expect(matches.some((entry) => entry.path.includes("private"))).toBe(false);
+			expect(matches).toContainEqual({ $riemann: "path_entry", path: "frozen", kind: "directory" });
 		} finally {
 			store.close();
 		}
@@ -298,9 +462,11 @@ describe("Riemann fs capabilities", () => {
 		if (!search) throw new Error("fs.search is unavailable");
 		try {
 			const result = await search.handler({ query: "find-me" }, new AbortController().signal);
-			expect(result).toEqual([{ path: "inside.txt", line: 1, text: "find-me inside", truncated: false }]);
+			expect(objectValue(result).items).toEqual([
+				{ $riemann: "search_match", path: "inside.txt", line: 1, text: "find-me inside", truncated: false },
+			]);
 			const scoped = await search.handler({ query: "find-me", glob: "secret.txt" }, new AbortController().signal);
-			expect(scoped).toEqual([]);
+			expect(objectValue(scoped).items).toEqual([]);
 		} finally {
 			store.close();
 		}
@@ -381,6 +547,7 @@ describe("Riemann fs capabilities", () => {
 			});
 			const artifact = objectValue(snapshot.artifact as JsonValue);
 			expect(artifact.$riemann).toBe("artifact");
+			expect(artifact.handle).toMatch(/^r[0-9a-z]+$/);
 			expect((await artifacts.readBuffer(String(artifact.handle))).byteLength).toBeGreaterThan(0);
 
 			await remove.handler(
@@ -415,7 +582,7 @@ describe("Riemann fs capabilities", () => {
 		}
 	});
 
-	test("publishes six strict ABI v2 filesystem definitions", async () => {
+	test("publishes six strict filesystem definitions", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-fs-abi-"));
 		roots.push(root);
 		const store = new RiemannStore(join(root, ".agent"));
@@ -453,6 +620,14 @@ describe("Riemann fs capabilities", () => {
 			expect(JSON.stringify(read?.outputSchema)).toContain('"kind"');
 			expect(remove?.outputSchema).toMatchObject({ $id: "RemovedFile" });
 			expect(remove?.pythonReturnType).toBe("RemovedFile");
+			const glob = definitions.find((definition) => definition.name === "glob")!;
+			const search = definitions.find((definition) => definition.name === "search")!;
+			expect(glob.pythonReturnType).toBe("Page[PathEntry]");
+			// User trace #6: glob items are records with .path, not strings.
+			for (const definition of [glob, search]) {
+				expect(definition.inputSchema.properties).toHaveProperty("max_items");
+				expect(definition.inputSchema.properties).not.toHaveProperty("limit");
+			}
 		} finally {
 			store.close();
 		}
@@ -551,11 +726,15 @@ describe("Riemann fs capabilities", () => {
 			await expect(glob.handler({ pattern: "**/*", include_hidden: null }, signal)).rejects.toMatchObject({
 				code: "invalid_arguments",
 			});
-			await expect(glob.handler({ pattern: "**/*", limit: 0 }, signal)).rejects.toMatchObject({
+			await expect(glob.handler({ pattern: "**/*", kind: "folder" }, signal)).rejects.toMatchObject({
+				code: "invalid_arguments",
+				message: "kind must be any, file, or directory",
+			});
+			await expect(glob.handler({ pattern: "**/*", max_items: 0 }, signal)).rejects.toMatchObject({
 				code: "invalid_arguments",
 			});
-			expect(await search.handler({ query: "find" }, signal)).toEqual([
-				{ path: "valid.txt", line: 1, text: "find valid", truncated: false },
+			expect(objectValue(await search.handler({ query: "find" }, signal)).items).toEqual([
+				{ $riemann: "search_match", path: "valid.txt", line: 1, text: "find valid", truncated: false },
 			]);
 		} finally {
 			store.close();
@@ -575,8 +754,11 @@ describe("Riemann fs capabilities", () => {
 			.find((definition) => definition.name === "search");
 		if (!search) throw new Error("fs.search is unavailable");
 		try {
-			expect(await search.handler({ query: "canonical", glob: "alias.txt" }, new AbortController().signal)).toEqual([
-				{ path: "target.txt", line: 1, text: "canonical hit", truncated: false },
+			expect(
+				objectValue(await search.handler({ query: "canonical", glob: "alias.txt" }, new AbortController().signal))
+					.items,
+			).toEqual([
+				{ $riemann: "search_match", path: "target.txt", line: 1, text: "canonical hit", truncated: false },
 			]);
 		} finally {
 			store.close();

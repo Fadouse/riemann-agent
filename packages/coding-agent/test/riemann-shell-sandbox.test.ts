@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { Value } from "typebox/value";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { FULL_FILESYSTEM, fileAccessPolicy } from "../src/riemann/access-policy.ts";
 import { ShellFunctions } from "../src/riemann/functions/shell.ts";
@@ -100,7 +101,23 @@ describe("Riemann shell argument validation", () => {
 		}
 	});
 
-	test("publishes the exact ABI v2 contract", async () => {
+	test("rejects cancellation before resolving cwd or launching side effects", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-cancel-"));
+		roots.push(root);
+		const { definition, store } = await shellDefinition(root, root, [root], [root]);
+		const controller = new AbortController();
+		controller.abort();
+		try {
+			await expect(
+				definition.handler({ script: "touch marker", cwd: "missing" }, controller.signal),
+			).rejects.toMatchObject({ code: "cancelled" });
+			expect(existsSync(join(root, "marker"))).toBe(false);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("publishes the exact tool contract", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-contract-"));
 		roots.push(root);
 		const workspace = join(root, "workspace");
@@ -116,6 +133,8 @@ describe("Riemann shell argument validation", () => {
 			});
 			expect(definition).not.toHaveProperty("parameters");
 			expect(definition).not.toHaveProperty("returns");
+			expect(definition.prompt.example).not.toMatch(/npm test|tail/);
+			expect(definition.prompt.example).toContain("output.show");
 			expect(definition.outputSchema).toMatchObject({
 				properties: {
 					$riemann: {},
@@ -126,7 +145,10 @@ describe("Riemann shell argument validation", () => {
 					termination: {},
 					stdout_truncated: {},
 					stderr_truncated: {},
-					artifact: {},
+					stdout_capture_truncated: {},
+					stderr_capture_truncated: {},
+					stdout_artifact: {},
+					stderr_artifact: {},
 				},
 			});
 		} finally {
@@ -136,7 +158,7 @@ describe("Riemann shell argument validation", () => {
 });
 
 describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
-	test("persists complete output parts without constructing a combined artifact string", async () => {
+	test("persists separate pure stream artifacts without markers", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-artifact-parts-"));
 		roots.push(root);
 		const store = new RiemannStore(join(root, "agent"));
@@ -150,16 +172,79 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		try {
 			const result = record(await definition.handler({ script }, new AbortController().signal));
 			expect(result).toMatchObject({ exit_code: 0, stdout_truncated: true, stderr_truncated: true });
-			const artifact = record(result.artifact);
-			expect(await artifacts.readBuffer(String(artifact.handle))).toEqual(
-				Buffer.from(`$ ${script}\n\n[stdout]\n完整😀stdout\n\n[stderr]\nstderr😀完整`),
+			expect(result).toMatchObject({
+				stdout: "完",
+				stderr: "stde",
+				stdout_capture_truncated: false,
+				stderr_capture_truncated: false,
+			});
+			const stdoutArtifact = record(result.stdout_artifact);
+			const stderrArtifact = record(result.stderr_artifact);
+			expect(await artifacts.readBuffer(String(stdoutArtifact.handle))).toEqual(Buffer.from("完整😀stdout"));
+			expect(await artifacts.readBuffer(String(stderrArtifact.handle))).toEqual(Buffer.from("stderr😀完整"));
+			expect(stdoutArtifact.handle).toMatch(/^r[0-9a-z]+$/);
+			expect(stderrArtifact.handle).toMatch(/^r[0-9a-z]+$/);
+			expect(stdoutArtifact.mime_type).toBe("text/plain; charset=utf-8");
+			expect(stderrArtifact.mime_type).toBe("text/plain; charset=utf-8");
+			const stdoutBytes = await artifacts.readBuffer(String(stdoutArtifact.handle));
+			expect(stdoutBytes.subarray(Buffer.byteLength(String(result.stdout))).toString("utf8")).toBe("整😀stdout");
+			const binary = record(
+				await definition.handler(
+					{ script: `${process.execPath} -e "process.stdout.write(Buffer.from([255,97,98,99,100]))"` },
+					new AbortController().signal,
+				),
 			);
+			expect(binary).toMatchObject({ stdout: "�a", stdout_truncated: true, stdout_capture_truncated: false });
+			const binaryArtifact = record(binary.stdout_artifact);
+			expect(binaryArtifact.mime_type).toBe("application/octet-stream");
+			expect(await artifacts.readBuffer(String(binaryArtifact.handle))).toEqual(Buffer.from([255, 97, 98, 99, 100]));
 			expect(putText).not.toHaveBeenCalled();
 		} finally {
 			putText.mockRestore();
 			store.close();
 		}
 	});
+
+	test("reports capture loss independently of inline omission at the capture cap", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-shell-capture-"));
+		roots.push(root);
+		const store = new RiemannStore(join(root, "agent"));
+		const run = store.openRun("capture", root);
+		const artifacts = new ArtifactStore(store, run.id);
+		const cap = 16 * 1024 * 1024;
+		const definition = new ShellFunctions(
+			fileAccessPolicy(root, FULL_FILESYSTEM),
+			artifacts,
+			cap + 100,
+			false,
+		).definitions()[0];
+		try {
+			const result = record(
+				await definition.handler(
+					{
+						script: `${process.execPath} -e "process.stdout.write('x'.repeat(${cap + 1})); process.stderr.write('err')"`,
+					},
+					new AbortController().signal,
+				),
+			);
+			expect(result).toMatchObject({
+				stdout_truncated: false,
+				stdout_capture_truncated: true,
+				stderr: "err",
+				stderr_truncated: false,
+				stderr_capture_truncated: false,
+				stderr_artifact: null,
+				termination: "exited",
+				exit_code: 0,
+			});
+			expect(String(result.stdout)).toHaveLength(cap);
+			expect(
+				(await artifacts.readBuffer(String(record(result.stdout_artifact).handle))).equals(Buffer.alloc(cap, "x")),
+			).toBe(true);
+		} finally {
+			store.close();
+		}
+	}, 30_000);
 
 	test("returns a structured command-not-found process result", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-missing-"));
@@ -192,7 +277,10 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 				termination: "exited",
 				stdout_truncated: false,
 				stderr_truncated: false,
-				artifact: null,
+				stdout_capture_truncated: false,
+				stderr_capture_truncated: false,
+				stdout_artifact: null,
+				stderr_artifact: null,
 			});
 			expect(String(result.stderr)).toContain("command not found");
 		} finally {
@@ -493,6 +581,8 @@ PROBE`;
 			});
 			expect(updates.map((update) => update.sequence)).toEqual(updates.map((_, index) => index));
 			expect(updates.every((update) => typeof update.truncated === "boolean")).toBe(true);
+			expect(definition.updateSchema).toBeDefined();
+			expect(updates.every((update) => Value.Check(definition.updateSchema!, update))).toBe(true);
 			expect(
 				updates
 					.filter((update) => update.kind === "stdout")

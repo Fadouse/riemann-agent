@@ -3,9 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Value } from "typebox/value";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { FunctionRegistry } from "../src/riemann/functions/registry.ts";
 import { WebFunctions } from "../src/riemann/functions/web.ts";
 import type { JsonValue } from "../src/riemann/kernel/types.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
+import { PageStore } from "../src/riemann/state/pages.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
 
 const roots: string[] = [];
@@ -30,16 +32,22 @@ async function webDefinitions(
 	const store = new RiemannStore(join(root, "agent"));
 	const run = store.openRun("web-test", root);
 	const artifacts = new ArtifactStore(store, run.id);
-	const definitions = new WebFunctions(apiKey, artifacts, previewChars, resolveHostname, (input, init) =>
-		globalThis.fetch(input, init),
+	const pages = new PageStore(artifacts, "web-test");
+	const definitions = new WebFunctions(
+		apiKey,
+		artifacts,
+		previewChars,
+		resolveHostname,
+		(input, init) => globalThis.fetch(input, init),
+		pages,
 	).definitions();
 	const search = definitions.find((definition) => definition.name === "search");
 	const fetchDefinition = definitions.find((definition) => definition.name === "fetch");
 	if (!search || !fetchDefinition) throw new Error("web functions are unavailable");
-	return { search, fetchDefinition, artifacts, store };
+	return { search, fetchDefinition, artifacts, pages, store };
 }
 
-describe("Riemann web ABI v2 contracts", () => {
+describe("Riemann web tool contracts", () => {
 	test("publishes strict input and exact stable output schemas", async () => {
 		const { search, fetchDefinition, store } = await webDefinitions();
 		try {
@@ -64,6 +72,8 @@ describe("Riemann web ABI v2 contracts", () => {
 				}),
 			).toBe(false);
 			expect(Value.Check(search.inputSchema, { query: "q", since: "last week" })).toBe(false);
+			expect(Value.Check(search.inputSchema, { query: "q", max_items: 1 })).toBe(true);
+			expect(Value.Check(search.inputSchema, { query: "q", limit: 1 })).toBe(false);
 		} finally {
 			store.close();
 		}
@@ -98,21 +108,94 @@ describe("Riemann web search", () => {
 				},
 				new AbortController().signal,
 			);
-			expect(result).toEqual([
-				{
-					$riemann: "search_hit",
-					title: "https://example.com/article",
-					url: "https://example.com/article",
-					snippet: "first\n\nsecond",
-					published_at: null,
-				},
-			]);
+			expect(record(result)).toMatchObject({
+				coverage: "unknown",
+				items: [
+					{
+						$riemann: "search_hit",
+						title: "https://example.com/article",
+						url: "https://example.com/article",
+						snippet: "first\n\nsecond",
+						snippet_truncated: false,
+						published_at: null,
+					},
+				],
+			});
+			expect(Value.Check(search.outputSchema, result)).toBe(true);
 			const init = fetchMock.mock.calls[0]?.[1];
 			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
 			expect(body).toMatchObject({
 				includeDomains: ["example.com"],
 				startPublishedDate: "2024-01-02T01:04:05.000Z",
 			});
+		} finally {
+			store.close();
+		}
+	});
+
+	test("reports snippet truncation and unknown provider coverage", async () => {
+		const { search, store } = await webDefinitions();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn<typeof fetch>().mockResolvedValue(
+				new Response(
+					JSON.stringify({
+						results: [{ id: "one", title: "title", url: "https://example.com", text: "😀".repeat(301) }],
+					}),
+				),
+			),
+		);
+		try {
+			const result = record(await search.handler({ query: "q" }, new AbortController().signal));
+			expect(result).toMatchObject({
+				coverage: "unknown",
+				items: [{ snippet: "😀".repeat(300), snippet_truncated: true }],
+			});
+		} finally {
+			store.close();
+		}
+	});
+
+	test("keeps excess provider results in the injected page snapshot without overstating coverage", async () => {
+		const { search, pages, store } = await webDefinitions();
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					results: ["first", "second"].map((id) => ({ id, title: id, url: `https://example.com/${id}` })),
+				}),
+			),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const first = record(await search.handler({ query: "q", max_items: 1 }, new AbortController().signal));
+			expect(first).toMatchObject({
+				coverage: "unknown",
+				items: [{ title: "first" }],
+				next_cursor: expect.any(String),
+			});
+			const authorize = vi.fn();
+			const second = await pages.next(String(first.next_cursor), authorize);
+			expect(authorize).toHaveBeenCalledWith("web.search");
+			expect(second).toMatchObject({ coverage: "unknown", items: [{ title: "second" }], next_cursor: null });
+			expect(fetchMock).toHaveBeenCalledOnce();
+			expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toHaveProperty("numResults", 1);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("does not send a request for a pre-cancelled call", async () => {
+		const { search, fetchDefinition, store } = await webDefinitions();
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response("ignored"));
+		vi.stubGlobal("fetch", fetchMock);
+		const controller = new AbortController();
+		controller.abort();
+		try {
+			await expect(search.handler({ query: "q" }, controller.signal)).rejects.toMatchObject({ code: "cancelled" });
+			await expect(fetchDefinition.handler({ url: "https://example.com" }, controller.signal)).rejects.toMatchObject(
+				{ code: "cancelled" },
+			);
+			expect(fetchMock).not.toHaveBeenCalled();
 		} finally {
 			store.close();
 		}
@@ -133,6 +216,35 @@ describe("Riemann web search", () => {
 				search.handler({ query: "q", since: "2024-02-31T00:00:00Z" }, new AbortController().signal),
 			).rejects.toMatchObject({ code: "invalid_arguments" });
 			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			store.close();
+		}
+	});
+
+	test.each([400, 401, 403, 429, 503])("preserves HTTP %s recovery through registry dispatch", async (status) => {
+		const { search, fetchDefinition, store } = await webDefinitions();
+		const registry = new FunctionRegistry();
+		registry.register(search);
+		registry.register(fetchDefinition);
+		vi.stubGlobal(
+			"fetch",
+			vi.fn<typeof fetch>().mockImplementation(async () => new Response("error", { status })),
+		);
+		const retryable = status === 429 || status >= 500;
+		const recovery = retryable ? "retry" : status === 401 || status === 403 ? "reauthorize" : "fix_arguments";
+		try {
+			for (const [operation, args] of [
+				["web.search", { query: "q" }],
+				["web.fetch", { url: "https://example.com" }],
+			] as const) {
+				await expect(
+					registry.dispatch(
+						{ requestId: "http", operation, arguments: args },
+						new Set(["web.*"]),
+						new AbortController().signal,
+					),
+				).rejects.toMatchObject({ retryable, recovery, details: { status } });
+			}
 		} finally {
 			store.close();
 		}
@@ -264,8 +376,33 @@ describe("Riemann web fetch", () => {
 				text: "plain body",
 				content_type: "text/plain",
 				artifact: null,
+				artifact_kind: null,
+				text_truncated: false,
 				trust: "untrusted",
 			});
+		} finally {
+			store.close();
+		}
+	});
+
+	test("keeps document previews marker-free and labels extracted artifacts", async () => {
+		const { fetchDefinition, artifacts, store } = await webDefinitions("exa-test-key", 4);
+		vi.stubGlobal(
+			"fetch",
+			vi
+				.fn<typeof fetch>()
+				.mockResolvedValue(new Response("完整😀abcdef", { headers: { "content-type": "text/plain" } })),
+		);
+		try {
+			const result = record(
+				await fetchDefinition.handler({ url: "https://example.com" }, new AbortController().signal),
+			);
+			expect(result).toMatchObject({ text: "完", text_truncated: true, artifact_kind: "extracted" });
+			expect(record(result.artifact).handle).toMatch(/^r[0-9a-z]+$/);
+			expect(await artifacts.readBuffer(String(record(result.artifact).handle))).toEqual(
+				Buffer.from("完整😀abcdef"),
+			);
+			expect(Value.Check(fetchDefinition.outputSchema, result)).toBe(true);
 		} finally {
 			store.close();
 		}
@@ -289,6 +426,8 @@ describe("Riemann web fetch", () => {
 			expect(result).toMatchObject({
 				text: "",
 				content_type: "application/octet-stream",
+				artifact_kind: "raw",
+				text_truncated: false,
 				trust: "untrusted",
 			});
 			const artifact = record(result.artifact);
@@ -299,7 +438,7 @@ describe("Riemann web fetch", () => {
 	});
 
 	test("artifactizes invalid text bytes instead of replacing them", async () => {
-		const { fetchDefinition, store } = await webDefinitions();
+		const { fetchDefinition, artifacts, store } = await webDefinitions();
 		vi.stubGlobal(
 			"fetch",
 			vi.fn<typeof fetch>().mockResolvedValue(
@@ -314,6 +453,8 @@ describe("Riemann web fetch", () => {
 			);
 			expect(result).toMatchObject({ text: "", trust: "untrusted" });
 			expect(result.artifact).not.toBeNull();
+			const chunk = record(await artifacts.get(String(record(result.artifact).handle)));
+			expect(chunk).toMatchObject({ kind: "binary", base64: "/w==", eof: true });
 		} finally {
 			store.close();
 		}

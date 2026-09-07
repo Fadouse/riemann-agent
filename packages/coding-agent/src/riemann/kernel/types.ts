@@ -1,5 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import type { FileAccessPolicy } from "../access-policy.ts";
+import type { ErrorRecovery } from "../errors.ts";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -14,7 +15,10 @@ export type KernelImageReference = {
 	detail?: "auto" | "low" | "high" | "original";
 };
 
-export type KernelModelContent = { type: "text"; text: string } | KernelImageReference;
+export type KernelModelContent =
+	| { type: "text"; text: string }
+	| KernelImageReference
+	| { type: "output_ref"; handle: string };
 
 export type KernelHostResult = {
 	[key: string]: JsonValue;
@@ -71,6 +75,13 @@ export interface KernelError {
 	ename: string;
 	evalue: string;
 	traceback: string[];
+	code?: string;
+	operation?: string;
+	repairCode?: string;
+	requestId?: string;
+	retryable?: boolean;
+	recovery?: ErrorRecovery;
+	details?: JsonValue;
 }
 
 export type KernelExecuteStatus = "ok" | "error" | "cancelled" | "timeout";
@@ -82,6 +93,7 @@ export interface KernelExecuteResult {
 	result?: KernelDisplay;
 	displays: KernelDisplay[];
 	modelContent: KernelModelContent[];
+	captureTruncated?: { stdout: boolean; stderr: boolean; rich: boolean };
 	error?: KernelError;
 	executionCount?: number;
 	durationMs: number;
@@ -100,6 +112,7 @@ export interface KernelHostRequestError {
 	operation: string;
 	requestId: string;
 	retryable: boolean;
+	recovery?: ErrorRecovery;
 	details?: JsonValue;
 }
 
@@ -154,6 +167,7 @@ export interface KernelManagerOptions {
 	env?: Record<string, string>;
 	sessionId: string;
 	bootstrapCode: string;
+	contractFingerprint?: string;
 	sandbox: KernelSandboxConfiguration | false;
 	hostRequest: KernelHostRequestHandler;
 	snapshotPath?: string;
@@ -164,6 +178,7 @@ export interface KernelManagerOptions {
 }
 
 export interface KernelRestoreResult {
+	incompatible?: boolean;
 	restored: string[];
 	skipped: Array<{ name: string; reason: string }>;
 	error?: string;

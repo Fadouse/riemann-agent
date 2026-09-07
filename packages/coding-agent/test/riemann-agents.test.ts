@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fauxAssistantMessage, fauxProvider, type Model } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai/compat";
-import { afterEach, describe, expect, test } from "vitest";
+import { Value } from "typebox/value";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionEventListener } from "../src/core/agent-session.ts";
 import { execCommand } from "../src/core/exec.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
@@ -22,6 +23,7 @@ import { IPythonSchema } from "../src/riemann/ipython.ts";
 import type { JsonValue } from "../src/riemann/kernel/types.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
 import { DatabaseSync } from "../src/riemann/state/database.ts";
+import { PageStore } from "../src/riemann/state/pages.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
 
 const roots: string[] = [];
@@ -173,8 +175,11 @@ const config: RiemannConfig = {
 	maxAgents: 4,
 	maxConcurrentAgents: 4,
 	limits: {
-		maxCellOutputChars: 100_000,
-		maxArtifactPreviewChars: 12_000,
+		maxModelTextBytes: 16_384,
+		maxPreviewBytes: 2_048,
+		maxPreviewItems: 10,
+		maxPreviewDepth: 4,
+		maxPreviewNodes: 200,
 	},
 	retention: {
 		maxAgeDays: 30,
@@ -199,6 +204,7 @@ interface SupervisorHarness {
 	root: string;
 	agentDir: string;
 	store: RiemannStore;
+	artifacts: ArtifactStore;
 	runId: string;
 	mainId: string;
 	supervisor: AgentSupervisor;
@@ -214,6 +220,7 @@ interface SupervisorHarnessOptions {
 	modelRegistry?: ModelRegistry;
 	createSession?: (model: Model<any>) => FakeChildSession;
 	warningSink?: (message: string) => void | Promise<void>;
+	closeRuntime?: () => Promise<void>;
 	rootNetwork?: "allow" | "deny";
 }
 
@@ -240,9 +247,10 @@ async function createHarness(
 	const resumeFlags = new Map<string, boolean[]>();
 	const deliveries: AgentEventDelivery[] = [];
 	const modelIds: string[] = [];
+	const artifacts = new ArtifactStore(store, run.id);
 	const supervisor = new AgentSupervisor({
 		store,
-		artifacts: new ArtifactStore(store, run.id),
+		artifacts,
 		runId: run.id,
 		rootAgent: main,
 		rootContext: {
@@ -260,7 +268,7 @@ async function createHarness(
 		},
 		agentDir,
 		config: { ...config, ...overrides },
-		createChildRuntime: async () => fakeRuntime(),
+		createChildRuntime: async () => fakeRuntime(options.closeRuntime),
 		...(options.defaultSession
 			? {}
 			: {
@@ -282,6 +290,7 @@ async function createHarness(
 		root,
 		agentDir,
 		store,
+		artifacts,
 		runId: run.id,
 		mainId: main.id,
 		supervisor,
@@ -293,6 +302,302 @@ async function createHarness(
 }
 
 describe("Riemann reusable Agent slots", () => {
+	test("lists child identities as immutable pages with complete coverage", async () => {
+		const harness = await createHarness();
+		const { supervisor, store, artifacts, mainId, sessions } = harness;
+		const pages = new PageStore(artifacts, mainId);
+		const definition = functionByName(supervisor.definitions(mainId, pages), "list");
+		const signal = new AbortController().signal;
+		try {
+			expect(definition.pythonReturnType).toBe("Page[AgentInfo]");
+			expect(definition.inputSchema.properties.max_items).toMatchObject({ default: 20, maximum: 500 });
+			expect(Value.Check(definition.inputSchema, { limit: 1 })).toBe(false);
+			expect(Value.Check(definition.inputSchema, { max_items: 501 })).toBe(false);
+			expect(objectValue(await definition.handler({}, signal))).toMatchObject({
+				items: [],
+				next_cursor: null,
+				coverage: "complete",
+				skipped: [],
+			});
+			await supervisor.start(mainId, { task: "first", name: "first" });
+			await supervisor.start(mainId, { task: "second", name: "second" });
+			const children = store.listAgents(harness.runId).filter((agent) => agent.parentId === mainId);
+			await waitFor(() => children.every((agent) => sessions.get(agent.id)?.at(-1)?.prompts.length === 1));
+			const first = objectValue(await definition.handler({ max_items: 1 }, signal));
+			expect(Value.Check(definition.outputSchema, first)).toBe(true);
+			expect(first).toMatchObject({
+				$riemann: "page",
+				items: [{ id: children[0].id, status: "running" }],
+				next_cursor: expect.any(String),
+				coverage: "complete",
+				skipped: [],
+			});
+			sessions.get(children[1].id)?.at(-1)?.finish();
+			await waitFor(() => store.getAgent(children[1].id)?.status === "idle");
+			const next = objectValue(
+				await pages.next(String(first.next_cursor), (operation) => {
+					expect(operation).toBe("agents.list");
+				}),
+			);
+			expect(Value.Check(definition.outputSchema, next)).toBe(true);
+			expect(next).toMatchObject({
+				items: [{ id: children[1].id, status: "running" }],
+				next_cursor: null,
+				coverage: "complete",
+				skipped: [],
+			});
+		} finally {
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test.each(["session", "prompt", "compaction", "cancelled", "completed"] as const)(
+		"keeps reused Turn output scoped to its own %s execution",
+		async (failure) => {
+			let history: unknown[] = [];
+			let reuse = false;
+			const harness = await createHarness({}, undefined, undefined, {
+				createSession: () => {
+					if (reuse && failure === "session") throw new Error("session unavailable");
+					const session =
+						reuse && failure === "compaction" ? new ObservableChildSession() : new FakeChildSession();
+					session.state.messages.push(...history);
+					if (reuse && failure === "compaction") {
+						vi.spyOn(session, "prompt").mockImplementation(async () => {
+							session.state.messages = structuredClone(history);
+							throw new Error("prompt failed after history replacement");
+						});
+					}
+					if (reuse && failure === "prompt") {
+						vi.spyOn(session, "prompt").mockImplementation(async () => {
+							await delay(20);
+							throw new Error("prompt unavailable");
+						});
+					}
+					return session;
+				},
+			});
+			const { supervisor, store, mainId, sessions } = harness;
+			try {
+				const first = objectValue(await supervisor.start(mainId, { task: "old answer", name: "worker" }));
+				const id = String(first.id);
+				await waitFor(() => sessions.get(id)?.at(-1)?.prompts.length === 1);
+				sessions.get(id)?.at(-1)?.finish();
+				const previous = objectValue(
+					await supervisor.wait(
+						mainId,
+						{ agent_id: id, turn_id: first.turn_id, timeout: 1 },
+						new AbortController().signal,
+					),
+				);
+				expect(previous.output).toBe("child completed: old answer");
+				await waitFor(() => !supervisor.listSubagentsForUi().find((agent) => agent.id === id)?.live);
+				history = [...(sessions.get(id)?.at(-1)?.state.messages ?? [])];
+				reuse = true;
+				const second = objectValue(
+					await supervisor.start(mainId, { task: "new answer", name: "worker", reuse: "exact" }),
+				);
+				if (failure === "prompt") {
+					await waitFor(() => sessions.get(id)?.length === 2);
+					const info = objectValue(
+						await functionByName(supervisor.definitions(mainId), "info").handler(
+							{ agent_id: id },
+							new AbortController().signal,
+						),
+					);
+					expect(info.output_preview).toBeNull();
+				}
+				if (failure === "completed") {
+					await waitFor(() => sessions.get(id)?.at(-1)?.prompts.length === 1);
+					sessions.get(id)?.at(-1)?.finish();
+				}
+				let result: Record<string, JsonValue>;
+				if (failure === "cancelled") {
+					await waitFor(() => sessions.get(id)?.at(-1)?.prompts.length === 1);
+					result = objectValue(
+						await supervisor.stopTurn(mainId, id, String(second.turn_id), new AbortController().signal, 1),
+					);
+				} else {
+					result = objectValue(
+						await supervisor.wait(
+							mainId,
+							{ agent_id: id, turn_id: second.turn_id, timeout: 1 },
+							new AbortController().signal,
+						),
+					);
+				}
+				expect(result).toMatchObject({
+					turn_id: second.turn_id,
+					output: failure === "completed" ? "child completed: new answer" : "",
+					outcome: failure === "completed" ? "ok" : failure === "cancelled" ? "cancelled" : "error",
+				});
+				expect(store.getAgent(id)?.activeTurnId).toBeNull();
+			} finally {
+				await supervisor.close();
+				store.close();
+			}
+		},
+	);
+
+	test.each(["transcript", "patch", "both"] as const)(
+		"settles and releases a Turn when %s artifact persistence fails",
+		async (failure) => {
+			const harness = await createHarness({}, undefined, undefined, {
+				createSession: () => {
+					const session = new FakeChildSession();
+					if (failure === "both") {
+						const prompt = session.prompt.bind(session);
+						vi.spyOn(session, "prompt").mockImplementation(async (text) => {
+							await prompt(text);
+							throw new Error("execution failed");
+						});
+					}
+					return session;
+				},
+			});
+			const { root, supervisor, store, mainId, sessions, deliveries } = harness;
+			await git(root, ["init"]);
+			await git(root, ["config", "user.email", "riemann@example.invalid"]);
+			await git(root, ["config", "user.name", "Riemann Test"]);
+			await writeFile(join(root, "tracked.txt"), "before\n");
+			await git(root, ["add", "tracked.txt"]);
+			await git(root, ["commit", "-m", "initial"]);
+			const putText = ArtifactStore.prototype.putText;
+			const persistence = vi.spyOn(ArtifactStore.prototype, "putText").mockImplementation(async function (
+				this: ArtifactStore,
+				text,
+				options,
+			) {
+				if (options?.mimeType === "application/json" && failure !== "patch")
+					throw new Error("transcript storage unavailable");
+				if (options?.mimeType === "text/x-diff; charset=utf-8" && failure !== "transcript")
+					throw new Error("patch storage unavailable");
+				return putText.call(this, text, options);
+			});
+			try {
+				const handle = objectValue(
+					await supervisor.start(mainId, { task: "write a patch", name: "worker", profile: "isolated" }),
+				);
+				const id = String(handle.id);
+				await waitFor(() => sessions.get(id)?.at(-1)?.prompts.length === 1);
+				const child = store.getAgent(id);
+				if (!child) throw new Error("Missing child");
+				await writeFile(join(child.workspace, "tracked.txt"), "after\n");
+				const waiting = supervisor.wait(
+					mainId,
+					{ agent_id: id, turn_id: handle.turn_id, timeout: 0.2 },
+					new AbortController().signal,
+				);
+				sessions.get(id)?.at(-1)?.finish();
+				const result = objectValue(await waiting);
+				expect(result).toMatchObject({ outcome: "error", output: "child completed: write a patch" });
+				expect(Value.Check(functionByName(supervisor.definitions(mainId), "wait").outputSchema, result)).toBe(true);
+				if (failure !== "patch") {
+					expect(result.transcript_handle).toBeNull();
+					expect(result.error).toContain("transcript storage unavailable");
+				} else expect(result.transcript_handle).toEqual(expect.any(String));
+				if (failure !== "transcript") {
+					expect(result.patch_handle).toBeNull();
+					expect(result.error).toContain("patch storage unavailable");
+				} else expect(result.patch_handle).toEqual(expect.any(String));
+				if (failure === "both") expect(result.error).toContain("execution failed");
+				expect(store.getAgent(id)).toMatchObject({ activeTurnId: null, status: "idle", lastOutcome: "error" });
+				expect(store.getAgentTurn(String(handle.turn_id))?.status).toBe("settled");
+				expect(deliveries).toEqual([]);
+				await waitFor(() => !supervisor.listSubagentsForUi().find((agent) => agent.id === id)?.live);
+				await supervisor.releaseAgent(mainId, id, String(handle.turn_id));
+				expect(store.getAgent(id)?.releasedAt).not.toBeNull();
+			} finally {
+				persistence.mockRestore();
+				await supervisor.close();
+				store.close();
+			}
+		},
+	);
+
+	test("settles queued cancellation when transcript persistence fails", async () => {
+		const harness = await createHarness({ maxConcurrentAgents: 1 });
+		const { supervisor, store, mainId } = harness;
+		const persistence = vi.spyOn(ArtifactStore.prototype, "putText");
+		try {
+			await supervisor.start(mainId, { task: "occupy execution", name: "running" });
+			const queued = objectValue(await supervisor.start(mainId, { task: "queued", name: "queued" }));
+			persistence.mockRejectedValue(new Error("transcript storage unavailable"));
+			const result = objectValue(
+				await supervisor.stopTurn(
+					mainId,
+					String(queued.id),
+					String(queued.turn_id),
+					new AbortController().signal,
+					0.2,
+				),
+			);
+			expect(result).toMatchObject({
+				outcome: "error",
+				output: "",
+				transcript_handle: null,
+				error: expect.stringContaining("transcript storage unavailable"),
+			});
+			expect(store.getAgent(String(queued.id))?.activeTurnId).toBeNull();
+		} finally {
+			persistence.mockRestore();
+			await supervisor.close();
+			store.close();
+		}
+	});
+
+	test("rejects current and later waiters when Turn settlement cannot be persisted", async () => {
+		const warnings: string[] = [];
+		let releaseClose!: () => void;
+		const closeBlocked = new Promise<void>((resolve) => {
+			releaseClose = resolve;
+		});
+		const harness = await createHarness({}, undefined, undefined, {
+			warningSink: (message) => {
+				warnings.push(message);
+			},
+			closeRuntime: () => closeBlocked,
+		});
+		const { supervisor, store, mainId, sessions, deliveries } = harness;
+		const persistence = vi.spyOn(store, "settleAgentTurn").mockImplementation(() => {
+			throw new Error("database unavailable");
+		});
+		try {
+			const handle = objectValue(await supervisor.start(mainId, { task: "complete", name: "worker" }));
+			const id = String(handle.id);
+			await waitFor(() => sessions.get(id)?.at(-1)?.prompts.length === 1);
+			const args = { agent_id: id, turn_id: handle.turn_id, timeout: 0.2 };
+			const waiting = [
+				supervisor.wait(mainId, args, new AbortController().signal),
+				supervisor.wait(mainId, args, new AbortController().signal),
+			];
+			const rejected = Promise.all(
+				waiting.map((wait) =>
+					expect(wait).rejects.toMatchObject({
+						code: "persistence_error",
+						message: expect.stringContaining("database unavailable"),
+					}),
+				),
+			);
+			sessions.get(id)?.at(-1)?.finish();
+			await rejected;
+			await expect(supervisor.wait(mainId, args, new AbortController().signal)).rejects.toMatchObject({
+				code: "persistence_error",
+			});
+			expect(store.getAgent(id)).toMatchObject({ activeTurnId: handle.turn_id, status: "running" });
+			expect(store.getAgentTurn(String(handle.turn_id))?.status).toBe("running");
+			expect(deliveries).toEqual([]);
+			expect(warnings).toContainEqual(expect.stringContaining("database unavailable"));
+			expect(supervisor.listSubagentsForUi().find((agent) => agent.id === id)?.live).toBe(true);
+		} finally {
+			releaseClose();
+			persistence.mockRestore();
+			await supervisor.close();
+			store.close();
+		}
+	});
+
 	test("exposes the actor API, delivers completion, and reuses one durable identity", async () => {
 		const harness = await createHarness({ maxAgents: 2, maxConcurrentAgents: 1 });
 		const { supervisor, store, mainId, sessions, resumeFlags, deliveries } = harness;
@@ -376,7 +681,7 @@ describe("Riemann reusable Agent slots", () => {
 				lastOutcome: "ok",
 				result: "child completed: Produce a bounded result",
 			});
-			expect(settled?.transcriptHandle).toMatch(/^artifact:\/\//);
+			expect(settled?.transcriptHandle).toMatch(/^r[1-9a-z][0-9a-z]*$/);
 			expect(deliveries.at(-1)?.events).toEqual([
 				{
 					id: expect.any(String),
@@ -522,12 +827,33 @@ describe("Riemann reusable Agent slots", () => {
 				status: "running",
 			});
 			expect(sessions.get(first.id)?.at(-1)?.steering).toHaveLength(1);
+			const childArtifacts = harness.artifacts.forAgent(first.id);
+			const parentArtifacts = harness.artifacts.forAgent(mainId);
+			const resource = objectValue(await childArtifacts.putText("child-owned data"));
+			const secret = objectValue(await harness.artifacts.putText("not granted to child"));
+			expect(() => parentArtifacts.open(String(resource.handle))).toThrow();
+			const sibling = objectValue(await supervisor.start(mainId, { task: "sibling", name: "sibling" }));
+			await expect(
+				supervisor.wait(
+					String(sibling.id),
+					{ agent_id: first.id, turn_id: first.turn_id },
+					new AbortController().signal,
+				),
+			).rejects.toMatchObject({ code: "permission_denied" });
 			const firstWait = waitDefinition.handler(
 				{ agent_id: first.id, turn_id: first.turn_id },
 				new AbortController().signal,
 			);
 			sessions.get(first.id)?.at(-1)?.finish();
 			const firstResult = objectValue(await firstWait);
+			expect(firstResult.transcript_handle).toMatch(/^r[1-9a-z][0-9a-z]*$/);
+			expect(objectValue(await parentArtifacts.get(String(resource.handle))).text).toBe("child-owned data");
+			expect(objectValue(parentArtifacts.open(String(firstResult.transcript_handle))).handle).toBe(
+				firstResult.transcript_handle,
+			);
+			expect(() => parentArtifacts.open(String(secret.handle))).toThrow();
+			expect(() => harness.artifacts.forAgent(String(sibling.id)).open(String(resource.handle))).toThrow();
+			expect(firstResult.output).not.toContain(String(resource.handle));
 			expect(firstResult).toMatchObject({
 				$riemann: "agent_result",
 				id: first.id,
@@ -1216,8 +1542,19 @@ describe("Riemann reusable Agent slots", () => {
 
 			const settled = store.getAgent(child.id);
 			if (!settled?.patchHandle) throw new Error("Missing patch artifact");
-			const patch = objectValue(await artifacts.get(settled.patchHandle));
-			expect(patch.content).toContain("changed in child");
+			const parentArtifacts = artifacts.forAgent(main.id);
+			expect(() => parentArtifacts.open(settled.patchHandle as string)).toThrow();
+			const delivered = objectValue(
+				await supervisor.wait(
+					main.id,
+					{ agent_id: child.id, turn_id: handle.turn_id },
+					new AbortController().signal,
+				),
+			);
+			expect(delivered.patch_handle).toMatch(/^r[1-9a-z][0-9a-z]*$/);
+			expect(delivered.transcript_handle).toMatch(/^r[1-9a-z][0-9a-z]*$/);
+			const patch = objectValue(await parentArtifacts.get(String(delivered.patch_handle)));
+			expect(patch.text).toContain("changed in child");
 			expect(JSON.stringify(deliveries.at(-1))).not.toContain(settled.patchHandle);
 
 			await supervisor.releaseSubagentFromUi(child.id);

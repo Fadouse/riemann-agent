@@ -4,14 +4,15 @@ import { access, copyFile, mkdir, open, readFile, rename, rm, stat, writeFile } 
 import { basename, dirname, join } from "node:path";
 import { RiemannHostError } from "../errors.ts";
 import type { JsonValue } from "../kernel/types.ts";
+import { resourceKind } from "./references.ts";
 import type { RiemannStore, StoredArtifact } from "./store.ts";
 
 const MAX_ARTIFACT_SLICE_BYTES = 1024 * 1024;
 
-function wireArtifact(artifact: StoredArtifact): JsonValue {
+function wireArtifact(artifact: StoredArtifact, handle: string): JsonValue {
 	return {
 		$riemann: "artifact",
-		handle: artifact.handle,
+		handle,
 		mime_type: artifact.mimeType,
 		size: artifact.size,
 		name: artifact.name,
@@ -21,10 +22,50 @@ function wireArtifact(artifact: StoredArtifact): JsonValue {
 export class ArtifactStore {
 	private readonly store: RiemannStore;
 	private readonly runId: string;
+	private readonly agentId: string | undefined;
 
-	constructor(store: RiemannStore, runId: string) {
+	constructor(store: RiemannStore, runId: string, agentId?: string) {
 		this.store = store;
 		this.runId = runId;
+		this.agentId = agentId;
+		if (agentId !== undefined) store.references.assertAgent(runId, agentId);
+	}
+
+	forAgent(agentId: string): ArtifactStore {
+		if (this.agentId !== undefined && this.agentId !== agentId) {
+			throw new RiemannHostError("permission_denied", "Cannot change the Agent of a scoped artifact store");
+		}
+		return new ArtifactStore(this.store, this.runId, agentId);
+	}
+
+	grant(handle: string, agentId: string): void {
+		this.store.references.grant(this.runId, this.reference(handle), agentId, this.agentId);
+	}
+
+	grantFromAgent(sourceId: string, targetId: string): void {
+		if (this.agentId !== undefined) {
+			throw new RiemannHostError("permission_denied", "Only the system artifact store may transfer Agent resources");
+		}
+		this.store.references.grantFromAgent(this.runId, sourceId, targetId);
+	}
+
+	reference(handle: string): string {
+		const artifact = this.getMetadata(handle);
+		// Reading an existing scoped reference must never recreate a revoked grant.
+		if (this.agentId !== undefined) return handle;
+		return this.store.references.issue(this.runId, artifact.handle, resourceKind(artifact.mimeType)).shortRef;
+	}
+
+	assertPublic(handle: string): StoredArtifact {
+		const artifact = this.getMetadata(handle);
+		if (resourceKind(artifact.mimeType) !== "artifact") {
+			throw new RiemannHostError("permission_denied", "Internal resources cannot be opened as public artifacts");
+		}
+		return artifact;
+	}
+
+	open(handle: string): JsonValue {
+		return wireArtifact(this.assertPublic(handle), this.reference(handle));
 	}
 
 	async putText(text: string, options: { name?: string; mimeType?: string } = {}): Promise<JsonValue> {
@@ -200,84 +241,114 @@ export class ArtifactStore {
 			createdAt: new Date().toISOString(),
 		};
 		this.store.putArtifact(artifact);
-		return wireArtifact(artifact);
+		const reference = this.store.references.issue(
+			this.runId,
+			artifact.handle,
+			resourceKind(artifact.mimeType),
+			this.agentId,
+		);
+		return wireArtifact(artifact, reference.shortRef);
 	}
 
 	getMetadata(handle: string): StoredArtifact {
-		const artifact = this.store.getArtifact(handle);
+		const resourceId =
+			this.agentId === undefined && handle.startsWith("artifact://")
+				? handle
+				: this.store.references.resolve(this.runId, handle, this.agentId).resourceId;
+		const artifact = this.store.getArtifact(resourceId);
 		if (!artifact || artifact.runId !== this.runId)
-			throw new RiemannHostError("not_found", `Artifact not found: ${handle}`);
+			throw new RiemannHostError("not_found", "Artifact is not present in this run");
 		return artifact;
 	}
 
-	async readBuffer(handle: string): Promise<Buffer> {
+	async readBuffer(handle: string, maximumBytes?: number): Promise<Buffer> {
 		const artifact = this.getMetadata(handle);
-		return readFile(artifact.path);
+		if (maximumBytes === undefined) return readFile(artifact.path);
+		if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
+			throw new RiemannHostError("invalid_arguments", "Artifact byte bound must be a non-negative safe integer");
+		}
+		const file = await open(artifact.path, "r");
+		try {
+			const size = (await file.stat()).size;
+			if (artifact.size > maximumBytes || size > maximumBytes) {
+				throw new RiemannHostError("response_too_large", "Artifact exceeds the bounded read limit");
+			}
+			const data = Buffer.allocUnsafe(size + 1);
+			let length = 0;
+			while (length < data.length) {
+				const { bytesRead } = await file.read(data, length, data.length - length, length);
+				if (bytesRead === 0) break;
+				length += bytesRead;
+			}
+			if (length !== size) throw new RiemannHostError("artifact_error", "Artifact changed during bounded read");
+			return data.subarray(0, length);
+		} finally {
+			await file.close();
+		}
 	}
 
 	async get(handle: string, options: { offset?: number; limit?: number } = {}): Promise<JsonValue> {
-		const artifact = this.getMetadata(handle);
+		const artifact = this.assertPublic(handle);
+		const shortRef = this.reference(handle);
+		const isText =
+			artifact.mimeType.startsWith("text/") ||
+			artifact.mimeType.includes("json") ||
+			artifact.mimeType.includes("xml");
+		const offset = options.offset ?? 0;
+		const limit = options.limit ?? 65_536;
+		const minimum = isText ? 4 : 1;
+		if (!Number.isSafeInteger(offset) || offset < 0) {
+			throw new RiemannHostError("invalid_arguments", "Artifact offset must be a non-negative safe integer");
+		}
+		if (!Number.isSafeInteger(limit) || limit < minimum || limit > MAX_ARTIFACT_SLICE_BYTES) {
+			throw new RiemannHostError(
+				"invalid_arguments",
+				`Artifact slice limit must be an integer from ${minimum} to ${MAX_ARTIFACT_SLICE_BYTES}`,
+			);
+		}
 		const file = await open(artifact.path, "r");
 		try {
 			const fileSize = (await file.stat()).size;
-			const offset = Math.max(0, options.offset ?? 0);
-			const limit = options.limit ?? 65_536;
-			if (!Number.isInteger(limit) || limit < 1 || limit > MAX_ARTIFACT_SLICE_BYTES) {
-				throw new RiemannHostError(
-					"invalid_arguments",
-					`Artifact slice limit must be an integer from 1 to ${MAX_ARTIFACT_SLICE_BYTES}`,
-				);
-			}
-			const end = Math.min(fileSize, offset + Math.max(0, limit));
-			const readStart = Math.min(fileSize, Number.isNaN(offset) ? 0 : Math.trunc(offset));
-			const readEnd = Math.min(fileSize, Number.isNaN(end) ? 0 : Math.trunc(end));
-			const data = Buffer.allocUnsafe(Math.max(0, readEnd - readStart));
+			const readStart = Math.min(fileSize, offset);
+			const data = Buffer.allocUnsafe(Math.min(fileSize - readStart, limit));
 			let bytesRead = 0;
 			while (bytesRead < data.length) {
 				const result = await file.read(data, bytesRead, data.length - bytesRead, readStart + bytesRead);
 				if (result.bytesRead === 0) break;
 				bytesRead += result.bytesRead;
 			}
-			let slice = bytesRead === data.length ? data : data.subarray(0, bytesRead);
-			let actualStart = readStart;
-			let actualEnd = readStart + slice.byteLength;
-			if (
-				artifact.mimeType.startsWith("text/") ||
-				artifact.mimeType.includes("json") ||
-				artifact.mimeType.includes("xml")
-			) {
-				while (slice.length > 0 && (slice[0] ?? 0) >= 0x80 && (slice[0] ?? 0) < 0xc0) {
-					slice = slice.subarray(1);
-					actualStart += 1;
+			const slice = data.subarray(0, bytesRead);
+			let nextOffset = readStart + bytesRead;
+			let text: string | undefined;
+			if (isText) {
+				if (slice.length > 0 && (slice[0] & 0xc0) === 0x80) {
+					throw new RiemannHostError(
+						"invalid_arguments",
+						"Artifact text offset must be a UTF-8 code-point boundary",
+					);
 				}
-				let content: string | undefined;
-				for (let trim = 0; trim <= Math.min(3, slice.length); trim += 1) {
-					try {
-						content = new TextDecoder("utf-8", { fatal: true }).decode(slice.subarray(0, slice.length - trim));
-						actualEnd -= trim;
-						break;
-					} catch {}
-				}
-				if (content === undefined)
+				try {
+					text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(slice, {
+						stream: nextOffset < fileSize,
+					});
+					nextOffset = readStart + Buffer.byteLength(text);
+				} catch {
 					throw new RiemannHostError("unsupported_media_type", "Artifact text is not valid UTF-8");
-				return {
-					handle,
-					mime_type: artifact.mimeType,
-					size: artifact.size,
-					offset: actualStart,
-					next_offset: actualEnd,
-					content,
-					truncated: actualEnd < fileSize,
-				};
+				}
+			}
+			if (nextOffset < fileSize && nextOffset <= readStart) {
+				throw new RiemannHostError("artifact_error", "Artifact slice could not make progress");
 			}
 			return {
-				handle,
+				$riemann: "artifact_slice",
+				kind: isText ? "text" : "binary",
+				handle: shortRef,
 				mime_type: artifact.mimeType,
 				size: artifact.size,
-				offset: actualStart,
-				next_offset: actualEnd,
-				base64: slice.toString("base64"),
-				truncated: actualEnd < fileSize,
+				offset: readStart,
+				next_offset: nextOffset,
+				eof: nextOffset >= fileSize,
+				...(isText ? { text: text ?? "" } : { base64: slice.toString("base64") }),
 			};
 		} finally {
 			await file.close();
@@ -285,7 +356,8 @@ export class ArtifactStore {
 	}
 
 	async materialize(handle: string, destination: string): Promise<JsonValue> {
-		const artifact = this.getMetadata(handle);
+		const artifact = this.assertPublic(handle);
+		const shortRef = this.reference(handle);
 		await mkdir(dirname(destination), { recursive: true });
 		const temporary = join(dirname(destination), `.${basename(destination)}.${process.pid}.${randomUUID()}.tmp`);
 		try {
@@ -295,6 +367,6 @@ export class ArtifactStore {
 			await rm(temporary, { force: true });
 		}
 		const info = await stat(destination);
-		return { path: destination, size: info.size, handle };
+		return { $riemann: "materialized_artifact", path: destination, size: info.size, handle: shortRef };
 	}
 }

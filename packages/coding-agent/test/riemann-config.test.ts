@@ -130,11 +130,25 @@ describe("Riemann configuration", () => {
 		const defaults = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
 		expect(defaults.maxAgents).toBe(4);
 		expect(defaults.maxConcurrentAgents).toBe(4);
+		expect(defaults.limits).toEqual({
+			maxModelTextBytes: 16384,
+			maxPreviewBytes: 2048,
+			maxPreviewItems: 10,
+			maxPreviewDepth: 4,
+			maxPreviewNodes: 200,
+		});
 
 		await updateGlobalRiemannSetting(agentDir, "agents.maxAgents", 0);
 		const disabled = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
 		expect(disabled.maxAgents).toBe(0);
 		expect(disabled.maxConcurrentAgents).toBe(0);
+		await writeFile(join(agentDir, "config.yaml"), "limits:\n  maxModelTextBytes: 2048\n  maxPreviewItems: 3\n");
+		const bounded = await loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false });
+		expect(bounded.limits).toEqual({ ...defaults.limits, maxModelTextBytes: 2048, maxPreviewItems: 3 });
+		await writeFile(join(agentDir, "config.yaml"), "limits:\n  maxModelTextBytes: 0\n");
+		await expect(loadRiemannConfig({ cwd: root, agentDir, projectTrusted: false })).rejects.toThrow(
+			"Invalid Riemann config",
+		);
 	});
 
 	test("requires descriptions for enabled MCP servers visible by default", async () => {

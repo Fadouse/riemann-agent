@@ -45,6 +45,12 @@ export interface IPythonShellActivity extends IPythonActivityBase {
 	cwd?: string;
 	stdout?: string;
 	stderr?: string;
+	stdoutTruncated?: boolean;
+	stderrTruncated?: boolean;
+	stdoutCaptureTruncated?: boolean;
+	stderrCaptureTruncated?: boolean;
+	stdoutArtifactHandle?: string;
+	stderrArtifactHandle?: string;
 	exitCode?: number | null;
 	timedOut?: boolean;
 }
@@ -113,8 +119,11 @@ export interface IPythonToolDetails {
 	startedAt?: number;
 	durationMs?: number;
 	errorName?: string;
+	errorCode?: string;
 	executionCount?: number;
-	artifactHandle?: string;
+	moreRef?: string;
+	diagnosticRef?: string;
+	captureTruncated?: { stdout: boolean; stderr: boolean; rich: boolean };
 	media?: Array<{
 		type: "image";
 		artifactHandle: string;

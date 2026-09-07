@@ -1,5 +1,5 @@
 import type { ChildProcess } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -7,6 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Dealer, Subscriber } from "zeromq";
 import { signalProcessGroup, spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { policyAllowsRead, policyAllowsWrite } from "../access-policy.ts";
+import { RiemannHostError } from "../errors.ts";
 import { sandboxedKernelCommand } from "./sandbox.ts";
 import type {
 	JsonValue,
@@ -55,6 +56,7 @@ interface ActiveExecution {
 	hostModelContent: Array<{ sequence: number; content: KernelModelContent[] }>;
 	hostNotificationQueue: Promise<void>;
 	richOutputTruncated: boolean;
+	richCaptureTruncated: boolean;
 }
 
 function endpoint(info: JupyterConnectionInfo, port: number): string {
@@ -92,6 +94,45 @@ function parseError(message: JupyterMessage): KernelError | undefined {
 	return { ename, evalue, traceback: traceback as string[] };
 }
 
+function parseStructuredError(message: JupyterMessage): KernelError | undefined {
+	const value = parseDisplay(message)?.data["application/vnd.riemann.error+json"];
+	if (value === undefined) return undefined;
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		Array.isArray(value) ||
+		typeof value.code !== "string" ||
+		!value.code ||
+		typeof value.message !== "string"
+	) {
+		return {
+			ename: "RiemannError",
+			evalue: "Invalid structured kernel error",
+			traceback: [],
+			code: "bridge_protocol_error",
+		};
+	}
+	const recovery = value.recovery;
+	return {
+		ename: "RiemannError",
+		evalue: value.message,
+		traceback: [],
+		code: value.code,
+		...(typeof value.operation === "string" ? { operation: value.operation } : {}),
+		...(typeof value.repair_code === "string" ? { repairCode: value.repair_code } : {}),
+		...(typeof value.request_id === "string" ? { requestId: value.request_id } : {}),
+		...(typeof value.retryable === "boolean" ? { retryable: value.retryable } : {}),
+		...(recovery === "none" ||
+		recovery === "retry" ||
+		recovery === "refresh" ||
+		recovery === "fix_arguments" ||
+		recovery === "reauthorize"
+			? { recovery }
+			: {}),
+		...(value.details === undefined ? {} : { details: value.details }),
+	};
+}
+
 function stripAnsi(value: string): string {
 	return value.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
 }
@@ -119,9 +160,14 @@ export class IPythonKernelManager {
 	private iopubLoop?: Promise<void>;
 	private closed = false;
 	private kernelReady = false;
+	private incompatibleSnapshot = false;
+	private incompatibleSnapshotWarningEmitted = false;
+	readonly contractFingerprint: string;
 
 	constructor(options: KernelManagerOptions) {
 		this.options = options;
+		this.contractFingerprint =
+			options.contractFingerprint ?? createHash("sha256").update(options.bootstrapCode).digest("hex");
 	}
 	private kernelSnapshotPath(): string | undefined {
 		if (!this.options.snapshotPath) return undefined;
@@ -373,6 +419,20 @@ export class IPythonKernelManager {
 		}
 		const execution = this.execution;
 		if (!execution || message.parentHeader.msg_id !== execution.id) return;
+		if (message.header.msg_type === "execute_result" || message.header.msg_type === "display_data") {
+			const error = parseStructuredError(message);
+			if (error) {
+				if (execution.status !== "cancelled" && execution.status !== "timeout") {
+					execution.status = "error";
+					execution.error = {
+						...error,
+						...(execution.error ? { ename: execution.error.ename, traceback: execution.error.traceback } : {}),
+					};
+				}
+				execution.executionCount ??= numberField(message.content.execution_count);
+				return;
+			}
+		}
 		switch (message.header.msg_type) {
 			case "stream": {
 				const text = stringField(message.content.text) ?? "";
@@ -395,6 +455,7 @@ export class IPythonKernelManager {
 				if (execution.displays.length < 32) execution.displays.push(display);
 				else if (!execution.richOutputTruncated) {
 					execution.richOutputTruncated = true;
+					execution.richCaptureTruncated = true;
 					execution.displays.push({
 						data: { "text/plain": "[additional rich output omitted by Riemann Agent]" },
 						metadata: {},
@@ -409,7 +470,8 @@ export class IPythonKernelManager {
 			}
 			case "error":
 				if (execution.status !== "cancelled" && execution.status !== "timeout") {
-					execution.error = parseError(message);
+					const error = parseError(message);
+					if (error) execution.error = { ...execution.error, ...error };
 					execution.status = "error";
 				}
 				break;
@@ -422,7 +484,8 @@ export class IPythonKernelManager {
 					execution.status !== "timeout"
 				) {
 					execution.status = "error";
-					execution.error ??= parseError(message);
+					const error = parseError(message);
+					if (error) execution.error = { ...execution.error, ...error };
 				} else if (message.content.status === "aborted" && execution.status === "ok") {
 					execution.status = "cancelled";
 				}
@@ -443,6 +506,7 @@ export class IPythonKernelManager {
 		const cap = Math.max(1, this.options.maxOutputChars ?? 100_000);
 		const encoded = JSON.stringify(display.data);
 		if (encoded.length <= cap) return display;
+		if (this.execution) this.execution.richCaptureTruncated = true;
 		const text = display.data["text/plain"];
 		if (typeof text === "string") {
 			return {
@@ -496,6 +560,15 @@ export class IPythonKernelManager {
 			status: execution.status,
 			stdout: execution.stdout,
 			stderr: execution.stderr,
+			...(execution.stdoutTruncated || execution.stderrTruncated || execution.richCaptureTruncated
+				? {
+						captureTruncated: {
+							stdout: execution.stdoutTruncated,
+							stderr: execution.stderrTruncated,
+							rich: execution.richCaptureTruncated,
+						},
+					}
+				: {}),
 			result: execution.result,
 			displays: execution.displays,
 			modelContent: execution.hostModelContent
@@ -537,9 +610,8 @@ export class IPythonKernelManager {
 					error: {
 						code: "bridge_protocol_error",
 						message: `Host produced a value that cannot be encoded: ${errorMessage(error)}`,
-						operation,
-						request_id: requestId,
 						retryable: false,
+						recovery: "none",
 					},
 				};
 				response = encodeJupyterMessage({
@@ -561,9 +633,8 @@ export class IPythonKernelManager {
 				error: {
 					code: "bridge_protocol_error",
 					message: messageText,
-					operation,
-					request_id: requestId,
 					retryable: false,
+					recovery: "none",
 				},
 			});
 		};
@@ -615,9 +686,8 @@ export class IPythonKernelManager {
 				error: {
 					code: "cancelled",
 					message: "The originating IPython cell is no longer active",
-					operation,
-					request_id: requestId,
 					retryable: false,
+					recovery: "none",
 				},
 			};
 		} else {
@@ -648,11 +718,12 @@ export class IPythonKernelManager {
 					error instanceof Error && "details" in error ? (error as { details?: JsonValue }).details : undefined;
 				const requestError: KernelHostRequestError = {
 					code:
-						error instanceof Error && "code" in error
-							? String((error as { code?: unknown }).code)
+						error instanceof RiemannHostError
+							? error.code
 							: controller.signal.aborted
 								? "cancelled"
-								: "runtime_error",
+								: "internal_error",
+					recovery: error instanceof RiemannHostError ? error.recovery : "none",
 					message: error instanceof Error ? error.message : String(error),
 					operation,
 					requestId,
@@ -669,9 +740,8 @@ export class IPythonKernelManager {
 					error: {
 						code: requestError.code,
 						message: requestError.message,
-						operation,
-						request_id: requestId,
 						retryable: requestError.retryable,
+						recovery: requestError.recovery ?? "none",
 						...(requestError.details === undefined ? {} : { details: requestError.details }),
 					},
 				};
@@ -731,6 +801,7 @@ export class IPythonKernelManager {
 			hostModelContent: [],
 			hostNotificationQueue: Promise.resolve(),
 			richOutputTruncated: false,
+			richCaptureTruncated: false,
 		};
 		this.execution = execution;
 		try {
@@ -806,7 +877,7 @@ export class IPythonKernelManager {
 			return {
 				restored: [],
 				skipped: [],
-				error: stripAnsi(result.error?.evalue ?? result.stderr.trim() ?? "Snapshot operation returned no result"),
+				error: stripAnsi(result.error?.evalue || result.stderr.trim() || "Snapshot operation returned no result"),
 			};
 		}
 		try {
@@ -837,7 +908,12 @@ export class IPythonKernelManager {
 			}
 			if (error !== undefined && typeof error !== "string")
 				throw new Error("snapshot result error must be a string");
-			return { restored: restored as string[], skipped: parsedSkipped, ...(error ? { error } : {}) };
+			return {
+				restored: restored as string[],
+				skipped: parsedSkipped,
+				...(error ? { error } : {}),
+				...("incompatible" in value && value.incompatible === true ? { incompatible: true } : {}),
+			};
 		} catch (error) {
 			return {
 				restored: [],
@@ -871,6 +947,9 @@ def _riemann_restore_snapshot(path, namespace):
     if snapshot_path.exists():
         try:
             with snapshot_path.open("rb") as file:
+                expected = ${JSON.stringify(`RIEMANN-CHECKPOINT ${this.contractFingerprint}\n`)}.encode("ascii")
+                if file.read(len(expected)) != expected:
+                    return {"restored": [], "skipped": [], "incompatible": True, "error": "Incompatible checkpoint contract; original file retained. Archive it before creating a new checkpoint."}
                 values = dill.load(file)
             for name, value in values.items():
                 namespace[name] = value
@@ -884,12 +963,27 @@ finally:
     del _riemann_restore_snapshot`,
 			{ internal: true, signal: AbortSignal.timeout(30_000) },
 		);
-		this.options.onRestore?.(this.parseSnapshotResult(result));
+		const restored = this.parseSnapshotResult(result);
+		this.incompatibleSnapshot = restored.incompatible === true;
+		if (!this.incompatibleSnapshot) this.incompatibleSnapshotWarningEmitted = false;
+		this.options.onRestore?.(restored);
 	}
 
 	async snapshot(signal: AbortSignal = AbortSignal.timeout(30_000)): Promise<KernelRestoreResult> {
 		const kernelPath = this.kernelSnapshotPath();
 		if (!kernelPath) return { restored: [], skipped: [], error: "Snapshots are disabled" };
+		if (this.incompatibleSnapshot) {
+			const warned = this.incompatibleSnapshotWarningEmitted;
+			this.incompatibleSnapshotWarningEmitted = true;
+			return {
+				restored: [],
+				skipped: [],
+				incompatible: true,
+				...(warned
+					? {}
+					: { error: "Incompatible checkpoint retained; archive it and restart the kernel before saving." }),
+			};
+		}
 		if (!this.kernelReady || this.process?.exitCode !== null)
 			return { restored: [], skipped: [], error: "Cannot snapshot while an IPython kernel restart is pending" };
 		if (this.execution)
@@ -910,11 +1004,13 @@ def _riemann_write_snapshot(path, namespace):
     fd, temporary = tempfile.mkstemp(dir=str(snapshot_path.parent), prefix=".snapshot-", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as file:
+            header = ${JSON.stringify(`RIEMANN-CHECKPOINT ${this.contractFingerprint}\n`)}.encode("ascii")
+            file.write(header)
             try:
                 dill.dump(candidates, file)
                 values = candidates
             except Exception:
-                file.seek(0)
+                file.seek(len(header))
                 file.truncate()
                 for name, value in candidates.items():
                     try:

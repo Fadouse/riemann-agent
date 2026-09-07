@@ -375,6 +375,17 @@ export interface AgentToolResult<T> {
 	terminate?: boolean;
 }
 
+/** A failed tool execution that retains model content and structured result metadata. */
+export class AgentToolExecutionError<T = unknown> extends Error {
+	readonly result: AgentToolResult<T>;
+
+	constructor(result: AgentToolResult<T>, message = "Tool execution failed") {
+		super(message);
+		this.name = "AgentToolExecutionError";
+		this.result = result;
+	}
+}
+
 /**
  * Callback used by tools to stream partial execution updates.
  *

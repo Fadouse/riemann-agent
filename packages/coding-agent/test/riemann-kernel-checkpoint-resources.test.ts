@@ -76,6 +76,7 @@ thread.start()
 thread.join()
 exec(code, namespace)
 with open(${JSON.stringify(path)}, "rb") as file:
+    assert file.readline().startswith(b"RIEMANN-CHECKPOINT ")
     saved = pickle.load(file)
 assert saved["items"] == [1, 2, 3]
 assert saved["items"] is saved["alias"]
@@ -98,16 +99,59 @@ print("passed")
 		try {
 			const path = join(root, "snapshot.dill");
 			const code = await checkpointCode(path, "restore");
+			const write = await checkpointCode(path, "snapshot");
 			await runPython(
 				`${picklePrelude}
-with open(${JSON.stringify(path)}, "wb") as file:
-    pickle.dump({"payload": Payload()}, file)
+exec(${JSON.stringify(write)}, {"payload": Payload()})
 namespace = {}
 exec(${JSON.stringify(code)}, namespace)
 reference = weakref.ref(namespace["payload"])
 del namespace["payload"]
 gc.collect()
 assert reference() is None, "restore temporaries retain a deleted user object"
+print("passed")
+`,
+				root,
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects incompatible checkpoints before loading user objects", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-checkpoint-contract-"));
+		try {
+			const path = join(root, "snapshot.dill");
+			const restore = await checkpointCode(path, "restore");
+			const kernel = new IPythonKernelManager({
+				python,
+				cwd: root,
+				sessionId: "incompatible-warning",
+				bootstrapCode: "",
+				sandbox: false,
+				snapshotPath: path,
+				hostRequest: async () => null,
+			});
+			(kernel as unknown as { incompatibleSnapshot: boolean }).incompatibleSnapshot = true;
+			const first = await kernel.snapshot();
+			expect(first).toMatchObject({ incompatible: true, error: expect.stringContaining("Incompatible checkpoint") });
+			expect(await kernel.snapshot()).toEqual({ restored: [], skipped: [], incompatible: true });
+			await runPython(
+				`${picklePrelude}
+import io, contextlib, pathlib
+path = pathlib.Path(${JSON.stringify(path)})
+original = pickle.dumps({"answer": 42})
+path.write_bytes(original)
+loads = []
+sys.modules["dill"].load = lambda file: loads.append(True) or {"answer": 42}
+output = io.StringIO()
+namespace = {}
+with contextlib.redirect_stdout(output):
+    exec(${JSON.stringify(restore)}, namespace)
+assert loads == [], "incompatible checkpoint executed dill.load"
+assert "incompatible" in output.getvalue().lower(), output.getvalue()
+assert "answer" not in namespace
+assert path.read_bytes() == original, "incompatible checkpoint was overwritten"
 print("passed")
 `,
 				root,

@@ -32,6 +32,8 @@ interface McpServerState {
 	stderr?: string;
 	namespace?: string;
 	functionNames?: string[];
+	lifecycle?: object;
+	closing?: Promise<void>;
 }
 
 const RESERVED_NAMESPACES = new Set([
@@ -43,6 +45,18 @@ const RESERVED_NAMESPACES = new Set([
 	"mcp",
 	"catalog",
 	"state",
+	"output",
+	"pages",
+	"MaterializedArtifact",
+	"Page",
+	"PathEntry",
+	"ArtifactSlice",
+	"SearchMatch",
+	"OperationSpec",
+	"OperationSummary",
+	"RuntimeStatus",
+	"McpNamespace",
+	"FileSnapshot",
 	"Artifact",
 	"TextSnapshot",
 	"ImageSnapshot",
@@ -166,7 +180,7 @@ function errorMessage(error: unknown): string {
 
 export class RiemannMcpManager {
 	private readonly states = new Map<string, McpServerState>();
-	private readonly startups = new Map<string, Promise<McpServerState>>();
+	private readonly startups = new Map<string, { controller: AbortController; promise: Promise<McpServerState> }>();
 	private closed = false;
 	private readonly configs: Record<string, McpServerConfig>;
 	private readonly cwd: string;
@@ -379,13 +393,47 @@ export class RiemannMcpManager {
 			description: `${tool.description || tool.title || tool.name} [MCP ${serverName}/${tool.name}]`,
 			inputSchema: Type.Object({ input: remoteInputSchema }, { additionalProperties: false }),
 			outputSchema: McpResultSchema,
+			...(tool.outputSchema
+				? { remoteOutputSchema: Type.Unsafe(asJson(tool.outputSchema) as Record<string, JsonValue>) }
+				: {}),
 			pythonReturnType: "McpResult",
 			errors: [
-				{ code: "not_ready", description: "The MCP server is not connected", retryable: true },
+				{
+					code: "not_ready",
+					description: "The MCP server is not connected",
+					retryable: false,
+					recovery: "refresh",
+				},
 				{ code: "mcp_tool_error", description: "The MCP tool returned isError", retryable: false },
-				{ code: "mcp_error", description: "The MCP transport failed", retryable: true },
+				{
+					code: "limit_exceeded",
+					description: "The run has exhausted its resource reference numbers.",
+					retryable: false,
+				},
+				{ code: "invalid_image", description: "The MCP image is empty.", retryable: false },
+				{
+					code: "unsupported_media_type",
+					description: "The MCP image format is unsupported or invalid.",
+					retryable: false,
+				},
+				{ code: "image_too_large", description: "The MCP source image exceeds 20 MiB.", retryable: false },
+				{ code: "image_decode_failed", description: "The MCP image cannot be decoded.", retryable: false },
+				{ code: "artifact_error", description: "The MCP image artifact is invalid.", retryable: false },
+				{
+					code: "cancelled",
+					description: "The MCP request was cancelled; remote effects may already have occurred.",
+					retryable: false,
+				},
+				{
+					code: "mcp_error",
+					description: "The MCP request or result failed; remote effects may already have occurred",
+					retryable: false,
+				},
 			],
-			effects: [{ kind: "remote-call", resource: `MCP ${serverName}/${tool.name}` }],
+			effects: [
+				{ kind: "remote-call", resource: `MCP ${serverName}/${tool.name}` },
+				{ kind: "write", resource: "artifact-store" },
+			],
 			idempotency: "conditional",
 			cancellation: { supported: true, description: "Cancels the MCP request" },
 			visibility: "public",
@@ -395,10 +443,17 @@ export class RiemannMcpManager {
 			},
 			capability: `mcp.${serverName}`,
 			handler: async (args, signal) => {
+				if (signal.aborted) throw new RiemannHostError("cancelled", "MCP tool call was cancelled");
 				const state = this.states.get(serverName);
 				const config = this.configs[serverName];
 				if (!state?.client || state.status !== "ready" || !config) {
-					throw new RiemannHostError("not_ready", `MCP server ${serverName} is not ready`);
+					throw new RiemannHostError(
+						"not_ready",
+						`MCP server ${serverName} is not ready`,
+						undefined,
+						false,
+						"refresh",
+					);
 				}
 				const input = args.input;
 				if (typeof input !== "object" || input === null || Array.isArray(input)) {
@@ -412,11 +467,17 @@ export class RiemannMcpManager {
 						resetTimeoutOnProgress: true,
 						signal,
 					});
-					return this.normalizeToolResult(result);
+					return await this.normalizeToolResult(result);
 				} catch (error) {
 					if (error instanceof RiemannHostError) throw error;
 					if (signal.aborted) throw new RiemannHostError("cancelled", "MCP tool call was cancelled");
-					throw new RiemannHostError("mcp_error", `MCP tool call failed: ${errorMessage(error)}`);
+					throw new RiemannHostError(
+						"mcp_error",
+						`MCP tool call failed: ${errorMessage(error)}`,
+						undefined,
+						false,
+						"none",
+					);
 				}
 			},
 		};
@@ -469,75 +530,142 @@ export class RiemannMcpManager {
 	}
 
 	async closeServer(serverName: string): Promise<void> {
-		const state = this.requireServer(serverName);
+		return this.shutdown(this.requireServer(serverName));
+	}
+
+	private async shutdown(state: McpServerState): Promise<void> {
+		const serverName = state.name;
+		state.lifecycle = {};
 		state.status = "closed";
-		await state.client?.close().catch(() => undefined);
-		if (state.namespace) this.registry.unregisterNamespace(state.namespace);
+		const startup = this.startups.get(serverName);
+		this.startups.delete(serverName);
+		startup?.controller.abort();
+		const client = state.client;
 		state.client = undefined;
 		state.transport = undefined;
+		if (state.namespace) this.registry.unregisterNamespace(state.namespace);
 		state.tools = [];
 		state.functionNames = [];
 		state.error = undefined;
-		state.status = "idle";
+		const previous = state.closing;
+		const closing = Promise.allSettled([
+			...(previous ? [previous] : []),
+			...(client ? [client.close()] : []),
+			...(startup ? [startup.promise] : []),
+		]).then(() => undefined);
+		state.closing = closing;
+		await closing;
+		if (state.closing === closing) state.closing = undefined;
 	}
 
 	async refresh(serverName: string, signal: AbortSignal): Promise<JsonValue> {
-		await this.closeServer(serverName);
+		if (signal.aborted) throw new RiemannHostError("cancelled", "MCP refresh was cancelled");
+		if (this.closed) throw new RiemannHostError("closed", "MCP manager is closed");
+		const state = this.requireServer(serverName);
+		const closing = this.closeServer(serverName);
+		const lifecycle = state.lifecycle;
+		await closing;
+		if (this.closed || state.lifecycle !== lifecycle)
+			throw new RiemannHostError("closed", "MCP refresh was superseded by close");
 		return this.open(serverName, signal);
 	}
 
 	async open(serverName: string, signal: AbortSignal): Promise<JsonValue> {
+		if (signal.aborted) throw new RiemannHostError("cancelled", "MCP open was cancelled");
 		if (this.closed) throw new RiemannHostError("closed", "MCP manager is closed");
 		const config = this.configs[serverName];
 		const state = this.requireServer(serverName);
 		if (!config) throw new RiemannHostError("not_found", `Unknown MCP server: ${serverName}`);
-		if (state.status === "ready") return this.functionBundle(serverName, state);
-		let startup = this.startups.get(serverName);
-		if (!startup) {
-			startup = this.connect(serverName, config, state, signal);
-			this.startups.set(serverName, startup);
+		try {
+			if (state.closing) {
+				const lifecycle = state.lifecycle;
+				await raceWithAbortSignal(state.closing, signal);
+				if (this.closed || state.lifecycle !== lifecycle)
+					throw new RiemannHostError("closed", "MCP open was superseded by close");
+			}
+			if (state.status === "ready") return this.functionBundle(serverName, state);
+			let startup = this.startups.get(serverName);
+			if (!startup) {
+				const controller = new AbortController();
+				const lifecycle = {};
+				state.lifecycle = lifecycle;
+				state.status = "connecting";
+				const promise = Promise.resolve().then(() =>
+					this.connect(serverName, config, state, lifecycle, controller.signal),
+				);
+				startup = { controller, promise };
+				this.startups.set(serverName, startup);
+				void promise
+					.finally(() => {
+						if (this.startups.get(serverName)?.promise === promise) this.startups.delete(serverName);
+					})
+					.catch(() => undefined);
+			}
+			const activated = await raceWithAbortSignal(startup.promise, signal);
+			if (this.closed || startup.controller.signal.aborted || activated.status !== "ready")
+				throw new RiemannHostError("closed", "MCP server was closed");
+			return this.functionBundle(serverName, activated);
+		} catch (error) {
+			if (signal.aborted) throw new RiemannHostError("cancelled", "MCP open was cancelled");
+			throw error;
 		}
-		const activated = await raceWithAbortSignal(startup, signal);
-		return this.functionBundle(serverName, activated);
 	}
 
 	private async connect(
 		serverName: string,
 		config: McpServerConfig,
 		state: McpServerState,
-		callerSignal: AbortSignal,
+		lifecycle: object,
+		managerSignal: AbortSignal,
 	): Promise<McpServerState> {
-		state.status = "connecting";
+		let client: Client | undefined;
 		try {
+			managerSignal.throwIfAborted();
 			const transport = this.createTransport(serverName, config, state);
-			const client = new Client({ name: "riemann-agent", version: "0.1.0" }, { capabilities: {} });
+			client = new Client({ name: "riemann-agent", version: "0.1.0" }, { capabilities: {} });
 			state.transport = transport;
 			state.client = client;
 			client.onerror = (error) => {
-				state.error = error.message;
+				if (state.lifecycle === lifecycle) state.error = error.message;
 			};
 			client.onclose = () => {
+				if (state.lifecycle !== lifecycle) return;
 				if (!this.closed && state.status !== "failed") state.status = "failed";
 				if (state.namespace) this.registry.unregisterNamespace(state.namespace);
 			};
 			const timeout = config.startupTimeoutMs ?? 15_000;
-			const startupSignal = AbortSignal.any([callerSignal, AbortSignal.timeout(timeout)]);
-			await client.connect(transport, { timeout, maxTotalTimeout: timeout, signal: startupSignal });
-			state.tools = this.filterTools(await this.listTools(client, timeout, startupSignal), config);
+			const startupSignal = AbortSignal.any([managerSignal, AbortSignal.timeout(timeout)]);
+			await raceWithAbortSignal(
+				client.connect(transport, { timeout, maxTotalTimeout: timeout, signal: startupSignal }),
+				startupSignal,
+			);
+			startupSignal.throwIfAborted();
+			const tools = this.filterTools(
+				await raceWithAbortSignal(this.listTools(client, timeout, startupSignal), startupSignal),
+				config,
+			);
+			startupSignal.throwIfAborted();
+			if (this.closed || state.lifecycle !== lifecycle)
+				throw new RiemannHostError("closed", "MCP startup was closed");
+			state.tools = tools;
 			state.status = "ready";
 			state.error = undefined;
 			this.installTools(serverName, state);
 			return state;
 		} catch (error) {
-			state.status = "failed";
-			state.error = errorMessage(error);
-			await state.client?.close().catch(() => undefined);
+			const wasClosed = managerSignal.aborted || this.closed || state.lifecycle !== lifecycle;
+			if (!wasClosed) {
+				state.status = "failed";
+				state.error = errorMessage(error);
+			}
+			await client?.close().catch(() => undefined);
+			if (wasClosed) throw new RiemannHostError("closed", `MCP server ${serverName} startup was closed`);
 			throw new RiemannHostError(
 				"mcp_error",
 				`MCP server ${serverName} failed: ${state.error}${state.stderr ? `\n${state.stderr}` : ""}`,
+				undefined,
+				true,
 			);
-		} finally {
-			this.startups.delete(serverName);
 		}
 	}
 
@@ -570,6 +698,11 @@ export class RiemannMcpManager {
 				outputSchema: FunctionBundleSchema,
 				pythonReturnType: "McpNamespace",
 				errors: [
+					{
+						code: "closed",
+						description: "The manager is closed or a concurrent close superseded startup.",
+						retryable: false,
+					},
 					{ code: "not_found", description: "The configured server does not exist", retryable: false },
 					{ code: "mcp_error", description: "The MCP server failed to start", retryable: true },
 				],
@@ -607,7 +740,14 @@ export class RiemannMcpManager {
 				inputSchema: Type.Object({ server_name: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
 				outputSchema: FunctionBundleSchema,
 				pythonReturnType: "McpNamespace",
-				errors: [{ code: "mcp_error", description: "The server failed to reconnect.", retryable: true }],
+				errors: [
+					{
+						code: "closed",
+						description: "The manager is closed or a concurrent close superseded startup.",
+						retryable: false,
+					},
+					{ code: "mcp_error", description: "The server failed to reconnect.", retryable: true },
+				],
 				effects: [{ kind: "connect", resource: "configured MCP server" }],
 				idempotency: "non-idempotent",
 				cancellation: { supported: true, description: "Cancels waiting for reconnection." },
@@ -639,11 +779,11 @@ export class RiemannMcpManager {
 	}
 
 	async close(): Promise<void> {
-		if (this.closed) return;
+		if (this.closed) {
+			await Promise.allSettled([...this.states.values()].flatMap((state) => (state.closing ? [state.closing] : [])));
+			return;
+		}
 		this.closed = true;
-		await Promise.allSettled(
-			[...this.states.values()].flatMap((state) => (state.client ? [state.client.close()] : [])),
-		);
-		for (const state of this.states.values()) state.status = "closed";
+		await Promise.allSettled([...this.states.values()].map((state) => this.shutdown(state)));
 	}
 }

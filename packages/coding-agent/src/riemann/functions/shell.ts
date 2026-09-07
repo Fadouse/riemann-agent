@@ -1,21 +1,21 @@
+import { isUtf8 } from "node:buffer";
 import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Type } from "typebox";
 import { signalProcessGroup, spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { getShellConfig } from "../../utils/shell.ts";
-import { graphemeSafePrefix } from "../../utils/text.ts";
 import { assertReadable, type FileAccessPolicy } from "../access-policy.ts";
 import { RiemannHostError } from "../errors.ts";
 import { resolveSandboxExecutable, type SandboxedCommand, sandboxedKernelCommand } from "../kernel/sandbox.ts";
 import type { JsonValue } from "../kernel/types.ts";
+import { utf8Prefix } from "../output.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
 import type { FunctionDefinition, FunctionUpdateCallback } from "./registry.ts";
 
 const MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
 const STREAM_UPDATE_INTERVAL_MS = 80;
 const MAX_STREAM_UPDATE_BYTES = 64 * 1024;
-const PREVIEW_TRUNCATION_MARKER = "[preview truncated; inspect artifact]";
 
 type StreamKind = "stdout" | "stderr";
 type ProcessTermination = "exited" | "timeout" | "cancelled" | "signal";
@@ -52,7 +52,10 @@ const ProcessResultSchema = Type.Object(
 		]),
 		stdout_truncated: Type.Boolean(),
 		stderr_truncated: Type.Boolean(),
-		artifact: Type.Union([ArtifactSchema, Type.Null()]),
+		stdout_capture_truncated: Type.Boolean(),
+		stderr_capture_truncated: Type.Boolean(),
+		stdout_artifact: Type.Union([ArtifactSchema, Type.Null()]),
+		stderr_artifact: Type.Union([ArtifactSchema, Type.Null()]),
 	},
 	{ additionalProperties: false },
 );
@@ -94,13 +97,13 @@ function appendCaptured(chunks: Buffer[], currentBytes: number, chunk: Buffer): 
 export class ShellFunctions {
 	private readonly policy: FileAccessPolicy;
 	private readonly artifacts: ArtifactStore;
-	private readonly previewChars: number;
+	private readonly previewBytes: number;
 	private readonly networkAllowed: boolean;
 
-	constructor(policy: FileAccessPolicy, artifacts: ArtifactStore, previewChars: number, networkAllowed: boolean) {
+	constructor(policy: FileAccessPolicy, artifacts: ArtifactStore, previewBytes: number, networkAllowed: boolean) {
 		this.policy = policy;
 		this.artifacts = artifacts;
-		this.previewChars = previewChars;
+		this.previewBytes = previewBytes;
 		this.networkAllowed = networkAllowed;
 	}
 
@@ -126,7 +129,6 @@ export class ShellFunctions {
 
 	private async run(
 		command: { executable: string; args: string[]; stdin?: string },
-		commandLine: string,
 		options: {
 			cwd: string;
 			env: Record<string, string>;
@@ -135,6 +137,8 @@ export class ShellFunctions {
 			onUpdate?: FunctionUpdateCallback;
 		},
 	): Promise<JsonValue> {
+		if (options.signal.aborted)
+			throw new RiemannHostError("cancelled", "Shell execution was cancelled before launch");
 		const started = Date.now();
 		const executable = resolveSandboxExecutable(
 			command.executable,
@@ -142,21 +146,28 @@ export class ShellFunctions {
 			options.env.PATH ?? process.env.PATH,
 		);
 		if (!executable) {
+			const stderr = `${command.executable}: command not found\n`;
+			const truncated = Buffer.byteLength(stderr) > this.previewBytes;
 			return {
 				$riemann: "process_result",
 				exit_code: 127,
 				stdout: "",
-				stderr: `${command.executable}: command not found\n`,
+				stderr: utf8Prefix(stderr, this.previewBytes),
 				duration_ms: Date.now() - started,
 				termination: "exited",
 				stdout_truncated: false,
-				stderr_truncated: false,
-				artifact: null,
+				stderr_truncated: truncated,
+				stdout_capture_truncated: false,
+				stderr_capture_truncated: false,
+				stdout_artifact: null,
+				stderr_artifact: truncated ? await this.artifacts.putText(stderr, { name: "stderr.txt" }) : null,
 			};
 		}
 		const sandboxDir = await mkdtemp(join(tmpdir(), "riemann-shell-"));
 		let launch: SandboxedCommand;
 		try {
+			if (options.signal.aborted)
+				throw new RiemannHostError("cancelled", "Shell execution was cancelled before launch");
 			launch = sandboxedKernelCommand(
 				{
 					policy: { ...this.policy, cwd: options.cwd },
@@ -274,45 +285,43 @@ export class ShellFunctions {
 		}
 		if (updateTimer) clearTimeout(updateTimer);
 		finishUpdates();
-		const stdoutText = Buffer.concat(stdout).toString("utf8");
-		const stderrText = Buffer.concat(stderr).toString("utf8");
+		const stdoutData = Buffer.concat(stdout);
+		const stderrData = Buffer.concat(stderr);
+		const stdoutText = stdoutData.toString("utf8");
+		const stderrText = stderrData.toString("utf8");
 		const stdoutCaptureTruncated = stdoutSeenBytes > stdoutBytes;
 		const stderrCaptureTruncated = stderrSeenBytes > stderrBytes;
-		const stdoutPreviewTruncated = stdoutText.length > this.previewChars;
-		const stderrPreviewTruncated = stderrText.length > this.previewChars;
-		const stdoutTruncated = stdoutCaptureTruncated || stdoutPreviewTruncated;
-		const stderrTruncated = stderrCaptureTruncated || stderrPreviewTruncated;
-		let artifact: JsonValue = null;
-		if (stdoutTruncated || stderrTruncated) {
-			const captureMarker = (truncated: boolean): string =>
-				truncated ? `\n[capture truncated at ${MAX_CAPTURE_BYTES} bytes]` : "";
-			artifact = await this.artifacts.putTextParts(
-				[
-					`$ ${commandLine}\n\n[stdout]\n`,
-					stdoutText,
-					captureMarker(stdoutCaptureTruncated),
-					"\n\n[stderr]\n",
-					stderrText,
-					captureMarker(stderrCaptureTruncated),
-				],
-				{ name: "process-output.txt" },
-			);
-		}
-		const preview = (text: string): string =>
-			text.length <= this.previewChars
-				? text
-				: `${graphemeSafePrefix(text, this.previewChars)}\n${PREVIEW_TRUNCATION_MARKER}`;
+		const stdoutTruncated = Buffer.byteLength(stdoutText) > this.previewBytes;
+		const stderrTruncated = Buffer.byteLength(stderrText) > this.previewBytes;
+		const stdoutArtifact =
+			stdoutTruncated || stdoutCaptureTruncated
+				? await this.artifacts.putStream(stdout, {
+						name: "stdout",
+						mimeType: isUtf8(stdoutData) ? "text/plain; charset=utf-8" : "application/octet-stream",
+					})
+				: null;
+		const stderrArtifact =
+			stderrTruncated || stderrCaptureTruncated
+				? await this.artifacts.putStream(stderr, {
+						name: "stderr",
+						mimeType: isUtf8(stderrData) ? "text/plain; charset=utf-8" : "application/octet-stream",
+					})
+				: null;
+
 		const termination: ProcessTermination = requestedTermination ?? (child.signalCode === null ? "exited" : "signal");
 		return {
 			$riemann: "process_result",
 			exit_code: exitCode,
-			stdout: preview(stdoutText),
-			stderr: preview(stderrText),
+			stdout: utf8Prefix(stdoutText, this.previewBytes),
+			stderr: utf8Prefix(stderrText, this.previewBytes),
 			duration_ms: Date.now() - started,
 			termination,
 			stdout_truncated: stdoutTruncated,
 			stderr_truncated: stderrTruncated,
-			artifact,
+			stdout_capture_truncated: stdoutCaptureTruncated,
+			stderr_capture_truncated: stderrCaptureTruncated,
+			stdout_artifact: stdoutArtifact,
+			stderr_artifact: stderrArtifact,
 		};
 	}
 
@@ -350,8 +359,23 @@ export class ShellFunctions {
 					{ additionalProperties: false },
 				),
 				outputSchema: ProcessResultSchema,
+				updateSchema: Type.Object(
+					{
+						sequence: Type.Integer({ minimum: 0 }),
+						kind: Type.Union([Type.Literal("stdout"), Type.Literal("stderr")]),
+						value: Type.String(),
+						truncated: Type.Boolean(),
+					},
+					{ additionalProperties: false },
+				),
 				pythonReturnType: "ProcessResult",
 				errors: [
+					{
+						code: "limit_exceeded",
+						description: "The run has exhausted its resource reference numbers.",
+						retryable: false,
+					},
+					{ code: "cancelled", description: "Cancelled before process launch.", retryable: false },
 					{
 						code: "invalid_arguments",
 						description: "The script or execution options are invalid.",
@@ -363,20 +387,27 @@ export class ShellFunctions {
 						retryable: false,
 					},
 				],
-				effects: [{ kind: "execute", resource: "sandboxed-process" }],
+				effects: [
+					{ kind: "execute", resource: "sandboxed-process" },
+					{ kind: "write", resource: "artifact-store" },
+				],
 				idempotency: "non-idempotent",
 				cancellation: {
 					supported: true,
-					description: "Aborting terminates the sandboxed process group and returns termination='cancelled'.",
+					description:
+						"Pre-cancelled calls do not launch. After launch, aborting terminates the process group and returns termination='cancelled'; prior side effects are not rolled back.",
 				},
 				visibility: "public",
 				prompt: {
 					inventory: "Run a shell script; pipes, redirection, and compound syntax are supported.",
-					example: "result = await shell.run(script='npm test 2>&1 | tail -40', timeout=300)",
+					example:
+						"result = await shell.run(script='pwd'); output.show(value=result, fields=['exit_code', 'stdout', 'stderr'])",
 					guidelines: ["Use shell.run for the target project's own builds, tests, and one-shot pipelines."],
 				},
 				capability: "shell.run",
 				handler: async (args, signal, onUpdate) => {
+					if (signal.aborted)
+						throw new RiemannHostError("cancelled", "Shell execution was cancelled before launch");
 					const script = requiredString(args, "script");
 					const cwd = await this.resolveCwd(args.cwd);
 					const environment = parseEnvironment(args.env);
@@ -389,7 +420,6 @@ export class ShellFunctions {
 							args: fromStdin ? shell.args : [...shell.args, script],
 							...(fromStdin ? { stdin: script } : {}),
 						},
-						script,
 						{ cwd, env: environment, timeoutSeconds, signal, onUpdate },
 					);
 				},

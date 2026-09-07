@@ -25,7 +25,13 @@ function createCompactionSettingsConfig(
 		riemann: {
 			maxAgents: 8,
 			maxConcurrentAgents: 4,
-			limits: { maxCellOutputChars: 100_000, maxArtifactPreviewChars: 12_000 },
+			limits: {
+				maxModelTextBytes: 16384,
+				maxPreviewBytes: 2048,
+				maxPreviewItems: 10,
+				maxPreviewDepth: 4,
+				maxPreviewNodes: 200,
+			},
 			retention: {
 				maxAgeDays: 30,
 				maxArtifactBytes: 1_073_741_824,
@@ -74,8 +80,11 @@ describe("SettingsSelectorComponent", () => {
 				maxAgents: 8,
 				maxConcurrentAgents: 4,
 				limits: {
-					maxCellOutputChars: 100_000,
-					maxArtifactPreviewChars: 12_000,
+					maxModelTextBytes: 16384,
+					maxPreviewBytes: 2048,
+					maxPreviewItems: 10,
+					maxPreviewDepth: 4,
+					maxPreviewNodes: 200,
 				},
 				retention: {
 					maxAgeDays: 30,
@@ -236,8 +245,11 @@ describe("SettingsSelectorComponent", () => {
 				maxAgents: 8,
 				maxConcurrentAgents: 4,
 				limits: {
-					maxCellOutputChars: 100_000,
-					maxArtifactPreviewChars: 12_000,
+					maxModelTextBytes: 16384,
+					maxPreviewBytes: 2048,
+					maxPreviewItems: 10,
+					maxPreviewDepth: 4,
+					maxPreviewNodes: 200,
 				},
 				retention: {
 					maxAgeDays: 30,

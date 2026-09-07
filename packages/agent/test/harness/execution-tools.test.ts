@@ -10,7 +10,7 @@ import {
 	prepareToolCall,
 } from "../../src/harness/execution/tools.ts";
 import type { AgentHarnessTool } from "../../src/harness/types.ts";
-import type { AgentToolCall, AgentToolResult } from "../../src/types.ts";
+import { type AgentToolCall, AgentToolExecutionError, type AgentToolResult } from "../../src/types.ts";
 
 const parameters = Type.Object({ value: Type.String() });
 
@@ -161,12 +161,58 @@ describe("tool execution primitives", () => {
 			},
 		],
 	])("converts %s tool throws to error output", async (_kind, execute) => {
-		const cleared = clearPrepared(prepareToolCall(call(), [tool({ execute })]));
-
-		const result = await executeToolCall(cleared, effectGate(), () => {}, undefined, invocation, BACKGROUND_CONTEXT);
-
-		expect(result.isError).toBe(true);
-		expect(text(result.result)).toBe("tool failed");
+		const failed: AgentToolResult<unknown> = {
+			content: [
+				{ type: "text", text: "partial output and repair" },
+				{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+			],
+			details: { code: "missing_await", repairCode: "await tools.echo()" },
+			usage: {
+				input: 1,
+				output: 2,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 3,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			addedToolNames: ["introduced"],
+			terminate: true,
+		};
+		for (const structured of [false, true]) {
+			const cleared = clearPrepared(
+				prepareToolCall(call(), [
+					tool({
+						execute: structured
+							? () => {
+									throw new AgentToolExecutionError(failed);
+								}
+							: execute,
+					}),
+				]),
+			);
+			const result = await executeToolCall(
+				cleared,
+				effectGate(),
+				() => {},
+				undefined,
+				invocation,
+				BACKGROUND_CONTEXT,
+			);
+			expect(result.isError).toBe(true);
+			if (structured) {
+				expect(result.result).toBe(failed);
+				expect(createToolResultMessage(finalizeToolCall(cleared, result, undefined))).toMatchObject({
+					content: failed.content,
+					details: failed.details,
+					usage: failed.usage,
+					addedToolNames: failed.addedToolNames,
+					isError: true,
+				});
+			} else {
+				expect(text(result.result)).toBe("tool failed");
+				expect(result.result.details).toBeUndefined();
+			}
+		}
 	});
 
 	it("lets abort-first gate refusal escape without invoking the tool", async () => {

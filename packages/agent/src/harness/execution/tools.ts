@@ -1,5 +1,5 @@
 import { type ToolResultMessage, validateToolArguments } from "@earendil-works/pi-ai";
-import type { AgentToolCall, AgentToolResult } from "../../types.ts";
+import { type AgentToolCall, AgentToolExecutionError, type AgentToolResult } from "../../types.ts";
 import { type Context, withAbortSignal } from "../context.ts";
 import type { JsonValue } from "../session/types.ts";
 import type { AgentHarnessTool, AgentHarnessToolInvocation, AgentHarnessToolUpdateCallback } from "../types.ts";
@@ -148,7 +148,10 @@ export function executeToolCall<TContext extends object | undefined>(
 			return { result, isError: false };
 		} catch (error) {
 			return {
-				result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+				result:
+					error instanceof AgentToolExecutionError
+						? error.result
+						: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 				isError: true,
 			};
 		} finally {

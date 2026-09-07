@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { BlockList, isIP } from "node:net";
 import { Readability } from "@mozilla/readability";
@@ -9,7 +10,9 @@ import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { graphemeSafePrefix } from "../../utils/text.ts";
 import { RiemannHostError } from "../errors.ts";
 import type { JsonValue } from "../kernel/types.ts";
+import { utf8Prefix } from "../output.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
+import { PageStore, pageSchema } from "../state/pages.ts";
 import type { FunctionDefinition } from "./registry.ts";
 
 const MAX_RESPONSE_BYTES = 20 * 1024 * 1024;
@@ -50,7 +53,7 @@ const ArtifactSchema = Type.Object(
 		size: Type.Integer({ minimum: 0 }),
 		name: Type.Union([Type.String(), Type.Null()]),
 	},
-	{ additionalProperties: false },
+	{ additionalProperties: false, $id: "Artifact" },
 );
 
 const SearchHitSchema = Type.Object(
@@ -59,9 +62,12 @@ const SearchHitSchema = Type.Object(
 		title: Type.String(),
 		url: Type.String(),
 		snippet: Type.String(),
+		snippet_truncated: Type.Boolean({
+			description: "Whether the local excerpt was shortened; no complete snippet artifact is retained",
+		}),
 		published_at: Type.Union([Type.String(), Type.Null()]),
 	},
-	{ additionalProperties: false },
+	{ additionalProperties: false, $id: "SearchHit" },
 );
 
 const DocumentSchema = Type.Object(
@@ -70,11 +76,13 @@ const DocumentSchema = Type.Object(
 		url: Type.String(),
 		title: Type.Union([Type.String(), Type.Null()]),
 		text: Type.String(),
+		text_truncated: Type.Boolean(),
+		artifact_kind: Type.Union([Type.Literal("raw"), Type.Literal("extracted"), Type.Literal("prefix"), Type.Null()]),
 		content_type: Type.String(),
 		artifact: Type.Union([ArtifactSchema, Type.Null()]),
 		trust: Type.Literal("untrusted"),
 	},
-	{ additionalProperties: false },
+	{ additionalProperties: false, $id: "Document" },
 );
 
 const ExaResponseSchema = Type.Object({
@@ -249,6 +257,7 @@ async function requestWithNormalizedErrors<T>(
 	timeoutMs: number,
 	request: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
+	if (callerSignal.aborted) throw new RiemannHostError("cancelled", `${operation} was cancelled`);
 	const timeoutSignal = AbortSignal.timeout(timeoutMs);
 	try {
 		const combinedSignal = AbortSignal.any([callerSignal, timeoutSignal]);
@@ -256,30 +265,33 @@ async function requestWithNormalizedErrors<T>(
 	} catch (error) {
 		if (error instanceof RiemannHostError) throw error;
 		if (callerSignal.aborted) throw new RiemannHostError("cancelled", `${operation} was cancelled`);
-		if (timeoutSignal.aborted) throw new RiemannHostError("timeout", `${operation} timed out`);
-		throw new RiemannHostError("network_error", `${operation} failed`);
+		if (timeoutSignal.aborted) throw new RiemannHostError("timeout", `${operation} timed out`, undefined, true);
+		throw new RiemannHostError("network_error", `${operation} failed`, undefined, true);
 	}
 }
 
 export class WebFunctions {
 	private readonly exaApiKey: string | undefined;
 	private readonly artifacts: ArtifactStore;
-	private readonly previewChars: number;
+	private readonly previewBytes: number;
 	private readonly resolveHostname: ResolveHostname;
 	private readonly dispatcher: Agent | undefined;
 	private readonly fetcher: Fetcher;
+	private readonly pages: PageStore;
 
 	constructor(
 		exaApiKey: string | undefined,
 		artifacts: ArtifactStore,
-		previewChars: number,
+		previewBytes: number,
 		resolveHostname: ResolveHostname = async (hostname) =>
 			(await lookup(hostname, { all: true, verbatim: true })).map(({ address }) => address),
 		fetcher?: Fetcher,
+		pages?: PageStore,
 	) {
+		this.pages = pages ?? new PageStore(artifacts, randomUUID());
 		this.exaApiKey = exaApiKey;
 		this.artifacts = artifacts;
-		this.previewChars = previewChars;
+		this.previewBytes = previewBytes;
 		this.resolveHostname = resolveHostname;
 		if (fetcher) {
 			this.fetcher = fetcher;
@@ -332,7 +344,9 @@ export class WebFunctions {
 	private async fetchPublic(url: URL, init: RequestInit, signal: AbortSignal): Promise<Response> {
 		let current = url;
 		for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
+			signal.throwIfAborted();
 			await this.assertPublicDestination(current);
+			signal.throwIfAborted();
 			const response = await this.fetcher(current, { ...init, redirect: "manual", signal });
 			if (![301, 302, 303, 307, 308].includes(response.status)) return response;
 			const location = response.headers.get("location");
@@ -361,7 +375,7 @@ export class WebFunctions {
 							pattern: ".*\\S.*",
 							description: "Search query",
 						}),
-						limit: Type.Optional(
+						max_items: Type.Optional(
 							Type.Union([Type.Integer({ minimum: 1, maximum: 30 }), Type.Null()], {
 								description: "Result count from 1 to 30",
 								default: 10,
@@ -391,9 +405,20 @@ export class WebFunctions {
 					},
 					{ additionalProperties: false },
 				),
-				outputSchema: Type.Array(SearchHitSchema),
-				pythonReturnType: "list[SearchHit]",
+				outputSchema: pageSchema(SearchHitSchema),
+				pythonReturnType: "Page[SearchHit]",
 				errors: [
+					{
+						code: "limit_exceeded",
+						description: "The run has exhausted its resource reference numbers.",
+						retryable: false,
+					},
+					{
+						code: "response_too_large",
+						description: "The search response or retained snapshot exceeds its byte limit.",
+						retryable: false,
+					},
+					{ code: "artifact_error", description: "The result snapshot artifact is invalid.", retryable: false },
 					{
 						code: "invalid_arguments",
 						description: "The query or search filters are invalid.",
@@ -411,8 +436,8 @@ export class WebFunctions {
 					},
 					{
 						code: "provider_error",
-						description: "Exa returned an HTTP or response-shape error.",
-						retryable: true,
+						description: "Exa returned an HTTP or response-shape error; only HTTP 429 and 5xx permit retry.",
+						retryable: false,
 					},
 					{
 						code: "timeout",
@@ -425,7 +450,10 @@ export class WebFunctions {
 						retryable: false,
 					},
 				],
-				effects: [{ kind: "read", resource: "external-network" }],
+				effects: [
+					{ kind: "read", resource: "external-network" },
+					{ kind: "write", resource: "artifact-store" },
+				],
 				idempotency: "idempotent",
 				cancellation: {
 					supported: true,
@@ -434,10 +462,12 @@ export class WebFunctions {
 				visibility: "public",
 				prompt: {
 					inventory: "Search the current web with excerpts and source URLs.",
-					example: "hits = await web.search(query='Node.js sqlite DatabaseSync documentation', limit=5)",
+					example:
+						"hits = await web.search(query='Node.js sqlite DatabaseSync documentation', max_items=5); output.show(value=hits)",
 				},
 				capability: "web.search",
 				handler: async (args, signal) => {
+					if (signal.aborted) throw new RiemannHostError("cancelled", "Web request was cancelled");
 					const exaApiKey = this.exaApiKey;
 					if (!exaApiKey)
 						throw new RiemannHostError(
@@ -445,9 +475,9 @@ export class WebFunctions {
 							`Exa is not configured. Set web.exaApiKey in ~/.riemann/agent/config.yaml, preferably as \${EXA_API_KEY}.`,
 						);
 					const query = requiredString(args, "query");
-					const limit = args.limit === undefined || args.limit === null ? 10 : args.limit;
+					const limit = args.max_items === undefined || args.max_items === null ? 10 : args.max_items;
 					if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 30) {
-						throw new RiemannHostError("invalid_arguments", "limit must be an integer from 1 to 30");
+						throw new RiemannHostError("invalid_arguments", "max_items must be an integer from 1 to 30");
 					}
 					const domains = normalizeDomains(args.domains);
 					const since = normalizeSince(args.since);
@@ -475,6 +505,13 @@ export class WebFunctions {
 							throw new RiemannHostError(
 								"provider_error",
 								`Exa search failed with HTTP ${response.status}: ${responseError(responseBody)}`,
+								{ status: response.status },
+								response.status === 429 || response.status >= 500,
+								response.status === 429 || response.status >= 500
+									? "retry"
+									: response.status === 401 || response.status === 403
+										? "reauthorize"
+										: "fix_arguments",
 							);
 						}
 						return responseBody;
@@ -488,13 +525,20 @@ export class WebFunctions {
 					if (!Value.Check(ExaResponseSchema, parsed))
 						throw new RiemannHostError("provider_error", "Exa response has an invalid result shape");
 					const result = parsed as ExaResponse;
-					return result.results.slice(0, limit).map((item) => ({
-						$riemann: "search_hit",
-						title: item.title ?? item.url,
-						url: normalizeProviderUrl(item.url),
-						snippet: graphemeSafePrefix(item.highlights?.join("\n\n") || item.text || "", 1_200),
-						published_at: item.publishedDate ?? null,
-					}));
+					const items = result.results.map((item) => {
+						const source = item.highlights?.join("\n\n") || item.text || "";
+						const sourceBytes = Buffer.byteLength(source);
+						const maximum = Math.min(1_200, this.previewBytes);
+						return {
+							$riemann: "search_hit",
+							title: item.title ?? item.url,
+							url: normalizeProviderUrl(item.url),
+							snippet: utf8Prefix(source, maximum),
+							snippet_truncated: sourceBytes > maximum,
+							published_at: item.publishedDate ?? null,
+						};
+					});
+					return this.pages.create("web.search", items, { limit, coverage: "unknown" });
 				},
 			},
 			{
@@ -509,6 +553,16 @@ export class WebFunctions {
 				outputSchema: DocumentSchema,
 				pythonReturnType: "Document",
 				errors: [
+					{
+						code: "limit_exceeded",
+						description: "The run has exhausted its resource reference numbers.",
+						retryable: false,
+					},
+					{
+						code: "permission_denied",
+						description: "The URL or redirect resolves to a non-public address.",
+						retryable: false,
+					},
 					{
 						code: "invalid_arguments",
 						description: "The URL is invalid or is not HTTP(S).",
@@ -547,10 +601,11 @@ export class WebFunctions {
 				visibility: "public",
 				prompt: {
 					inventory: "Fetch an HTTP(S) resource; large and binary bodies become durable artifacts.",
-					example: "document = await web.fetch(url='https://example.com')",
+					example: "document = await web.fetch(url='https://example.com'); output.show(value=document)",
 				},
 				capability: "web.fetch",
 				handler: async (args, signal) => {
+					if (signal.aborted) throw new RiemannHostError("cancelled", "Web request was cancelled");
 					const url = parseUrl(requiredString(args, "url"));
 					const { response, data } = await requestWithNormalizedErrors(
 						"Fetch",
@@ -571,6 +626,13 @@ export class WebFunctions {
 								throw new RiemannHostError(
 									"network_error",
 									`Fetch failed with HTTP ${fetched.status} ${fetched.statusText}`.trim(),
+									{ status: fetched.status },
+									fetched.status === 429 || fetched.status >= 500,
+									fetched.status === 429 || fetched.status >= 500
+										? "retry"
+										: fetched.status === 401 || fetched.status === 403
+											? "reauthorize"
+											: "fix_arguments",
 								);
 							}
 							const contentLength = Number(fetched.headers.get("content-length"));
@@ -600,13 +662,15 @@ export class WebFunctions {
 					if (source === undefined) {
 						const artifact = await this.artifacts.putBuffer(data, {
 							name: "web-fetch.bin",
-							mimeType: contentType,
+							mimeType: isTextContentType(contentType) ? "application/octet-stream" : contentType,
 						});
 						return {
 							$riemann: "document",
 							url: finalUrl,
 							title: null,
 							text: "",
+							text_truncated: false,
+							artifact_kind: "raw",
 							content_type: contentType,
 							artifact,
 							trust: "untrusted",
@@ -615,21 +679,20 @@ export class WebFunctions {
 					const extracted = contentType.includes("html")
 						? readableHtml(source, finalUrl)
 						: { title: null, text: source.replace(/\u0000/g, "").trim() };
-					const artifact =
-						extracted.text.length > this.previewChars
-							? await this.artifacts.putText(extracted.text, {
-									name: "web-fetch.txt",
-									mimeType: "text/plain; charset=utf-8",
-								})
-							: null;
+					const textTruncated = Buffer.byteLength(extracted.text) > this.previewBytes;
+					const artifact = textTruncated
+						? await this.artifacts.putText(extracted.text, {
+								name: "web-fetch.txt",
+								mimeType: "text/plain; charset=utf-8",
+							})
+						: null;
 					return {
 						$riemann: "document",
 						url: finalUrl,
 						title: extracted.title,
-						text:
-							extracted.text.length > this.previewChars
-								? `${graphemeSafePrefix(extracted.text, this.previewChars)}\n[preview truncated; inspect artifact]`
-								: extracted.text,
+						text: utf8Prefix(extracted.text, this.previewBytes),
+						text_truncated: textTruncated,
+						artifact_kind: artifact ? "extracted" : null,
 						content_type: contentType,
 						artifact,
 						trust: "untrusted",

@@ -4,12 +4,18 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { Type } from "typebox";
 import { afterAll, describe, expect, test } from "vitest";
 import { FULL_FILESYSTEM, fileAccessPolicy } from "../src/riemann/access-policy.ts";
+import { ShellFunctions } from "../src/riemann/functions/shell.ts";
+import { WebFunctions } from "../src/riemann/functions/web.ts";
 import { IPythonKernelManager } from "../src/riemann/kernel/manager.ts";
 import type { JsonValue, JupyterMessage, KernelSandboxConfiguration } from "../src/riemann/kernel/types.ts";
-import { encodeJupyterMessage } from "../src/riemann/kernel/wire.ts";
+import { decodeJupyterMessage, encodeJupyterMessage } from "../src/riemann/kernel/wire.ts";
 import { ensureManagedPython } from "../src/riemann/python/runtime.ts";
+import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
+import { pageSchema } from "../src/riemann/state/pages.ts";
+import { RiemannStore } from "../src/riemann/state/store.ts";
 
 const roots: string[] = [];
 
@@ -93,7 +99,104 @@ async function createKernel(
 		required: [],
 		additionalProperties: false,
 	};
+	const contractStore = new RiemannStore(join(root, "contract-state"));
+	const contractRun = contractStore.openRun("kernel-contract", root);
+	const artifacts = new ArtifactStore(contractStore, contractRun.id);
+	const shell = new ShellFunctions(fileAccessPolicy(root, FULL_FILESYSTEM), artifacts, 2048, false);
+	const web = new WebFunctions(undefined, artifacts, 2048);
+	const resultSpecifications = [...shell.definitions(), ...web.definitions()].map((definition) => ({
+		name: definition.name,
+		namespace: definition.namespace,
+		qualified_name: `${definition.namespace}.${definition.name}`,
+		description: definition.description,
+		input_schema: definition.inputSchema,
+		output_schema: definition.outputSchema,
+		return_type: definition.pythonReturnType,
+		visibility: "handle-method",
+	}));
+	await web.close();
+	contractStore.close();
+	const agentSchema = Type.Object(
+		Object.fromEntries(
+			Object.keys(testAgentWire(TEST_AGENTS[0])).map((key) => [
+				key,
+				key === "$riemann" ? Type.Literal("agent_info") : Type.Unknown(),
+			]),
+		),
+		{ additionalProperties: false },
+	);
+	const resultSchema = Type.Object(
+		Object.fromEntries(
+			Object.keys(testAgentResultWire(TEST_AGENTS[0], "turn")).map((key) => [
+				key,
+				key === "$riemann" ? Type.Literal("agent_result") : Type.Unknown(),
+			]),
+		),
+		{ additionalProperties: false },
+	);
+	const handleSchema = Type.Object(
+		{
+			$riemann: Type.Literal("agent_turn_handle"),
+			id: Type.String(),
+			name: Type.String(),
+			turn_id: Type.String(),
+			status: Type.String(),
+		},
+		{ additionalProperties: false },
+	);
 	const specifications = JSON.stringify([
+		...resultSpecifications,
+		{
+			name: "show",
+			namespace: "output",
+			qualified_name: "output.show",
+			description: "Display selected fields; max_items bounds collection entries, not text bytes.",
+			input_schema: Type.Object(
+				{
+					value: Type.Unknown(),
+					fields: Type.Optional(Type.Union([Type.Array(Type.String()), Type.Null()], { default: null })),
+					max_items: Type.Optional(
+						Type.Integer({
+							minimum: 1,
+							maximum: 15,
+							default: 10,
+							description: "Maximum collection entries displayed; use output.more for retained entries.",
+						}),
+					),
+				},
+				{ additionalProperties: false },
+			),
+			output_schema: Type.Null(),
+			return_type: "None",
+			visibility: "public",
+		},
+		{
+			name: "get",
+			namespace: "artifacts",
+			qualified_name: "artifacts.get",
+			description: "Read artifact bytes.",
+			input_schema: Type.Object(
+				{
+					handle: Type.String(),
+					offset_bytes: Type.Optional(Type.Integer({ minimum: 0, default: 0 })),
+					max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 131072, default: 65536 })),
+				},
+				{ additionalProperties: false },
+			),
+			output_schema: Type.Null(),
+			return_type: "None",
+			visibility: "handle-method",
+		},
+		{
+			name: "next",
+			namespace: "pages",
+			qualified_name: "pages.next",
+			description: "Generic continuation",
+			input_schema: Type.Object({ cursor: Type.String() }, { additionalProperties: false }),
+			output_schema: pageSchema(Type.Unknown()),
+			return_type: "Page[unknown]",
+			visibility: "handle-method",
+		},
 		{
 			name: "echo",
 			namespace: "testing",
@@ -106,6 +209,7 @@ async function createKernel(
 				additionalProperties: false,
 			},
 			return_type: "object",
+			output_schema: {},
 		},
 		{
 			name: "optional_echo",
@@ -119,6 +223,7 @@ async function createKernel(
 				additionalProperties: false,
 			},
 			return_type: "dict",
+			output_schema: { type: "object", additionalProperties: true },
 		},
 		{
 			name: "block",
@@ -127,6 +232,7 @@ async function createKernel(
 			description: "Wait until the host request is cancelled.",
 			input_schema: noArguments,
 			return_type: "None",
+			output_schema: { type: "null" },
 		},
 		{
 			name: "invalid_agent",
@@ -135,6 +241,7 @@ async function createKernel(
 			description: "Return an incompatible AgentInfo payload.",
 			input_schema: noArguments,
 			return_type: "AgentInfo",
+			output_schema: agentSchema,
 		},
 		{
 			name: "list",
@@ -143,7 +250,40 @@ async function createKernel(
 			description: "Return reusable AgentInfo payloads.",
 			input_schema: noArguments,
 			return_type: "list[AgentInfo]",
+			output_schema: Type.Array(agentSchema),
 		},
+		...["info", "wait", "steer", "stop", "release"].map((name) => ({
+			name,
+			namespace: "agents",
+			qualified_name: `agents.${name}`,
+			description: "Agent handle method",
+			input_schema: Type.Object(
+				{
+					agent_id: Type.String(),
+					turn_id: Type.Optional(Type.String()),
+					message: Type.Optional(Type.String()),
+					timeout: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+				},
+				{ additionalProperties: false },
+			),
+			visibility: "handle-method",
+			output_schema:
+				name === "info"
+					? agentSchema
+					: name === "steer"
+						? handleSchema
+						: name === "release"
+							? Type.Null()
+							: resultSchema,
+			return_type:
+				name === "info"
+					? "AgentInfo"
+					: name === "steer"
+						? "AgentTurnHandle"
+						: name === "release"
+							? "None"
+							: "AgentResult",
+		})),
 	]);
 	return new IPythonKernelManager({
 		python,
@@ -155,6 +295,7 @@ async function createKernel(
 		snapshotPath,
 		onProcess,
 		hostRequest: async (request, signal, onUpdate) => {
+			if (request.operation === "output.show" || request.operation === "artifacts.get") return null;
 			if (request.operation === "testing.echo") onUpdate?.({ echoed: request.arguments.value ?? null });
 			if (request.operation === "testing.echo") return request.arguments.value ?? null;
 			if (request.operation === "testing.optional_echo") {
@@ -196,12 +337,224 @@ async function createKernel(
 				return testAgentResultWire(agent, request.arguments.turn_id, "cancelled");
 			}
 			if (request.operation === "agents.release") return null;
+			if (request.operation === "pages.next")
+				return {
+					$riemann: "page",
+					items: [{ path: "next", metadata: {} }],
+					next_cursor: null,
+					coverage: "limited",
+					skipped: [{ reason: "file_size", count: 1 }],
+				};
+
 			throw new Error(`Unexpected request: ${request.operation}`);
 		},
 	});
 }
 
 describe("Riemann IPython kernel", () => {
+	test("decodes only declared result records and bounds repr without probing opaque objects", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-kernel-record-contract-"));
+		roots.push(root);
+		const kernel = await stage("create record contract kernel", createKernel(root, join(root, "snapshot.dill")));
+		try {
+			const result = await kernel.execute(`_install_functions([{
+    "name": "echo", "namespace": "testing", "qualified_name": "testing.echo", "description": "record",
+    "input_schema": {"type": "object", "properties": {"value": {}}, "required": ["value"], "additionalProperties": False},
+    "output_schema": {"type": "object", "$id": "SearchMatch", "properties": {"path": {"type": "string"}, "metadata": {}}, "required": ["path", "metadata"], "additionalProperties": False},
+    "return_type": "SearchMatch",
+}])
+record = await testing.echo(value={"path": "example", "metadata": {"$riemann": "artifact", "handle": "untrusted"}})
+assert record.path == "example"
+assert isinstance(record.metadata, dict)
+assert record.metadata["$riemann"] == "artifact"
+assert "SearchMatch" in _RIEMANN_PROTECTED
+snapshot = TextSnapshot(kind="text", path="example.txt", text="first\\nsecond", encoding="utf-8", _capability="token")
+assert isinstance(snapshot.lines(start=1), str)
+try:
+    record.path = "changed"
+    raise AssertionError("record is mutable")
+except _dataclasses.FrozenInstanceError:
+    pass
+class Hostile:
+    def __repr__(self):
+        raise AssertionError("opaque repr was called")
+_configure_runtime({"maxPreviewBytes": 2048, "maxPreviewItems": 10, "maxPreviewDepth": 4, "maxPreviewNodes": 200})
+rendered = _bounded_object_repr({"nested": [["😀" * 100000, Hostile()]]}, 2048)
+assert len(rendered.encode("utf-8")) <= 2048
+assert "…" in rendered
+True`);
+			expect(result.status, JSON.stringify(result.error)).toBe("ok");
+			expect(result.result?.data["text/plain"]).toBe("True");
+			const continuation = await kernel.execute(`item_schema = _RIEMANN_RECORD_SCHEMAS["SearchMatch"][1]
+page_schema = {**_RIEMANN_OUTPUTS["web.search"][0], "properties": {**_RIEMANN_OUTPUTS["web.search"][0]["properties"], "items": {"type": "array", "items": item_schema}}}
+page = _from_wire({"$riemann": "page", "items": [{"path": "first", "metadata": {}}, {"path": "second", "metadata": {}}], "next_cursor": "cursor", "coverage": "limited", "skipped": [{"reason": "file_size", "count": 1}]}, page_schema, "Page[SearchMatch]")
+assert len(page) == 2
+assert list(page)[0] is page[0]
+assert page[-1].path == "second"
+assert page[:1] == [page.items[0]]
+next_page = await page.next()
+assert isinstance(next_page.items[0], SearchMatch)
+assert next_page.items[0].path == "next"
+assert next_page.skipped[0].reason == "file_size"
+try:
+    await next_page.next()
+    raise AssertionError("expected exhausted page error")
+except RiemannError as error:
+    assert error.code == "invalid_arguments"
+    assert error.recovery == "fix_arguments"
+projected = _project_show(page, fields=["path"])
+assert projected == {"$riemann": "page", "items": [{"path": "first"}, {"path": "second"}], "next_cursor": "cursor", "coverage": "limited", "skipped": [{"reason": "file_size", "count": 1}]}
+assert _project_show({"numbers": [1, 2]}) == {"numbers": [1, 2]}
+assert len(page.items) == 2
+assert not hasattr(page, "show")
+complete_page = Page(items=["x" * 100000], next_cursor=None, coverage="complete", skipped=[])
+assert "coverage='complete'" in repr(complete_page)
+assert "next_cursor=None" in repr(complete_page)
+process_result = ProcessResult(exit_code=0, stdout="", stderr="", duration_ms=1, termination="exited", stdout_truncated=False, stderr_truncated=False, stdout_capture_truncated=False, stderr_capture_truncated=False, stdout_artifact=None, stderr_artifact=Artifact(handle="artifact://recover", mime_type="text/plain", size=1))
+assert "artifact://recover" in repr(process_result)
+binary = ArtifactSlice(kind="binary", handle="artifact://binary", mime_type="application/octet-stream", size=3, offset=0, next_offset=3, eof=True, base64="AP9B")
+assert binary.data == bytes([0, 255, 65])
+assert _project_show(binary, fields=["data"]) == {"data": "<3 bytes>"}
+assert "base64" not in _project_show(binary)
+assert "AP9B" not in repr(binary)
+assert _to_wire(Artifact(handle="artifact://x", mime_type="text/plain", size=1)) == {"$riemann": "artifact_ref", "handle": "artifact://x"}
+state_schema = {"type": "object", "$id": "ContractState", "properties": {"network": {"type": "object", "properties": {"effective": {"type": "string"}}, "required": ["effective"], "additionalProperties": False}, "remote_schema": {}}, "required": ["network", "remote_schema"], "additionalProperties": False}
+state_record = _from_wire({"network": {"effective": "allow"}, "remote_schema": {"type": "object"}}, state_schema, "ContractState")
+assert state_record.network.effective == "allow"
+assert isinstance(state_record.remote_schema, dict)
+assert "ContractStateNetwork" in _RIEMANN_PROTECTED
+assert SearchMatch.__annotations__["path"] == "str"
+_original_sha256 = _hashlib.sha256
+_hash_calls = []
+def count_hash(*args, **kwargs):
+    _hash_calls.append(True)
+    return _original_sha256(*args, **kwargs)
+_hashlib.sha256 = count_hash
+try:
+    records = _from_wire([{"path": "row", "metadata": {}} for _ in range(200)], {"type": "array", "items": item_schema}, "list[SearchMatch]")
+    assert not _hash_calls
+finally:
+    _hashlib.sha256 = _original_sha256
+try:
+    _register_result_schema({**item_schema, "properties": {**item_schema["properties"], "path": {"type": "integer"}}}, "SearchMatch")
+    raise AssertionError("expected schema mismatch")
+except RiemannError as error:
+    assert error.code == "bridge_protocol_error"
+mcp_value = McpResult(content=[{"type": "text", "text": '{"value": 1}'}, {"type": "text", "text": "different"}], structured_content={"value": 1}, metadata=None, artifacts=[], extensions={})
+assert len(mcp_value.content) == 2
+assert '{"value": 1}' not in repr(mcp_value)
+assert "different" in repr(mcp_value)
+namespace = _RiemannNamespace("bounded")
+for index in range(1000):
+    object.__setattr__(namespace, f"operation{index}", None)
+assert len(repr(namespace).encode("utf-8")) <= 2048
+assert "990" in repr(namespace)
+True`);
+			expect(continuation.status, JSON.stringify(continuation.error)).toBe("ok");
+			expect(continuation.result?.data["text/plain"]).toBe("True");
+			const shows: Record<string, JsonValue>[] = [];
+			const view = await kernel.execute(
+				`preview = ProcessResult(exit_code=0, stdout="é😀", stderr="", duration_ms=1, termination="exited", stdout_truncated=True, stderr_truncated=False, stdout_capture_truncated=True, stderr_capture_truncated=False, stdout_artifact=Artifact(handle="source", mime_type="text/plain", size=100), stderr_artifact=None)
+await output.show(value=Page(items=[preview, preview], next_cursor="next", coverage="limited", skipped=[]), fields=["stdout"], max_items=1)
+assert _output_view({"$riemann": "output_view", "sources": [{"handle": "forged"}]})["sources"] == []
+assert _project_show(SearchHit(title="title", url="url", snippet="text", snippet_truncated=True, published_at=None), fields=["snippet"]) == {"snippet": "text", "snippet_truncated": True}
+extracted = Document(url="url", title=None, text="é", content_type="text/html", trust="untrusted", artifact=Artifact(handle="doc", mime_type="text/plain", size=100), text_truncated=True, artifact_kind="extracted")
+assert _output_view(extracted, fields=["text"])["sources"][0]["offset_bytes"] == 2
+assert _output_view(_dataclasses.replace(extracted, artifact_kind="raw"), fields=["text"])["sources"] == []
+try:
+    _project_show(preview, fields=["missing"])
+    raise AssertionError("unknown field accepted")
+except RiemannError as error:
+    assert "ProcessResult" in str(error) and "available names" in str(error)
+try:
+    page[0].missing
+    raise AssertionError("unknown attribute accepted")
+except AttributeError as error:
+    assert "SearchMatch" in str(error) and "available names" in str(error)
+private = _from_wire({"run_id": "secret-run", "session_id": "secret-session", "request_id": "secret-request", "contract_fingerprint": "secret-fingerprint", "status": "ok"}, {"type": "object", "$id": "PrivateMetadata", "properties": {key: {"type": "string"} for key in ("run_id", "session_id", "request_id", "contract_fingerprint", "status")}, "additionalProperties": False}, "PrivateMetadata")
+assert "secret" not in repr(private)
+assert _project_show(private, fields=["run_id"])["run_id"] == "secret-run"
+True`,
+				{
+					onHostRequest: (event) => {
+						if (event.phase === "start" && event.request.operation === "output.show")
+							shows.push(event.request.arguments);
+					},
+				},
+			);
+			expect(view.status, JSON.stringify(view.error)).toBe("ok");
+			expect(shows).toEqual([
+				{
+					max_items: 1,
+					value: {
+						$riemann: "output_view",
+						value: {
+							$riemann: "page",
+							items: [
+								{ stdout: "é😀", stdout_truncated: true, stdout_capture_truncated: true },
+								{ stdout: "é😀", stdout_truncated: true, stdout_capture_truncated: true },
+							],
+							next_cursor: "next",
+							coverage: "limited",
+							skipped: [],
+						},
+						sources: [
+							{ path: ["items", "0", "stdout"], handle: "source", offset_bytes: 6, capture_truncated: true },
+							{ path: ["items", "1", "stdout"], handle: "source", offset_bytes: 6, capture_truncated: true },
+						],
+					},
+				},
+			]);
+
+			const cleanup = await kernel.execute(`_original_create_comm = _create_comm
+class TestComm:
+    def __init__(self):
+        self.closed = 0
+    def on_msg(self, callback):
+        self.callback = callback
+    def on_close(self, callback):
+        pass
+    def open(self, *, data):
+        pass
+    def close(self):
+        self.closed += 1
+_test_comm = TestComm()
+_create_comm = lambda **kwargs: _test_comm
+try:
+    pending = _asyncio.create_task(_riemann_call("testing.block", {}))
+    await _asyncio.sleep(0)
+    pending.cancel()
+    try:
+        await pending
+    except _asyncio.CancelledError:
+        pass
+    assert _test_comm.closed == 1
+finally:
+    _create_comm = _original_create_comm
+class ErrorComm(TestComm):
+    def open(self, *, data):
+        self.callback({"content": {"data": {"operation": data["operation"], "request_id": data["request_id"], "status": "error", "error": {"code": "conflict", "message": "changed", "retryable": False, "recovery": "refresh", "details": {"large": "x" * 100000}}}}})
+_error_comm = ErrorComm()
+_create_comm = lambda **kwargs: _error_comm
+try:
+    try:
+        await _riemann_call("testing.error", {})
+        raise AssertionError("expected structured error")
+    except ConflictError as error:
+        assert error.recovery == "refresh"
+        assert "testing.error [conflict]: changed (recovery=refresh)" == str(error)
+        assert "large" not in repr(error)
+        assert len(repr(error).encode("utf-8")) <= 2048
+finally:
+    _create_comm = _original_create_comm
+True`);
+			expect(cleanup.status, JSON.stringify(cleanup.error)).toBe("ok");
+			expect(cleanup.result?.data["text/plain"]).toBe("True");
+		} finally {
+			await kernel.close();
+		}
+	}, 30_000);
+
 	test("rejects values that cannot cross strict Jupyter JSON frames", () => {
 		const encode = (value: unknown) =>
 			encodeJupyterMessage({
@@ -220,6 +573,113 @@ describe("Riemann IPython kernel", () => {
 		const symbolKey = { [Symbol("invalid")]: true };
 		expect(() => encode(symbolKey)).toThrowError(/non-string dict key/);
 	});
+
+	test.each(["execute_result", "display_data"])(
+		"preserves structured errors from %s without executing repair code",
+		async (messageType) => {
+			let hostCalls = 0;
+			const kernel = new IPythonKernelManager({
+				python: "python",
+				cwd: process.cwd(),
+				sessionId: "structured-error",
+				bootstrapCode: "",
+				sandbox: false,
+				maxOutputChars: 5,
+				hostRequest: async () => {
+					hostCalls += 1;
+					return null;
+				},
+			});
+			const internals = kernel as unknown as {
+				shell: { send(frames: Buffer[]): Promise<void> };
+				connection: { key: string };
+				handleMessage(channel: "shell" | "iopub", message: JupyterMessage): void;
+			};
+			let requestId = "";
+			internals.connection = { key: "secret" };
+			internals.shell = {
+				send: async (frames) => {
+					requestId = decodeJupyterMessage(frames, "secret")?.header.msg_id ?? "";
+				},
+			};
+			const pending = kernel.execute("print('abc'); testing.echo(value=1)", { internal: true });
+			const receive = (type: string, content: Record<string, JsonValue>) => {
+				const encoded = encodeJupyterMessage({
+					type,
+					content,
+					parentHeader: { msg_id: requestId },
+					session: "structured-error",
+					username: "test",
+					key: "secret",
+				});
+				const message = decodeJupyterMessage(encoded.frames, "secret");
+				if (!message) throw new Error("Invalid test message");
+				internals.handleMessage(type === "execute_reply" ? "shell" : "iopub", message);
+			};
+			receive("stream", { name: "stdout", text: "abc" });
+			receive("display_data", { data: { "text/plain": "partial activity" }, metadata: {} });
+			const payload: Record<string, JsonValue> =
+				messageType === "execute_result"
+					? {
+							code: "missing_await",
+							operation: "testing.echo",
+							message: "Await the tool call",
+							repair_code: "await testing.echo(value=1)",
+						}
+					: {
+							code: "invalid_arguments",
+							operation: "testing.echo",
+							message: "Invalid arguments",
+							request_id: "request",
+							retryable: false,
+							recovery: "fix_arguments",
+							details: { errors: [{ path: "/value", message: "Expected string" }] },
+						};
+			receive(messageType, {
+				data: { "application/vnd.riemann.error+json": payload },
+				metadata: {},
+				execution_count: 1,
+			});
+			if (messageType === "display_data")
+				receive("error", {
+					ename: "RiemannError",
+					evalue: "short validation message",
+					traceback: ["full traceback"],
+				});
+			receive(
+				"execute_reply",
+				messageType === "execute_result"
+					? { status: "ok" }
+					: {
+							status: "error",
+							ename: "RiemannError",
+							evalue: "short validation message",
+							traceback: ["full traceback"],
+						},
+			);
+			receive("status", { execution_state: "idle" });
+			const result = await pending;
+			expect(result.status).toBe("error");
+			expect(result.stdout).toBe("abc");
+			expect(result.displays).toHaveLength(1);
+			expect(result.error).toMatchObject({ code: payload.code, operation: payload.operation });
+			if (messageType === "execute_result")
+				expect(result.error).toMatchObject({
+					repairCode: "await testing.echo(value=1)",
+					evalue: "Await the tool call",
+					traceback: [],
+				});
+			else
+				expect(result.error).toMatchObject({
+					requestId: "request",
+					retryable: false,
+					recovery: "fix_arguments",
+					details: payload.details,
+					traceback: ["full traceback"],
+				});
+			expect(hostCalls).toBe(0);
+		},
+	);
 
 	test("stops rewriting stream buffers after preserving capped output", () => {
 		const kernel = new IPythonKernelManager({
@@ -467,6 +927,64 @@ _test_dill.dump = _test_flaky_dump`),
 			);
 			expect(result.status).toBe("ok");
 			expect(phases).toEqual(["start", "update:7", "end"]);
+			const invoked: string[] = [];
+			const executeObserved = (code: string) =>
+				kernel.execute(code, {
+					onHostRequest: (event) => {
+						if (event.phase === "start") invoked.push(event.request.operation);
+					},
+				});
+			const bare = await executeObserved(
+				"parameter_evaluations = []\ntesting.echo(value=(parameter_evaluations.append('first') or 99))",
+			);
+			expect(bare.error).toMatchObject({ code: "unawaited_operation", operation: "testing.echo" });
+			expect(bare.error?.evalue).not.toContain("0x");
+			const firstRepair = bare.error?.repairCode;
+			const second = await executeObserved(
+				"testing.optional_echo(value=(parameter_evaluations.append('second') or 202))",
+			);
+			expect(second.error).toMatchObject({ code: "unawaited_operation", operation: "testing.optional_echo" });
+			const secondRepair = second.error?.repairCode;
+			if (typeof firstRepair !== "string" || typeof secondRepair !== "string")
+				throw new Error("Missing coroutine repair code");
+			expect(bare.error?.evalue).not.toContain(firstRepair);
+			expect(second.error?.evalue).not.toContain(secondRepair);
+			expect(invoked).toEqual([]);
+			const repaired = await executeObserved(`${firstRepair}\n(result, parameter_evaluations)`);
+			expect(repaired.status, JSON.stringify(repaired.error)).toBe("ok");
+			expect(invoked).toEqual(["testing.echo"]);
+			expect(repaired.result?.data["text/plain"]).toBe("(99, ['first', 'second'])");
+			expect(secondRepair).not.toBe(firstRepair);
+			const repeated = await executeObserved(firstRepair);
+			expect(repeated.status).toBe("error");
+			expect(invoked).toEqual(["testing.echo"]);
+			const secondResult = await executeObserved(`${secondRepair}\n(result, parameter_evaluations)`);
+			expect(secondResult.status, JSON.stringify(secondResult.error)).toBe("ok");
+			expect(invoked).toEqual(["testing.echo", "testing.optional_echo"]);
+			expect(secondResult.result?.data["text/plain"]).toBe(
+				"({'has_value': True, 'value': 202}, ['first', 'second'])",
+			);
+			const parallel = await kernel.execute(
+				"await _asyncio.gather(testing.echo(value=1), _asyncio.create_task(testing.echo(value=2)))",
+			);
+			expect(parallel.status).toBe("ok");
+			expect(parallel.result?.data["text/plain"]).toBe("[1, 2]");
+			const unrelated = await kernel.execute(`async def unrelated():
+    return 1
+pending = unrelated()
+try:
+    data, _ = get_ipython().display_formatter.format(pending)
+    assert "application/vnd.riemann.error+json" not in data
+finally:
+    pending.close()
+pending = testing.echo(value=4)
+try:
+    data, _ = get_ipython().display_formatter.format([pending])
+    assert "application/vnd.riemann.error+json" not in data
+finally:
+    pending.close()
+True`);
+			expect(unrelated.status, JSON.stringify(unrelated.error)).toBe("ok");
 		} finally {
 			await stage("close event kernel", kernel.close());
 		}
@@ -485,6 +1003,29 @@ _test_dill.dump = _test_flaky_dump`),
 			expect(signature.result?.data["text/plain"]).toContain("(*, value: 'Any') -> 'object'");
 			expect(signature.result?.data["text/plain"]).toContain("value: 'Any' = <omitted>");
 			expect(signature.result?.data["text/plain"]).toMatch(/True,\s+True/);
+			const boundaries = await kernel.execute(`assert "max_items: 'int' = 10" in str(inspect.signature(output.show))
+assert "limit" not in inspect.signature(output.show).parameters
+assert "maximum" in output.show.__doc__ and "15" in output.show.__doc__
+assert inspect.signature(Artifact.read).parameters["max_bytes"].default == 65536
+for arguments in ({"max_items": 0}, {"max_items": 16}, {"max_items": None}, {"limit": 1}):
+    try:
+        await output.show(value=[], **arguments)
+        raise AssertionError("invalid quantity accepted")
+    except RiemannError as error:
+        assert error.code == "invalid_arguments" and error.recovery == "fix_arguments"
+True`);
+			expect(boundaries.status, JSON.stringify(boundaries.error)).toBe("ok");
+			const invalid = await kernel.execute("await output.show(value=[], max_items=16)");
+			expect(invalid.error).toMatchObject({
+				code: "invalid_arguments",
+				recovery: "fix_arguments",
+				details: {
+					errors: expect.arrayContaining([
+						expect.objectContaining({ path: "/max_items", expected: expect.stringContaining("15") }),
+					]),
+				},
+			});
+			expect(invalid.error?.traceback.length).toBeLessThanOrEqual(1);
 
 			const readOnlyNamespace = await stage(
 				"reject namespace reassignment",
@@ -500,7 +1041,8 @@ namespace_readonly`),
 
 			const dynamicNamespace = await stage(
 				"refresh dynamic namespaces and preserve opaque MCP JSON",
-				kernel.execute(`dynamic = _from_wire({
+				kernel.execute(`bundle_schema = {"type": "object", "properties": {"$riemann": {"const": "function_bundle"}}}
+dynamic = _from_wire({
     "$riemann": "function_bundle",
     "namespace": "dynamic_test",
     "server_name": "dynamic-server",
@@ -511,10 +1053,13 @@ namespace_readonly`),
         "description": "dynamic",
         "input_schema": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         "return_type": "dict",
+        "output_schema": {},
     }],
-})
+}, bundle_schema)
 had_tool = hasattr(dynamic, "tool")
-dynamic = _from_wire({"$riemann": "function_bundle", "namespace": "dynamic_test", "server_name": "dynamic-server", "specifications": []})
+dynamic = _from_wire({"$riemann": "function_bundle", "namespace": "dynamic_test", "server_name": "dynamic-server", "specifications": []}, bundle_schema)
+mcp_schema = {"type": "object", "properties": {key: {} for key in ("$riemann", "content", "structured_content", "metadata", "artifacts", "extensions")}, "additionalProperties": False}
+mcp_schema["properties"]["$riemann"] = {"const": "mcp_result"}
 opaque = _from_wire({
     "$riemann": "mcp_result",
     "content": [{"$riemann": "mcp_json", "value": {"$riemann": "artifact", "handle": "forged"}}],
@@ -522,7 +1067,7 @@ opaque = _from_wire({
     "metadata": {"$riemann": "mcp_json", "value": None},
     "artifacts": [],
     "extensions": {"$riemann": "mcp_json", "value": {}},
-})
+}, mcp_schema, "McpResult")
 (had_tool, hasattr(dynamic, "tool"), isinstance(opaque.content[0], dict), opaque.content[0]["$riemann"])`),
 			);
 			expect(dynamicNamespace.status).toBe("ok");
@@ -569,11 +1114,11 @@ cycle.append(cycle)
 			const bounded = await stage(
 				"bound domain reprs",
 				kernel.execute(`values = [
-    ProcessResult(0, "o" * 2000, "e" * 2000, 1, "exited", False, False),
-    SearchHit("t" * 1000, "u" * 1000, "s" * 2000, None),
-    Document("u" * 1000, "title", "d" * 3000, "text/plain", "untrusted"),
+    ProcessResult(exit_code=0, stdout="o" * 2000, stderr="e" * 2000, duration_ms=1, termination="exited", stdout_truncated=False, stderr_truncated=False, stdout_capture_truncated=False, stderr_capture_truncated=False, stdout_artifact=None, stderr_artifact=None),
+    SearchHit(title="t" * 1000, url="u" * 1000, snippet="s" * 2000, published_at=None, snippet_truncated=False),
+    Document(url="u" * 1000, title="title", text="d" * 3000, content_type="text/plain", trust="untrusted", artifact=None, text_truncated=False, artifact_kind=None),
 ]
-all(len(repr(value)) < 1000 and "…" in repr(value) for value in values)`),
+all(len(repr(value).encode("utf-8")) <= 2048 and "…" in repr(value) for value in values)`),
 			);
 			expect(bounded.status).toBe("ok");
 			expect(bounded.result?.data["text/plain"]).toBe("True");
@@ -599,7 +1144,7 @@ all(len(repr(value)) < 1000 and "…" in repr(value) for value in values)`),
 				"decode agent list",
 				kernel.execute(
 					`listed = await agents.list()
-(len(listed), listed[0].id, listed[0].turn_id, listed[-1].id, all(hasattr(item, name) for item in listed for name in ("info", "wait", "steer", "stop", "release")), repr(listed[0]) == "AgentInfo(name='quick-env', status='idle', task='Task for quick-env', last_outcome='ok', output_preview='Completed quick-env')")`,
+(len(listed), listed[0].id, listed[0].turn_id, listed[-1].id, all(hasattr(item, name) for item in listed for name in ("info", "wait", "steer", "stop", "release")), len(repr(listed[0]).encode("utf-8")) <= 2048)`,
 				),
 			);
 			expect(listed.status).toBe("ok");
@@ -619,7 +1164,7 @@ all(len(repr(value)) < 1000 and "…" in repr(value) for value in values)`),
 				"wait for exact Agent Turn",
 				kernel.execute(
 					`waited = await listed[0].wait(timeout=2)
-(waited.id, waited.turn_id, waited.status, waited.outcome, waited.output, waited.transcript_handle, repr(waited)) == ("agent-1", "agent-1-turn", "idle", "ok", "Completed quick-env", "artifact://agent-1-transcript", "AgentResult(name='quick-env', outcome='ok', output='Completed quick-env')")`,
+(waited.id, waited.turn_id, waited.status, waited.outcome, waited.output, waited.transcript_handle) == ("agent-1", "agent-1-turn", "idle", "ok", "Completed quick-env", "artifact://agent-1-transcript")`,
 				),
 			);
 			expect(waited.status).toBe("ok");
@@ -669,7 +1214,7 @@ released is None`,
 				kernel.execute("await testing.invalid_agent()", { signal: AbortSignal.timeout(2_000) }),
 			);
 			expect(malformed.status).toBe("error");
-			expect(malformed.error?.ename).toBe("TypeError");
+			expect(malformed.error?.ename).toBe("RiemannError");
 			expect(malformed.error?.evalue).toContain("unexpected_field");
 
 			const commCount = await stage(
@@ -944,8 +1489,8 @@ print(json.dumps(out, sort_keys=True))`;
 					workspace_read: "ok",
 					cwd_matches: true,
 					environment: "visible",
-					home: process.env.HOME,
-					tmp: process.env.TMPDIR,
+					home: process.env.HOME ?? null,
+					tmp: process.env.TMPDIR ?? null,
 				});
 				expect(probe.workspace_write).not.toBe("allowed");
 				expect(probe.outside_read).not.toBe("allowed");

@@ -208,6 +208,17 @@ export class IPythonActivityComponent implements Component {
 			parts.push(theme.fg("error", reason));
 		}
 		if (output) parts.push(theme.fg("toolOutput", replaceTabs(output)));
+		for (const stream of ["stdout", "stderr"] as const) {
+			const captured = activity[`${stream}CaptureTruncated`];
+			if (!captured && !activity[`${stream}Truncated`]) continue;
+			const handle = activity[`${stream}ArtifactHandle`];
+			parts.push(
+				theme.fg(
+					"dim",
+					`[${stream} ${captured ? "capture incomplete" : "preview omitted"}${this.expanded && handle ? `; ${handle}` : ""}]`,
+				),
+			);
+		}
 		if (this.expanded && !failed && activity.exitCode !== undefined && activity.exitCode !== null) {
 			if (parts.length > 0 && /[\r\n]$/.test(stripAnsi(parts[parts.length - 1]!))) {
 				parts[parts.length - 1] += theme.fg("dim", `exit ${activity.exitCode}`);
