@@ -298,15 +298,6 @@ function optionalString(args: Record<string, JsonValue>, name: string): string |
 	return value;
 }
 
-function optionalTimeout(args: Record<string, JsonValue>, name = "timeout"): number | undefined {
-	const value = args[name];
-	if (value === undefined || value === null) return undefined;
-	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > 86_400) {
-		throw new RiemannHostError("invalid_arguments", `${name} must be a positive number no greater than 86400`);
-	}
-	return value;
-}
-
 function turnHandleWire(agent: StoredAgent, turnId: string): JsonValue {
 	if (agent.activeTurnId !== turnId || (agent.status !== "queued" && agent.status !== "running")) {
 		throw new RiemannHostError("conflict", `Agent Turn is no longer active: ${agent.name}/${turnId}`);
@@ -1614,7 +1605,6 @@ export class AgentSupervisor {
 		agentId: string,
 		turnId: string,
 		signal: AbortSignal,
-		timeout: number | undefined,
 	): Promise<{ agent: StoredAgent; turn: StoredAgentTurn }> {
 		const owned = this.ownedTurn(callerId, agentId, turnId);
 		if (owned.turn.status === "settled") {
@@ -1626,11 +1616,9 @@ export class AgentSupervisor {
 		this.waiters.set(turnId, (this.waiters.get(turnId) ?? 0) + 1);
 		try {
 			await new Promise<void>((resolve, reject) => {
-				let timer: NodeJS.Timeout | undefined;
 				const cleanup = () => {
 					this.events.removeListener(`turn:${turnId}`, onTurn);
 					signal.removeEventListener("abort", onAbort);
-					if (timer) clearTimeout(timer);
 				};
 				const settle = (operation: () => void) => {
 					cleanup();
@@ -1664,16 +1652,6 @@ export class AgentSupervisor {
 					);
 				this.events.on(`turn:${turnId}`, onTurn);
 				signal.addEventListener("abort", onAbort, { once: true });
-				if (timeout !== undefined) {
-					timer = setTimeout(
-						() =>
-							settle(() =>
-								reject(new RiemannHostError("timeout", `Timed out waiting for Agent Turn after ${timeout}s`)),
-							),
-						timeout * 1_000,
-					);
-					timer.unref?.();
-				}
 				if (signal.aborted) onAbort();
 				else onTurn();
 			});
@@ -1689,7 +1667,7 @@ export class AgentSupervisor {
 	async wait(callerId: string, args: Record<string, JsonValue>, signal: AbortSignal): Promise<JsonValue> {
 		const agentId = requiredString(args, "agent_id");
 		const turnId = requiredString(args, "turn_id");
-		const settled = await this.waitForTurn(callerId, agentId, turnId, signal, optionalTimeout(args));
+		const settled = await this.waitForTurn(callerId, agentId, turnId, signal);
 		return this.agentResultWire(callerId, settled.agent, settled.turn);
 	}
 
@@ -1750,14 +1728,8 @@ export class AgentSupervisor {
 		if (cancelledAdmission) this.startQueuedCancellation(stopped, turn.id);
 	}
 
-	async stopTurn(
-		callerId: string,
-		agentId: string,
-		turnId: string,
-		signal: AbortSignal,
-		timeout?: number,
-	): Promise<JsonValue> {
-		const completion = this.waitForTurn(callerId, agentId, turnId, signal, timeout);
+	async stopTurn(callerId: string, agentId: string, turnId: string, signal: AbortSignal): Promise<JsonValue> {
+		const completion = this.waitForTurn(callerId, agentId, turnId, signal);
 		this.requestStop(callerId, agentId, turnId);
 		const settled = await completion;
 		return this.agentResultWire(callerId, settled.agent, settled.turn);
@@ -1873,12 +1845,6 @@ export class AgentSupervisor {
 			agent_id: Type.String({ minLength: 1, description: "Owned child identity id" }),
 			turn_id: Type.String({ minLength: 1, description: "Exact Agent Turn id" }),
 		};
-		const timeoutSchema = Type.Optional(
-			Type.Union([
-				Type.Number({ exclusiveMinimum: 0, maximum: 86_400, description: "Timeout in seconds" }),
-				Type.Null(),
-			]),
-		);
 		const startProperties = {
 			task: Type.String({ minLength: 1, description: "Complete, self-contained task" }),
 			name: Type.Optional(
@@ -1920,18 +1886,10 @@ export class AgentSupervisor {
 				namespace: "agents",
 				description:
 					"Snapshot this Agent's reusable child identities, current activity, and latest outcomes as a page.",
-				inputSchema: Type.Object(
-					{ max_items: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, default: 20 })) },
-					{ additionalProperties: false },
-				),
+				inputSchema: Type.Object({}, { additionalProperties: false }),
 				outputSchema: pageSchema(agentInfoSchema),
 				pythonReturnType: "Page[AgentInfo]",
 				errors: [
-					{
-						code: "response_too_large",
-						description: "The Agent snapshot exceeds the page storage limit.",
-						retryable: false,
-					},
 					{
 						code: "artifact_error",
 						description: "The Agent page snapshot could not be stored.",
@@ -1950,13 +1908,12 @@ export class AgentSupervisor {
 					example: "await agents.list()",
 				},
 				capability: "agents.list",
-				handler: async (args) => {
+				handler: async () => {
 					const snapshot = this.options.store
 						.listAgents(this.options.runId)
 						.filter((agent) => agent.parentId === callerId)
 						.map((agent) => this.agentInfoWire(agent));
 					return pages.create("agents.list", snapshot, {
-						limit: typeof args.max_items === "number" ? args.max_items : 20,
 						coverage: "complete",
 					});
 				},
@@ -2038,7 +1995,7 @@ export class AgentSupervisor {
 				name: "wait",
 				namespace: "agents",
 				description: "Wait for and claim one exact child Agent Turn result.",
-				inputSchema: Type.Object({ ...exactTurnInput, timeout: timeoutSchema }, { additionalProperties: false }),
+				inputSchema: Type.Object(exactTurnInput, { additionalProperties: false }),
 				outputSchema: agentResultSchema,
 				pythonReturnType: "AgentResult",
 				errors: [
@@ -2049,7 +2006,6 @@ export class AgentSupervisor {
 						retryable: false,
 					},
 					{ code: "persistence_error", description: "The Turn could not be durably finalized.", retryable: false },
-					{ code: "timeout", description: "The Turn did not settle before the timeout.", retryable: true },
 					{ code: "cancelled", description: "The originating cell was interrupted.", retryable: true },
 				],
 				effects: [
@@ -2059,7 +2015,7 @@ export class AgentSupervisor {
 				idempotency: "idempotent",
 				cancellation: waitCancellation,
 				visibility: "handle-method",
-				prompt: { inventory: "Wait for this exact Agent Turn.", example: "await handle.wait(timeout=60)" },
+				prompt: { inventory: "Wait for this exact Agent Turn.", example: "await handle.wait()" },
 				capability: "agents.manage",
 				handler: (args, signal) => this.wait(callerId, args, signal),
 			},
@@ -2109,7 +2065,7 @@ export class AgentSupervisor {
 				name: "stop",
 				namespace: "agents",
 				description: "Stop and settle one exact Agent Turn while retaining its identity.",
-				inputSchema: Type.Object({ ...exactTurnInput, timeout: timeoutSchema }, { additionalProperties: false }),
+				inputSchema: Type.Object(exactTurnInput, { additionalProperties: false }),
 				outputSchema: agentResultSchema,
 				pythonReturnType: "AgentResult",
 				errors: [
@@ -2121,7 +2077,6 @@ export class AgentSupervisor {
 					},
 					{ code: "conflict", description: "The identity has advanced to another Turn.", retryable: false },
 					{ code: "persistence_error", description: "The Turn could not be durably finalized.", retryable: false },
-					{ code: "timeout", description: "The stopped Turn did not settle before the timeout.", retryable: true },
 					{ code: "cancelled", description: "The settlement wait was interrupted.", retryable: true },
 				],
 				effects: [
@@ -2131,16 +2086,10 @@ export class AgentSupervisor {
 				idempotency: "idempotent",
 				cancellation: stopCancellation,
 				visibility: "handle-method",
-				prompt: { inventory: "Stop and settle this exact Turn.", example: "await handle.stop(timeout=30)" },
+				prompt: { inventory: "Stop and settle this exact Turn.", example: "await handle.stop()" },
 				capability: "agents.manage",
 				handler: (args, signal) =>
-					this.stopTurn(
-						callerId,
-						requiredString(args, "agent_id"),
-						requiredString(args, "turn_id"),
-						signal,
-						optionalTimeout(args),
-					),
+					this.stopTurn(callerId, requiredString(args, "agent_id"), requiredString(args, "turn_id"), signal),
 			},
 			{
 				name: "release",

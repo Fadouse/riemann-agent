@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { AgentToolExecutionError } from "@earendil-works/pi-agent-core";
 import { expect, test } from "vitest";
 import type { ExtensionContext } from "../src/core/extensions/types.ts";
+import { MODEL_TEXT_BYTES } from "../src/riemann/output.ts";
 import { RiemannRuntime } from "../src/riemann/runtime.ts";
 
 test("real Python cell yields explicit output, completes once, isolates locals and cancels nested shell work", async () => {
@@ -28,31 +29,38 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 						throw new Error(JSON.stringify(error.result.content), { cause: error });
 					throw error;
 				});
-		const wait = (id: string, terminate = false, yield_time_ms = 10000) =>
-			runtime!
-				.waitToolDefinition()
-				.execute("wait", { cell_id: id, terminate, yield_time_ms }, undefined, undefined, context);
+		const wait = (id: string, terminate = false) =>
+			runtime!.waitToolDefinition().execute("wait", { cell_id: id, terminate }, undefined, undefined, context);
 		const warmup = await execute('store("answer", 42)');
 		expect(warmup.details.status).toBe("ok");
+		let page = await execute('print("中😀" * 70000, end="END")');
+		const recovered: string[] = [];
+		for (let count = 0; count < 20; count++) {
+			const text = page.content
+				.filter((item) => item.type === "text")
+				.map((item) => item.text)
+				.join("");
+			expect(Buffer.byteLength(text)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);
+			expect(text).not.toContain("�");
+			recovered.push(text.replace(/^Cell c[0-9a-f]+ ok\.\n*/, "").replace(/\n\[more r[0-9a-z]+\]$/, ""));
+			if (!page.details.moreRef) break;
+			page = await execute(`await output.more(ref=${JSON.stringify(page.details.moreRef)})`);
+		}
+		expect(page.details.moreRef).toBeUndefined();
+		expect(recovered.join("")).toBe(`${"中😀".repeat(70000)}END`);
 		const first = await execute(
-			'# @exec: {"yield_time_ms": 0}\nimport asyncio\ntransient = 1\nawait output.show(value="before-sleep")\nawait asyncio.sleep(0.3)\nprint("after-sleep", flush=True)',
+			'import asyncio\ntransient = 1\nawait output.show(value="before-sleep")\nawait asyncio.sleep(10.2)\nprint("after-sleep", flush=True)',
 		);
 		expect(first.details.status).toBe("running");
 		const id = first.details.cellId!;
 		const parts = [JSON.stringify(first.content)];
-		let running = true;
-		let sawIntermediate = false;
-		for (let attempt = 0; running && attempt < 100; attempt++) {
-			const result = await wait(id, false, 20);
-			parts.push(JSON.stringify(result.content));
-			running = result.details.status === "running";
-			if (running && parts.at(-1)?.includes("before-sleep")) sawIntermediate = true;
-		}
-		expect(running).toBe(false);
-		expect(sawIntermediate).toBe(true);
+		expect(parts[0]).toContain("before-sleep");
+		const completed = await wait(id);
+		parts.push(JSON.stringify(completed.content));
+		expect(completed.details.status).toBe("ok");
 		expect(parts.join(" ").match(/before-sleep/g)).toHaveLength(1);
 		expect(parts.join(" ").match(/after-sleep/g)).toHaveLength(1);
-		await expect(wait(id)).rejects.toThrow("already collected");
+		await expect(wait(id)).rejects.toBeInstanceOf(AgentToolExecutionError);
 		expect((await execute('assert "transient" not in globals(); print(load("answer"))')).content).toEqual(
 			expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining("42") })]),
 		);
@@ -67,18 +75,11 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 		await execute('assert load("answer") == 42');
 
 		const long = await execute(
-			'# @exec: {"yield_time_ms": 0}\nawait shell.run(script="printf started > started.txt; sleep 30; printf finished > finished.txt", timeout=60)',
+			'await shell.run(script="printf started > started.txt; sleep 30; printf finished > finished.txt")',
 		);
 		const longId = long.details.cellId!;
-		let started = false;
-		for (let attempt = 0; !started && attempt < 100; attempt++) {
-			await wait(longId, false, 20);
-			started = await readFile(join(root, "started.txt"), "utf8").then(
-				() => true,
-				() => false,
-			);
-		}
-		expect(started).toBe(true);
+		expect(long.details.status).toBe("running");
+		expect(await readFile(join(root, "started.txt"), "utf8")).toBe("started");
 		try {
 			await wait(longId, true);
 			throw new Error("expected cancellation");
@@ -95,4 +96,4 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 		else process.env.RIEMANN_CODING_AGENT_DIR = previous;
 		await rm(root, { recursive: true, force: true });
 	}
-}, 30000);
+}, 60000);

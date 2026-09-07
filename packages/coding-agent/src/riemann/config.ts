@@ -61,8 +61,6 @@ const McpServerSchema = Type.Object(
 		cwd: Type.Optional(Type.String()),
 		url: Type.Optional(Type.String()),
 		headers: Type.Optional(Type.Record(Type.String(), Type.String())),
-		startupTimeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
-		toolTimeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
 		enabledTools: Type.Optional(Type.Array(Type.String())),
 		disabledTools: Type.Optional(Type.Array(Type.String())),
 	},
@@ -70,7 +68,6 @@ const McpServerSchema = Type.Object(
 );
 const OutputLimitsSchema = Type.Object(
 	{
-		maxModelTextBytes: Type.Optional(Type.Integer({ minimum: 1024, maximum: 1_048_576 })),
 		maxPreviewBytes: Type.Optional(Type.Integer({ minimum: 128, maximum: 65_536 })),
 		maxPreviewItems: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
 		maxPreviewDepth: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
@@ -148,8 +145,6 @@ export type RiemannSettingPath =
 	| "agents.defaults.filesystem"
 	| `mcp.servers.${string}.enabled`
 	| `mcp.servers.${string}.exposeToModel`
-	| `mcp.servers.${string}.startupTimeoutMs`
-	| `mcp.servers.${string}.toolTimeoutMs`
 	| `mcp.servers.${string}.enabledTools`
 	| `mcp.servers.${string}.disabledTools`;
 
@@ -157,7 +152,6 @@ export interface RiemannConfig {
 	maxAgents: number;
 	maxConcurrentAgents: number;
 	limits: {
-		maxModelTextBytes: number;
 		maxPreviewBytes: number;
 		maxPreviewItems: number;
 		maxPreviewDepth: number;
@@ -196,7 +190,6 @@ const DEFAULTS: Omit<RiemannConfig, "files"> = {
 	maxAgents: 4,
 	maxConcurrentAgents: 4,
 	limits: {
-		maxModelTextBytes: 16_384,
 		maxPreviewBytes: 2_048,
 		maxPreviewItems: 10,
 		maxPreviewDepth: 4,
@@ -246,14 +239,7 @@ function configuredSettingPaths(config: RiemannConfigFile): Set<RiemannSettingPa
 	if (config.agents?.defaults?.workspace !== undefined) paths.add("agents.defaults.workspace");
 	if (config.agents?.defaults?.filesystem !== undefined) paths.add("agents.defaults.filesystem");
 	for (const [name, server] of Object.entries(config.mcp?.servers ?? {})) {
-		for (const key of [
-			"enabled",
-			"exposeToModel",
-			"startupTimeoutMs",
-			"toolTimeoutMs",
-			"enabledTools",
-			"disabledTools",
-		] as const) {
+		for (const key of ["enabled", "exposeToModel", "enabledTools", "disabledTools"] as const) {
 			if (server[key] !== undefined) paths.add(`mcp.servers.${name}.${key}`);
 		}
 	}
@@ -361,14 +347,7 @@ export async function loadRiemannConfig(options: {
 
 function settingPathSegments(path: RiemannSettingPath): string[] {
 	if (!path.startsWith("mcp.servers.")) return path.split(".");
-	for (const field of [
-		"enabled",
-		"exposeToModel",
-		"startupTimeoutMs",
-		"toolTimeoutMs",
-		"enabledTools",
-		"disabledTools",
-	] as const) {
+	for (const field of ["enabled", "exposeToModel", "enabledTools", "disabledTools"] as const) {
 		const suffix = `.${field}`;
 		if (path.endsWith(suffix)) return ["mcp", "servers", path.slice("mcp.servers.".length, -suffix.length), field];
 	}

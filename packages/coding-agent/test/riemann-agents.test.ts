@@ -178,7 +178,6 @@ const config: RiemannConfig = {
 	maxAgents: 4,
 	maxConcurrentAgents: 4,
 	limits: {
-		maxModelTextBytes: 16_384,
 		maxPreviewBytes: 2_048,
 		maxPreviewItems: 10,
 		maxPreviewDepth: 4,
@@ -313,7 +312,7 @@ describe("Riemann reusable Agent slots", () => {
 		const signal = new AbortController().signal;
 		try {
 			expect(definition.pythonReturnType).toBe("Page[AgentInfo]");
-			expect(definition.inputSchema.properties.max_items).toMatchObject({ default: 20, maximum: 500 });
+			expect(definition.inputSchema.properties.max_items).toBeUndefined();
 			expect(Value.Check(definition.inputSchema, { limit: 1 })).toBe(false);
 			expect(Value.Check(definition.inputSchema, { max_items: 501 })).toBe(false);
 			expect(objectValue(await definition.handler({}, signal))).toMatchObject({
@@ -326,29 +325,18 @@ describe("Riemann reusable Agent slots", () => {
 			await supervisor.start(mainId, { task: "second", name: "second" });
 			const children = store.listAgents(harness.runId).filter((agent) => agent.parentId === mainId);
 			await waitFor(() => children.every((agent) => sessions.get(agent.id)?.at(-1)?.prompts.length === 1));
-			const first = objectValue(await definition.handler({ max_items: 1 }, signal));
+			const first = objectValue(await definition.handler({}, signal));
 			expect(Value.Check(definition.outputSchema, first)).toBe(true);
 			expect(first).toMatchObject({
 				$riemann: "page",
-				items: [{ id: children[0].id, status: "running" }],
-				next_cursor: expect.any(String),
+				items: children.map((child) => ({ id: child.id, status: "running" })),
+				next_cursor: null,
 				coverage: "complete",
 				skipped: [],
 			});
 			sessions.get(children[1].id)?.at(-1)?.finish();
 			await waitFor(() => store.getAgent(children[1].id)?.status === "idle");
-			const next = objectValue(
-				await pages.next(String(first.next_cursor), (operation) => {
-					expect(operation).toBe("agents.list");
-				}),
-			);
-			expect(Value.Check(definition.outputSchema, next)).toBe(true);
-			expect(next).toMatchObject({
-				items: [{ id: children[1].id, status: "running" }],
-				next_cursor: null,
-				coverage: "complete",
-				skipped: [],
-			});
+			expect(first.items).toMatchObject(children.map((child) => ({ id: child.id, status: "running" })));
 		} finally {
 			await supervisor.close();
 			store.close();
@@ -419,7 +407,7 @@ describe("Riemann reusable Agent slots", () => {
 				if (failure === "cancelled") {
 					await waitFor(() => sessions.get(id)?.at(-1)?.prompts.length === 1);
 					result = objectValue(
-						await supervisor.stopTurn(mainId, id, String(second.turn_id), new AbortController().signal, 1),
+						await supervisor.stopTurn(mainId, id, String(second.turn_id), new AbortController().signal),
 					);
 				} else {
 					result = objectValue(
@@ -528,13 +516,7 @@ describe("Riemann reusable Agent slots", () => {
 			const queued = objectValue(await supervisor.start(mainId, { task: "queued", name: "queued" }));
 			persistence.mockRejectedValue(new Error("transcript storage unavailable"));
 			const result = objectValue(
-				await supervisor.stopTurn(
-					mainId,
-					String(queued.id),
-					String(queued.turn_id),
-					new AbortController().signal,
-					0.2,
-				),
+				await supervisor.stopTurn(mainId, String(queued.id), String(queued.turn_id), new AbortController().signal),
 			);
 			expect(result).toMatchObject({
 				outcome: "error",
@@ -894,11 +876,8 @@ describe("Riemann reusable Agent slots", () => {
 				),
 			).rejects.toMatchObject({ code: "conflict" });
 			await expect(
-				waitDefinition.handler(
-					{ agent_id: second.id, turn_id: second.turn_id, timeout: 0.01 },
-					new AbortController().signal,
-				),
-			).rejects.toMatchObject({ code: "timeout" });
+				waitDefinition.handler({ agent_id: second.id, turn_id: second.turn_id }, AbortSignal.timeout(10)),
+			).rejects.toMatchObject({ code: "cancelled" });
 			expect(store.getAgent(second.id as string)?.status).toBe("running");
 
 			const stopped = objectValue(

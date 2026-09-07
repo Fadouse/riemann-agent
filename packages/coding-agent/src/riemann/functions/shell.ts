@@ -1,7 +1,7 @@
-import { isUtf8 } from "node:buffer";
 import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { Readable } from "node:stream";
 import { Type } from "typebox";
 import { signalProcessGroup, spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { getShellConfig } from "../../utils/shell.ts";
@@ -13,7 +13,6 @@ import { utf8Prefix } from "../output.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
 import type { FunctionDefinition, FunctionUpdateCallback } from "./registry.ts";
 
-const MAX_CAPTURE_BYTES = 16 * 1024 * 1024;
 const STREAM_UPDATE_INTERVAL_MS = 80;
 const MAX_STREAM_UPDATE_BYTES = 64 * 1024;
 
@@ -67,14 +66,6 @@ function requiredString(args: Record<string, JsonValue>, name: string): string {
 	return value;
 }
 
-function parseTimeout(value: JsonValue | undefined): number {
-	const timeout = value === undefined || value === null ? 120 : value;
-	if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1 || timeout > 86_400) {
-		throw new RiemannHostError("invalid_arguments", "timeout must be an integer from 1 to 86400 seconds");
-	}
-	return timeout;
-}
-
 function parseEnvironment(value: JsonValue | undefined): Record<string, string> {
 	if (value === undefined || value === null) return {};
 	if (typeof value !== "object" || Array.isArray(value))
@@ -85,13 +76,6 @@ function parseEnvironment(value: JsonValue | undefined): Record<string, string> 
 		environment[key] = item;
 	}
 	return environment;
-}
-
-function appendCaptured(chunks: Buffer[], currentBytes: number, chunk: Buffer): number {
-	if (currentBytes >= MAX_CAPTURE_BYTES) return currentBytes;
-	const remaining = MAX_CAPTURE_BYTES - currentBytes;
-	chunks.push(chunk.length <= remaining ? chunk : chunk.subarray(0, remaining));
-	return currentBytes + Math.min(chunk.length, remaining);
 }
 
 export class ShellFunctions {
@@ -132,7 +116,6 @@ export class ShellFunctions {
 		options: {
 			cwd: string;
 			env: Record<string, string>;
-			timeoutSeconds: number;
 			signal: AbortSignal;
 			onUpdate?: FunctionUpdateCallback;
 		},
@@ -194,8 +177,6 @@ export class ShellFunctions {
 		}
 		const stdout: Buffer[] = [];
 		const stderr: Buffer[] = [];
-		let stdoutBytes = 0;
-		let stderrBytes = 0;
 		let stdoutSeenBytes = 0;
 		let stderrSeenBytes = 0;
 		let pendingUpdates: PendingStreamUpdate[] = [];
@@ -250,16 +231,6 @@ export class ShellFunctions {
 			pendingUpdateBytes += captured;
 			scheduleUpdate();
 		};
-		child.stdout?.on("data", (chunk: Buffer) => {
-			stdoutSeenBytes += chunk.length;
-			stdoutBytes = appendCaptured(stdout, stdoutBytes, chunk);
-			queueUpdate("stdout", chunk);
-		});
-		child.stderr?.on("data", (chunk: Buffer) => {
-			stderrSeenBytes += chunk.length;
-			stderrBytes = appendCaptured(stderr, stderrBytes, chunk);
-			queueUpdate("stderr", chunk);
-		});
 		let requestedTermination: "timeout" | "cancelled" | null = null;
 		let forceKill: NodeJS.Timeout | undefined;
 		const terminate = (reason: "timeout" | "cancelled") => {
@@ -267,15 +238,50 @@ export class ShellFunctions {
 			requestedTermination = reason;
 			forceKill = setTimeout(() => signalProcessGroup(child, "SIGKILL"), 2_000);
 		};
-		const onAbort = () => terminate("cancelled");
+		const onAbort = () => terminate(options.signal.reason?.name === "TimeoutError" ? "timeout" : "cancelled");
 		options.signal.addEventListener("abort", onAbort, { once: true });
-		const timeout = setTimeout(() => terminate("timeout"), options.timeoutSeconds * 1_000);
+		const previewBytes = this.previewBytes;
+		async function* capture(stream: Readable | null, kind: StreamKind): AsyncGenerator<Uint8Array> {
+			if (!stream) return;
+			for await (const value of stream) {
+				const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value as Uint8Array);
+				const seen = kind === "stdout" ? stdoutSeenBytes : stderrSeenBytes;
+				const preview = kind === "stdout" ? stdout : stderr;
+				if (seen < previewBytes) preview.push(chunk.subarray(0, previewBytes - seen));
+				if (kind === "stdout") stdoutSeenBytes += chunk.length;
+				else stderrSeenBytes += chunk.length;
+				queueUpdate(kind, chunk);
+				yield chunk;
+			}
+		}
+		const captured = Promise.allSettled(
+			[
+				this.artifacts.putStream(capture(child.stdout, "stdout"), {
+					name: "stdout",
+					mimeType: "application/octet-stream",
+					detectText: true,
+				}),
+				this.artifacts.putStream(capture(child.stderr, "stderr"), {
+					name: "stderr",
+					mimeType: "application/octet-stream",
+					detectText: true,
+				}),
+			].map((stream) =>
+				stream.catch((error: unknown) => {
+					terminate("cancelled");
+					throw error;
+				}),
+			),
+		);
 		if (options.signal.aborted) onAbort();
-		let exitCode: number | null;
+		let exitCode: number | null = null;
+		let processError: unknown;
 		try {
 			exitCode = await waitForChildProcess(child);
+		} catch (error) {
+			processError = error;
+			terminate("cancelled");
 		} finally {
-			clearTimeout(timeout);
 			if (forceKill) {
 				clearTimeout(forceKill);
 				signalProcessGroup(child, "SIGKILL");
@@ -283,43 +289,50 @@ export class ShellFunctions {
 			options.signal.removeEventListener("abort", onAbort);
 			await rm(sandboxDir, { recursive: true, force: true });
 		}
+		const streams = await captured;
 		if (updateTimer) clearTimeout(updateTimer);
 		finishUpdates();
+		const failure = streams.find((stream) => stream.status === "rejected");
+		if (failure || processError) {
+			const error: unknown = failure?.reason ?? processError;
+			throw new RiemannHostError(failure ? "artifact_error" : "execution_error", String(error), {
+				streams: streams.map((stream) =>
+					stream.status === "fulfilled"
+						? stream.value
+						: {
+								error: String(stream.reason),
+								details: stream.reason instanceof RiemannHostError ? (stream.reason.details ?? null) : null,
+							},
+				),
+			});
+		}
 		const stdoutData = Buffer.concat(stdout);
 		const stderrData = Buffer.concat(stderr);
-		const stdoutText = stdoutData.toString("utf8");
-		const stderrText = stderrData.toString("utf8");
-		const stdoutCaptureTruncated = stdoutSeenBytes > stdoutBytes;
-		const stderrCaptureTruncated = stderrSeenBytes > stderrBytes;
-		const stdoutTruncated = Buffer.byteLength(stdoutText) > this.previewBytes;
-		const stderrTruncated = Buffer.byteLength(stderrText) > this.previewBytes;
-		const stdoutArtifact =
-			stdoutTruncated || stdoutCaptureTruncated
-				? await this.artifacts.putStream(stdout, {
-						name: "stdout",
-						mimeType: isUtf8(stdoutData) ? "text/plain; charset=utf-8" : "application/octet-stream",
-					})
-				: null;
-		const stderrArtifact =
-			stderrTruncated || stderrCaptureTruncated
-				? await this.artifacts.putStream(stderr, {
-						name: "stderr",
-						mimeType: isUtf8(stderrData) ? "text/plain; charset=utf-8" : "application/octet-stream",
-					})
-				: null;
+		const stdoutText = new TextDecoder("utf-8", { ignoreBOM: true }).decode(stdoutData, {
+			stream: stdoutSeenBytes > stdoutData.length,
+		});
+		const stderrText = new TextDecoder("utf-8", { ignoreBOM: true }).decode(stderrData, {
+			stream: stderrSeenBytes > stderrData.length,
+		});
+		const stdoutPreview = utf8Prefix(stdoutText, this.previewBytes);
+		const stderrPreview = utf8Prefix(stderrText, this.previewBytes);
+		const stdoutTruncated = stdoutSeenBytes > stdoutData.length || stdoutPreview.length < stdoutText.length;
+		const stderrTruncated = stderrSeenBytes > stderrData.length || stderrPreview.length < stderrText.length;
+		const stdoutArtifact = streams[0].status === "fulfilled" ? streams[0].value : null;
+		const stderrArtifact = streams[1].status === "fulfilled" ? streams[1].value : null;
 
 		const termination: ProcessTermination = requestedTermination ?? (child.signalCode === null ? "exited" : "signal");
 		return {
 			$riemann: "process_result",
 			exit_code: exitCode,
-			stdout: utf8Prefix(stdoutText, this.previewBytes),
-			stderr: utf8Prefix(stderrText, this.previewBytes),
+			stdout: stdoutPreview,
+			stderr: stderrPreview,
 			duration_ms: Date.now() - started,
 			termination,
 			stdout_truncated: stdoutTruncated,
 			stderr_truncated: stderrTruncated,
-			stdout_capture_truncated: stdoutCaptureTruncated,
-			stderr_capture_truncated: stderrCaptureTruncated,
+			stdout_capture_truncated: false,
+			stderr_capture_truncated: false,
 			stdout_artifact: stdoutArtifact,
 			stderr_artifact: stderrArtifact,
 		};
@@ -347,12 +360,6 @@ export class ShellFunctions {
 						env: Type.Optional(
 							Type.Union([Type.Object({}, { additionalProperties: Type.String() }), Type.Null()], {
 								description: "Additional environment variables",
-							}),
-						),
-						timeout: Type.Optional(
-							Type.Union([Type.Integer({ minimum: 1, maximum: 86_400 }), Type.Null()], {
-								description: "Timeout in seconds",
-								default: 120,
 							}),
 						),
 					},
@@ -411,7 +418,6 @@ export class ShellFunctions {
 					const script = requiredString(args, "script");
 					const cwd = await this.resolveCwd(args.cwd);
 					const environment = parseEnvironment(args.env);
-					const timeoutSeconds = parseTimeout(args.timeout);
 					const shell = getShellConfig();
 					const fromStdin = shell.commandTransport === "stdin";
 					return this.run(
@@ -420,7 +426,7 @@ export class ShellFunctions {
 							args: fromStdin ? shell.args : [...shell.args, script],
 							...(fromStdin ? { stdin: script } : {}),
 						},
-						{ cwd, env: environment, timeoutSeconds, signal, onUpdate },
+						{ cwd, env: environment, signal, onUpdate },
 					);
 				},
 			},

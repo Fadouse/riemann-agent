@@ -24,7 +24,9 @@ Model tools: `ipython` and `ipython_wait`. The entries below are Python APIs, ne
 
 Send raw Python source on grammar-capable transports; JSON-only transports put the same source in `code`. Use top-level await. Cells have fresh user namespaces; explicitly use store/load for JSON state or a first-line `# @exec: {"persist": true}` for a reusable namespace. Emit selected output with print or await output.show; bare expressions do not display.
 
-Use a first-line `# @exec: {"yield_time_ms": 10000, "max_output_tokens": 2000}` for wait/output budgets. A running cell_id must be continued with ipython_wait, not rerun. Only one uncollected cell per agent is allowed. Yield does not terminate execution; timeout_ms and operation timeouts do. terminate=true cancels the cell without rolling back side effects. Await every operation. Do not return a final handoff while a cell remains uncollected.
+Execution automatically yields while running. Continue the returned cell_id with ipython_wait, not by rerunning. Only one uncollected cell per agent is allowed. The optional first-line `# @exec: {"timeout_ms": 300000}` sets the only execution deadline, covering nested operations; waiting does not reset it. terminate=true cancels the cell without rolling back side effects. Await every operation. Do not return a final handoff while a cell remains uncollected.
+
+Each tool return contains at most 50 KB (51200 UTF-8 bytes) of text, including status and reference notices. Complete output is retained. Read a `[more ...]` reference with `await output.more(ref="...")`; continuations follow the same bound.
 
 ## Python API
 

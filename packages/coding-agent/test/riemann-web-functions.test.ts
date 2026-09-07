@@ -5,7 +5,7 @@ import { Value } from "typebox/value";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { FunctionRegistry } from "../src/riemann/functions/registry.ts";
 import { WebFunctions } from "../src/riemann/functions/web.ts";
-import type { JsonValue } from "../src/riemann/kernel/types.ts";
+import { isKernelHostResult, type JsonValue } from "../src/riemann/kernel/types.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
 import { PageStore } from "../src/riemann/state/pages.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
@@ -18,6 +18,7 @@ afterEach(async () => {
 });
 
 function record(value: JsonValue): Record<string, JsonValue> {
+	if (isKernelHostResult(value)) value = value.value;
 	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Expected record");
 	return value;
 }
@@ -72,7 +73,8 @@ describe("Riemann web tool contracts", () => {
 				}),
 			).toBe(false);
 			expect(Value.Check(search.inputSchema, { query: "q", since: "last week" })).toBe(false);
-			expect(Value.Check(search.inputSchema, { query: "q", max_items: 1 })).toBe(true);
+			expect(Value.Check(search.inputSchema, { query: "q", result_count: 1 })).toBe(true);
+			expect(Value.Check(search.inputSchema, { query: "q", max_items: 1 })).toBe(false);
 			expect(Value.Check(search.inputSchema, { query: "q", limit: 1 })).toBe(false);
 		} finally {
 			store.close();
@@ -121,7 +123,7 @@ describe("Riemann web search", () => {
 					},
 				],
 			});
-			expect(Value.Check(search.outputSchema, result)).toBe(true);
+			expect(Value.Check(search.outputSchema, record(result))).toBe(true);
 			const init = fetchMock.mock.calls[0]?.[1];
 			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
 			expect(body).toMatchObject({
@@ -133,7 +135,7 @@ describe("Riemann web search", () => {
 		}
 	});
 
-	test("reports snippet truncation and unknown provider coverage", async () => {
+	test("preserves complete provider snippets and reports unknown provider coverage", async () => {
 		const { search, store } = await webDefinitions();
 		vi.stubGlobal(
 			"fetch",
@@ -149,7 +151,7 @@ describe("Riemann web search", () => {
 			const result = record(await search.handler({ query: "q" }, new AbortController().signal));
 			expect(result).toMatchObject({
 				coverage: "unknown",
-				items: [{ snippet: "😀".repeat(300), snippet_truncated: true }],
+				items: [{ snippet: "😀".repeat(301), snippet_truncated: false }],
 			});
 		} finally {
 			store.close();
@@ -157,7 +159,7 @@ describe("Riemann web search", () => {
 	});
 
 	test("keeps excess provider results in the injected page snapshot without overstating coverage", async () => {
-		const { search, pages, store } = await webDefinitions();
+		const { search, store } = await webDefinitions();
 		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
 			new Response(
 				JSON.stringify({
@@ -167,16 +169,12 @@ describe("Riemann web search", () => {
 		);
 		vi.stubGlobal("fetch", fetchMock);
 		try {
-			const first = record(await search.handler({ query: "q", max_items: 1 }, new AbortController().signal));
+			const first = record(await search.handler({ query: "q", result_count: 1 }, new AbortController().signal));
 			expect(first).toMatchObject({
 				coverage: "unknown",
-				items: [{ title: "first" }],
-				next_cursor: expect.any(String),
+				items: [{ title: "first" }, { title: "second" }],
+				next_cursor: null,
 			});
-			const authorize = vi.fn();
-			const second = await pages.next(String(first.next_cursor), authorize);
-			expect(authorize).toHaveBeenCalledWith("web.search");
-			expect(second).toMatchObject({ coverage: "unknown", items: [{ title: "second" }], next_cursor: null });
 			expect(fetchMock).toHaveBeenCalledOnce();
 			expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toHaveProperty("numResults", 1);
 		} finally {
@@ -369,7 +367,7 @@ describe("Riemann web fetch", () => {
 				{ url: "https://example.test/plain" },
 				new AbortController().signal,
 			);
-			expect(result).toEqual({
+			expect(record(result)).toEqual({
 				$riemann: "document",
 				url: "https://example.test/plain",
 				title: null,

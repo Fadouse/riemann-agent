@@ -5,10 +5,9 @@ import { RiemannHostError } from "./errors.ts";
 import type { JsonValue, KernelImageReference } from "./kernel/types.ts";
 import type { ArtifactStore } from "./state/artifacts.ts";
 
-export const MAX_SOURCE_IMAGE_BYTES = 20 * 1024 * 1024;
-
 export interface StoredModelImage {
 	artifact: JsonValue;
+	sourceMimeType: string;
 	reference: KernelImageReference;
 	hints: string[];
 }
@@ -35,14 +34,15 @@ export async function storeModelImage(options: {
 			`Unsupported or invalid image${options.claimedMimeType ? ` (${options.claimedMimeType})` : ""}`,
 		);
 	}
-	if (options.bytes.byteLength > MAX_SOURCE_IMAGE_BYTES) {
-		throw new RiemannHostError(
-			"image_too_large",
-			`Image is ${options.bytes.byteLength} bytes; maximum source size is ${MAX_SOURCE_IMAGE_BYTES} bytes`,
-		);
-	}
+	const source = await options.artifacts.putBuffer(Buffer.from(options.bytes), {
+		name: options.name ? basename(options.name) : undefined,
+		mimeType: detectedMimeType,
+	});
 	const processed = await processImage(options.bytes, detectedMimeType, { autoResizeImages: true });
-	if (!processed.ok) throw new RiemannHostError("image_decode_failed", processed.message);
+	if (!processed.ok)
+		throw new RiemannHostError("image_decode_failed", `${processed.message}; original: ${artifactHandle(source)}`, {
+			artifact: source,
+		});
 	const normalizedBytes = Buffer.from(processed.data, "base64");
 	const artifact = await options.artifacts.putBuffer(normalizedBytes, {
 		name: options.name ? basename(options.name) : undefined,
@@ -51,7 +51,8 @@ export async function storeModelImage(options: {
 	const handle = artifactHandle(artifact);
 	const metadata = options.artifacts.getMetadata(handle);
 	return {
-		artifact,
+		artifact: source,
+		sourceMimeType: detectedMimeType,
 		reference: {
 			type: "image_ref",
 			artifactHandle: handle,

@@ -67,6 +67,7 @@ import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { validateThemeJson } from "./modes/interactive/theme/theme-json.ts";
 import { cleanupManagedInstall, handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
+import { RIEMANN_TOOL_NAMES } from "./riemann/ipython.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
@@ -809,7 +810,7 @@ export async function main(args: string[], options?: MainOptions) {
 			model: sessionOptions.model,
 			thinkingLevel: sessionOptions.thinkingLevel,
 			scopedModels: sessionOptions.scopedModels,
-			tools: ["ipython"],
+			tools: [...RIEMANN_TOOL_NAMES],
 			excludeTools: undefined,
 			noTools: undefined,
 			customTools: sessionOptions.customTools,

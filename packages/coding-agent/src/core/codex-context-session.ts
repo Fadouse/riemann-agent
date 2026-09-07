@@ -8,6 +8,7 @@ import type {
 } from "@earendil-works/pi-ai/api/openai-codex-context";
 import { Type } from "typebox";
 import type { ConfiguredCompactionStrategy } from "../riemann/compaction-strategy.ts";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { assignCodexContextIds } from "./codex-context-item-ids.ts";
 import { CODEX_CONTEXT_STATE, type CodexContextWindow, isCodexContextWindow } from "./codex-context-state.ts";
 
@@ -39,7 +40,7 @@ export interface CodexContextHost {
 	parentTurnId?: string;
 	rootTurnId?: string;
 	/** Called only when generating full initial context for a fresh window. */
-	initialContext: () => Promise<{ systemPrompt?: string; messages: AgentMessage[] }>;
+	initialContext: (signal?: AbortSignal) => Promise<{ systemPrompt?: string; messages: AgentMessage[] }>;
 }
 
 const hosts = new Map<string, CodexContextHost>();
@@ -114,7 +115,7 @@ export interface CodexContextSessionOptions {
 	backend: CodexContextBackend;
 	budget: CodexTokenBudget;
 	/** Rebuild host/environment state; never include the old conversation or a generated summary. */
-	initialContext: () => Promise<AgentMessage[]>;
+	initialContext: (signal?: AbortSignal) => Promise<AgentMessage[]>;
 }
 
 /** Session-local context windows. The host calls advance only at a completed tool-batch boundary. */
@@ -135,7 +136,8 @@ export class CodexContextSession {
 		this.boundaryId = boundaryId;
 	}
 
-	static async create(options: CodexContextSessionOptions): Promise<CodexContextSession> {
+	static async create(options: CodexContextSessionOptions, signal?: AbortSignal): Promise<CodexContextSession> {
+		signal?.throwIfAborted();
 		const manager = options.sessionManager;
 		const branch = manager.getBranch();
 		const previous = [...branch]
@@ -167,7 +169,7 @@ export class CodexContextSession {
 				.some((entry) => entry.type === "compaction");
 			const inherited = manager.buildSessionContext().messages;
 			const child = options.agentName !== "/root";
-			const initial = child ? await options.initialContext() : [];
+			const initial = child ? await raceWithAbortSignal(options.initialContext(signal), signal) : [];
 			const id = uuidv7();
 			const forked: CodexContextWindow = {
 				...previous.data,
@@ -179,7 +181,11 @@ export class CodexContextSession {
 					? [...initial, ...inherited.slice(hasLaterCompaction ? 0 : (previous.data.initialContextLength ?? 1))]
 					: inherited,
 			};
-			forked.threadHint = await options.backend.threadHint?.(forked);
+			forked.threadHint = await raceWithAbortSignal(
+				Promise.resolve(options.backend.threadHint?.(forked, signal)),
+				signal,
+			);
+			signal?.throwIfAborted();
 			const session = new CodexContextSession(options, forked, "");
 			if (child) forked.initialMessages.unshift(session.guidance());
 			assignCodexContextIds(forked.initialMessages);
@@ -187,7 +193,8 @@ export class CodexContextSession {
 			return session;
 		}
 		const id = uuidv7();
-		const initial = await options.initialContext();
+		const initial = await raceWithAbortSignal(options.initialContext(signal), signal);
+		signal?.throwIfAborted();
 		const window: CodexContextWindow = {
 			version: 1,
 			sessionId: manager.getSessionId(),
@@ -198,7 +205,11 @@ export class CodexContextSession {
 			initialMessages: [...initial, ...options.messages],
 			initialContextLength: initial.length + 1,
 		};
-		window.threadHint = await options.backend.threadHint?.(window);
+		window.threadHint = await raceWithAbortSignal(
+			Promise.resolve(options.backend.threadHint?.(window, signal)),
+			signal,
+		);
+		signal?.throwIfAborted();
 		const session = new CodexContextSession(options, window, "");
 		window.initialMessages.unshift(session.guidance());
 		assignCodexContextIds(window.initialMessages);
@@ -385,7 +396,7 @@ export class CodexContextSession {
 	): Promise<AgentMessage[]> {
 		if (!this.pendingReset) return messages;
 		signal?.throwIfAborted();
-		const initial = await this.options.initialContext();
+		const initial = await raceWithAbortSignal(this.options.initialContext(signal), signal);
 		const initialMessages = [...initial, ...incoming];
 		signal?.throwIfAborted();
 		const next: CodexContextWindow = {
@@ -397,7 +408,11 @@ export class CodexContextSession {
 			initialMessages,
 			initialContextLength: initial.length + 1,
 		};
-		next.threadHint = await this.options.backend.threadHint?.(next, signal);
+		next.threadHint = await raceWithAbortSignal(
+			Promise.resolve(this.options.backend.threadHint?.(next, signal)),
+			signal,
+		);
+		signal?.throwIfAborted();
 		const previous = this.window;
 		this.window = next;
 		next.initialMessages.unshift(this.guidance());

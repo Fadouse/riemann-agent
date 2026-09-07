@@ -1,13 +1,46 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, createReadStream } from "node:fs";
 import { access, copyFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { setImmediate as yieldLoop } from "node:timers/promises";
 import { RiemannHostError } from "../errors.ts";
 import type { JsonValue } from "../kernel/types.ts";
 import { resourceKind } from "./references.ts";
 import type { RiemannStore, StoredArtifact } from "./store.ts";
 
-const MAX_ARTIFACT_SLICE_BYTES = 1024 * 1024;
+async function* jsonChunks(value: JsonValue, ancestors = new Set<object>()): AsyncGenerator<Uint8Array> {
+	if (typeof value === "string") {
+		yield Buffer.from('"');
+		for (let offset = 0; offset < value.length; ) {
+			let end = Math.min(value.length, offset + 16384);
+			const last = value.charCodeAt(end - 1);
+			if (end < value.length && last >= 0xd800 && last <= 0xdbff) end--;
+			yield Buffer.from(JSON.stringify(value.slice(offset, end)).slice(1, -1));
+			offset = end;
+		}
+		yield Buffer.from('"');
+	} else if (value !== null && typeof value === "object") {
+		if (ancestors.has(value)) throw new RiemannHostError("invalid_arguments", "Cannot retain cyclic JSON");
+		ancestors.add(value);
+		const array = Array.isArray(value);
+		yield Buffer.from(array ? "[" : "{");
+		let first = true;
+		const keys = array ? Array.from({ length: value.length }, (_, index) => String(index)) : Object.keys(value);
+		for (const key of keys) {
+			if (!first) yield Buffer.from(",");
+			first = false;
+			if (!array) {
+				yield* jsonChunks(key, ancestors);
+				yield Buffer.from(":");
+			}
+			yield* jsonChunks(array ? (value[Number(key)] ?? null) : value[key], ancestors);
+		}
+		yield Buffer.from(array ? "]" : "}");
+		ancestors.delete(value);
+	} else {
+		yield Buffer.from(JSON.stringify(value));
+	}
+}
 
 function wireArtifact(artifact: StoredArtifact, handle: string): JsonValue {
 	return {
@@ -69,14 +102,11 @@ export class ArtifactStore {
 	}
 
 	async putText(text: string, options: { name?: string; mimeType?: string } = {}): Promise<JsonValue> {
-		return this.putBuffer(Buffer.from(text), {
-			name: options.name,
-			mimeType: options.mimeType ?? "text/plain; charset=utf-8",
-		});
+		return this.putTextParts([text], options);
 	}
 
-	async putJson(value: JsonValue, name?: string): Promise<JsonValue> {
-		return this.putText(`${JSON.stringify(value, null, 2)}\n`, { name, mimeType: "application/json" });
+	async putJson(value: JsonValue, name?: string, mimeType = "application/json"): Promise<JsonValue> {
+		return this.putStream(jsonChunks(value), { name, mimeType });
 	}
 
 	async putBuffer(data: Buffer, options: { name?: string; mimeType: string }): Promise<JsonValue> {
@@ -153,13 +183,12 @@ export class ArtifactStore {
 			}
 			if (pending) yield pending;
 		}
-		// Text parts are replayable. Hash before writing so repeated output keeps
-		// the existing content-addressed fast path, without a full encoded copy.
 		const digest = createHash("sha256");
 		let size = 0;
 		for (const chunk of textChunks()) {
 			digest.update(chunk);
 			size += Buffer.byteLength(chunk);
+			await yieldLoop();
 		}
 		return this.putKnownData(textChunks(), digest.digest("hex"), size, {
 			name: options.name,
@@ -170,17 +199,46 @@ export class ArtifactStore {
 	/** Hash and persist every chunk; chunking does not limit artifact size. */
 	async putStream(
 		chunks: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
-		options: { name?: string; mimeType: string },
+		options: { name?: string; mimeType: string; detectText?: boolean },
 	): Promise<JsonValue> {
 		await mkdir(this.store.artifactsDir, { recursive: true, mode: 0o700 });
 		const temporary = join(this.store.artifactsDir, `.stream.${process.pid}.${randomUUID()}.tmp`);
+		let preservePartial = false;
 		const digest = createHash("sha256");
 		let size = 0;
+		const decoder = options.detectText ? new TextDecoder("utf-8", { fatal: true }) : undefined;
+		let validText = !!decoder;
 		async function* recordedChunks(): AsyncGenerator<Uint8Array> {
-			for await (const chunk of chunks) {
-				digest.update(chunk);
-				size += chunk.byteLength;
-				yield chunk;
+			let buffered: Uint8Array[] = [];
+			let bufferedBytes = 0;
+			try {
+				for await (const chunk of chunks) {
+					if (validText) {
+						try {
+							decoder?.decode(chunk, { stream: true });
+						} catch {
+							validText = false;
+						}
+					}
+					digest.update(chunk);
+					size += chunk.byteLength;
+					buffered.push(chunk);
+					bufferedBytes += chunk.byteLength;
+					if (bufferedBytes >= 65536) {
+						yield buffered.length === 1 ? buffered[0] : Buffer.concat(buffered, bufferedBytes);
+						buffered = [];
+						bufferedBytes = 0;
+					}
+				}
+			} finally {
+				if (bufferedBytes) yield Buffer.concat(buffered, bufferedBytes);
+			}
+			if (validText) {
+				try {
+					decoder?.decode();
+				} catch {
+					validText = false;
+				}
 			}
 		}
 		try {
@@ -212,9 +270,40 @@ export class ArtifactStore {
 					// Directory fsync is unavailable on some supported platforms.
 				}
 			}
-			return this.registerArtifact(hash, size, path, options);
+			return this.registerArtifact(hash, size, path, {
+				...options,
+				mimeType: validText ? "text/plain; charset=utf-8" : options.mimeType,
+			});
+		} catch (error) {
+			let partial: JsonValue = null;
+			let retainedPath: string | null = null;
+			try {
+				await access(temporary);
+				preservePartial = true;
+				retainedPath = temporary;
+				const partialHash = createHash("sha256");
+				let partialSize = 0;
+				for await (const chunk of createReadStream(temporary)) {
+					partialHash.update(chunk);
+					partialSize += chunk.length;
+				}
+				partial = this.registerArtifact(partialHash.digest("hex"), partialSize, temporary, {
+					name: `${options.name ?? "output"}-partial`,
+					mimeType: "application/octet-stream",
+				});
+			} catch {
+				// Keep any written prefix even if metadata storage also failed.
+			}
+			throw new RiemannHostError(
+				"artifact_error",
+				`Capture incomplete: ${error instanceof Error ? error.message : String(error)}`,
+				{
+					partial,
+					retained_path: retainedPath,
+				},
+			);
 		} finally {
-			await rm(temporary, { force: true });
+			if (!preservePartial) await rm(temporary, { force: true });
 		}
 	}
 
@@ -296,15 +385,11 @@ export class ArtifactStore {
 			artifact.mimeType.includes("xml");
 		const offset = options.offset ?? 0;
 		const limit = options.limit ?? 65_536;
-		const minimum = isText ? 4 : 1;
 		if (!Number.isSafeInteger(offset) || offset < 0) {
 			throw new RiemannHostError("invalid_arguments", "Artifact offset must be a non-negative safe integer");
 		}
-		if (!Number.isSafeInteger(limit) || limit < minimum || limit > MAX_ARTIFACT_SLICE_BYTES) {
-			throw new RiemannHostError(
-				"invalid_arguments",
-				`Artifact slice limit must be an integer from ${minimum} to ${MAX_ARTIFACT_SLICE_BYTES}`,
-			);
+		if (!Number.isSafeInteger(limit) || limit < 0) {
+			throw new RiemannHostError("invalid_arguments", "Artifact slice length must be a non-negative safe integer");
 		}
 		const file = await open(artifact.path, "r");
 		try {
@@ -336,8 +421,8 @@ export class ArtifactStore {
 					throw new RiemannHostError("unsupported_media_type", "Artifact text is not valid UTF-8");
 				}
 			}
-			if (nextOffset < fileSize && nextOffset <= readStart) {
-				throw new RiemannHostError("artifact_error", "Artifact slice could not make progress");
+			if (limit > 0 && nextOffset < fileSize && nextOffset <= readStart) {
+				throw new RiemannHostError("invalid_arguments", "Artifact span must include a complete UTF-8 code point");
 			}
 			return {
 				$riemann: "artifact_slice",

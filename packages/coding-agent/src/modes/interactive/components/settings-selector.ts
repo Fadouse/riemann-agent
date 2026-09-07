@@ -507,7 +507,7 @@ const COMPACTION_STRATEGY_CHOICES = CONFIGURED_COMPACTION_STRATEGIES.map(
 function parseRiemannValue(path: string, display: string): unknown {
 	if (path.endsWith(".enabled") || path.endsWith(".exposeToModel")) return display === "true";
 	if (path === "agents.defaults.model") return display === "inherit" ? undefined : display;
-	if (path.endsWith("TimeoutMs") || path === "agents.maxAgents") return Number.parseInt(display, 10);
+	if (path === "agents.maxAgents") return Number.parseInt(display, 10);
 	if (path === "compaction.strategy") {
 		const strategy = COMPACTION_STRATEGY_BY_LABEL.get(display);
 		if (!strategy) throw new Error(`Unknown compaction strategy: ${display}`);
@@ -606,24 +606,6 @@ function mcpSettingItems(config: RiemannConfig): SettingItem[] {
 				description: "Applies to new runs.",
 				currentValue: display("exposeToModel", server.exposeToModel === false ? "false" : "true"),
 				values: editable("exposeToModel") ? ["true", "false"] : undefined,
-			},
-			{
-				id: `${prefix}.startupTimeoutMs`,
-				label: `${name}: startup timeout`,
-				description: "Applies to new runs.",
-				currentValue: display("startupTimeoutMs", `${server.startupTimeoutMs ?? 10_000} ms`),
-				values: editable("startupTimeoutMs")
-					? ["1000 ms", "5000 ms", "10000 ms", "30000 ms", "60000 ms"]
-					: undefined,
-			},
-			{
-				id: `${prefix}.toolTimeoutMs`,
-				label: `${name}: tool timeout`,
-				description: "Applies to new runs.",
-				currentValue: display("toolTimeoutMs", `${server.toolTimeoutMs ?? 120_000} ms`),
-				values: editable("toolTimeoutMs")
-					? ["10000 ms", "30000 ms", "60000 ms", "120000 ms", "300000 ms"]
-					: undefined,
 			},
 			{
 				id: `${prefix}.enabledTools`,

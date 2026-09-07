@@ -736,7 +736,7 @@ export class FunctionRegistry {
 		}
 		const inventory = [...grouped].map(([namespace, items]) => `- \`${namespace}\`: ${items.join("; ")}`).join("\n");
 		const summary = returnTypes.size
-			? `${inventory}\n- Return types: ${[...returnTypes.values()].map((shape) => `\`${shape}\``).join("; ")}. Use \`output.show(value=..., fields=None, max_items=10)\` for explicit display.`
+			? `${inventory}\n- Return types: ${[...returnTypes.values()].map((shape) => `\`${shape}\``).join("; ")}. Use \`output.show(value=..., fields=None)\` for explicit display.`
 			: inventory;
 		const contracts = visible.map((definition) =>
 			[
@@ -767,6 +767,7 @@ export class FunctionRegistry {
 		capabilities: ReadonlySet<string>,
 		signal: AbortSignal,
 		onUpdate?: FunctionUpdateCallback,
+		retain?: (value: JsonValue) => Promise<string | undefined>,
 	): Promise<JsonValue | KernelHostResult> {
 		const definition = this.definitions.get(request.operation);
 		if (!definition) throw new RiemannHostError("not_found", `Function is not registered: ${request.operation}`);
@@ -830,14 +831,18 @@ export class FunctionRegistry {
 					: undefined,
 			);
 		}
-		if (updateError) throw updateError;
 		const output = isKernelHostResult(result) ? result.value : result;
+		const ref = await retain?.(output);
+		if (updateError)
+			throw new RiemannHostError(updateError.code, updateError.message, {
+				ref: ref ?? null,
+				errors: updateError.details ?? null,
+			});
 		if (!Value.Check(definition.outputSchema, output)) {
-			throw new RiemannHostError(
-				"invalid_output",
-				`Invalid output from ${request.operation}`,
-				validationDetails(definition.outputSchema, output),
-			);
+			throw new RiemannHostError("invalid_output", `Invalid output from ${request.operation}`, {
+				...validationDetails(definition.outputSchema, output),
+				ref: ref ?? null,
+			});
 		}
 		return result;
 	}

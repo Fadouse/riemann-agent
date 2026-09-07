@@ -155,6 +155,56 @@ function call(name: string, extra: Partial<ToolCall> = {}): ToolCall {
 }
 
 describe("Codex context through AgentSession", () => {
+	it("warms metadata without a window and exposes a cancellable run before the first thread hint", async () => {
+		const respond = vi.fn(() => "done");
+		const session = await createSession(respond);
+		await session.warmCodexContext();
+		expect(discoverOpenAICodexContext).toHaveBeenCalledTimes(1);
+		expect(getOpenAICodexThreadHint).not.toHaveBeenCalled();
+		expect(session.sessionManager.getEntries()).not.toEqual(
+			expect.arrayContaining([expect.objectContaining({ customType: CODEX_CONTEXT_STATE })]),
+		);
+		let resolveHint!: (hint: string) => void;
+		const hint = new Promise<string>((resolve) => {
+			resolveHint = resolve;
+		});
+		let enterHint!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enterHint = resolve;
+		});
+		const events: string[] = [];
+		session.subscribe((event) => events.push(event.type));
+		vi.mocked(getOpenAICodexThreadHint).mockImplementationOnce(async () => {
+			expect(session.isStreaming).toBe(true);
+			expect(events).toContain("turn_start");
+			expect(events).toContain("message_end");
+			expect(respond).not.toHaveBeenCalled();
+			enterHint();
+			return hint;
+		});
+		const prompt = session.prompt("first");
+		await entered;
+		await session.prompt("queued", { streamingBehavior: "steer" });
+		expect(session.getSteeringMessages()).toEqual(["queued"]);
+		session.clearQueue();
+		await session.abort();
+		await prompt;
+		expect(session.isIdle).toBe(true);
+		expect(events).toContain("agent_settled");
+		expect(events.indexOf("agent_start")).toBeLessThan(events.indexOf("turn_start"));
+		resolveHint("late hint");
+		await Promise.resolve();
+		expect(respond).not.toHaveBeenCalled();
+		expect(
+			session.sessionManager
+				.getEntries()
+				.some((entry) => entry.type === "custom" && entry.customType === CODEX_CONTEXT_STATE),
+		).toBe(false);
+		await session.prompt("retry");
+		expect(respond).toHaveBeenCalledTimes(1);
+		expect(discoverOpenAICodexContext).toHaveBeenCalledTimes(1);
+	});
+
 	it("activates before first generation and resets only after the complete tool batch", async () => {
 		const contexts: Context[] = [];
 		const identities: unknown[] = [];

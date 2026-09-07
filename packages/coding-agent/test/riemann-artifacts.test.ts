@@ -2,6 +2,7 @@ import { type FileHandle, mkdtemp, open, readdir, rm, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { RiemannHostError } from "../src/riemann/errors.ts";
 import type { JsonValue } from "../src/riemann/kernel/types.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
 import { PageStore } from "../src/riemann/state/pages.ts";
@@ -206,9 +207,7 @@ describe("Riemann artifact storage", () => {
 			await expect(artifacts.get(textHandle, { offset: 3, limit: -1 })).rejects.toMatchObject({
 				code: "invalid_arguments",
 			});
-			await expect(artifacts.get(textHandle, { limit: 1_048_577 })).rejects.toMatchObject({
-				code: "invalid_arguments",
-			});
+			expect(await artifacts.get(textHandle, { limit: 1_048_577 })).toMatchObject({ text: "0123456789", eof: true });
 			expect(await artifacts.get(textHandle, { offset: 50, limit: 4 })).toMatchObject({
 				offset: 10,
 				next_offset: 10,
@@ -306,7 +305,7 @@ describe("Riemann artifact storage", () => {
 		const run = store.openRun("pages", root);
 		const artifacts = new ArtifactStore(store, run.id);
 		const pages = new PageStore(artifacts, "owner");
-		const persisted = vi.spyOn(artifacts, "putText");
+		const persisted = vi.spyOn(artifacts, "putJson");
 		try {
 			expect(await pages.create("fs.glob", ["only"], { limit: 1, coverage: "complete" })).toEqual({
 				$riemann: "page",
@@ -370,7 +369,7 @@ describe("Riemann artifact storage", () => {
 			const oversized = artifactHandle(
 				await artifacts.putText(" ".repeat(4 * 1024 + 1), { mimeType: "application/vnd.riemann.page-cursor+json" }),
 			);
-			await expect(pages.next(oversized, authorize)).rejects.toMatchObject({ code: "response_too_large" });
+			await expect(pages.next(oversized, authorize)).rejects.toMatchObject({ code: "invalid_arguments" });
 
 			await expect(new PageStore(artifacts, "other-owner").next(cursor, authorize)).rejects.toMatchObject({
 				code: "invalid_arguments",
@@ -419,7 +418,7 @@ describe("Riemann artifact storage", () => {
 			} finally {
 				await file.close();
 			}
-			await expect(pages.next(cursor, authorize)).rejects.toMatchObject({ code: "response_too_large" });
+			await expect(pages.next(cursor, authorize)).rejects.toMatchObject({ code: "invalid_arguments" });
 			await writeFile(path, '{"operation":"fs.remove"}');
 			await expect(pages.next(cursor, authorize)).rejects.toMatchObject({ code: "invalid_arguments" });
 		} finally {
@@ -473,7 +472,7 @@ describe("Riemann artifact storage", () => {
 			}
 		});
 
-		test("streams binary chunks and cleans staging files on producer failure", async () => {
+		test("streams binary chunks and retains the written prefix on producer failure", async () => {
 			const root = await mkdtemp(join(tmpdir(), "riemann-artifact-stream-error-"));
 			roots.push(root);
 			const store = new RiemannStore(join(root, ".agent"));
@@ -492,8 +491,22 @@ describe("Riemann artifact storage", () => {
 					yield data;
 					throw new Error("producer failed");
 				}
-				await expect(artifacts.putStream(failed(), options)).rejects.toThrow("producer failed");
-				expect((await readdir(store.artifactsDir)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+				try {
+					await artifacts.putStream(failed(), options);
+					throw new Error("Expected producer failure");
+				} catch (error) {
+					expect(error).toBeInstanceOf(RiemannHostError);
+					expect(String(error)).toContain("producer failed");
+					if (
+						!(error instanceof RiemannHostError) ||
+						!error.details ||
+						typeof error.details !== "object" ||
+						Array.isArray(error.details)
+					)
+						throw error;
+					expect(await artifacts.readBuffer(artifactHandle(error.details.partial))).toEqual(data);
+				}
+				expect((await readdir(store.artifactsDir)).filter((name) => name.endsWith(".tmp"))).toHaveLength(1);
 			} finally {
 				store.close();
 			}

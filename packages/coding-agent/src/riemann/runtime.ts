@@ -52,9 +52,12 @@ import {
 } from "./ipython.ts";
 import { IPythonKernelManager } from "./kernel/manager.ts";
 import {
+	isKernelHostResult,
 	type JsonValue,
+	type KernelDisplay,
 	type KernelExecuteResult,
 	type KernelImageReference,
+	type KernelModelContent,
 	type KernelRestoreResult,
 	kernelHostResult,
 } from "./kernel/types.ts";
@@ -65,7 +68,7 @@ import { renderRiemannPrompt } from "./prompts.ts";
 import { ensureManagedPython } from "./python/runtime.ts";
 import { ArtifactStore } from "./state/artifacts.ts";
 import { PageStore, pageSchema } from "./state/pages.ts";
-import { applyRetention, type RetentionReport } from "./state/retention.ts";
+import type { RetentionReport } from "./state/retention.ts";
 import { RiemannStore, type StoredAgent, type StoredRun } from "./state/store.ts";
 
 const MAX_MODEL_IMAGES = 8;
@@ -134,6 +137,31 @@ function imageFromDisplay(data: Record<string, JsonValue>): { mimeType: string; 
 		return { mimeType, bytes: Buffer.from(encoded.replace(/\s/g, ""), "base64") };
 	}
 	return undefined;
+}
+
+async function retainDisplay(artifacts: ArtifactStore, display: KernelDisplay): Promise<KernelModelContent[]> {
+	const handle = artifactHandle(
+		await artifacts.putJson({ data: display.data, metadata: display.metadata }, "python-display.json"),
+	);
+	const content: KernelModelContent[] = [{ type: "text", text: `Display source: ${handle}` }];
+	const text = textFromDisplay(display.data);
+	if (text) {
+		const retained = artifactHandle(await artifacts.putText(text, { name: "python-display.txt" }));
+		if (retained) content.push({ type: "output_ref", handle: retained });
+	}
+	const rawImage = imageFromDisplay(display.data);
+	if (rawImage) {
+		try {
+			const image = await storeModelImage({ artifacts, bytes: rawImage.bytes, claimedMimeType: rawImage.mimeType });
+			content.push(image.reference);
+		} catch (error) {
+			content.push({
+				type: "text",
+				text: `Image display failed; original display retained at ${handle}: ${String(error)}`,
+			});
+		}
+	}
+	return content;
 }
 
 function restoreNotice(result: KernelRestoreResult): string | undefined {
@@ -227,7 +255,14 @@ export class RiemannRuntime {
 		const config = await loadRiemannConfig(configLoadOptions);
 		const store = new RiemannStore(agentDir);
 		const run = store.openRun(ctx.sessionManager.getSessionId(), ctx.cwd);
-		const retentionReport = await applyRetention(store, config.retention);
+		// Closing a run does not invalidate references in a resumable session.
+		const retentionReport: RetentionReport = {
+			removedRunIds: [],
+			freedArtifactBytes: 0,
+			freedSnapshotBytes: 0,
+			freedWorktreeBytes: 0,
+			errors: [],
+		};
 		const mainFilesystem = resolveFilesystemSnapshot({
 			config: config.mainAgent.filesystem,
 			mode: "main",
@@ -380,9 +415,6 @@ export class RiemannRuntime {
 				inputSchema: Type.Object(
 					{
 						query: Type.String({ description: "Capability or task query" }),
-						max_items: Type.Optional(
-							Type.Integer({ minimum: 1, maximum: 50, default: 8, description: "Maximum matches" }),
-						),
 					},
 					{ additionalProperties: false },
 				),
@@ -398,17 +430,12 @@ export class RiemannRuntime {
 				visibility: "public",
 				prompt: {
 					inventory: "Search available functions by task or capability.",
-					example: 'await catalog.search(query="workspace write", max_items=8)',
+					example: 'await catalog.search(query="workspace write")',
 				},
 				handler: async (args) => {
 					if (typeof args.query !== "string")
 						throw new RiemannHostError("invalid_arguments", "query must be a string");
-					const limit = args.max_items === undefined || args.max_items === null ? 8 : args.max_items;
-					if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 50) {
-						throw new RiemannHostError("invalid_arguments", "max_items must be an integer from 1 to 50");
-					}
 					return this.pages.create("catalog.search", this.registry.searchAll(args.query, this.capabilities), {
-						limit,
 						coverage: "complete",
 					});
 				},
@@ -484,14 +511,17 @@ export class RiemannRuntime {
 				inputSchema: Type.Object(
 					{
 						handle: Type.String({ minLength: 1, description: "Artifact handle" }),
-						offset_bytes: Type.Optional(
-							Type.Union([Type.Integer({ minimum: 0 }), Type.Null()], { description: "Byte offset" }),
-						),
-						max_bytes: Type.Optional(
-							Type.Union([Type.Integer({ minimum: 1, maximum: 1_048_576 }), Type.Null()], {
-								description:
-									"Maximum bytes; defaults to 65536. Text requires at least 4 bytes and a UTF-8 boundary offset.",
-							}),
+						span: Type.Optional(
+							Type.Tuple(
+								[
+									Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+									Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+								],
+								{
+									description:
+										"Requested half-open byte interval [start, end). Omit to read the artifact. Text boundaries must align with UTF-8 code points; this selects data, not a display budget.",
+								},
+							),
 						),
 					},
 					{ additionalProperties: false },
@@ -514,14 +544,30 @@ export class RiemannRuntime {
 				visibility: "handle-method",
 				prompt: {
 					inventory: "Read a slice of a durable artifact.",
-					example: "await artifact.read(offset_bytes=0, max_bytes=4096)",
+					example: "await artifact.read(span=[0, 4096])",
 				},
 				handler: async (args) => {
 					if (typeof args.handle !== "string")
 						throw new RiemannHostError("invalid_arguments", "handle must be a string");
-					const offset = typeof args.offset_bytes === "number" ? args.offset_bytes : undefined;
-					const limit = typeof args.max_bytes === "number" ? args.max_bytes : undefined;
-					return this.artifacts.get(args.handle, { offset, limit });
+					const span = args.span;
+					const offset = Array.isArray(span) && typeof span[0] === "number" ? span[0] : 0;
+					const end =
+						Array.isArray(span) && typeof span[1] === "number"
+							? span[1]
+							: this.artifacts.getMetadata(args.handle).size;
+					if (end < offset) throw new RiemannHostError("invalid_arguments", "span end must not precede start");
+					const limit = end - offset;
+					const slice = await this.artifacts.get(args.handle, { offset, limit });
+					if (
+						slice &&
+						typeof slice === "object" &&
+						!Array.isArray(slice) &&
+						slice.kind === "text" &&
+						slice.next_offset !== Math.min(end, this.artifacts.getMetadata(args.handle).size)
+					) {
+						throw new RiemannHostError("invalid_arguments", "span end must be a UTF-8 code-point boundary");
+					}
+					return slice;
 				},
 			},
 			{
@@ -582,7 +628,7 @@ export class RiemannRuntime {
 							kind: "image",
 							path: null,
 							artifact: image.artifact,
-							mime_type: image.reference.mimeType,
+							mime_type: image.sourceMimeType,
 							source_size: source.size,
 							_capability: null,
 							width: null,
@@ -678,20 +724,11 @@ export class RiemannRuntime {
 				name: "show",
 				namespace: "output",
 				description:
-					"Send selected fields to the model. max_items counts collection entries, never characters. More text is read with output.more; producers are not repeated.",
+					"Send selected fields to the model. Each tool return is at most 50 KB of text; read retained content with output.more without repeating producers.",
 				inputSchema: Type.Object(
 					{
 						value: Type.Unknown(),
 						fields: Type.Optional(Type.Union([Type.Array(Type.String({ minLength: 1 })), Type.Null()])),
-						max_items: Type.Optional(
-							Type.Integer({
-								minimum: 1,
-								maximum: 1000,
-								default: 10,
-								description:
-									"Collection entries, not text length. Omit for scalar fields; read more text with output.more.",
-							}),
-						),
 					},
 					{ additionalProperties: false },
 				),
@@ -719,15 +756,7 @@ export class RiemannRuntime {
 					],
 				},
 				handler: async (args) => {
-					if (typeof args.max_items !== "number")
-						throw new RiemannHostError("invalid_arguments", "max_items must be an integer from 1 to 1000");
-					return kernelHostResult(null, [
-						await this.outputViews.prepare(
-							args.value,
-							args.max_items,
-							this.shared.config.limits.maxModelTextBytes,
-						),
-					]);
+					return kernelHostResult(null, [await this.outputViews.prepare(args.value)]);
 				},
 			},
 			{
@@ -736,7 +765,9 @@ export class RiemannRuntime {
 				description:
 					"Read the next budgeted portion of retained output or a text diagnostic using its short reference. Does not rerun commands or requests.",
 				inputSchema: Type.Object(
-					{ ref: Type.String({ minLength: 1, description: "Short reference returned in more= or details=" }) },
+					{
+						ref: Type.String({ minLength: 1, description: "Short reference returned in [more ...] or details=" }),
+					},
 					{ additionalProperties: false },
 				),
 				outputSchema: Type.Null(),
@@ -1193,11 +1224,36 @@ export class RiemannRuntime {
 					.update(specifications)
 					.update(PYTHON_CODE_MODE_BOOTSTRAP)
 					.digest("hex"),
-				hostRequest: (request, signal, onUpdate) =>
-					this.registry.dispatch(request, this.capabilities, signal, onUpdate),
+				hostRequest: async (request, signal, onUpdate) => {
+					let ref: string | undefined;
+					const result = await this.registry.dispatch(
+						request,
+						this.capabilities,
+						signal,
+						onUpdate,
+						async (value) => {
+							if (value !== null)
+								ref = artifactHandle(await this.artifacts.putJson(value, `${request.operation}-result.json`));
+							return ref;
+						},
+					);
+					if (!ref) return result;
+					return kernelHostResult(isKernelHostResult(result) ? result.value : result, [
+						...(isKernelHostResult(result) ? result.modelContent : []),
+						{ type: "text", text: `[${request.operation} result ${ref}]` },
+					]);
+				},
 				snapshotPath: join(this.shared.store.snapshotsDir, this.agent.id, "kernel.dill"),
 				sandbox: { policy: this.policy, networkAllowed: this.agent.network === "allow" },
-				maxOutputChars: Math.max(this.shared.config.limits.maxModelTextBytes * 4, 400_000),
+				retainOutput: async (output) => {
+					if ("stream" in output) {
+						const artifact = await this.artifacts.putText(output.text, { name: `python-${output.stream}.txt` });
+						const handle = artifactHandle(artifact);
+						if (!handle) throw new RiemannHostError("artifact_error", "Python output has no reference");
+						return [{ type: "output_ref", handle, separator: output.stream === "stderr" ? "\n[stderr]\n" : "" }];
+					}
+					return retainDisplay(this.artifacts, output);
+				},
 				onRestore: (result) => {
 					this.checkpointIncompatible = result.incompatible === true;
 					this.pendingRestoreNotice = restoreNotice(result);
@@ -1219,7 +1275,7 @@ export class RiemannRuntime {
 
 	private async formatResult(
 		result: KernelExecuteResult,
-		maxOutputTokens = 2000,
+		header: string,
 		running = false,
 	): Promise<{
 		content: Array<TextContent | ImageContent>;
@@ -1240,53 +1296,21 @@ export class RiemannRuntime {
 			sections.push(this.pendingRestoreNotice);
 			this.pendingRestoreNotice = undefined;
 		}
-		if (result.stdout) sections.push(result.stdout.trimEnd());
-		if (result.stderr) sections.push(`[stderr]\n${result.stderr.trimEnd()}`);
-		let displayIndex = 0;
-		for (const display of result.displays) {
-			const text = textFromDisplay(display.data);
-			if (text) sections.push(text);
-			const rawImage = imageFromDisplay(display.data);
-			if (rawImage) {
-				if (!this.root) {
-					sections.push(`Displayed image [${rawImage.mimeType}; omitted from child Agent context]`);
-					continue;
-				}
-				displayIndex += 1;
-				const image = await storeModelImage({
-					artifacts: this.artifacts,
-					bytes: rawImage.bytes,
-					claimedMimeType: rawImage.mimeType,
-					name: `ipython-display-${result.executionCount ?? "internal"}-${displayIndex}`,
-				});
-				imageReferences.push(image.reference);
-				sections.push(`Displayed image [${image.reference.mimeType}]`);
-			}
+		if (result.stdout) sections.push(result.stdout);
+		if (result.stderr) sections.push(`[stderr]\n${result.stderr}`);
+		const modelContent: KernelModelContent[] = [];
+		for (const display of [...result.displays, ...(result.result ? [result.result] : [])]) {
+			modelContent.push(...(await retainDisplay(this.artifacts, display)));
 		}
-		if (result.result) {
-			const text = textFromDisplay(result.result.data);
-			if (text) sections.push(text);
-			const rawImage = imageFromDisplay(result.result.data);
-			if (rawImage) {
-				if (!this.root) {
-					sections.push(`Returned image [${rawImage.mimeType}; omitted from child Agent context]`);
-				} else {
-					const image = await storeModelImage({
-						artifacts: this.artifacts,
-						bytes: rawImage.bytes,
-						claimedMimeType: rawImage.mimeType,
-						name: `ipython-result-${result.executionCount ?? "internal"}`,
-					});
-					imageReferences.push(image.reference);
-					sections.push(`Returned image [${image.reference.mimeType}]`);
-				}
-			}
-		}
-		for (const content of result.modelContent) {
+		modelContent.push(...result.modelContent);
+		for (const content of modelContent) {
 			if (content.type === "text") sections.push(content.text);
 			else if (content.type === "output_ref") sections.push(content);
 			else if (this.root) imageReferences.push(content);
-			else sections.push(`Image content [${content.mimeType}; omitted from child Agent context]`);
+			else
+				sections.push(
+					`Image content [${content.mimeType}; reference ${content.artifactHandle}; not displayed in child Agent context]`,
+				);
 		}
 		let diagnosticRef: string | undefined;
 		if (result.error) {
@@ -1295,33 +1319,22 @@ export class RiemannRuntime {
 				: `${result.error.ename}: `;
 			const summary = result.error.evalue.startsWith(prefix) ? result.error.evalue : prefix + result.error.evalue;
 			const repair = result.error.repairCode ? `\nUse: ${result.error.repairCode}` : "";
-			const actionable = new Set([
-				"invalid_arguments",
-				"unawaited_operation",
-				"not_found",
-				"permission_denied",
-				"conflict",
-			]);
-			if (result.error.code && actionable.has(result.error.code)) {
-				sections.unshift(summary + repair);
-			} else {
-				try {
-					const traceback = stripAnsi(
-						result.error.traceback.length > 0 ? result.error.traceback.join("\n") : summary,
-					);
-					const diagnostic = await this.artifacts.putText(
-						result.error.details === undefined
-							? traceback
-							: `${traceback}\n\nHost details:\n${JSON.stringify(result.error.details, null, 2)}`,
-						{ name: "ipython-error.txt" },
-					);
-					diagnosticRef = artifactHandle(diagnostic);
-					sections.unshift(`${summary}${repair}\n[details=${diagnosticRef}]`);
-				} catch (error) {
-					sections.unshift(
-						`${summary}${repair}\n[Diagnostic unavailable: ${error instanceof Error ? error.message : String(error)}]`,
-					);
-				}
+			try {
+				const traceback = stripAnsi(
+					result.error.traceback.length > 0 ? result.error.traceback.join("\n") : summary,
+				);
+				const diagnostic = await this.artifacts.putText(
+					result.error.details === undefined
+						? traceback
+						: `${traceback}\n\nHost details:\n${JSON.stringify(result.error.details, null, 2)}`,
+					{ name: "ipython-error.txt" },
+				);
+				diagnosticRef = artifactHandle(diagnostic);
+				sections.unshift(`${summary}${repair}\n[details=${diagnosticRef}]`);
+			} catch (error) {
+				sections.unshift(
+					`${summary}${repair}\n[Diagnostic unavailable: ${error instanceof Error ? error.message : String(error)}]`,
+				);
 			}
 		}
 		if (sections.length === 0)
@@ -1342,17 +1355,16 @@ export class RiemannRuntime {
 				selectedImageBytes + image.byteLength > MAX_MODEL_IMAGE_BYTES
 			) {
 				omittedImages += 1;
+				sections.push(
+					`Image retained: ${image.artifactHandle} (${image.mimeType}); open the artifact and call view() to display it.`,
+				);
 				continue;
 			}
 			selectedImages.push(image);
 			selectedImageBytes += image.byteLength;
 		}
 		if (omittedImages > 0) sections.push(`[${omittedImages} image(s) omitted by model-context budget]`);
-		const rendered = await renderModelText(
-			this.outputViews,
-			sections,
-			Math.min(this.shared.config.limits.maxModelTextBytes, maxOutputTokens * 4),
-		);
+		const rendered = await renderModelText(this.outputViews, [`${header}\n`, ...sections]);
 		const text = rendered.text;
 		const content: Array<TextContent | ImageContent> = [{ type: "text", text }];
 		for (const image of selectedImages) {
@@ -1388,7 +1400,12 @@ export class RiemannRuntime {
 			...IPYTHON_TOOL_METADATA,
 			async execute(_toolCallId, params, signal, onUpdate) {
 				if (signal?.aborted) throw signal.reason;
-				const options = parsePythonExec(params.code);
+				let options: ReturnType<typeof parsePythonExec>;
+				try {
+					options = parsePythonExec(params.code);
+				} catch (error) {
+					return runtime.toolFailure(error);
+				}
 				let observing = true;
 				const cellId = runtime.cells.start(options, async (cell) => {
 					const kernel = await raceWithAbortSignal(runtime.ensureKernel(), cell.signal);
@@ -1436,16 +1453,10 @@ export class RiemannRuntime {
 					return result;
 				});
 				try {
-					return await runtime.collectCell(
-						cellId,
-						options.yield_time_ms,
-						options.max_output_tokens,
-						false,
-						signal,
-					);
+					return await runtime.collectCell(cellId, false, signal);
 				} catch (error) {
 					if (signal?.aborted) runtime.cells.cancel(cellId);
-					throw error;
+					return runtime.toolFailure(error);
 				} finally {
 					observing = false;
 				}
@@ -1457,40 +1468,37 @@ export class RiemannRuntime {
 		return {
 			...IPYTHON_WAIT_TOOL_METADATA,
 			execute: async (_id, params, signal) =>
-				this.collectCell(
-					params.cell_id,
-					params.yield_time_ms ?? 10000,
-					params.max_tokens ?? 2000,
-					params.terminate ?? false,
-					signal,
+				this.collectCell(params.cell_id, params.terminate ?? false, signal).catch((error: unknown) =>
+					this.toolFailure(error),
 				),
 		};
 	}
 
-	private async collectCell(
-		cellId: string,
-		yieldMs: number,
-		maxTokens: number,
-		terminate: boolean,
-		signal?: AbortSignal,
-	) {
-		if (!Number.isInteger(maxTokens) || maxTokens < 256 || maxTokens > 16384)
-			throw new Error("max_tokens must be an integer from 256 to 16384");
+	private async toolFailure(error: unknown): Promise<never> {
+		if (error instanceof AgentToolExecutionError) throw error;
+		const rendered = await renderModelText(this.outputViews, [
+			error instanceof Error ? error.message : String(error),
+		]);
+		throw new AgentToolExecutionError({
+			content: [{ type: "text", text: rendered.text }],
+			details: { status: "error", ...(rendered.more ? { moreRef: rendered.more } : {}) },
+		});
+	}
+
+	private async collectCell(cellId: string, terminate: boolean, signal?: AbortSignal) {
 		const outcome = await this.cells.poll(
 			cellId,
-			yieldMs,
+			10000,
 			terminate,
 			signal,
 			async (result, running, cell: PythonCell) => {
-				const formatted = await this.formatResult(result, maxTokens, running);
-				const status = formatted.error && result.status === "ok" ? "error" : result.status;
+				const status = result.status;
 				const header = running
 					? `Script running with cell ID ${cellId}. Continue with ipython_wait; do not rerun.`
 					: `Cell ${cellId} ${status}.`;
+				const formatted = await this.formatResult(result, header, running);
 				return {
-					content: formatted.content.map((part, index) =>
-						index === 0 && part.type === "text" ? { ...part, text: `${header}\n${part.text}` } : part,
-					),
+					content: formatted.content,
 					details: {
 						...cell.details,
 						status: running ? ("running" as const) : status,

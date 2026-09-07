@@ -65,6 +65,7 @@
 
 ### Fixed
 
+- Fixed the first Codex Automatic prompt waiting for context initialization before showing Working; capabilities are warmed at startup and persisted per account and model, while cancellable window initialization runs after `turn_start` and before model sampling.
 - Fixed TUI streaming stalls with native Codex history by retaining footer context estimates across display-only deltas instead of reserializing unchanged encrypted and image payloads on each frame.
 
 - Fixed diff word emphasis swapping syntax colors into bright blocks; collapsed previews retain both sides of the first replacement while expanded diffs remain complete.

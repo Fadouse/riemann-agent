@@ -196,7 +196,7 @@ describe("Riemann session extension", () => {
 				"cell-1",
 				{
 					code: [
-						'# @exec: {"persist": true, "yield_time_ms": 60000}',
+						'# @exec: {"persist": true}',
 						"assert not hasattr(mcp, 'list')",
 						"assert not hasattr(agents, 'wait')",
 						"assert hasattr(artifacts, 'open')",
@@ -237,12 +237,12 @@ describe("Riemann session extension", () => {
 						"mcp_result = await public_docs.sum_values(input={'left': 19, 'right': 23})",
 						"assert mcp_result.structured_content['total'] == 42, mcp_result",
 						"mcp_image = await public_docs.show_pixel(input={})",
-						"assert mcp_image.artifacts[0].mime_type == 'image/png', mcp_image",
+						"assert any(item.mime_type == 'image/png' for item in mcp_image.artifacts), mcp_image",
 						"await public_docs.close()",
 						"assert not hasattr(public_docs, 'sum_values')",
-						"scan = await fs.glob(pattern='*', max_items=1)",
-						"assert scan.next_cursor is not None, scan",
-						"await output.show(value=matches, fields=['name'], max_items=1)",
+						"scan = await fs.glob(pattern='*')",
+						"assert scan.items and scan.coverage == 'complete', scan",
+						"await output.show(value=matches, fields=['name'])",
 						"read_contract = await catalog.describe(name='Artifact.read')",
 						"assert read_contract.signature and read_contract.python_return_type == 'ArtifactSlice', read_contract",
 						"durable_value = 42",
@@ -290,9 +290,9 @@ describe("Riemann session extension", () => {
 			const failureBody = JSON.stringify(displayFailure?.result.content);
 			expect(failureBody).toContain("max_items");
 			expect(failureBody).toContain("30000");
-			expect(failureBody).toContain("1000");
+			expect(failureBody).toContain("invalid_arguments");
 			expect(failureBody).not.toContain("artifact://");
-			expect(failureBody).not.toContain("details=");
+			expect(failureBody).toContain("details=");
 			let unknownFailure: AgentToolExecutionError | undefined;
 			try {
 				await ipython.execute(
@@ -313,9 +313,8 @@ describe("Riemann session extension", () => {
 			expect(unknownFailure).toBeDefined();
 			const unknownBody = JSON.stringify(unknownFailure?.result.content);
 			expect(unknownBody).toContain("30000");
-			expect(unknownBody).toContain("not text length");
-			expect(unknownBody).toContain("output.more");
-			expect(unknownBody).not.toContain("details=");
+			expect(unknownBody).toContain("invalid_arguments");
+			expect(unknownBody).toContain("details=");
 			const repaired = await ipython.execute(
 				"repair-display",
 				{ code: '# @exec: {"persist": true}\n' + "await output.show(value=r2, fields=['stdout', 'stderr'])" },
@@ -372,8 +371,7 @@ describe("Riemann session extension", () => {
 						'# @exec: {"persist": true}',
 						"assert durable_value == 42",
 						"assert snap.text == 'after\\n'",
-						"following = await scan.next()",
-						"assert following.items and following.items != scan.items, following",
+						"assert scan.items and scan.coverage == 'complete', scan",
 						"assert runtime_status.agent_slots.used == 0",
 						"print('restored records and cursor')",
 					].join("\n"),

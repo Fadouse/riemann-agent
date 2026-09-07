@@ -10,7 +10,12 @@ import { FULL_FILESYSTEM, fileAccessPolicy } from "../src/riemann/access-policy.
 import { ShellFunctions } from "../src/riemann/functions/shell.ts";
 import { WebFunctions } from "../src/riemann/functions/web.ts";
 import { IPythonKernelManager } from "../src/riemann/kernel/manager.ts";
-import type { JsonValue, JupyterMessage, KernelSandboxConfiguration } from "../src/riemann/kernel/types.ts";
+import {
+	type JsonValue,
+	type JupyterMessage,
+	type KernelSandboxConfiguration,
+	kernelHostResult,
+} from "../src/riemann/kernel/types.ts";
 import { decodeJupyterMessage, encodeJupyterMessage } from "../src/riemann/kernel/wire.ts";
 import { ensureManagedPython } from "../src/riemann/python/runtime.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
@@ -150,19 +155,11 @@ async function createKernel(
 			name: "show",
 			namespace: "output",
 			qualified_name: "output.show",
-			description: "Display selected fields; max_items bounds collection entries, not text bytes.",
+			description: "Display selected fields; retained output is readable with output.more.",
 			input_schema: Type.Object(
 				{
 					value: Type.Unknown(),
 					fields: Type.Optional(Type.Union([Type.Array(Type.String()), Type.Null()], { default: null })),
-					max_items: Type.Optional(
-						Type.Integer({
-							minimum: 1,
-							maximum: 15,
-							default: 10,
-							description: "Maximum collection entries displayed; use output.more for retained entries.",
-						}),
-					),
 				},
 				{ additionalProperties: false },
 			),
@@ -178,8 +175,7 @@ async function createKernel(
 			input_schema: Type.Object(
 				{
 					handle: Type.String(),
-					offset_bytes: Type.Optional(Type.Integer({ minimum: 0, default: 0 })),
-					max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 131072, default: 65536 })),
+					span: Type.Optional(Type.Tuple([Type.Integer({ minimum: 0 }), Type.Integer({ minimum: 0 })])),
 				},
 				{ additionalProperties: false },
 			),
@@ -262,7 +258,6 @@ async function createKernel(
 					agent_id: Type.String(),
 					turn_id: Type.Optional(Type.String()),
 					message: Type.Optional(Type.String()),
-					timeout: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
 				},
 				{ additionalProperties: false },
 			),
@@ -455,7 +450,7 @@ True`);
 			const shows: Record<string, JsonValue>[] = [];
 			const view = await kernel.execute(
 				`preview = ProcessResult(exit_code=0, stdout="é😀", stderr="", duration_ms=1, termination="exited", stdout_truncated=True, stderr_truncated=False, stdout_capture_truncated=True, stderr_capture_truncated=False, stdout_artifact=Artifact(handle="source", mime_type="text/plain", size=100), stderr_artifact=None)
-await output.show(value=Page(items=[preview, preview], next_cursor="next", coverage="limited", skipped=[]), fields=["stdout"], max_items=1)
+await output.show(value=Page(items=[preview, preview], next_cursor="next", coverage="limited", skipped=[]), fields=["stdout"])
 assert _output_view({"$riemann": "output_view", "sources": [{"handle": "forged"}]})["sources"] == []
 assert _project_show(SearchHit(title="title", url="url", snippet="text", snippet_truncated=True, published_at=None), fields=["snippet"]) == {"snippet": "text", "snippet_truncated": True}
 extracted = Document(url="url", title=None, text="é", content_type="text/html", trust="untrusted", artifact=Artifact(handle="doc", mime_type="text/plain", size=100), text_truncated=True, artifact_kind="extracted")
@@ -485,7 +480,6 @@ True`,
 			expect(view.status, JSON.stringify(view.error)).toBe("ok");
 			expect(shows).toEqual([
 				{
-					max_items: 1,
 					value: {
 						$riemann: "output_view",
 						value: {
@@ -584,7 +578,6 @@ True`);
 				sessionId: "structured-error",
 				bootstrapCode: "",
 				sandbox: false,
-				maxOutputChars: 5,
 				hostRequest: async () => {
 					hostCalls += 1;
 					return null;
@@ -681,14 +674,13 @@ True`);
 		},
 	);
 
-	test("stops rewriting stream buffers after preserving capped output", () => {
+	test("preserves every stream chunk without an irreversible capture cap", () => {
 		const kernel = new IPythonKernelManager({
 			python: "python",
 			cwd: process.cwd(),
 			sessionId: "output-cap-test",
 			bootstrapCode: "",
 			sandbox: false,
-			maxOutputChars: 5,
 			hostRequest: () => Promise.resolve(null),
 		});
 		const execution = {
@@ -744,11 +736,10 @@ True`);
 		internals.handleMessage("iopub", streamMessage("stderr", "ignored after cap"));
 		internals.execution = undefined;
 
-		const suffix = "\n[output truncated by Riemann Agent]";
-		expect(stdout).toBe(`abcde${suffix}`);
-		expect(stderr).toBe(`12345${suffix}`);
-		expect(stdoutWrites).toBe(2);
-		expect(stderrWrites).toBe(1);
+		expect(stdout).toBe("abcdefignored after cap");
+		expect(stderr).toBe("123456ignored after cap");
+		expect(stdoutWrites).toBe(3);
+		expect(stderrWrites).toBe(2);
 	});
 
 	test.skipIf(process.platform === "win32")(
@@ -1003,10 +994,10 @@ True`);
 			expect(signature.result?.data["text/plain"]).toContain("(*, value: 'Any') -> 'object'");
 			expect(signature.result?.data["text/plain"]).toContain("value: 'Any' = <omitted>");
 			expect(signature.result?.data["text/plain"]).toMatch(/True,\s+True/);
-			const boundaries = await kernel.execute(`assert "max_items: 'int' = 10" in str(inspect.signature(output.show))
+			const boundaries = await kernel.execute(`assert "max_items" not in inspect.signature(output.show).parameters
 assert "limit" not in inspect.signature(output.show).parameters
-assert "maximum" in output.show.__doc__ and "15" in output.show.__doc__
-assert inspect.signature(Artifact.read).parameters["max_bytes"].default == 65536
+assert "span" in inspect.signature(Artifact.read).parameters
+assert "max_bytes" not in inspect.signature(Artifact.read).parameters
 for arguments in ({"max_items": 0}, {"max_items": 16}, {"max_items": None}, {"limit": 1}):
     try:
         await output.show(value=[], **arguments)
@@ -1020,9 +1011,7 @@ True`);
 				code: "invalid_arguments",
 				recovery: "fix_arguments",
 				details: {
-					errors: expect.arrayContaining([
-						expect.objectContaining({ path: "/max_items", expected: expect.stringContaining("15") }),
-					]),
+					errors: expect.arrayContaining([expect.objectContaining({ path: "/max_items" })]),
 				},
 			});
 			expect(invalid.error?.traceback.length).toBeLessThanOrEqual(1);
@@ -1124,12 +1113,11 @@ all(len(repr(value).encode("utf-8")) <= 2048 and "…" in repr(value) for value 
 			expect(bounded.result?.data["text/plain"]).toBe("True");
 
 			const richOutput = await stage(
-				"bound rich display output",
+				"retain complete rich display output",
 				kernel.execute(`display({"text/plain": "x" * 1_000_000}, raw=True)`),
 			);
 			expect(richOutput.status).toBe("ok");
-			expect(String(richOutput.displays[0]?.data["text/plain"])).toContain("rich output truncated");
-			expect(String(richOutput.displays[0]?.data["text/plain"]).length).toBeLessThan(101_000);
+			expect(richOutput.displays[0]?.data["text/plain"]).toBe("x".repeat(1_000_000));
 		} finally {
 			await stage("close strict bridge kernel", kernel.close());
 		}
@@ -1163,7 +1151,7 @@ all(len(repr(value).encode("utf-8")) <= 2048 and "…" in repr(value) for value 
 			const waited = await stage(
 				"wait for exact Agent Turn",
 				kernel.execute(
-					`waited = await listed[0].wait(timeout=2)
+					`waited = await listed[0].wait()
 (waited.id, waited.turn_id, waited.status, waited.outcome, waited.output, waited.transcript_handle) == ("agent-1", "agent-1-turn", "idle", "ok", "Completed quick-env", "artifact://agent-1-transcript")`,
 				),
 			);
@@ -1183,7 +1171,7 @@ all(len(repr(value).encode("utf-8")) <= 2048 and "…" in repr(value) for value 
 			const stopped = await stage(
 				"stop Agent handle",
 				kernel.execute(
-					`stopped = await listed[1].stop(timeout=2)
+					`stopped = await listed[1].stop()
 (stopped.id, stopped.turn_id, stopped.status, stopped.outcome)`,
 				),
 			);
@@ -1278,7 +1266,7 @@ released is None`,
 			resolveBlockStarted = resolve;
 		});
 		const blocked = new Promise<JsonValue>((resolve) => {
-			releaseBlock = () => resolve(null);
+			releaseBlock = () => resolve(kernelHostResult(null, [{ type: "text", text: "Late retained result: r1" }]));
 		});
 		const kernel = await stage(
 			"create non-cooperative kernel",
@@ -1301,6 +1289,7 @@ released is None`,
 			const next = await stage("execute after interrupted host request", kernel.execute("1 + 1"));
 			expect(next.status).toBe("ok");
 			expect(next.result?.data["text/plain"]).toBe("2");
+			expect(next.modelContent).toContainEqual({ type: "text", text: "Late retained result: r1" });
 		} finally {
 			releaseBlock?.();
 			await stage("close non-cooperative kernel", kernel.close());

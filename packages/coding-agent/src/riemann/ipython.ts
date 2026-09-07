@@ -5,9 +5,9 @@ export const IPYTHON_TOOL_DESCRIPTION = `Execute Python code with top-level awai
 - On grammar-capable transports, send raw Python source, not JSON, quoted strings, or markdown fences. On JSON-only transports, put the same source in code.
 - Each call starts with a fresh user namespace. Use store(key, value) / load(key, default=None) for explicit cross-call state, or persist=true to reuse a dedicated namespace. This is namespace isolation, not process or security isolation.
 - Emit only the needed output with print(...) or await output.show(value=..., fields=...). Bare expressions do not automatically display results. Images use the documented view methods.
-- Optional first line: # @exec: {"yield_time_ms": 10000, "max_output_tokens": 2000, "timeout_ms": 300000, "persist": false}
-- yield_time_ms (0..60000, default 10000) limits this tool's wait, not the cell lifetime. timeout_ms (1..86400000, default 300000) is the hard cell deadline; nested shell.run has its own timeout in seconds.
-- max_output_tokens (256..16384, default 2000) sets an approximate text budget, additionally capped by host policy.
+- Optional first line: # @exec: {"timeout_ms": 300000, "persist": false}
+- timeout_ms (1..86400000, default 300000) is the only execution deadline, covering the cell and its nested operations. Execution automatically yields while still running; waiting does not reset the deadline.
+- Each return contains at most 50 KB (51200 UTF-8 bytes) of text, including status and reference notices. Complete output is retained; read the remaining content with await output.more(ref="...").
 - A yielded call returns "Script running with cell ID ...". Continue it with ipython_wait; do not rerun its producer. Only one uncollected cell per agent is allowed.
 - ipython_wait returns new output only. terminate=true cancels the cell and its host operations; prior filesystem/network side effects are not rolled back.
 - Await every operation. Tasks created by a cell are cancelled when it finishes. Runtime state may be lost after forced termination; retained checkpoints and artifact handles are the recovery path.`;
@@ -37,8 +37,6 @@ export const IPYTHON_TOOL_METADATA = {
 export const IPythonWaitSchema = Type.Object(
 	{
 		cell_id: Type.String({ minLength: 1, description: "Running cell ID returned by ipython" }),
-		yield_time_ms: Type.Optional(Type.Integer({ minimum: 0, maximum: 60000, default: 10000 })),
-		max_tokens: Type.Optional(Type.Integer({ minimum: 256, maximum: 16384, default: 2000 })),
 		terminate: Type.Optional(Type.Boolean({ default: false })),
 	},
 	{ additionalProperties: false },
@@ -48,12 +46,14 @@ export const IPYTHON_WAIT_TOOL_METADATA = {
 	name: "ipython_wait",
 	label: "Python wait",
 	description:
-		"Wait on a yielded ipython cell. Use only a returned cell_id. Returns new output or final completion and closes the completed cell. yield_time_ms does not kill the cell. terminate=true cancels it; false or omitted waits. Unknown or already collected IDs are errors; never rerun the producer merely to retrieve output.",
+		"Wait on a yielded ipython cell. Use only a returned cell_id. Returns new output or final completion and closes the completed cell. Waiting does not reset its execution deadline. terminate=true cancels it; false or omitted waits. Unknown or already collected IDs are errors; never rerun the producer merely to retrieve output. Each return is at most 50 KB of text; remaining output is retained and readable by reference.",
 	parameters: IPythonWaitSchema,
 	executionMode: "sequential",
 } as const;
 
 export type IPythonInput = Static<typeof IPythonSchema>;
+
+export const RIEMANN_TOOL_NAMES = [IPYTHON_TOOL_METADATA.name, IPYTHON_WAIT_TOOL_METADATA.name] as const;
 
 export type IPythonActivityStatus = "running" | "ok" | "error";
 

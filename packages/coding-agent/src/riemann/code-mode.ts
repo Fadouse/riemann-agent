@@ -1,11 +1,10 @@
 import { randomBytes } from "node:crypto";
 import { raceWithAbortSignal } from "../utils/abort.ts";
+import { setExecutionDeadline } from "./execution.ts";
 import type { IPythonToolDetails } from "./ipython.ts";
 import type { KernelExecuteResult } from "./kernel/types.ts";
 
 export interface PythonExecOptions {
-	yield_time_ms: number;
-	max_output_tokens: number;
 	timeout_ms: number;
 	persist: boolean;
 }
@@ -13,8 +12,6 @@ export interface PythonExecOptions {
 export function parsePythonExec(source: string): PythonExecOptions {
 	if (!source.trim()) throw new Error("Python source must not be empty");
 	const options: PythonExecOptions = {
-		yield_time_ms: 10000,
-		max_output_tokens: 2000,
 		timeout_ms: 300000,
 		persist: false,
 	};
@@ -28,9 +25,8 @@ export function parsePythonExec(source: string): PythonExecOptions {
 		if (key === "persist") {
 			if (typeof item !== "boolean") throw new Error("persist must be boolean");
 			options.persist = item;
-		} else if (key === "yield_time_ms" || key === "max_output_tokens" || key === "timeout_ms") {
-			const [min, max] =
-				key === "yield_time_ms" ? [0, 60000] : key === "max_output_tokens" ? [256, 16384] : [1, 86400000];
+		} else if (key === "timeout_ms") {
+			const [min, max] = [1, 86400000];
 			if (typeof item !== "number" || !Number.isInteger(item) || item < min || item > max)
 				throw new Error(`${key} must be an integer from ${min} to ${max}`);
 			options[key] = item;
@@ -84,6 +80,7 @@ export class PythonCells {
 		if (this.closed) throw new Error("Python runtime is closed");
 		if (this.cell) throw new Error(`Collect cell ${this.cell.id} with ipython_wait before starting another cell`);
 		const controller = new AbortController();
+		setExecutionDeadline(controller.signal, Date.now() + options.timeout_ms);
 		const cell: ActiveCell = {
 			id: `c${randomBytes(4).toString("hex")}`,
 			signal: controller.signal,
@@ -108,16 +105,17 @@ export class PythonCells {
 					cell.result = result;
 				},
 				(error: unknown) => {
+					const retained = cell.peek?.();
 					cell.result = {
 						status: controller.signal.aborted
 							? controller.signal.reason?.name === "TimeoutError"
 								? "timeout"
 								: "cancelled"
 							: "error",
-						stdout: "",
-						stderr: "",
-						displays: [],
-						modelContent: [],
+						stdout: retained?.stdout ?? "",
+						stderr: retained?.stderr ?? "",
+						displays: retained?.displays ?? [],
+						modelContent: retained?.modelContent ?? [],
 						durationMs: Date.now() - (cell.details.startedAt ?? Date.now()),
 						error: {
 							ename: error instanceof Error ? error.name : "Error",

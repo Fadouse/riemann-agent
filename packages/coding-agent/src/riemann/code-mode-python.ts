@@ -50,8 +50,6 @@ def store(key, value):
     if not isinstance(key, str) or not key:
         raise ValueError("store key must be a non-empty string")
     encoded = _json.dumps(value, allow_nan=False)
-    if len(encoded.encode("utf-8")) > 1048576:
-        raise ValueError("store values are limited to 1 MiB; use an artifact for larger data")
     riemann_code_state["store"][key] = _json.loads(encoded)
 
 def load(key, default=None):

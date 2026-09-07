@@ -62,9 +62,8 @@ describe("Python code mode", () => {
 	});
 
 	test("parses only a first-line pragma and rejects unknown or out-of-range controls", () => {
-		expect(parsePythonExec('# @exec: {"persist": true, "yield_time_ms": 0}\r\nprint(1)')).toMatchObject({
+		expect(parsePythonExec('# @exec: {"persist": true, "timeout_ms": 300000}\r\nprint(1)')).toMatchObject({
 			persist: true,
-			yield_time_ms: 0,
 			timeout_ms: 300000,
 		});
 		expect(parsePythonExec('print(1)\n# @exec: {"persist": true}').persist).toBe(false);

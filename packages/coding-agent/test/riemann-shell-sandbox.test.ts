@@ -84,12 +84,8 @@ describe("Riemann shell argument validation", () => {
 			await expect(definition.handler({ script: "" }, signal)).rejects.toMatchObject({
 				code: "invalid_arguments",
 			});
-			await expect(definition.handler({ script: "true", timeout: 0 }, signal)).rejects.toMatchObject({
-				code: "invalid_arguments",
-			});
-			await expect(definition.handler({ script: "true", timeout: 1.5 }, signal)).rejects.toMatchObject({
-				code: "invalid_arguments",
-			});
+			expect(Value.Check(definition.inputSchema, { script: "true", timeout: 0 })).toBe(false);
+			expect(Value.Check(definition.inputSchema, { script: "true", timeout: 1.5 })).toBe(false);
 			await expect(definition.handler({ script: "true", env: { VALUE: null } }, signal)).rejects.toMatchObject({
 				code: "invalid_arguments",
 			});
@@ -205,7 +201,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		}
 	});
 
-	test("reports capture loss independently of inline omission at the capture cap", async () => {
+	test("retains every byte beyond the former shell capture cap", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-capture-"));
 		roots.push(root);
 		const store = new RiemannStore(join(root, "agent"));
@@ -229,17 +225,19 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 			);
 			expect(result).toMatchObject({
 				stdout_truncated: false,
-				stdout_capture_truncated: true,
+				stdout_capture_truncated: false,
 				stderr: "err",
 				stderr_truncated: false,
 				stderr_capture_truncated: false,
-				stderr_artifact: null,
+				stderr_artifact: expect.objectContaining({ handle: expect.any(String) }),
 				termination: "exited",
 				exit_code: 0,
 			});
-			expect(String(result.stdout)).toHaveLength(cap);
+			expect(String(result.stdout)).toHaveLength(cap + 1);
 			expect(
-				(await artifacts.readBuffer(String(record(result.stdout_artifact).handle))).equals(Buffer.alloc(cap, "x")),
+				(await artifacts.readBuffer(String(record(result.stdout_artifact).handle))).equals(
+					Buffer.alloc(cap + 1, "x"),
+				),
 			).toBe(true);
 		} finally {
 			store.close();
@@ -263,10 +261,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 			const definition = shell.definitions().find((item) => item.name === "run");
 			if (!definition) throw new Error("shell.run is unavailable");
 			const result = record(
-				await definition.handler(
-					{ script: "riemann-command-that-does-not-exist", timeout: 10 },
-					new AbortController().signal,
-				),
+				await definition.handler({ script: "riemann-command-that-does-not-exist" }, new AbortController().signal),
 			);
 			expect(result).toEqual({
 				$riemann: "process_result",
@@ -279,8 +274,8 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 				stderr_truncated: false,
 				stdout_capture_truncated: false,
 				stderr_capture_truncated: false,
-				stdout_artifact: null,
-				stderr_artifact: null,
+				stdout_artifact: expect.objectContaining({ handle: expect.any(String) }),
+				stderr_artifact: expect.objectContaining({ handle: expect.any(String) }),
 			});
 			expect(String(result.stderr)).toContain("command not found");
 		} finally {
@@ -303,10 +298,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 const fs=require("node:fs");const out={inside:fs.readFileSync("inside.txt","utf8"),hostSecret:process.env.RIEMANN_HOST_SECRET_TEST??null,explicit:process.env.EXPLICIT_VALUE??null};try{fs.writeFileSync("write.txt","bad");out.write="allowed"}catch(e){out.write=e.code}try{fs.readFileSync(${JSON.stringify(outside)},"utf8");out.outside="allowed"}catch(e){out.outside=e.code}console.log(JSON.stringify(out))
 PROBE`;
 			const result = record(
-				await definition.handler(
-					{ script, env: { EXPLICIT_VALUE: "visible" }, timeout: 10 },
-					new AbortController().signal,
-				),
+				await definition.handler({ script, env: { EXPLICIT_VALUE: "visible" } }, new AbortController().signal),
 			);
 			expect(result.exit_code).toBe(0);
 			const output = JSON.parse(String(result.stdout).trim()) as Record<string, string | null>;
@@ -336,10 +328,7 @@ PROBE`;
 		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
 		try {
 			const result = record(
-				await definition.handler(
-					{ script: "path-probe", env: { PATH: bin }, timeout: 10 },
-					new AbortController().signal,
-				),
+				await definition.handler({ script: "path-probe", env: { PATH: bin } }, new AbortController().signal),
 			);
 			expect(result).toMatchObject({ exit_code: 0, stdout: "path-ok\n" });
 		} finally {
@@ -357,10 +346,7 @@ PROBE`;
 console.log(JSON.stringify({ cwdMatches: process.cwd().endsWith(${JSON.stringify(workspace)}), value: process.env.RIEMANN_TEST_VALUE, home: process.env.HOME ?? null, tmp: process.env.TMPDIR ?? null }));
 PROBE`;
 			const result = record(
-				await definition.handler(
-					{ script, env: { RIEMANN_TEST_VALUE: "visible" }, timeout: 10 },
-					new AbortController().signal,
-				),
+				await definition.handler({ script, env: { RIEMANN_TEST_VALUE: "visible" } }, new AbortController().signal),
 			);
 			expect(result.exit_code).toBe(0);
 			expect(JSON.parse(String(result.stdout).trim())).toEqual({
@@ -382,9 +368,7 @@ PROBE`;
 			const workspace = process.cwd();
 			const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"], [tmpdir()]);
 			try {
-				const result = record(
-					await definition.handler({ script: "pwd", timeout: 10 }, new AbortController().signal),
-				);
+				const result = record(await definition.handler({ script: "pwd" }, new AbortController().signal));
 				expect(result).toMatchObject({
 					exit_code: 0,
 					stdout: `${workspace}\n`,
@@ -424,7 +408,7 @@ PROBE`;
 			const script = `${process.execPath} - <<'PROBE'
 const fs=require("node:fs");const out={visible:fs.readFileSync("visible.txt","utf8")};try{fs.readFileSync(${JSON.stringify(join(agentDir, "auth.json"))},"utf8");out.state="allowed"}catch(error){out.state=error.code}console.log(JSON.stringify(out))
 PROBE`;
-			const result = record(await definition.handler({ script, timeout: 10 }, new AbortController().signal));
+			const result = record(await definition.handler({ script }, new AbortController().signal));
 			expect(result.exit_code).toBe(0);
 			const output = JSON.parse(String(result.stdout).trim()) as Record<string, string>;
 			expect(output.visible).toBe("visible");
@@ -441,9 +425,7 @@ PROBE`;
 		await mkdir(workspace);
 		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
 		try {
-			const timeoutResult = record(
-				await definition.handler({ script: "sleep 30", timeout: 1 }, new AbortController().signal),
-			);
+			const timeoutResult = record(await definition.handler({ script: "sleep 30" }, AbortSignal.timeout(1000)));
 			expect(timeoutResult).toMatchObject({
 				termination: "timeout",
 				exit_code: null,
@@ -451,7 +433,7 @@ PROBE`;
 
 			const controller = new AbortController();
 			setTimeout(() => controller.abort(), 300);
-			const abortedResult = record(await definition.handler({ script: "sleep 30", timeout: 30 }, controller.signal));
+			const abortedResult = record(await definition.handler({ script: "sleep 30" }, controller.signal));
 			expect(abortedResult).toMatchObject({
 				termination: "cancelled",
 				exit_code: null,
@@ -483,9 +465,8 @@ setInterval(() => {}, 1000);
 				const execution = definition.handler(
 					{
 						script: `/run/current-system/sw/bin/setsid ${JSON.stringify(process.execPath)} ${JSON.stringify(daemonFile)} >${JSON.stringify(daemonLog)} 2>&1 & sleep 30`,
-						timeout: 1,
 					},
-					new AbortController().signal,
+					AbortSignal.timeout(1000),
 				);
 				for (let attempt = 0; attempt < 40 && daemonPid === undefined; attempt++) {
 					daemonPid = findProcessWithExactArgument(daemonFile);
@@ -522,7 +503,7 @@ setInterval(() => {}, 1000);
 const fs=require("node:fs");fs.writeFileSync("created.txt","created");console.log(fs.readFileSync("secret.txt","utf8"))
 PROBE`;
 			const result = record(
-				await definition.handler({ script, cwd: outsideDirectory, timeout: 10 }, new AbortController().signal),
+				await definition.handler({ script, cwd: outsideDirectory }, new AbortController().signal),
 			);
 			expect(result.exit_code).toBe(0);
 			expect(String(result.stdout).trim()).toBe("secret");
@@ -542,7 +523,7 @@ PROBE`;
 			const updates: Array<Record<string, JsonValue>> = [];
 			const script = `${process.execPath} -e "process.stdout.write('x'.repeat(70000))"`;
 			const result = record(
-				await definition.handler({ script, timeout: 10 }, new AbortController().signal, (update) => {
+				await definition.handler({ script }, new AbortController().signal, (update) => {
 					updates.push(record(update));
 				}),
 			);
@@ -569,7 +550,7 @@ PROBE`;
 const first=Buffer.from([0xf0,0x9f]);process.stdout.write(first);process.stderr.write(first);setTimeout(()=>process.stdout.write(Buffer.from([0x98,0x80])),150)
 PROBE`;
 			const result = record(
-				await definition.handler({ script, timeout: 10 }, new AbortController().signal, (update) => {
+				await definition.handler({ script }, new AbortController().signal, (update) => {
 					updates.push(record(update));
 				}),
 			);

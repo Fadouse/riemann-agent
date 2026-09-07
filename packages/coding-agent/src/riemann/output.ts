@@ -19,12 +19,10 @@ export function utf8Prefix(text: string, bytes: number): string {
 	return text.slice(0, end);
 }
 
-const MAX_VIEW_BYTES = 64 * 1024 * 1024;
-const MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
-const MAX_SEGMENTS = 10000;
+export const MODEL_TEXT_BYTES = 50 * 1024;
 const SourceSchema = Type.Object(
 	{
-		path: Type.Array(Type.String(), { maxItems: 64 }),
+		path: Type.Array(Type.String()),
 		handle: Type.String({ minLength: 1 }),
 		offset_bytes: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 		capture_truncated: Type.Boolean(),
@@ -35,7 +33,7 @@ const EnvelopeSchema = Type.Object(
 	{
 		$riemann: Type.Literal("output_view"),
 		value: Type.Unknown(),
-		sources: Type.Array(SourceSchema, { maxItems: MAX_SEGMENTS }),
+		sources: Type.Array(SourceSchema),
 	},
 	{ additionalProperties: false },
 );
@@ -43,19 +41,19 @@ const SegmentSchema = Type.Object(
 	{
 		handle: Type.String({ minLength: 1 }),
 		offset_bytes: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-		prefix: Type.String({ maxLength: 1024 }),
+		prefix: Type.String(),
 		stop_after: Type.Boolean(),
 	},
 	{ additionalProperties: false },
 );
 const ViewSchema = Type.Object(
 	{
-		segments: Type.Array(SegmentSchema, { maxItems: MAX_SEGMENTS }),
+		segments: Type.Array(SegmentSchema),
 	},
 	{ additionalProperties: false },
 );
 type Segment = Static<typeof SegmentSchema>;
-export type OutputPart = string | { type: "output_ref"; handle: string };
+export type OutputPart = string | Extract<KernelModelContent, { type: "output_ref" }>;
 
 function handleOf(value: JsonValue): string {
 	if (typeof value !== "object" || value === null || Array.isArray(value) || typeof value.handle !== "string") {
@@ -72,20 +70,14 @@ export class OutputViews {
 	}
 
 	private async literal(text: string, stopAfter = false): Promise<Segment> {
-		if (Buffer.byteLength(text) > MAX_VIEW_BYTES) {
-			throw new RiemannHostError("response_too_large", "Selected output exceeds 64 MiB; select fewer fields");
-		}
 		const handle = handleOf(await this.artifacts.putText(text, { name: "output-text.txt" }));
 		return { handle, offset_bytes: 0, prefix: "", stop_after: stopAfter };
 	}
 
 	private async save(segments: Segment[]): Promise<string> {
 		const value = { segments };
-		if (!Value.Check(ViewSchema, value)) throw new RiemannHostError("response_too_large", "Too many output segments");
-		const text = JSON.stringify(value);
-		if (Buffer.byteLength(text) > MAX_MANIFEST_BYTES)
-			throw new RiemannHostError("response_too_large", "Output cursor exceeds its size bound");
-		return handleOf(await this.artifacts.putText(text, { mimeType: OUTPUT_VIEW_MIME, name: "output-cursor.json" }));
+		if (!Value.Check(ViewSchema, value)) throw new RiemannHostError("invalid_output", "Invalid output segments");
+		return handleOf(await this.artifacts.putJson(value, "output-cursor.json", OUTPUT_VIEW_MIME));
 	}
 
 	private async load(handle: string): Promise<Segment[]> {
@@ -105,9 +97,7 @@ export class OutputViews {
 			}
 			return [{ handle, offset_bytes: 0, prefix: "", stop_after: false }];
 		}
-		if (metadata.size > MAX_MANIFEST_BYTES)
-			throw new RiemannHostError("response_too_large", "Output cursor exceeds its size bound");
-		const bytes = await this.artifacts.readBuffer(handle, MAX_MANIFEST_BYTES);
+		const bytes = await this.artifacts.readBuffer(handle);
 		if (createHash("sha256").update(bytes).digest("hex") !== metadata.hash) {
 			throw new RiemannHostError("invalid_arguments", "Output cursor integrity check failed");
 		}
@@ -121,44 +111,24 @@ export class OutputViews {
 		return value.segments;
 	}
 
-	async prepare(envelope: JsonValue, maxItems: number, budget: number): Promise<KernelModelContent> {
+	async prepare(envelope: JsonValue): Promise<KernelModelContent> {
 		if (!Value.Check(EnvelopeSchema, envelope)) {
 			throw new RiemannHostError(
 				"invalid_arguments",
-				"Use output.show(value=..., fields=..., max_items=...) to construct an output view",
+				"Use output.show(value=..., fields=...) to construct an output view",
 			);
 		}
-		const overflow: Array<{ path: string[]; value: JsonValue }> = [];
-		let nodes = 0;
-		const select = (value: JsonValue, path: string[], depth: number): JsonValue => {
-			if (++nodes > 100000 || depth > 64)
-				throw new RiemannHostError(
-					"response_too_large",
-					"Selected output is too deeply nested; select fewer fields",
-				);
-			if (Array.isArray(value)) {
-				if (value.length > maxItems) overflow.push({ path, value: value.slice(maxItems) });
-				return value.slice(0, maxItems).map((item, index) => select(item, [...path, String(index)], depth + 1));
-			}
-			if (value !== null && typeof value === "object") {
-				return Object.fromEntries(
-					Object.entries(value).map(([key, item]) => [key, select(item, [...path, key], depth + 1)]),
-				);
-			}
-			return value;
-		};
-		const preview = select(envelope.value as JsonValue, [], 0);
-		let visible = typeof preview === "string" ? preview : JSON.stringify(preview, null, 2);
+		const preview = envelope.value;
+		const retained =
+			typeof preview === "string"
+				? await this.artifacts.putText(preview, { name: "output-text.txt" })
+				: await this.artifacts.putJson(preview as JsonValue, "output-value.json");
+		let visible = "";
 		const pending: Segment[] = [];
-		for (const remainder of overflow) {
-			const label = utf8Prefix(remainder.path.join("."), 256) || "items";
-			visible += `\n[${label}: ${Array.isArray(remainder.value) ? remainder.value.length : 0} retained items omitted]`;
-			pending.push(await this.literal(`\n${label} (continued):\n${JSON.stringify(remainder.value, null, 2)}`));
-		}
 		for (const source of envelope.sources) {
 			this.artifacts.assertPublic(source.handle);
 			const metadata = this.artifacts.getMetadata(source.handle);
-			const label = utf8Prefix(source.path.join("."), 256) || "text";
+			const label = source.path.join(".") || "text";
 			if (source.capture_truncated) visible += `\n[${label}: capture incomplete; only retained bytes are available]`;
 			const text =
 				metadata.mimeType.startsWith("text/") ||
@@ -178,9 +148,11 @@ export class OutputViews {
 					stop_after: false,
 				});
 		}
-		if (!pending.length && Buffer.byteLength(visible) <= budget) return { type: "text", text: visible };
-		const initial = await this.literal(visible, pending.length > 0);
-		return { type: "output_ref", handle: await this.save([initial, ...pending]) };
+		const initial: Segment = { handle: handleOf(retained), offset_bytes: 0, prefix: "", stop_after: false };
+		return {
+			type: "output_ref",
+			handle: await this.save([initial, ...(visible ? [await this.literal(visible)] : []), ...pending]),
+		};
 	}
 
 	async more(ref: string): Promise<Extract<KernelModelContent, { type: "output_ref" }>> {
@@ -232,8 +204,7 @@ export class OutputViews {
 				if (part) segments.push(await this.literal((segments.length ? "\n\n" : "") + part));
 			} else {
 				const next = await this.load(part.handle);
-				if (segments.length && next.length && !next[0].prefix.startsWith("\n\n"))
-					next[0].prefix = `\n\n${next[0].prefix}`;
+				if (segments.length && next.length) next[0].prefix = (part.separator ?? "\n\n") + next[0].prefix;
 				segments.push(...next);
 			}
 		}
@@ -245,60 +216,13 @@ export class OutputViews {
 export async function renderModelText(
 	views: OutputViews,
 	parts: OutputPart[],
-	maxBytes: number,
 ): Promise<{ text: string; more?: string; error?: string }> {
-	const visible: string[] = [];
-	const pending: OutputPart[] = [];
-	let remaining = Math.max(0, maxBytes - 128);
-	let emitted = false;
-	let outputError: string | undefined;
-	for (const part of parts) {
-		if (emitted && remaining >= 2) {
-			visible.push("\n\n");
-			remaining -= 2;
-		}
-		if (typeof part === "string") {
-			const prefix = utf8Prefix(part, remaining);
-			visible.push(prefix);
-			remaining -= Buffer.byteLength(prefix);
-			emitted ||= prefix.length > 0;
-			if (prefix.length < part.length) pending.push(part.slice(prefix.length));
-		} else if (remaining >= 4) {
-			try {
-				const result = await views.read(part.handle, remaining);
-				visible.push(result.text);
-				remaining -= Buffer.byteLength(result.text);
-				emitted ||= result.text.length > 0;
-				if (result.next) pending.push({ type: "output_ref", handle: result.next });
-			} catch (error) {
-				outputError = error instanceof Error ? error.message : String(error);
-				const failure = utf8Prefix(
-					`[Output unavailable: ${error instanceof Error ? error.message : String(error)}]`,
-					remaining,
-				);
-				visible.push(failure);
-				remaining -= Buffer.byteLength(failure);
-				emitted = true;
-			}
-		} else pending.push(part);
-	}
-	let more: string | undefined;
-	let footer = "";
-	if (pending.length) {
-		try {
-			more = await views.combine(pending);
-			footer = `\n[more=${more}]`;
-		} catch (error) {
-			outputError = error instanceof Error ? error.message : String(error);
-			footer = utf8Prefix(
-				`\n[Recovery unavailable: ${error instanceof Error ? error.message : String(error)}]`,
-				128,
-			);
-		}
-	}
+	// Persist the ordered output before publishing any continuation. Reading a
+	// cursor never consumes it, so a failed delivery or repeated read is safe.
+	const ref = await views.combine(parts);
+	const result = await views.read(ref, MODEL_TEXT_BYTES - 128);
 	return {
-		text: visible.join("") + footer,
-		...(more ? { more } : {}),
-		...(outputError ? { error: outputError } : {}),
+		text: result.text + (result.next ? `\n[more ${result.next}]` : ""),
+		...(result.next ? { more: result.next } : {}),
 	};
 }

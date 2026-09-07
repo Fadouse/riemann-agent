@@ -299,14 +299,12 @@ def _output_view(value, *, fields=None):
     return {"$riemann": "output_view", "value": projected, "sources": sources}
 
 
-async def _show(*, value, fields=_RIEMANN_MISSING, max_items=_RIEMANN_MISSING, _extra=None):
+async def _show(*, value, fields=_RIEMANN_MISSING, _extra=None):
     arguments = {**(_extra or {}), "value": value}
     if fields is not _RIEMANN_MISSING:
         arguments["fields"] = fields
-    if max_items is not _RIEMANN_MISSING:
-        arguments["max_items"] = max_items
     arguments = _validate_arguments("output.show", arguments)
-    return await _riemann_call("output.show", {"value": _output_view(value, fields=arguments.get("fields")), "max_items": arguments["max_items"]})
+    return await _riemann_call("output.show", {"value": _output_view(value, fields=arguments.get("fields"))})
 
 
 class _RiemannRecord:
@@ -324,12 +322,10 @@ class Artifact(_RiemannRecord):
     size: int
     name: str | None = None
 
-    async def read(self, *, offset_bytes=_RIEMANN_MISSING, max_bytes=_RIEMANN_MISSING):
+    async def read(self, *, span=_RIEMANN_MISSING):
         arguments = {"handle": self.handle}
-        if offset_bytes is not _RIEMANN_MISSING:
-            arguments["offset_bytes"] = offset_bytes
-        if max_bytes is not _RIEMANN_MISSING:
-            arguments["max_bytes"] = max_bytes
+        if span is not _RIEMANN_MISSING:
+            arguments["span"] = span
         return await _riemann_call("artifacts.get", arguments)
 
     async def materialize(self, *, path: str):
@@ -430,19 +426,15 @@ class AgentTurnHandle(_RiemannRecord):
     async def info(self):
         return await _riemann_call("agents.info", {"agent_id": self.id})
 
-    async def wait(self, *, timeout=_RIEMANN_MISSING):
+    async def wait(self):
         arguments = {"agent_id": self.id, "turn_id": self.turn_id}
-        if timeout is not _RIEMANN_MISSING:
-            arguments["timeout"] = timeout
         return await _riemann_call("agents.wait", arguments)
 
     async def steer(self, *, message: str):
         return await _riemann_call("agents.steer", {"agent_id": self.id, "turn_id": self.turn_id, "message": message})
 
-    async def stop(self, *, timeout=_RIEMANN_MISSING):
+    async def stop(self):
         arguments = {"agent_id": self.id, "turn_id": self.turn_id}
-        if timeout is not _RIEMANN_MISSING:
-            arguments["timeout"] = timeout
         return await _riemann_call("agents.stop", arguments)
 
     async def release(self):
@@ -1186,10 +1178,9 @@ def _make_function(namespace: _RiemannNamespace, spec: dict):
     if qualified_name == "output.show":
         scope["_show"] = _show
         scope["_fields_default"] = properties["fields"].get("default", _RIEMANN_MISSING)
-        scope["_items_default"] = properties["max_items"].get("default", _RIEMANN_MISSING)
         source = (
-            "async def show(*, value, fields=_fields_default, max_items=_items_default, **_extra):\n"
-            "    return await _show(value=value, fields=fields, max_items=max_items, _extra=_extra)"
+            "async def show(*, value, fields=_fields_default, **_extra):\n"
+            "    return await _show(value=value, fields=fields, _extra=_extra)"
         )
     exec(source, scope)
     function = scope[name]

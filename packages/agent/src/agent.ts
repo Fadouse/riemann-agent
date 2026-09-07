@@ -432,7 +432,7 @@ export class Agent {
 				this.createLoopConfig(options),
 				(event) => this.processEvents(event),
 				signal,
-				this.streamFunction,
+				(model, context, options) => this.streamFunction(model, context, options),
 			);
 		});
 	}
@@ -444,7 +444,7 @@ export class Agent {
 				this.createLoopConfig(),
 				(event) => this.processEvents(event),
 				signal,
-				this.streamFunction,
+				(model, context, options) => this.streamFunction(model, context, options),
 			);
 		});
 	}
@@ -470,7 +470,15 @@ export class Agent {
 			thinkingBudgets: this.thinkingBudgets,
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
-			nativeTools: this.nativeTools,
+			// Request preparation can activate native tools after the initial loop snapshot.
+			nativeTools: {
+				matches: (call) => this.nativeTools?.matches(call) ?? false,
+				supportsParallel: (call) => this.nativeTools?.supportsParallel?.(call) ?? true,
+				execute: (call, signal) => {
+					if (!this.nativeTools) throw new Error("Native tools are no longer available");
+					return this.nativeTools.execute(call, signal);
+				},
+			},
 			prepareRequest: this.prepareRequest
 				? (context, incoming) => this.prepareRequest!(context, incoming, this.signal)
 				: undefined,

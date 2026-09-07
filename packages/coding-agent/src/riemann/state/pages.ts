@@ -6,9 +6,6 @@ import type { JsonValue } from "../kernel/types.ts";
 import type { ArtifactStore } from "./artifacts.ts";
 import { PAGE_CURSOR_MIME, PAGE_MANIFEST_MIME } from "./references.ts";
 
-const MAX_MANIFEST_BYTES = 64 * 1024 * 1024;
-const MAX_CURSOR_BYTES = 4 * 1024;
-const MAX_PAGE_LIMIT = 100_000;
 const coverageSchema = Type.Union([Type.Literal("complete"), Type.Literal("limited"), Type.Literal("unknown")]);
 const skippedSchema = Type.Array(
 	Type.Object(
@@ -31,7 +28,7 @@ export function pageSchema(items: TSchema): TSchema {
 }
 
 interface PageOptions {
-	limit: number;
+	limit?: number;
 	coverage: "complete" | "limited" | "unknown";
 	skipped?: { reason: string; count: number }[];
 }
@@ -52,7 +49,7 @@ const cursorSchema = Type.Object(
 		ownerId: Type.String(),
 		operation: Type.String({ minLength: 1 }),
 		offset: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
-		limit: Type.Integer({ minimum: 1, maximum: MAX_PAGE_LIMIT }),
+		limit: Type.Integer({ minimum: 1 }),
 	},
 	{ additionalProperties: false },
 );
@@ -61,7 +58,7 @@ const manifestSchema = Type.Object(
 	{
 		ownerId: Type.String(),
 		operation: Type.String({ minLength: 1 }),
-		limit: Type.Integer({ minimum: 1, maximum: MAX_PAGE_LIMIT }),
+		limit: Type.Integer({ minimum: 1 }),
 		items: Type.Array(Type.Unknown()),
 		coverage: coverageSchema,
 		skipped: skippedSchema,
@@ -92,50 +89,43 @@ export class PageStore {
 	}
 
 	async create(operation: string, items: JsonValue[], options: PageOptions): Promise<JsonValue> {
+		const limit = options.limit ?? 100;
 		const manifest = {
 			ownerId: this.ownerId,
 			operation,
-			items,
-			limit: options.limit,
+			items: structuredClone(items),
+			limit,
 			coverage: options.coverage,
 			skipped: options.skipped ?? [],
 		};
 		if (!Value.Check(manifestSchema, manifest))
 			throw new RiemannHostError("invalid_arguments", "Invalid page snapshot options");
-		if (items.length <= options.limit) {
+		if (items.length <= limit) {
 			return {
 				$riemann: "page",
-				items: structuredClone(items),
+				items: manifest.items,
 				next_cursor: null,
 				coverage: options.coverage,
 				skipped: structuredClone(manifest.skipped),
 			};
 		}
-		const encoded = JSON.stringify(manifest);
-		if (Buffer.byteLength(encoded) > MAX_MANIFEST_BYTES)
-			throw new RiemannHostError("response_too_large", "Page snapshot exceeds the manifest limit");
-		const handle = artifactHandle(
-			await this.artifacts.putText(encoded, { mimeType: PAGE_MANIFEST_MIME, name: "page-snapshot.json" }),
-		);
+		const handle = artifactHandle(await this.artifacts.putJson(manifest, "page-snapshot.json", PAGE_MANIFEST_MIME));
 		const metadata = this.artifacts.getMetadata(handle);
-		// Decode the persisted representation so callers cannot mutate an issued snapshot.
-		return this.slice(JSON.parse(encoded) as Record<string, JsonValue>, {
+		return this.slice(manifest, {
 			handle,
 			runId: metadata.runId,
 			ownerId: this.ownerId,
 			operation,
 			offset: 0,
-			limit: options.limit,
+			limit,
 		});
 	}
 
-	private async readJson(handle: string, mimeType: string, maximumBytes: number): Promise<JsonValue> {
+	private async readJson(handle: string, mimeType: string): Promise<JsonValue> {
 		const metadata = this.artifacts.getMetadata(handle);
 		if (metadata.mimeType !== mimeType)
 			throw new RiemannHostError("invalid_arguments", "Artifact is not an issued page cursor or snapshot");
-		if (metadata.size > maximumBytes)
-			throw new RiemannHostError("response_too_large", "Page artifact exceeds its read bound");
-		const bytes = await this.artifacts.readBuffer(handle, maximumBytes);
+		const bytes = await this.artifacts.readBuffer(handle);
 		if (createHash("sha256").update(bytes).digest("hex") !== metadata.hash)
 			throw new RiemannHostError("invalid_arguments", "Page artifact integrity check failed");
 		try {
@@ -146,7 +136,7 @@ export class PageStore {
 	}
 
 	async next(cursor: string, authorize: (operation: string) => void): Promise<JsonValue> {
-		const value = await this.readJson(cursor, PAGE_CURSOR_MIME, MAX_CURSOR_BYTES);
+		const value = await this.readJson(cursor, PAGE_CURSOR_MIME);
 		if (!Value.Check(cursorSchema, value)) throw new RiemannHostError("invalid_arguments", "Invalid page cursor");
 		const reference = value as unknown as Cursor;
 		if (
@@ -157,7 +147,7 @@ export class PageStore {
 			throw new RiemannHostError("invalid_arguments", "Page cursor does not match its owner, run or offset");
 		}
 		authorize(reference.operation);
-		const manifestValue = await this.readJson(reference.handle, PAGE_MANIFEST_MIME, MAX_MANIFEST_BYTES);
+		const manifestValue = await this.readJson(reference.handle, PAGE_MANIFEST_MIME);
 		if (!Value.Check(manifestSchema, manifestValue))
 			throw new RiemannHostError("invalid_arguments", "Invalid page snapshot");
 		const manifest = manifestValue as Record<string, JsonValue>;
@@ -181,15 +171,13 @@ export class PageStore {
 		let nextCursor: string | null = null;
 		if (nextOffset < items.length) {
 			const encoded = JSON.stringify({ ...reference, offset: nextOffset });
-			if (Buffer.byteLength(encoded) > MAX_CURSOR_BYTES)
-				throw new RiemannHostError("response_too_large", "Page cursor exceeds its size bound");
 			nextCursor = artifactHandle(
 				await this.artifacts.putText(encoded, { mimeType: PAGE_CURSOR_MIME, name: "page-cursor.json" }),
 			);
 		}
 		return {
 			$riemann: "page",
-			items: items.slice(reference.offset, nextOffset),
+			items: structuredClone(items.slice(reference.offset, nextOffset)),
 			next_cursor: nextCursor,
 			coverage: manifest.coverage,
 			skipped: manifest.skipped,

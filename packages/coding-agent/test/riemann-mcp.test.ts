@@ -54,8 +54,6 @@ function fixtureConfig() {
 	return {
 		command: process.execPath,
 		args: [join(import.meta.dirname, "fixtures", "riemann-mcp-server.mjs")],
-		startupTimeoutMs: 10_000,
-		toolTimeoutMs: 10_000,
 	};
 }
 
@@ -128,7 +126,11 @@ describe("Riemann MCP tool bridge", () => {
 			expect(imageContent).toEqual(
 				expect.objectContaining({ type: "image", mimeType: "image/png", artifact: expect.any(Object) }),
 			);
-			const imageArtifact = objectValue(Array.isArray(imageWire.artifacts) ? imageWire.artifacts[0] : undefined);
+			const imageArtifact = objectValue(objectValue(imageContent ?? undefined).artifact);
+			expect(imageWire.artifacts).toContainEqual(imageArtifact);
+			expect(imageWire.artifacts).toContainEqual(
+				expect.objectContaining({ name: "mcp-result.json", mime_type: "application/json" }),
+			);
 			expect(imageArtifact.handle).toMatch(/^r[0-9a-z]+$/);
 			expect(objectValue(imageContent ?? undefined).artifact).toEqual(imageArtifact);
 			const materialized = objectValue(

@@ -3468,6 +3468,9 @@ export class InteractiveMode {
 				break;
 
 			case "agent_settled":
+				if (this.settingsManager.getShowTerminalProgress()) this.ui.terminal.setProgress(false);
+				this.clearStatusIndicator("working");
+				this.ui.requestRender();
 				await this.checkShutdownRequested();
 				break;
 
@@ -4492,7 +4495,7 @@ export class InteractiveMode {
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
 			if (options?.abort) {
-				this.agent.abort();
+				void this.session.abort();
 			}
 			return 0;
 		}
@@ -4524,7 +4527,7 @@ export class InteractiveMode {
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
-			this.agent.abort();
+			void this.session.abort();
 		}
 		return allQueued.length;
 	}

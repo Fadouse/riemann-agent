@@ -28,7 +28,7 @@ test.each([false, true])("exec and wait hide protocol IDs but retain output refe
 		const component = new ToolExecutionComponent(
 			name,
 			"tool-call",
-			name === "ipython" ? { code: "print(42)" } : { cell_id: "c1234abcd", yield_time_ms: 10000 },
+			name === "ipython" ? { code: "print(42)" } : { cell_id: "c1234abcd" },
 			{ requestAnimationFrames: false },
 			undefined,
 			{ requestRender: () => {} } as unknown as TUI,
@@ -41,7 +41,7 @@ test.each([false, true])("exec and wait hide protocol IDs but retain output refe
 					? "Script running with cell ID c1234abcd. Continue with ipython_wait; do not rerun."
 					: `Cell c1234abcd ${status}.`;
 			component.updateResult({
-				content: [{ type: "text", text: `${header}\nselected output\n[more=r7]` }],
+				content: [{ type: "text", text: `${header}\nselected output\n[more r7]` }],
 				details: { status, cellId: "c1234abcd", moreRef: "r7" },
 				isError: status === "error",
 			});

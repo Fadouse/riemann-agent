@@ -5,7 +5,6 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { glob } from "glob";
 import lockfile from "proper-lockfile";
 import { Type } from "typebox";
-import { graphemeSafePrefix } from "../../utils/text.ts";
 import { assertReadable, assertWritable, type FileAccessPolicy, isInside } from "../access-policy.ts";
 import { RiemannHostError } from "../errors.ts";
 import { type StoredModelImage, storeModelImage } from "../images.ts";
@@ -14,10 +13,6 @@ import type { ArtifactStore } from "../state/artifacts.ts";
 import { PageStore, pageSchema } from "../state/pages.ts";
 import type { RiemannStore } from "../state/store.ts";
 import type { FunctionDefinition } from "./registry.ts";
-
-const MAX_READ_BYTES = 32 * 1024 * 1024;
-const MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024;
-const MAX_SEARCH_LINE_CHARS = 4_000;
 
 interface SnapshotReference {
 	$riemann: "text_snapshot_ref" | "image_snapshot_ref";
@@ -159,21 +154,6 @@ function optionalBoolean(args: Record<string, JsonValue>, name: string, fallback
 	return value;
 }
 
-function optionalInteger(
-	args: Record<string, JsonValue>,
-	name: string,
-	fallback: number,
-	minimum: number,
-	maximum: number,
-): number {
-	const value = args[name];
-	if (value === undefined) return fallback;
-	if (typeof value !== "number" || !Number.isInteger(value) || value < minimum || value > maximum) {
-		throw new RiemannHostError("invalid_arguments", `${name} must be an integer from ${minimum} to ${maximum}`);
-	}
-	return value;
-}
-
 function optionalString(args: Record<string, JsonValue>, name: string, fallback: string): string {
 	const value = args[name];
 	if (value === undefined) return fallback;
@@ -260,22 +240,18 @@ export class FileFunctions {
 		}
 	}
 
-	private async readBounded(file: FileHandle, maximumBytes: number): Promise<Buffer> {
+	private async readContents(file: FileHandle): Promise<Buffer> {
 		const info = await file.stat();
 		if (!info.isFile()) throw new RiemannHostError("unsupported_media_type", "Path is not a regular file");
-		if (info.size > maximumBytes) {
-			throw new RiemannHostError("response_too_large", `File exceeds ${maximumBytes} bytes`);
-		}
 		const chunks: Buffer[] = [];
 		let total = 0;
-		while (total <= maximumBytes) {
-			const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maximumBytes + 1 - total));
+		while (true) {
+			const chunk = Buffer.allocUnsafe(64 * 1024);
 			const { bytesRead } = await file.read(chunk, 0, chunk.length, null);
 			if (bytesRead === 0) break;
 			chunks.push(chunk.subarray(0, bytesRead));
 			total += bytesRead;
 		}
-		if (total > maximumBytes) throw new RiemannHostError("response_too_large", `File exceeds ${maximumBytes} bytes`);
 		return Buffer.concat(chunks, total);
 	}
 
@@ -343,7 +319,7 @@ export class FileFunctions {
 			$riemann: "image_snapshot",
 			path,
 			artifact: { ...image.artifact, $riemann: "artifact" },
-			mime_type: image.reference.mimeType,
+			mime_type: image.sourceMimeType,
 			source_size: sourceBytes.byteLength,
 			_capability: capability,
 			width: null,
@@ -492,8 +468,6 @@ export class FileFunctions {
 						description: "The path is outside readable policy roots.",
 						retryable: false,
 					},
-					{ code: "response_too_large", description: "The file exceeds the read limit.", retryable: false },
-					{ code: "image_too_large", description: "The source image exceeds 20 MiB.", retryable: false },
 					{ code: "image_decode_failed", description: "The image cannot be decoded.", retryable: false },
 					{ code: "artifact_error", description: "Image artifact metadata is invalid.", retryable: false },
 					{
@@ -529,7 +503,7 @@ export class FileFunctions {
 					const path = opened.path;
 					let bytes: Buffer;
 					try {
-						bytes = await this.readBounded(opened.file, MAX_READ_BYTES);
+						bytes = await this.readContents(opened.file);
 					} finally {
 						await opened.file.close();
 					}
@@ -575,14 +549,6 @@ export class FileFunctions {
 								description: "Entry kinds to include",
 							}),
 						),
-						max_items: Type.Optional(
-							Type.Integer({
-								minimum: 1,
-								maximum: 5_000,
-								default: 200,
-								description: "Paths per page; the snapshot contains at most 5000 paths",
-							}),
-						),
 					},
 					{ additionalProperties: false },
 				),
@@ -592,11 +558,6 @@ export class FileFunctions {
 					{
 						code: "limit_exceeded",
 						description: "The run has exhausted its resource reference numbers.",
-						retryable: false,
-					},
-					{
-						code: "response_too_large",
-						description: "The retained result snapshot exceeds its byte limit.",
 						retryable: false,
 					},
 					{ code: "artifact_error", description: "The result snapshot artifact is invalid.", retryable: false },
@@ -611,15 +572,13 @@ export class FileFunctions {
 				visibility: "public",
 				prompt: {
 					inventory: "Find readable file and directory entries without reading file contents.",
-					example:
-						'entries = await fs.glob(pattern="src/*", max_items=20); output.show(value=entries, fields=["path", "kind"])',
+					example: 'entries = await fs.glob(pattern="src/*"); output.show(value=entries, fields=["path", "kind"])',
 				},
 				capability: "fs.read",
 				handler: async (args) => {
 					const kind = optionalString(args, "kind", "any");
 					if (kind !== "any" && kind !== "file" && kind !== "directory")
 						throw new RiemannHostError("invalid_arguments", "kind must be any, file, or directory");
-					const limit = optionalInteger(args, "max_items", 200, 1, 5_000);
 					const matches = await this.globMatches(
 						requiredString(args, "pattern"),
 						optionalBoolean(args, "include_hidden", false),
@@ -627,7 +586,6 @@ export class FileFunctions {
 					);
 					const visible: JsonValue[] = [];
 					let skippedFiles = 0;
-					let capped = false;
 					for (const match of matches.sort()) {
 						let path: string;
 						let entryKind: "file" | "directory";
@@ -645,17 +603,11 @@ export class FileFunctions {
 							continue;
 						}
 						if (kind !== "any" && kind !== entryKind) continue;
-						if (visible.length >= 5_000) {
-							capped = true;
-							break;
-						}
 						visible.push({ $riemann: "path_entry", path: this.displayPath(path) || ".", kind: entryKind });
 					}
 					const skipped = [];
 					if (skippedFiles) skipped.push({ reason: "unreadable_or_unavailable_file", count: skippedFiles });
-					if (capped) skipped.push({ reason: "result_limit", count: 1 });
 					return this.pages.create("fs.glob", visible, {
-						limit,
 						coverage: skipped.length ? "limited" : "complete",
 						skipped,
 					});
@@ -677,14 +629,6 @@ export class FileFunctions {
 						),
 						case_sensitive: Type.Optional(
 							Type.Boolean({ default: true, description: "Use case-sensitive matching" }),
-						),
-						max_items: Type.Optional(
-							Type.Integer({
-								minimum: 1,
-								maximum: 2_000,
-								default: 100,
-								description: "Matches per page; the snapshot contains at most 2000 matches",
-							}),
 						),
 					},
 					{ additionalProperties: false },
@@ -708,11 +652,6 @@ export class FileFunctions {
 						description: "The run has exhausted its resource reference numbers.",
 						retryable: false,
 					},
-					{
-						code: "response_too_large",
-						description: "The retained result snapshot exceeds its byte limit.",
-						retryable: false,
-					},
 					{ code: "artifact_error", description: "The result snapshot artifact is invalid.", retryable: false },
 					{
 						code: "invalid_arguments",
@@ -729,8 +668,7 @@ export class FileFunctions {
 				visibility: "public",
 				prompt: {
 					inventory: "Search file text with canonical paths and line numbers.",
-					example:
-						'matches = await fs.search(query="needle", glob="src/**/*.ts", max_items=20); output.show(value=matches)',
+					example: 'matches = await fs.search(query="needle", glob="src/**/*.ts"); output.show(value=matches)',
 				},
 				capability: "fs.read",
 				handler: async (args) => {
@@ -750,32 +688,23 @@ export class FileFunctions {
 					}
 					const needle = caseSensitive ? query : query.toLowerCase();
 					const files = await this.globMatches(optionalString(args, "glob", "**/*"), false, true);
-					const limit = optionalInteger(args, "max_items", 100, 1, 2_000);
 					const hits: JsonValue[] = [];
 					const skippedCounts = new Map<string, number>();
 					const skip = (reason: string) => skippedCounts.set(reason, (skippedCounts.get(reason) ?? 0) + 1);
 					for (const file of files.sort()) {
-						if (hits.length >= 2_000) {
-							skip("result_limit");
-							break;
-						}
 						let data: Buffer;
 						let displayPath: string;
 						try {
 							const opened = await this.openReadable(file);
 							try {
 								displayPath = this.displayPath(opened.path);
-								data = await this.readBounded(opened.file, MAX_SEARCH_FILE_BYTES);
+								data = await this.readContents(opened.file);
 							} finally {
 								await opened.file.close();
 							}
-						} catch (error) {
+						} catch {
 							// Glob results can be unreadable or escape through a symlink.
-							skip(
-								error instanceof RiemannHostError && error.code === "response_too_large"
-									? "file_size_limit"
-									: "unreadable_or_unavailable_file",
-							);
+							skip("unreadable_or_unavailable_file");
 							continue;
 						}
 						if (data.includes(0)) {
@@ -792,32 +721,28 @@ export class FileFunctions {
 						// Visit lines without retaining a second, whole-file array of strings.
 						// Include the final empty line and strip CR only when it precedes LF.
 						let start = 0;
-						for (let lineNumber = 1; start <= text.length && hits.length < 2_000; lineNumber += 1) {
+						for (let lineNumber = 1; start <= text.length; lineNumber += 1) {
 							const newline = text.indexOf("\n", start);
 							const end = newline === -1 ? text.length : newline;
 							const line = text.slice(start, newline !== -1 && text.charCodeAt(end - 1) === 13 ? end - 1 : end);
 							start = newline === -1 ? text.length + 1 : newline + 1;
-							const searchableLine = matcher ? graphemeSafePrefix(line, MAX_SEARCH_LINE_CHARS) : line;
-							if (matcher && searchableLine.length < line.length) skip("regex_line_scan_limit");
 							if (matcher) matcher.lastIndex = 0;
 							const matched = matcher
-								? matcher.test(searchableLine)
+								? matcher.test(line)
 								: (caseSensitive ? line : line.toLowerCase()).includes(needle);
 							if (matched) {
 								hits.push({
 									$riemann: "search_match",
 									path: displayPath,
 									line: lineNumber,
-									text: graphemeSafePrefix(line, MAX_SEARCH_LINE_CHARS),
-									truncated: line.length > MAX_SEARCH_LINE_CHARS,
+									text: line,
+									truncated: false,
 								});
 							}
 						}
-						if (start <= text.length && hits.length >= 2_000) skip("result_limit");
 					}
 					const skipped = [...skippedCounts].map(([reason, count]) => ({ reason, count }));
 					return this.pages.create("fs.search", hits, {
-						limit,
 						coverage: skipped.length ? "limited" : "complete",
 						skipped,
 					});

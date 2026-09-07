@@ -18,7 +18,7 @@ export type KernelImageReference = {
 export type KernelModelContent =
 	| { type: "text"; text: string }
 	| KernelImageReference
-	| { type: "output_ref"; handle: string };
+	| { type: "output_ref"; handle: string; separator?: string };
 
 export type KernelHostResult = {
 	[key: string]: JsonValue;
@@ -174,7 +174,10 @@ export interface KernelManagerOptions {
 	hostRequest: KernelHostRequestHandler;
 	snapshotPath?: string;
 	startupTimeoutMs?: number;
-	maxOutputChars?: number;
+	/** Persist user output before it becomes visible to a yielded collector. */
+	retainOutput?: (
+		output: KernelDisplay | { stream: "stdout" | "stderr"; text: string },
+	) => Promise<KernelModelContent[]>;
 	onProcess?: (process: ChildProcess | undefined) => void;
 	onRestore?: (result: KernelRestoreResult) => void;
 }

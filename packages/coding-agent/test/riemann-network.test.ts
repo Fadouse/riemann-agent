@@ -51,7 +51,7 @@ try:
     ipython_connected = True
 except OSError:
     pass
-shell_result = await shell.run(script="printf ping > /dev/tcp/127.0.0.1/${port}", timeout=5)
+shell_result = await shell.run(script="printf ping > /dev/tcp/127.0.0.1/${port}")
 status = await state.status()
 print((ipython_connected, shell_result.exit_code == 0, (status.network.configured, status.network.effective, status.network.source), hasattr(web, "fetch"), hasattr(mcp, "open")))`,
 			},

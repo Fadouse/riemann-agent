@@ -6,17 +6,14 @@ import { parseHTML } from "linkedom";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { Agent, fetch as undiciFetch } from "undici";
-import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { graphemeSafePrefix } from "../../utils/text.ts";
 import { RiemannHostError } from "../errors.ts";
-import type { JsonValue } from "../kernel/types.ts";
+import { type JsonValue, kernelHostResult } from "../kernel/types.ts";
 import { utf8Prefix } from "../output.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
 import { PageStore, pageSchema } from "../state/pages.ts";
 import type { FunctionDefinition } from "./registry.ts";
 
-const MAX_RESPONSE_BYTES = 20 * 1024 * 1024;
-const MAX_SEARCH_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_REDIRECTS = 10;
 const PRIVATE_NETWORKS = new BlockList();
 for (const [address, prefix] of [
@@ -62,9 +59,7 @@ const SearchHitSchema = Type.Object(
 		title: Type.String(),
 		url: Type.String(),
 		snippet: Type.String(),
-		snippet_truncated: Type.Boolean({
-			description: "Whether the local excerpt was shortened; no complete snippet artifact is retained",
-		}),
+		snippet_truncated: Type.Boolean(),
 		published_at: Type.Union([Type.String(), Type.Null()]),
 	},
 	{ additionalProperties: false, $id: "SearchHit" },
@@ -197,27 +192,19 @@ function decodeBody(data: Uint8Array, contentType: string | null): string | unde
 	}
 }
 
-async function readLimitedBody(response: Response, maximumBytes: number): Promise<Buffer> {
-	if (!response.body) return Buffer.alloc(0);
+async function* responseChunks(response: Response): AsyncGenerator<Uint8Array> {
+	if (!response.body) return;
 	const reader = response.body.getReader();
-	const chunks: Uint8Array[] = [];
-	let total = 0;
 	try {
 		while (true) {
 			const { done, value } = await reader.read();
 			if (done) break;
 			if (!value) continue;
-			total += value.byteLength;
-			if (total > maximumBytes) {
-				await reader.cancel("response_too_large").catch(() => undefined);
-				throw new RiemannHostError("response_too_large", `Response exceeds ${maximumBytes} bytes`);
-			}
-			chunks.push(value);
+			yield value;
 		}
 	} finally {
 		reader.releaseLock();
 	}
-	return Buffer.concat(chunks, total);
 }
 
 function responseError(body: string): string {
@@ -254,18 +241,14 @@ function isTextContentType(contentType: string): boolean {
 async function requestWithNormalizedErrors<T>(
 	operation: string,
 	callerSignal: AbortSignal,
-	timeoutMs: number,
 	request: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
 	if (callerSignal.aborted) throw new RiemannHostError("cancelled", `${operation} was cancelled`);
-	const timeoutSignal = AbortSignal.timeout(timeoutMs);
 	try {
-		const combinedSignal = AbortSignal.any([callerSignal, timeoutSignal]);
-		return await raceWithAbortSignal(request(combinedSignal), combinedSignal);
+		return await request(callerSignal);
 	} catch (error) {
 		if (error instanceof RiemannHostError) throw error;
 		if (callerSignal.aborted) throw new RiemannHostError("cancelled", `${operation} was cancelled`);
-		if (timeoutSignal.aborted) throw new RiemannHostError("timeout", `${operation} timed out`, undefined, true);
 		throw new RiemannHostError("network_error", `${operation} failed`, undefined, true);
 	}
 }
@@ -350,11 +333,28 @@ export class WebFunctions {
 			const response = await this.fetcher(current, { ...init, redirect: "manual", signal });
 			if (![301, 302, 303, 307, 308].includes(response.status)) return response;
 			const location = response.headers.get("location");
+			await this.retainBody(response, "web-redirect");
 			if (!location) throw new RiemannHostError("network_error", "Redirect response omitted Location");
 			if (redirects === MAX_REDIRECTS) throw new RiemannHostError("network_error", "Too many redirects");
 			current = parseUrl(new URL(location, current).toString());
 		}
 		throw new RiemannHostError("network_error", "Too many redirects");
+	}
+
+	private async retainBody(response: Response, name: string): Promise<{ data: Buffer; ref: string }> {
+		const artifact = await this.artifacts.putStream(responseChunks(response), {
+			name,
+			mimeType: "application/octet-stream",
+			detectText: true,
+		});
+		if (
+			typeof artifact !== "object" ||
+			artifact === null ||
+			Array.isArray(artifact) ||
+			typeof artifact.handle !== "string"
+		)
+			throw new RiemannHostError("artifact_error", "HTTP response has no retained reference");
+		return { data: await this.artifacts.readBuffer(artifact.handle), ref: artifact.handle };
 	}
 
 	async close(): Promise<void> {
@@ -375,7 +375,7 @@ export class WebFunctions {
 							pattern: ".*\\S.*",
 							description: "Search query",
 						}),
-						max_items: Type.Optional(
+						result_count: Type.Optional(
 							Type.Union([Type.Integer({ minimum: 1, maximum: 30 }), Type.Null()], {
 								description: "Result count from 1 to 30",
 								default: 10,
@@ -413,11 +413,6 @@ export class WebFunctions {
 						description: "The run has exhausted its resource reference numbers.",
 						retryable: false,
 					},
-					{
-						code: "response_too_large",
-						description: "The search response or retained snapshot exceeds its byte limit.",
-						retryable: false,
-					},
 					{ code: "artifact_error", description: "The result snapshot artifact is invalid.", retryable: false },
 					{
 						code: "invalid_arguments",
@@ -440,11 +435,6 @@ export class WebFunctions {
 						retryable: false,
 					},
 					{
-						code: "timeout",
-						description: "The Exa request exceeded 30 seconds.",
-						retryable: true,
-					},
-					{
 						code: "cancelled",
 						description: "The caller cancelled the search.",
 						retryable: false,
@@ -463,7 +453,7 @@ export class WebFunctions {
 				prompt: {
 					inventory: "Search the current web with excerpts and source URLs.",
 					example:
-						"hits = await web.search(query='Node.js sqlite DatabaseSync documentation', max_items=5); output.show(value=hits)",
+						"hits = await web.search(query='Node.js sqlite DatabaseSync documentation', result_count=5); output.show(value=hits)",
 				},
 				capability: "web.search",
 				handler: async (args, signal) => {
@@ -475,13 +465,13 @@ export class WebFunctions {
 							`Exa is not configured. Set web.exaApiKey in ~/.riemann/agent/config.yaml, preferably as \${EXA_API_KEY}.`,
 						);
 					const query = requiredString(args, "query");
-					const limit = args.max_items === undefined || args.max_items === null ? 10 : args.max_items;
+					const limit = args.result_count === undefined || args.result_count === null ? 10 : args.result_count;
 					if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 30) {
-						throw new RiemannHostError("invalid_arguments", "max_items must be an integer from 1 to 30");
+						throw new RiemannHostError("invalid_arguments", "result_count must be an integer from 1 to 30");
 					}
 					const domains = normalizeDomains(args.domains);
 					const since = normalizeSince(args.since);
-					const body = await requestWithNormalizedErrors("Exa search", signal, 30_000, async (requestSignal) => {
+					const retained = await requestWithNormalizedErrors("Exa search", signal, async (requestSignal) => {
 						const response = await this.fetcher("https://api.exa.ai/search", {
 							method: "POST",
 							headers: {
@@ -496,16 +486,17 @@ export class WebFunctions {
 								numResults: limit,
 								...(domains ? { includeDomains: domains } : {}),
 								...(since ? { startPublishedDate: since } : {}),
-								contents: { highlights: { query, maxCharacters: 1_200 } },
+								contents: { highlights: { query } },
 							}),
 							signal: requestSignal,
 						});
-						const responseBody = (await readLimitedBody(response, MAX_SEARCH_RESPONSE_BYTES)).toString("utf8");
+						const retained = await this.retainBody(response, "web-search.json");
+						const responseBody = retained.data.toString("utf8");
 						if (!response.ok) {
 							throw new RiemannHostError(
 								"provider_error",
 								`Exa search failed with HTTP ${response.status}: ${responseError(responseBody)}`,
-								{ status: response.status },
+								{ status: response.status, ref: retained.ref },
 								response.status === 429 || response.status >= 500,
 								response.status === 429 || response.status >= 500
 									? "retry"
@@ -514,31 +505,33 @@ export class WebFunctions {
 										: "fix_arguments",
 							);
 						}
-						return responseBody;
+						return retained;
 					});
 					let parsed: unknown;
 					try {
-						parsed = JSON.parse(body);
+						parsed = JSON.parse(retained.data.toString("utf8"));
 					} catch {
-						throw new RiemannHostError("provider_error", "Exa returned invalid JSON");
+						throw new RiemannHostError("provider_error", "Exa returned invalid JSON", { ref: retained.ref });
 					}
 					if (!Value.Check(ExaResponseSchema, parsed))
-						throw new RiemannHostError("provider_error", "Exa response has an invalid result shape");
+						throw new RiemannHostError("provider_error", "Exa response has an invalid result shape", {
+							ref: retained.ref,
+						});
 					const result = parsed as ExaResponse;
 					const items = result.results.map((item) => {
 						const source = item.highlights?.join("\n\n") || item.text || "";
-						const sourceBytes = Buffer.byteLength(source);
-						const maximum = Math.min(1_200, this.previewBytes);
 						return {
 							$riemann: "search_hit",
 							title: item.title ?? item.url,
 							url: normalizeProviderUrl(item.url),
-							snippet: utf8Prefix(source, maximum),
-							snippet_truncated: sourceBytes > maximum,
+							snippet: source,
+							snippet_truncated: false,
 							published_at: item.publishedDate ?? null,
 						};
 					});
-					return this.pages.create("web.search", items, { limit, coverage: "unknown" });
+					return kernelHostResult(await this.pages.create("web.search", items, { coverage: "unknown" }), [
+						{ type: "text", text: `Search response: ${retained.ref}` },
+					]);
 				},
 			},
 			{
@@ -574,16 +567,6 @@ export class WebFunctions {
 						retryable: true,
 					},
 					{
-						code: "response_too_large",
-						description: "The response exceeds 20 MiB.",
-						retryable: false,
-					},
-					{
-						code: "timeout",
-						description: "The request exceeded 45 seconds.",
-						retryable: true,
-					},
-					{
 						code: "cancelled",
 						description: "The caller cancelled the fetch.",
 						retryable: false,
@@ -607,10 +590,9 @@ export class WebFunctions {
 				handler: async (args, signal) => {
 					if (signal.aborted) throw new RiemannHostError("cancelled", "Web request was cancelled");
 					const url = parseUrl(requiredString(args, "url"));
-					const { response, data } = await requestWithNormalizedErrors(
+					const { response, data, ref } = await requestWithNormalizedErrors(
 						"Fetch",
 						signal,
-						45_000,
 						async (requestSignal) => {
 							const fetched = await this.fetchPublic(
 								url,
@@ -622,11 +604,12 @@ export class WebFunctions {
 								},
 								requestSignal,
 							);
+							const retained = await this.retainBody(fetched, "web-response");
 							if (!fetched.ok) {
 								throw new RiemannHostError(
 									"network_error",
 									`Fetch failed with HTTP ${fetched.status} ${fetched.statusText}`.trim(),
-									{ status: fetched.status },
+									{ status: fetched.status, ref: retained.ref },
 									fetched.status === 429 || fetched.status >= 500,
 									fetched.status === 429 || fetched.status >= 500
 										? "retry"
@@ -635,21 +618,7 @@ export class WebFunctions {
 											: "fix_arguments",
 								);
 							}
-							const contentLength = Number(fetched.headers.get("content-length"));
-							if (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_BYTES) {
-								throw new RiemannHostError(
-									"response_too_large",
-									`Response is ${contentLength} bytes; maximum is ${MAX_RESPONSE_BYTES} bytes`,
-								);
-							}
-							const responseData = await readLimitedBody(fetched, MAX_RESPONSE_BYTES);
-							if (responseData.length > MAX_RESPONSE_BYTES) {
-								throw new RiemannHostError(
-									"response_too_large",
-									`Response exceeds ${MAX_RESPONSE_BYTES} bytes`,
-								);
-							}
-							return { response: fetched, data: responseData };
+							return { response: fetched, ...retained };
 						},
 					);
 					const contentType =
@@ -676,9 +645,14 @@ export class WebFunctions {
 							trust: "untrusted",
 						};
 					}
-					const extracted = contentType.includes("html")
-						? readableHtml(source, finalUrl)
-						: { title: null, text: source.replace(/\u0000/g, "").trim() };
+					let extracted: { title: string | null; text: string };
+					try {
+						extracted = contentType.includes("html")
+							? readableHtml(source, finalUrl)
+							: { title: null, text: source };
+					} catch (error) {
+						throw new RiemannHostError("parse_error", `Response retained at ${ref}: ${String(error)}`, { ref });
+					}
 					const textTruncated = Buffer.byteLength(extracted.text) > this.previewBytes;
 					const artifact = textTruncated
 						? await this.artifacts.putText(extracted.text, {
@@ -686,17 +660,20 @@ export class WebFunctions {
 								mimeType: "text/plain; charset=utf-8",
 							})
 						: null;
-					return {
-						$riemann: "document",
-						url: finalUrl,
-						title: extracted.title,
-						text: utf8Prefix(extracted.text, this.previewBytes),
-						text_truncated: textTruncated,
-						artifact_kind: artifact ? "extracted" : null,
-						content_type: contentType,
-						artifact,
-						trust: "untrusted",
-					};
+					return kernelHostResult(
+						{
+							$riemann: "document",
+							url: finalUrl,
+							title: extracted.title,
+							text: utf8Prefix(extracted.text, this.previewBytes),
+							text_truncated: textTruncated,
+							artifact_kind: artifact ? "extracted" : null,
+							content_type: contentType,
+							artifact,
+							trust: "untrusted",
+						},
+						[{ type: "text", text: `Raw response: ${ref}` }],
+					);
 				},
 			},
 		];

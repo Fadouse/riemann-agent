@@ -8,6 +8,7 @@ import { Dealer, Subscriber } from "zeromq";
 import { signalProcessGroup, spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { policyAllowsRead, policyAllowsWrite } from "../access-policy.ts";
 import { RiemannHostError } from "../errors.ts";
+import { inheritExecutionDeadline } from "../execution.ts";
 import { sandboxedKernelCommand } from "./sandbox.ts";
 import type {
 	JsonValue,
@@ -51,12 +52,15 @@ interface ActiveExecution {
 	resolve: (result: KernelExecuteResult) => void;
 	abort?: () => void;
 	hostControllers: Set<AbortController>;
+	hostRequests: Set<Promise<void>>;
+	pendingOutput: number;
 	onHostRequest?: KernelExecuteOptions["onHostRequest"];
 	outputOrder?: "arrival";
+	internal: boolean;
+	signal?: AbortSignal;
 	nextHostSequence: number;
 	hostModelContent: Array<{ sequence: number; content: KernelModelContent[] }>;
 	hostNotificationQueue: Promise<void>;
-	richOutputTruncated: boolean;
 	richCaptureTruncated: boolean;
 }
 
@@ -156,6 +160,7 @@ export class IPythonKernelManager {
 	private iopub?: Subscriber;
 	private startup?: Promise<void>;
 	private execution?: ActiveExecution;
+	private readonly lateModelContent: KernelModelContent[] = [];
 	private shellLoop?: Promise<void>;
 	private controlLoop?: Promise<void>;
 	private iopubLoop?: Promise<void>;
@@ -397,24 +402,29 @@ export class IPythonKernelManager {
 			for await (const frames of socket) {
 				if (!this.connection) continue;
 				const message = decodeJupyterMessage(frames as Buffer[], this.connection.key);
-				if (message) this.handleMessage(channel, message);
+				if (message) await this.handleMessage(channel, message);
 			}
 		} catch (error) {
 			if (!this.closed) this.failActive(error instanceof Error ? error : new Error(String(error)));
 		}
 	}
 
-	private handleMessage(channel: "shell" | "control" | "iopub", message: JupyterMessage): void {
+	private async handleMessage(channel: "shell" | "control" | "iopub", message: JupyterMessage): Promise<void> {
 		if (message.header.msg_type === "kernel_info_reply") {
 			this.kernelReady = true;
 			return;
 		}
 		if (message.header.msg_type === "comm_open" && stringField(message.content.target_name) === HOST_COMM_TARGET) {
 			const execution = this.execution?.id === stringField(message.parentHeader.msg_id) ? this.execution : undefined;
-			void this.handleHostRequest(channel, message).catch((error: unknown) => {
+			const pending = this.handleHostRequest(channel, message).catch((error: unknown) => {
 				if (execution && this.execution === execution) {
 					this.failActive(error instanceof Error ? error : new Error(String(error)));
 				}
+			});
+			execution?.hostRequests.add(pending);
+			void pending.then(() => {
+				execution?.hostRequests.delete(pending);
+				if (execution) this.settleIfComplete(execution);
 			});
 			return;
 		}
@@ -437,35 +447,25 @@ export class IPythonKernelManager {
 		switch (message.header.msg_type) {
 			case "stream": {
 				const text = stringField(message.content.text) ?? "";
-				if (message.content.name === "stderr") {
-					if (execution.stderrTruncated) break;
-					const output = this.capOutput(execution.stderr, text);
-					execution.stderr = output.value;
-					execution.stderrTruncated = output.truncated;
-				} else {
-					if (execution.stdoutTruncated) break;
-					const output = this.capOutput(execution.stdout, text);
-					execution.stdout = output.value;
-					execution.stdoutTruncated = output.truncated;
-				}
+				const stream = message.content.name === "stderr" ? "stderr" : "stdout";
+				if (!execution.internal && this.options.retainOutput) {
+					await this.retainOutput(execution, { stream, text });
+				} else execution[stream] += text;
 				break;
 			}
 			case "display_data": {
-				const display = this.boundedDisplay(message);
+				const display = parseDisplay(message);
 				if (!display) break;
-				if (execution.displays.length < 32) execution.displays.push(display);
-				else if (!execution.richOutputTruncated) {
-					execution.richOutputTruncated = true;
-					execution.richCaptureTruncated = true;
-					execution.displays.push({
-						data: { "text/plain": "[additional rich output omitted by Riemann Agent]" },
-						metadata: {},
-					});
-				}
+				if (!execution.internal && this.options.retainOutput) {
+					await this.retainOutput(execution, display);
+				} else execution.displays.push(display);
 				break;
 			}
 			case "execute_result": {
-				execution.result = this.boundedDisplay(message);
+				const display = parseDisplay(message);
+				if (display && !execution.internal && this.options.retainOutput) {
+					await this.retainOutput(execution, display);
+				} else execution.result = display;
 				execution.executionCount = numberField(message.content.execution_count);
 				break;
 			}
@@ -501,41 +501,31 @@ export class IPythonKernelManager {
 		}
 	}
 
-	private boundedDisplay(message: JupyterMessage): KernelDisplay | undefined {
-		const display = parseDisplay(message);
-		if (!display) return undefined;
-		const cap = Math.max(1, this.options.maxOutputChars ?? 100_000);
-		const encoded = JSON.stringify(display.data);
-		if (encoded.length <= cap) return display;
-		if (this.execution) this.execution.richCaptureTruncated = true;
-		const text = display.data["text/plain"];
-		if (typeof text === "string") {
-			return {
-				data: { "text/plain": `${text.slice(0, cap)}\n[rich output truncated by Riemann Agent]` },
-				metadata: display.metadata,
+	private async retainOutput(
+		execution: ActiveExecution,
+		output: Parameters<NonNullable<KernelManagerOptions["retainOutput"]>>[0],
+	): Promise<void> {
+		const sequence = execution.nextHostSequence++;
+		execution.pendingOutput++;
+		try {
+			const content = await this.options.retainOutput!(output);
+			execution.hostModelContent.push({ sequence, content });
+		} catch (error) {
+			execution.status = "error";
+			execution.richCaptureTruncated = true;
+			if ("stream" in output) execution[output.stream] += output.text;
+			else execution.displays.push(output);
+			execution.error = {
+				ename: "OutputPersistenceError",
+				evalue: errorMessage(error),
+				traceback: [],
+				...(error instanceof RiemannHostError && error.details !== undefined ? { details: error.details } : {}),
 			};
+			void this.interrupt().catch(() => undefined);
+		} finally {
+			execution.pendingOutput--;
+			this.settleIfComplete(execution);
 		}
-		return {
-			data: { "text/plain": `[rich output omitted by Riemann Agent; ${encoded.length} encoded characters]` },
-			metadata: {},
-		};
-	}
-
-	private capOutput(value: string, addition: string): { value: string; truncated: boolean } {
-		const cap = this.options.maxOutputChars ?? 100_000;
-		if (cap >= 0) {
-			if (value.length + addition.length <= cap) return { value: value + addition, truncated: false };
-			return {
-				value: `${value}${addition.slice(0, cap - value.length)}\n[output truncated by Riemann Agent]`,
-				truncated: true,
-			};
-		}
-		const combined = value + addition;
-		if (combined.length <= cap) return { value: combined, truncated: false };
-		return {
-			value: `${combined.slice(0, cap)}\n[output truncated by Riemann Agent]`,
-			truncated: false,
-		};
 	}
 
 	private abortHostRequests(execution: ActiveExecution, reason: Error): void {
@@ -553,8 +543,9 @@ export class IPythonKernelManager {
 
 	private settleIfComplete(execution: ActiveExecution): void {
 		if (execution.settled || !execution.replied || !execution.idle) return;
-		execution.settled = true;
 		this.abortHostRequests(execution, new Error("IPython cell finished"));
+		if (execution.pendingOutput > 0 || (execution.status === "ok" && execution.hostRequests.size > 0)) return;
+		execution.settled = true;
 		execution.abort?.();
 		if (this.execution === execution) this.execution = undefined;
 		execution.resolve({
@@ -667,6 +658,7 @@ export class IPythonKernelManager {
 		const sequence = execution?.nextHostSequence ?? 0;
 		if (execution) execution.nextHostSequence += 1;
 		const controller = new AbortController();
+		inheritExecutionDeadline(execution?.signal, controller.signal);
 		if (!execution || message.parentHeader.msg_id !== execution.id) {
 			controller.abort(new Error("The originating IPython cell is no longer active"));
 		} else {
@@ -700,7 +692,14 @@ export class IPythonKernelManager {
 				});
 				const value = isKernelHostResult(result) ? result.value : result;
 				if (isKernelHostResult(result) && result.modelContent.length > 0) {
-					execution.hostModelContent.push({ sequence, content: result.modelContent });
+					if (execution.settled) {
+						if (this.execution && !this.execution.internal) {
+							this.execution.hostModelContent.push({
+								sequence: this.execution.nextHostSequence++,
+								content: result.modelContent,
+							});
+						} else this.lateModelContent.push(...result.modelContent);
+					} else execution.hostModelContent.push({ sequence, content: result.modelContent });
 				}
 				reply = {
 					request_id: requestId,
@@ -798,15 +797,24 @@ export class IPythonKernelManager {
 			settled: false,
 			resolve: resolveExecution,
 			hostControllers: new Set(),
+			hostRequests: new Set(),
+			pendingOutput: 0,
 			onHostRequest: options.onHostRequest,
 			outputOrder: options.outputOrder,
+			internal: options.internal ?? false,
+			signal: options.signal,
 			nextHostSequence: 0,
 			hostModelContent: [],
 			hostNotificationQueue: Promise.resolve(),
-			richOutputTruncated: false,
 			richCaptureTruncated: false,
 		};
 		this.execution = execution;
+		if (!execution.internal && this.lateModelContent.length > 0) {
+			execution.hostModelContent.push({
+				sequence: execution.nextHostSequence++,
+				content: this.lateModelContent.splice(0),
+			});
+		}
 		try {
 			await this.shell.send(request.frames);
 		} catch (error) {
@@ -843,7 +851,10 @@ export class IPythonKernelManager {
 		const execution = this.execution;
 		if (!execution) return;
 		if (execution.status === "ok") execution.status = "cancelled";
-		this.abortHostRequests(execution, new Error("IPython cell interrupted"));
+		this.abortHostRequests(
+			execution,
+			execution.signal?.reason instanceof Error ? execution.signal.reason : new Error("IPython cell interrupted"),
+		);
 		if (this.control && this.connection) {
 			const request = encodeJupyterMessage({
 				type: "interrupt_request",

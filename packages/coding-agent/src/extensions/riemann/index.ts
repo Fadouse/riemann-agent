@@ -16,6 +16,7 @@ import {
 	type IPythonSchema,
 	type IPythonToolDetails,
 	type IPythonWaitSchema,
+	RIEMANN_TOOL_NAMES,
 } from "../../riemann/ipython.ts";
 import { getPreservedOpenAICompaction } from "../../riemann/openai-compaction-state.ts";
 import { RiemannRuntime } from "../../riemann/runtime.ts";
@@ -328,7 +329,7 @@ const riemannExtension: ExtensionFactory = (pi) => {
 		const current = await getRuntime(ctx);
 		subagentUi?.dispose();
 		subagentUi = installSubagentUi(current, ctx);
-		pi.setActiveTools(["ipython", "ipython_wait"]);
+		pi.setActiveTools([...RIEMANN_TOOL_NAMES]);
 	});
 
 	pi.on("model_select", async (event, ctx) => {
@@ -345,8 +346,8 @@ const riemannExtension: ExtensionFactory = (pi) => {
 		systemPromptOptions = event.systemPromptOptions;
 		const current = await getRuntime(ctx);
 		const active = pi.getActiveTools();
-		if (active.length !== 2 || active[0] !== "ipython" || active[1] !== "ipython_wait")
-			pi.setActiveTools(["ipython", "ipython_wait"]);
+		if (active.length !== RIEMANN_TOOL_NAMES.length || RIEMANN_TOOL_NAMES.some((name, i) => active[i] !== name))
+			pi.setActiveTools([...RIEMANN_TOOL_NAMES]);
 		return { systemPrompt: appendProjectContext(current.systemPrompt("main"), event.systemPromptOptions) };
 	});
 

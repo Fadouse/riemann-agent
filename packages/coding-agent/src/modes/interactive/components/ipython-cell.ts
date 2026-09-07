@@ -83,7 +83,7 @@ function visiblePythonOutput(text: string, details: IPythonDetails): string {
 			"Collect the previous Python execution before starting another.",
 		)
 		.replace(/^Python cell \S+ already has an active wait$/m, "Python execution already has an active wait.");
-	return details.moreRef ? text.replaceAll(`[more=${details.moreRef}]`, "") : text;
+	return details.moreRef ? text.replaceAll(`[more ${details.moreRef}]`, "") : text;
 }
 
 interface LineSummary {

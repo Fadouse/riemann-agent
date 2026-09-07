@@ -10,6 +10,7 @@ import { raceWithAbortSignal } from "../../utils/abort.ts";
 import type { McpServerConfig } from "../config.ts";
 import { expandConfigSecret } from "../config.ts";
 import { RiemannHostError } from "../errors.ts";
+import { remainingExecutionMs } from "../execution.ts";
 import {
 	type FunctionDefinition,
 	type FunctionRegistry,
@@ -180,7 +181,10 @@ function errorMessage(error: unknown): string {
 
 export class RiemannMcpManager {
 	private readonly states = new Map<string, McpServerState>();
-	private readonly startups = new Map<string, { controller: AbortController; promise: Promise<McpServerState> }>();
+	private readonly startups = new Map<
+		string,
+		{ controller: AbortController; promise: Promise<McpServerState>; waiters: number }
+	>();
 	private closed = false;
 	private readonly configs: Record<string, McpServerConfig>;
 	private readonly cwd: string;
@@ -273,22 +277,18 @@ export class RiemannMcpManager {
 		return new StreamableHTTPClientTransport(url, { requestInit: { headers } });
 	}
 
-	private async listTools(client: Client, timeout: number, signal: AbortSignal): Promise<Tool[]> {
+	private async listTools(client: Client, signal: AbortSignal): Promise<Tool[]> {
 		const tools: Tool[] = [];
 		let cursor: string | undefined;
 		const cursors = new Set<string>();
-		const deadline = Date.now() + timeout;
 		do {
-			if (cursors.size >= 100) throw new RiemannHostError("mcp_error", "MCP tools/list exceeded 100 pages");
-			const remaining = deadline - Date.now();
-			if (remaining <= 0) throw new RiemannHostError("timeout", "MCP tools/list timed out");
+			const remaining = remainingExecutionMs(signal);
 			const result = await client.listTools(cursor ? { cursor } : undefined, {
 				timeout: remaining,
 				maxTotalTimeout: remaining,
 				signal,
 			});
 			tools.push(...result.tools);
-			if (tools.length > 1_000) throw new RiemannHostError("mcp_error", "MCP server exposed more than 1000 tools");
 			cursor = result.nextCursor;
 			if (cursor && cursors.has(cursor))
 				throw new RiemannHostError("mcp_error", "MCP tools/list returned a duplicate cursor");
@@ -305,71 +305,80 @@ export class RiemannMcpManager {
 
 	private async normalizeToolResult(result: McpCallToolResult): Promise<JsonValue> {
 		const raw = asJson(result);
-		if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-			throw new RiemannHostError("mcp_error", "MCP tool returned an invalid result");
-		}
-		const rawContent = Array.isArray(raw.content) ? raw.content : [];
-		const protocolContent = "content" in result && Array.isArray(result.content) ? result.content : [];
-		const content: JsonValue[] = [];
-		const artifacts: JsonValue[] = [];
-		for (let index = 0; index < rawContent.length; index += 1) {
-			const wireItem = rawContent[index];
-			const item = protocolContent[index];
-			if (!item || typeof wireItem !== "object" || wireItem === null || Array.isArray(wireItem)) {
-				content.push(wireItem ?? null);
-				continue;
+		const source = await this.artifacts.putJson(raw, "mcp-result.json");
+		try {
+			if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+				throw new RiemannHostError("mcp_error", "MCP tool returned an invalid result");
 			}
-			if (item.type === "image") {
-				const image = await storeModelImage({
-					artifacts: this.artifacts,
-					bytes: Buffer.from(item.data, "base64"),
-					claimedMimeType: item.mimeType,
-					name: `mcp-image-${index + 1}`,
-				});
-				const normalized = { ...wireItem };
-				delete normalized.data;
-				normalized.mimeType = image.reference.mimeType;
-				normalized.artifact = image.artifact;
-				content.push(normalized);
-				artifacts.push(image.artifact);
-				continue;
-			}
-			if (item.type === "resource" && "blob" in item.resource && item.resource.mimeType?.startsWith("image/")) {
-				const image = await storeModelImage({
-					artifacts: this.artifacts,
-					bytes: Buffer.from(item.resource.blob, "base64"),
-					claimedMimeType: item.resource.mimeType,
-					name: `mcp-resource-image-${index + 1}`,
-				});
-				const wireResource = wireItem.resource;
-				if (typeof wireResource === "object" && wireResource !== null && !Array.isArray(wireResource)) {
-					const normalizedResource = { ...wireResource };
-					delete normalizedResource.blob;
-					normalizedResource.mimeType = image.reference.mimeType;
-					normalizedResource.artifact = image.artifact;
-					content.push({ ...wireItem, resource: normalizedResource });
+			const rawContent = Array.isArray(raw.content) ? raw.content : [];
+			const protocolContent = "content" in result && Array.isArray(result.content) ? result.content : [];
+			const content: JsonValue[] = [];
+			const artifacts: JsonValue[] = [source];
+			for (let index = 0; index < rawContent.length; index += 1) {
+				const wireItem = rawContent[index];
+				const item = protocolContent[index];
+				if (!item || typeof wireItem !== "object" || wireItem === null || Array.isArray(wireItem)) {
+					content.push(wireItem ?? null);
+					continue;
+				}
+				if (item.type === "image") {
+					const image = await storeModelImage({
+						artifacts: this.artifacts,
+						bytes: Buffer.from(item.data, "base64"),
+						claimedMimeType: item.mimeType,
+						name: `mcp-image-${index + 1}`,
+					});
+					const normalized = { ...wireItem };
+					delete normalized.data;
+					normalized.mimeType = image.sourceMimeType;
+					normalized.artifact = image.artifact;
+					content.push(normalized);
 					artifacts.push(image.artifact);
 					continue;
 				}
+				if (item.type === "resource" && "blob" in item.resource && item.resource.mimeType?.startsWith("image/")) {
+					const image = await storeModelImage({
+						artifacts: this.artifacts,
+						bytes: Buffer.from(item.resource.blob, "base64"),
+						claimedMimeType: item.resource.mimeType,
+						name: `mcp-resource-image-${index + 1}`,
+					});
+					const wireResource = wireItem.resource;
+					if (typeof wireResource === "object" && wireResource !== null && !Array.isArray(wireResource)) {
+						const normalizedResource = { ...wireResource };
+						delete normalizedResource.blob;
+						normalizedResource.mimeType = image.sourceMimeType;
+						normalizedResource.artifact = image.artifact;
+						content.push({ ...wireItem, resource: normalizedResource });
+						artifacts.push(image.artifact);
+						continue;
+					}
+				}
+				content.push(wireItem);
 			}
-			content.push(wireItem);
+			const extensions = Object.fromEntries(
+				Object.entries(raw).filter(([key]) => !["content", "structuredContent", "_meta", "isError"].includes(key)),
+			);
+			const opaqueMcpJson = (value: JsonValue): JsonValue => ({ $riemann: "mcp_json", value });
+			const normalized: JsonValue = {
+				$riemann: "mcp_result",
+				content: content.map(opaqueMcpJson),
+				structured_content: opaqueMcpJson(raw.structuredContent ?? null),
+				metadata: opaqueMcpJson(raw._meta ?? null),
+				artifacts,
+				extensions: opaqueMcpJson(extensions),
+			};
+			if (result.isError) {
+				throw new RiemannHostError("mcp_tool_error", "MCP tool reported an error", normalized);
+			}
+			return normalized;
+		} catch (error) {
+			if (error instanceof RiemannHostError && error.code === "mcp_tool_error") throw error;
+			throw new RiemannHostError("mcp_error", `MCP result normalization failed: ${errorMessage(error)}`, {
+				artifact: source,
+				cause: error instanceof RiemannHostError ? (error.details ?? null) : null,
+			});
 		}
-		const extensions = Object.fromEntries(
-			Object.entries(raw).filter(([key]) => !["content", "structuredContent", "_meta", "isError"].includes(key)),
-		);
-		const opaqueMcpJson = (value: JsonValue): JsonValue => ({ $riemann: "mcp_json", value });
-		const normalized: JsonValue = {
-			$riemann: "mcp_result",
-			content: content.map(opaqueMcpJson),
-			structured_content: opaqueMcpJson(raw.structuredContent ?? null),
-			metadata: opaqueMcpJson(raw._meta ?? null),
-			artifacts,
-			extensions: opaqueMcpJson(extensions),
-		};
-		if (result.isError) {
-			throw new RiemannHostError("mcp_tool_error", "MCP tool reported an error", normalized);
-		}
-		return normalized;
 	}
 
 	private definitionForTool(
@@ -416,7 +425,6 @@ export class RiemannMcpManager {
 					description: "The MCP image format is unsupported or invalid.",
 					retryable: false,
 				},
-				{ code: "image_too_large", description: "The MCP source image exceeds 20 MiB.", retryable: false },
 				{ code: "image_decode_failed", description: "The MCP image cannot be decoded.", retryable: false },
 				{ code: "artifact_error", description: "The MCP image artifact is invalid.", retryable: false },
 				{
@@ -459,7 +467,7 @@ export class RiemannMcpManager {
 				if (typeof input !== "object" || input === null || Array.isArray(input)) {
 					throw new RiemannHostError("invalid_arguments", "input must be an object");
 				}
-				const timeout = config.toolTimeoutMs ?? 60_000;
+				const timeout = remainingExecutionMs(signal);
 				try {
 					const result = await state.client.callTool({ name: tool.name, arguments: input }, undefined, {
 						timeout,
@@ -593,7 +601,7 @@ export class RiemannMcpManager {
 				const promise = Promise.resolve().then(() =>
 					this.connect(serverName, config, state, lifecycle, controller.signal),
 				);
-				startup = { controller, promise };
+				startup = { controller, promise, waiters: 0 };
 				this.startups.set(serverName, startup);
 				void promise
 					.finally(() => {
@@ -601,7 +609,17 @@ export class RiemannMcpManager {
 					})
 					.catch(() => undefined);
 			}
-			const activated = await raceWithAbortSignal(startup.promise, signal);
+			startup.waiters++;
+			let activated: McpServerState;
+			try {
+				activated = await raceWithAbortSignal(startup.promise, signal);
+			} finally {
+				startup.waiters--;
+				if (startup.waiters === 0 && signal.aborted && this.startups.get(serverName) === startup) {
+					this.startups.delete(serverName);
+					startup.controller.abort(signal.reason);
+				}
+			}
 			if (this.closed || startup.controller.signal.aborted || activated.status !== "ready")
 				throw new RiemannHostError("closed", "MCP server was closed");
 			return this.functionBundle(serverName, activated);
@@ -633,15 +651,15 @@ export class RiemannMcpManager {
 				if (!this.closed && state.status !== "failed") state.status = "failed";
 				if (state.namespace) this.registry.unregisterNamespace(state.namespace);
 			};
-			const timeout = config.startupTimeoutMs ?? 15_000;
-			const startupSignal = AbortSignal.any([managerSignal, AbortSignal.timeout(timeout)]);
+			const timeout = remainingExecutionMs(managerSignal);
+			const startupSignal = managerSignal;
 			await raceWithAbortSignal(
 				client.connect(transport, { timeout, maxTotalTimeout: timeout, signal: startupSignal }),
 				startupSignal,
 			);
 			startupSignal.throwIfAborted();
 			const tools = this.filterTools(
-				await raceWithAbortSignal(this.listTools(client, timeout, startupSignal), startupSignal),
+				await raceWithAbortSignal(this.listTools(client, startupSignal), startupSignal),
 				config,
 			);
 			startupSignal.throwIfAborted();
