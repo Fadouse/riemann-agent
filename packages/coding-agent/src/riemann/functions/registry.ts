@@ -429,6 +429,7 @@ function promptInventoryItem(definition: FunctionDefinition): string {
 
 export class FunctionRegistry {
 	private readonly definitions = new Map<string, FunctionDefinition>();
+	private cachedPrompt?: { capabilities: string; text: string };
 
 	register(definition: FunctionDefinition): void {
 		if (!isPythonIdentifier(definition.namespace) || !isPythonIdentifier(definition.name)) {
@@ -447,9 +448,11 @@ export class FunctionRegistry {
 			if (!isPythonIdentifier(name)) throw new Error(`Invalid parameter name: ${name}`);
 		}
 		this.definitions.set(qualifiedName, definition);
+		this.cachedPrompt = undefined;
 	}
 
 	unregisterNamespace(namespace: string): void {
+		this.cachedPrompt = undefined;
 		for (const name of this.definitions.keys()) {
 			if (name.startsWith(`${namespace}.`)) this.definitions.delete(name);
 		}
@@ -688,7 +691,10 @@ export class FunctionRegistry {
 	}
 
 	promptInventory(capabilities: ReadonlySet<string>): string {
+		const capabilityKey = [...capabilities].sort().join("\n");
+		if (this.cachedPrompt?.capabilities === capabilityKey) return this.cachedPrompt.text;
 		const available = this.list(capabilities);
+		const visible = publicDefinitions(available, capabilities);
 		const grouped = new Map<string, string[]>();
 		const returnTypes = new Map<string, string>();
 		const collect = (name: string, schema: TSchema): void => {
@@ -716,7 +722,7 @@ export class FunctionRegistry {
 			}
 			if (/^[A-Z]/.test(name)) returnTypes.set(name, formatPythonReturnShape(name, schema, available));
 		};
-		for (const definition of publicDefinitions(this.list(capabilities), capabilities).sort((left, right) => {
+		for (const definition of [...visible].sort((left, right) => {
 			const namespaceOrder =
 				(PROMPT_NAMESPACE_ORDER.get(left.namespace) ?? Number.MAX_SAFE_INTEGER) -
 				(PROMPT_NAMESPACE_ORDER.get(right.namespace) ?? Number.MAX_SAFE_INTEGER);
@@ -729,9 +735,20 @@ export class FunctionRegistry {
 			grouped.set(definition.namespace, items);
 		}
 		const inventory = [...grouped].map(([namespace, items]) => `- \`${namespace}\`: ${items.join("; ")}`).join("\n");
-		return returnTypes.size
+		const summary = returnTypes.size
 			? `${inventory}\n- Return types: ${[...returnTypes.values()].map((shape) => `\`${shape}\``).join("; ")}. Use \`output.show(value=..., fields=None, max_items=10)\` for explicit display.`
 			: inventory;
+		const contracts = visible.map((definition) =>
+			[
+				`### ${definition.namespace}.${definition.name}`,
+				definition.description,
+				`Input contract (JSON Schema; construct arguments as Python values):\n\`\`\`json\n${JSON.stringify(definition.inputSchema)}\n\`\`\``,
+				`Example:\n\`\`\`python\n${consumptionExample(definition)}\n\`\`\``,
+			].join("\n\n"),
+		);
+		const text = [summary, ...contracts].join("\n\n");
+		this.cachedPrompt = { capabilities: capabilityKey, text };
+		return text;
 	}
 
 	promptGuidelines(capabilities: ReadonlySet<string>): string[] {

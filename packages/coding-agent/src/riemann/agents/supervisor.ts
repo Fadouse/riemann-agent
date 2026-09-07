@@ -43,7 +43,7 @@ import {
 } from "../config.ts";
 import { RiemannHostError } from "../errors.ts";
 import type { FunctionDefinition } from "../functions/registry.ts";
-import type { IPythonSchema, IPythonToolDetails } from "../ipython.ts";
+import type { IPythonSchema, IPythonToolDetails, IPythonWaitSchema } from "../ipython.ts";
 import type { JsonValue } from "../kernel/types.ts";
 import { getPreservedOpenAICompaction } from "../openai-compaction-state.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
@@ -60,6 +60,7 @@ import type {
 
 export interface ChildRiemannRuntime {
 	tool: ToolDefinition<typeof IPythonSchema, IPythonToolDetails>;
+	waitTool?: ToolDefinition<typeof IPythonWaitSchema, IPythonToolDetails>;
 	systemPrompt: string;
 	initialCodexContext(): Promise<{ systemPrompt?: string; messages: AgentMessage[] }>;
 	compact(
@@ -1010,8 +1011,8 @@ export class AgentSupervisor {
 			modelRuntime,
 			thinkingLevel:
 				this.options.config.profiles[agent.modelRole]?.thinkingLevel ?? this.options.rootContext.thinkingLevel,
-			tools: ["ipython"],
-			customTools: [defineTool(runtime.tool)],
+			tools: runtime.waitTool ? ["ipython", "ipython_wait"] : ["ipython"],
+			customTools: [defineTool(runtime.tool), ...(runtime.waitTool ? [defineTool(runtime.waitTool)] : [])],
 			resourceLoader,
 			sessionManager,
 			settingsManager,

@@ -10,7 +10,13 @@ import {
 	latestActiveCompactionHasOpenAIContext,
 } from "../../riemann/compaction-warning.ts";
 import { getRiemannAgentDir, loadRiemannConfig } from "../../riemann/config.ts";
-import { IPYTHON_TOOL_METADATA, type IPythonSchema, type IPythonToolDetails } from "../../riemann/ipython.ts";
+import {
+	IPYTHON_TOOL_METADATA,
+	IPYTHON_WAIT_TOOL_METADATA,
+	type IPythonSchema,
+	type IPythonToolDetails,
+	type IPythonWaitSchema,
+} from "../../riemann/ipython.ts";
 import { getPreservedOpenAICompaction } from "../../riemann/openai-compaction-state.ts";
 import { RiemannRuntime } from "../../riemann/runtime.ts";
 import { installSubagentUi, type SubagentUiController } from "./subagent-ui.ts";
@@ -294,6 +300,13 @@ const riemannExtension: ExtensionFactory = (pi) => {
 			return current.toolDefinition().execute(toolCallId, params, signal, onUpdate, ctx);
 		},
 	});
+	pi.registerTool<typeof IPythonWaitSchema, IPythonToolDetails>({
+		...IPYTHON_WAIT_TOOL_METADATA,
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const current = await getRuntime(ctx);
+			return current.waitToolDefinition().execute(toolCallId, params, signal, onUpdate, ctx);
+		},
+	});
 
 	pi.registerCommand("agents", {
 		description: "Inspect and manage active Riemann Subagents",
@@ -315,7 +328,7 @@ const riemannExtension: ExtensionFactory = (pi) => {
 		const current = await getRuntime(ctx);
 		subagentUi?.dispose();
 		subagentUi = installSubagentUi(current, ctx);
-		pi.setActiveTools(["ipython"]);
+		pi.setActiveTools(["ipython", "ipython_wait"]);
 	});
 
 	pi.on("model_select", async (event, ctx) => {
@@ -331,7 +344,9 @@ const riemannExtension: ExtensionFactory = (pi) => {
 	pi.on("before_agent_start", async (event, ctx) => {
 		systemPromptOptions = event.systemPromptOptions;
 		const current = await getRuntime(ctx);
-		if (pi.getActiveTools().length !== 1 || pi.getActiveTools()[0] !== "ipython") pi.setActiveTools(["ipython"]);
+		const active = pi.getActiveTools();
+		if (active.length !== 2 || active[0] !== "ipython" || active[1] !== "ipython_wait")
+			pi.setActiveTools(["ipython", "ipython_wait"]);
 		return { systemPrompt: appendProjectContext(current.systemPrompt("main"), event.systemPromptOptions) };
 	});
 

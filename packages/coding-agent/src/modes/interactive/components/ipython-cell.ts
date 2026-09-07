@@ -32,6 +32,7 @@ export interface IPythonCellContentBlock {
 
 export interface IPythonCellState {
 	code: string;
+	wait?: boolean;
 	content?: readonly IPythonCellContentBlock[];
 	details?: unknown;
 	isPartial?: boolean;
@@ -50,6 +51,8 @@ interface IPythonDetails {
 	status?: string;
 	durationMs?: number;
 	errorName?: string;
+	cellId?: string;
+	moreRef?: string;
 }
 
 function readDetails(value: unknown): IPythonDetails {
@@ -60,14 +63,27 @@ function readDetails(value: unknown): IPythonDetails {
 		startedAt: typeof record.startedAt === "number" ? record.startedAt : undefined,
 		durationMs: typeof record.durationMs === "number" ? record.durationMs : undefined,
 		errorName: typeof record.errorName === "string" ? record.errorName : undefined,
+		cellId: typeof record.cellId === "string" ? record.cellId : undefined,
+		moreRef: typeof record.moreRef === "string" ? record.moreRef : undefined,
 	};
 }
 
-function textFromBlocks(blocks: readonly IPythonCellContentBlock[] | undefined): string {
-	return (blocks ?? [])
-		.filter((block) => block.type === "text" && typeof block.text === "string")
-		.map((block) => block.text ?? "")
-		.join("\n");
+function visiblePythonOutput(text: string, details: IPythonDetails): string {
+	if (
+		details.cellId &&
+		(text.startsWith(`Script running with cell ID ${details.cellId}`) || text.startsWith(`Cell ${details.cellId} `))
+	) {
+		const newline = text.indexOf("\n");
+		text = newline === -1 ? "" : text.slice(newline + 1);
+	}
+	text = text
+		.replace(/^Unknown or already collected Python cell: \S+$/m, "Python cell is unavailable or already collected.")
+		.replace(
+			/^Collect cell \S+ with ipython_wait before starting another cell$/m,
+			"Collect the previous Python execution before starting another.",
+		)
+		.replace(/^Python cell \S+ already has an active wait$/m, "Python execution already has an active wait.");
+	return details.moreRef ? text.replaceAll(`[more=${details.moreRef}]`, "") : text;
 }
 
 interface LineSummary {
@@ -98,7 +114,7 @@ function summarizeLines(text: string): LineSummary {
 	}
 }
 
-type StatusKind = "error" | "aborted" | "running" | "queued" | "done";
+type StatusKind = "error" | "aborted" | "running" | "queued" | "yielded" | "done";
 
 /** Safely extract the cell source while tool-call arguments are still streaming. */
 export function getIPythonCodeFromArgs(args: unknown): string {
@@ -140,6 +156,7 @@ export class IPythonCellComponent implements Component {
 	update(state: IPythonCellState): void {
 		if (
 			this.state.code === state.code &&
+			this.state.wait === state.wait &&
 			this.state.content === state.content &&
 			this.state.details === state.details &&
 			this.state.isPartial === state.isPartial &&
@@ -222,6 +239,8 @@ export class IPythonCellComponent implements Component {
 		// A completed host call does not mean the surrounding Python computation has ended.
 		const showWrapper =
 			this.state.expanded ||
+			details.moreRef !== undefined ||
+			status === "yielded" ||
 			failed ||
 			(this.state.activities?.length ?? 0) === 0 ||
 			(running && !hasRunningActivity);
@@ -270,7 +289,12 @@ export class IPythonCellComponent implements Component {
 	}
 
 	private summaryLabel(details: IPythonDetails): string {
-		const parts = [toolAction("Python")];
+		const parts = [toolAction(this.state.wait ? "Python wait" : "Python")];
+		if (details.moreRef) parts.push(toolDim(`[more ${details.moreRef}]`));
+		if (this.statusKind(details) === "yielded") {
+			parts.push(toolDim("Yielded"));
+			return parts.join(" ");
+		}
 		if (!this.state.expanded) {
 			const status = this.statusKind(details);
 			if (details.status === "timeout") parts.push(theme.fg("toolStatusError", "Timed out"));
@@ -294,6 +318,7 @@ export class IPythonCellComponent implements Component {
 	private statusKind(details: IPythonDetails): StatusKind {
 		if (this.state.isError || details.status === "error" || details.status === "timeout") return "error";
 		if (details.status === "aborted" || details.status === "cancelled") return "aborted";
+		if (details.status === "running" && this.state.isPartial === false) return "yielded";
 		if (
 			this.state.isPartial === false ||
 			(!this.state.isPartial && (details.status !== undefined || (this.state.content?.length ?? 0) > 0))
@@ -309,6 +334,8 @@ export class IPythonCellComponent implements Component {
 				return theme.fg("toolStatusError", "•");
 			case "aborted":
 				return theme.fg("toolStatusWarning", "•");
+			case "yielded":
+				return toolDim("•");
 			case "done":
 				return theme.fg("success", "•");
 			case "running":
@@ -332,8 +359,10 @@ export class IPythonCellComponent implements Component {
 
 	private lineCounts(input: number): string | undefined {
 		const parts: string[] = [];
+		const details = readDetails(this.state.details);
 		this.state.content?.forEach((block) => {
-			if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
+			if (block.type === "text" && typeof block.text === "string")
+				parts.push(visiblePythonOutput(block.text, details));
 		});
 		if (
 			!this.cachedOutputSummary ||
@@ -361,7 +390,8 @@ export class IPythonCellComponent implements Component {
 	private renderCompactOutput(lines: string[], width: number, details: IPythonDetails, failed: boolean): void {
 		const parts: string[] = [];
 		for (const block of this.state.content ?? []) {
-			if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
+			if (block?.type === "text" && typeof block.text === "string")
+				parts.push(visiblePythonOutput(block.text, details));
 		}
 		const cached = this.compactOutputCache;
 		if (
@@ -576,7 +606,10 @@ export class IPythonCellComponent implements Component {
 	}
 
 	private renderOutput(lines: string[], width: number, details: IPythonDetails): void {
-		const output = textFromBlocks(this.state.content);
+		const output = (this.state.content ?? [])
+			.filter((block) => block.type === "text" && typeof block.text === "string")
+			.map((block) => visiblePythonOutput(block.text ?? "", details))
+			.join("\n");
 		if (!output) return;
 		const rendered = this.statusKind(details) === "error" ? theme.fg("toolStatusError", output) : toolOutput(output);
 		appendToolOutput(lines, rendered, width, true);

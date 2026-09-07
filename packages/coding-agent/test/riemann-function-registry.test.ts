@@ -7,6 +7,24 @@ import { type JsonValue, type KernelHostRequest, kernelHostResult } from "../src
 
 const NEVER_ABORTED = new AbortController().signal;
 
+test("cached prompt inventory follows capability changes, registration, and namespace removal", () => {
+	const registry = new FunctionRegistry();
+	registry.register(readDefinition());
+	const capabilities = new Set(["fs.read"]);
+	const original = registry.promptInventory(capabilities);
+	expect(registry.promptInventory(new Set(["fs.read"]))).toBe(original);
+	capabilities.clear();
+	expect(registry.promptInventory(capabilities)).not.toContain("fs.read");
+	capabilities.add("fs.read");
+	expect(registry.promptInventory(capabilities)).toBe(original);
+	registry.register({ ...readDefinition(), name: "scan" });
+	expect(registry.promptInventory(capabilities)).toContain("fs.scan");
+	registry.unregisterNamespace("fs");
+	expect(registry.promptInventory(capabilities)).not.toContain("fs.read");
+	registry.register({ ...readDefinition(), description: "Updated read contract." });
+	expect(registry.promptInventory(capabilities)).toContain("Updated read contract.");
+});
+
 function request(operation: string, arguments_: Record<string, JsonValue> = {}): KernelHostRequest {
 	return { requestId: `test-${operation}`, operation, arguments: arguments_ };
 }
@@ -101,6 +119,40 @@ async function expectHostError(promise: Promise<unknown>, code: string): Promise
 }
 
 describe("Riemann function registry", () => {
+	test("includes nested input contracts and consumption examples only for permitted public operations", () => {
+		const registry = new FunctionRegistry();
+		registry.register({
+			...editDefinition(),
+			inputSchema: Type.Object(
+				{
+					operations: Type.Array(
+						Type.Union([
+							Type.Object(
+								{
+									kind: Type.Literal("replace"),
+									start: Type.Integer(),
+									end: Type.Integer(),
+									text: Type.String(),
+								},
+								{ additionalProperties: false },
+							),
+							Type.Object(
+								{ kind: Type.Literal("delete"), start: Type.Integer(), end: Type.Integer() },
+								{ additionalProperties: false },
+							),
+						]),
+					),
+				},
+				{ additionalProperties: false },
+			),
+		});
+		const prompt = registry.promptInventory(new Set(["workspace.write"]));
+		expect(prompt).toContain('"const":"replace"');
+		expect(prompt).toContain('"required":["kind","start","end","text"]');
+		expect(prompt).toContain("Edit a file snapshot.");
+		expect(prompt).toContain("print(result)");
+		expect(registry.promptInventory(new Set())).not.toContain("fs.edit");
+	});
 	test("renders executable Python literals and preserves explicit null defaults", async () => {
 		const registry = new FunctionRegistry();
 		registry.register({

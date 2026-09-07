@@ -87,7 +87,7 @@ describe("Riemann session extension", () => {
 		]);
 	});
 
-	test("exposes only IPython and checkpoints a session through the live runtime", async () => {
+	test("exposes raw Python and wait, and checkpoints explicit persistent state through the live runtime", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-extension-"));
 		roots.push(root);
 		const agentDir = join(root, "agent-dir");
@@ -131,6 +131,7 @@ describe("Riemann session extension", () => {
 		let beforeStart: ((event: unknown, ctx: ExtensionContext) => Promise<unknown>) | undefined;
 		let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<unknown>) | undefined;
 		let shutdown: ((event: unknown, ctx: ExtensionContext) => Promise<unknown>) | undefined;
+		let settled: ((event: unknown, ctx: ExtensionContext) => Promise<unknown>) | undefined;
 		const api = {
 			registerEntryRenderer() {},
 			registerTool(tool: ToolDefinition) {
@@ -143,6 +144,7 @@ describe("Riemann session extension", () => {
 				if (name === "session_start") sessionStart = handler;
 				if (name === "before_agent_start") beforeStart = handler;
 				if (name === "session_shutdown") shutdown = handler;
+				if (name === "agent_settled") settled = handler;
 			},
 			getActiveTools: () => [registered[0]?.name].filter(Boolean),
 			setActiveTools() {},
@@ -171,7 +173,8 @@ describe("Riemann session extension", () => {
 		const sessionStartContext = { ...ctx, model: undefined } as ExtensionContext;
 		try {
 			riemannExtension(api as never);
-			expect(registered.map((tool) => tool.name)).toEqual(["ipython"]);
+			expect(registered.map((tool) => tool.name)).toEqual(["ipython", "ipython_wait"]);
+			expect(registered[0].constrainedSampling).toMatchObject({ type: "grammar" });
 			expect(registeredCommands).toEqual(["agents"]);
 			expect(sessionStart).toBeDefined();
 			await sessionStart?.({}, sessionStartContext);
@@ -193,6 +196,7 @@ describe("Riemann session extension", () => {
 				"cell-1",
 				{
 					code: [
+						'# @exec: {"persist": true, "yield_time_ms": 60000}',
 						"assert not hasattr(mcp, 'list')",
 						"assert not hasattr(agents, 'wait')",
 						"assert hasattr(artifacts, 'open')",
@@ -242,7 +246,7 @@ describe("Riemann session extension", () => {
 						"read_contract = await catalog.describe(name='Artifact.read')",
 						"assert read_contract.signature and read_contract.python_return_type == 'ArtifactSlice', read_contract",
 						"durable_value = 42",
-						"durable_value",
+						"print(durable_value)",
 					].join("\n"),
 				},
 				undefined,
@@ -270,7 +274,9 @@ describe("Riemann session extension", () => {
 				await ipython.execute(
 					"invalid-display",
 					{
-						code: "r2 = await shell.run(script=\"printf one >> show-count.txt; printf retained\")\nawait output.show(value=r2, fields=['stdout', 'stderr'], max_items=30000)",
+						code:
+							'# @exec: {"persist": true}\n' +
+							"r2 = await shell.run(script=\"printf one >> show-count.txt; printf retained\")\nawait output.show(value=r2, fields=['stdout', 'stderr'], max_items=30000)",
 					},
 					undefined,
 					undefined,
@@ -291,7 +297,11 @@ describe("Riemann session extension", () => {
 			try {
 				await ipython.execute(
 					"unknown-display-argument",
-					{ code: "await output.show(value=r2, fields=['stdout', 'stderr'], limit=30000)" },
+					{
+						code:
+							'# @exec: {"persist": true}\n' +
+							"await output.show(value=r2, fields=['stdout', 'stderr'], limit=30000)",
+					},
 					undefined,
 					undefined,
 					ctx,
@@ -308,7 +318,7 @@ describe("Riemann session extension", () => {
 			expect(unknownBody).not.toContain("details=");
 			const repaired = await ipython.execute(
 				"repair-display",
-				{ code: "await output.show(value=r2, fields=['stdout', 'stderr'])" },
+				{ code: '# @exec: {"persist": true}\n' + "await output.show(value=r2, fields=['stdout', 'stderr'])" },
 				undefined,
 				undefined,
 				ctx,
@@ -340,6 +350,15 @@ describe("Riemann session extension", () => {
 
 			const database = await readFile(join(agentDir, "state", "riemann.db"));
 			expect(database.byteLength).toBeGreaterThan(0);
+			await settled?.({}, ctx);
+			const checkpointStatus = await ipython.execute(
+				"checkpoint-status",
+				{ code: "pass" },
+				undefined,
+				undefined,
+				ctx,
+			);
+			expect(JSON.stringify(checkpointStatus.content)).not.toContain("Checkpoint warning");
 			const snapshotNames = await readdir(join(agentDir, "state", "snapshots"));
 			expect(snapshotNames).toHaveLength(1);
 			const snapshot = await readFile(join(agentDir, "state", "snapshots", snapshotNames[0], "kernel.dill"));
@@ -350,6 +369,7 @@ describe("Riemann session extension", () => {
 				"restored-cell",
 				{
 					code: [
+						'# @exec: {"persist": true}',
 						"assert durable_value == 42",
 						"assert snap.text == 'after\\n'",
 						"following = await scan.next()",

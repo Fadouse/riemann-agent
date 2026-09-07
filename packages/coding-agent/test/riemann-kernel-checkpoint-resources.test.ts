@@ -56,6 +56,41 @@ class Payload:
 `;
 
 describe("checkpoint resources", () => {
+	test("code-mode snapshot hooks contribute values and skipped-binding diagnostics without changing live state", async () => {
+		const root = await mkdtemp(join(tmpdir(), "riemann-code-state-checkpoint-"));
+		try {
+			const path = join(root, "snapshot.dill");
+			const code = await checkpointCode(path, "snapshot");
+			await runPython(
+				`${picklePrelude}
+import contextlib, io, threading
+items = [1, 2]
+namespace = {"riemann_code_state": {"store": {"answer": 42}, "namespace": {"items": items, "alias": items, "bad": threading.Lock()}}}
+def snapshot_code_state(value):
+    retained = {key: item for key, item in value["namespace"].items() if key != "bad"}
+    return {"store": value["store"], "namespace": retained}, [{"name": "persist.bad", "reason": "unsupported"}]
+namespace["_riemann_snapshot_code_state"] = snapshot_code_state
+output = io.StringIO()
+with contextlib.redirect_stdout(output):
+    exec(${JSON.stringify(code)}, namespace)
+with open(${JSON.stringify(path)}, "rb") as file:
+    file.readline()
+    saved = pickle.load(file)["riemann_code_state"]
+assert saved["store"] == {"answer": 42}
+assert saved["namespace"]["items"] == [1, 2]
+assert saved["namespace"]["items"] is saved["namespace"]["alias"]
+assert "bad" not in saved["namespace"]
+assert "persist.bad" in output.getvalue()
+assert "bad" in namespace["riemann_code_state"]["namespace"], "snapshot mutated live state"
+print("passed")
+`,
+				root,
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("snapshot releases temporary references while preserving aliases and in-place changes", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-checkpoint-resources-"));
 		try {

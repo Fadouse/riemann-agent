@@ -19,6 +19,8 @@ import {
 	type CompactionWarningSink,
 	type SubagentUiSnapshot,
 } from "./agents/supervisor.ts";
+import { type PythonCell, PythonCells, parsePythonExec } from "./code-mode.ts";
+import { PYTHON_CODE_MODE_BOOTSTRAP } from "./code-mode-python.ts";
 import { createRiemannCompaction, createRiemannSnapshotCompaction } from "./compaction.ts";
 import { type CompactionStrategyResolution, resolveCompactionStrategy } from "./compaction-strategy.ts";
 import {
@@ -41,7 +43,13 @@ import {
 import { ShellFunctions } from "./functions/shell.ts";
 import { WebFunctions } from "./functions/web.ts";
 import { storeModelImage } from "./images.ts";
-import { IPYTHON_TOOL_METADATA, type IPythonSchema, type IPythonToolDetails } from "./ipython.ts";
+import {
+	IPYTHON_TOOL_METADATA,
+	IPYTHON_WAIT_TOOL_METADATA,
+	type IPythonSchema,
+	type IPythonToolDetails,
+	type IPythonWaitSchema,
+} from "./ipython.ts";
 import { IPythonKernelManager } from "./kernel/manager.ts";
 import {
 	type JsonValue,
@@ -164,6 +172,7 @@ export class RiemannRuntime {
 	private readonly pages: PageStore;
 	private readonly artifacts: ArtifactStore;
 	private readonly outputViews: OutputViews;
+	private readonly cells = new PythonCells();
 	private kernel?: IPythonKernelManager;
 	private kernelStartup?: Promise<IPythonKernelManager>;
 	private pendingRestoreNotice?: string;
@@ -988,7 +997,7 @@ export class RiemannRuntime {
 	private exposedMcpServers(): string {
 		const inventory = this.mcp.promptInventory(this.capabilities);
 		return inventory
-			? `## Configured MCP servers\n\nInside \`ipython.code\`, \`await mcp.open(name=...)\` returns a Python namespace.\n\n${inventory}`
+			? `## Configured MCP servers\n\nInside \`ipython\`, \`await mcp.open(name=...)\` returns a Python namespace.\n\n${inventory}`
 			: "";
 	}
 
@@ -1030,6 +1039,7 @@ export class RiemannRuntime {
 				patch_handle: accessibleReference(agent.patchHandle),
 			})),
 			pending_agent_events: pendingEvents.map((event) => event.id),
+			python_cell: this.cells.pending,
 			compaction: {
 				configured: compaction.configured,
 				effective: compaction.effective,
@@ -1113,8 +1123,8 @@ export class RiemannRuntime {
 		const text = `<riemann_state>\n${JSON.stringify(state, null, 2)}\n</riemann_state>`;
 		return {
 			systemPrompt: this.systemPrompt(this.root ? "main" : "child").replace(
-				"Emit model tool calls only with the name `ipython`.",
-				"Use `ipython` for Python operations. Native model-only `history`, `notes`, `new_context`, and `get_context_remaining` tools are also available directly; never call them through Python.",
+				"Model tools: `ipython` and `ipython_wait`.",
+				"Model tools: `ipython` and `ipython_wait`. Native model-only `history`, `notes`, `new_context`, and `get_context_remaining` tools are also available directly; never call them through Python.",
 			),
 			messages: [
 				{
@@ -1132,7 +1142,7 @@ export class RiemannRuntime {
 
 	systemPrompt(kind: "main" | "child"): string {
 		const values = {
-			environment: formatEnvironmentContext(this.agent.workspace),
+			environment: `${formatEnvironmentContext(this.agent.workspace)}\n- Effective policy: ${JSON.stringify({ filesystem: { read: [...this.policy.readRoots], read_exclude: [...this.policy.readExcludes], write: [...this.policy.writeRoots], write_exclude: [...this.policy.writeExcludes] }, network: this.agent.network })}`,
 			pythonNamespaceInventory: this.pythonNamespaceInventory(),
 			runtimeSections: [this.operationGuidelines(), this.agentProfiles(), this.exposedMcpServers()]
 				.filter(Boolean)
@@ -1171,14 +1181,18 @@ export class RiemannRuntime {
 			const { python, environment } = await ensureManagedPython();
 			const prelude = await readFile(preludePath(), "utf8");
 			const specifications = JSON.stringify(this.registry.pythonSpecifications(undefined, this.capabilities));
-			const bootstrapCode = `${prelude}\n\n_configure_runtime(_json.loads(${JSON.stringify(JSON.stringify(this.shared.config.limits))}))\n_install_functions(_json.loads(${JSON.stringify(specifications)}))`;
+			const bootstrapCode = `${prelude}\n\n_configure_runtime(_json.loads(${JSON.stringify(JSON.stringify(this.shared.config.limits))}))\n_install_functions(_json.loads(${JSON.stringify(specifications)}))\n${PYTHON_CODE_MODE_BOOTSTRAP}`;
 			const kernel = new IPythonKernelManager({
 				python,
 				env: environment,
 				cwd: this.agent.workspace,
 				sessionId: this.agent.id,
 				bootstrapCode,
-				contractFingerprint: createHash("sha256").update(prelude).update(specifications).digest("hex"),
+				contractFingerprint: createHash("sha256")
+					.update(prelude)
+					.update(specifications)
+					.update(PYTHON_CODE_MODE_BOOTSTRAP)
+					.digest("hex"),
 				hostRequest: (request, signal, onUpdate) =>
 					this.registry.dispatch(request, this.capabilities, signal, onUpdate),
 				snapshotPath: join(this.shared.store.snapshotsDir, this.agent.id, "kernel.dill"),
@@ -1203,7 +1217,11 @@ export class RiemannRuntime {
 		return this.kernelStartup;
 	}
 
-	private async formatResult(result: KernelExecuteResult): Promise<{
+	private async formatResult(
+		result: KernelExecuteResult,
+		maxOutputTokens = 2000,
+		running = false,
+	): Promise<{
 		content: Array<TextContent | ImageContent>;
 		moreRef?: string;
 		diagnosticRef?: string;
@@ -1308,7 +1326,9 @@ export class RiemannRuntime {
 		}
 		if (sections.length === 0)
 			sections.push(
-				`Cell ${result.status === "ok" ? "completed" : result.status} in ${result.durationMs} ms. No explicit output.`,
+				running
+					? "No new explicit output."
+					: `Cell ${result.status === "ok" ? "completed" : result.status} in ${result.durationMs} ms. No explicit output.`,
 			);
 		const selectedImages: KernelImageReference[] = [];
 		const seenImages = new Set<string>();
@@ -1328,7 +1348,11 @@ export class RiemannRuntime {
 			selectedImageBytes += image.byteLength;
 		}
 		if (omittedImages > 0) sections.push(`[${omittedImages} image(s) omitted by model-context budget]`);
-		const rendered = await renderModelText(this.outputViews, sections, this.shared.config.limits.maxModelTextBytes);
+		const rendered = await renderModelText(
+			this.outputViews,
+			sections,
+			Math.min(this.shared.config.limits.maxModelTextBytes, maxOutputTokens * 4),
+		);
 		const text = rendered.text;
 		const content: Array<TextContent | ImageContent> = [{ type: "text", text }];
 		for (const image of selectedImages) {
@@ -1363,53 +1387,114 @@ export class RiemannRuntime {
 		return {
 			...IPYTHON_TOOL_METADATA,
 			async execute(_toolCallId, params, signal, onUpdate) {
-				const timeoutSignal = AbortSignal.timeout((params.timeout ?? 300) * 1_000);
-				const executionSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-				const kernel = await raceWithAbortSignal(runtime.ensureKernel(), executionSignal);
-				const activityTracker = new RiemannActivityTracker(
-					runtime.agent.workspace,
-					(capability) => runtime.shared.store.getFileCapability(runtime.shared.run.id, capability)?.path,
-					(operation) => runtime.registry.get(operation)?.pythonReturnType === "McpResult",
-					(agentId) => {
-						const child = runtime.shared.store.getAgent(agentId);
-						return child?.runId === runtime.shared.run.id && child.parentId === runtime.agent.id
-							? child.name
-							: undefined;
-					},
-				);
-				let activities: IPythonToolDetails["activities"] = [];
-				// Exclude managed-Python/kernel startup. Keep the same dispatch timestamp
-				// through host updates and the final result; durationMs remains kernel-authoritative.
-				const startedAt = Date.now();
-				onUpdate?.({ content: [], details: { status: "running", startedAt, activities } });
-				const result = await kernel.execute(params.code, {
-					signal: executionSignal,
-					onHostRequest: async (event) => {
-						const next = await activityTracker.observe(event);
-						if (!next) return;
-						activities = next;
-						onUpdate?.({
-							content: [],
-							details: {
-								status: "running",
-								startedAt,
-								durationMs: undefined,
-								activities,
+				if (signal?.aborted) throw signal.reason;
+				const options = parsePythonExec(params.code);
+				let observing = true;
+				const cellId = runtime.cells.start(options, async (cell) => {
+					const kernel = await raceWithAbortSignal(runtime.ensureKernel(), cell.signal);
+					cell.peek = () => kernel.peek();
+					const activityTracker = new RiemannActivityTracker(
+						runtime.agent.workspace,
+						(capability) => runtime.shared.store.getFileCapability(runtime.shared.run.id, capability)?.path,
+						(operation) => runtime.registry.get(operation)?.pythonReturnType === "McpResult",
+						(agentId) => {
+							const child = runtime.shared.store.getAgent(agentId);
+							return child?.runId === runtime.shared.run.id && child.parentId === runtime.agent.id
+								? child.name
+								: undefined;
+						},
+					);
+					let activities: IPythonToolDetails["activities"] = [];
+					// Exclude managed-Python/kernel startup. Keep the same dispatch timestamp
+					// through host updates and the final result; durationMs remains kernel-authoritative.
+					const startedAt = Date.now();
+					cell.details = { status: "running", startedAt, cellId: cell.id, activities };
+					if (observing) onUpdate?.({ content: [], details: { status: "running", startedAt, activities } });
+					const result = await kernel.execute(
+						`await _riemann_exec_source(${JSON.stringify(params.code)}, ${options.persist ? "True" : "False"})`,
+						{
+							signal: cell.signal,
+							outputOrder: "arrival",
+							onHostRequest: async (event) => {
+								const next = await activityTracker.observe(event);
+								if (!next) return;
+								activities = next;
+								cell.details.activities = activities;
+								if (observing)
+									onUpdate?.({
+										content: [],
+										details: {
+											status: "running",
+											startedAt,
+											durationMs: undefined,
+											activities,
+										},
+									});
 							},
-						});
-					},
+						},
+					);
+					return result;
 				});
-				if (result.status !== "cancelled" && result.status !== "timeout") {
-					const snapshot = await kernel.snapshot(AbortSignal.any([timeoutSignal, AbortSignal.timeout(30_000)]));
-					if (snapshot.error) runtime.pendingRestoreNotice = `[Checkpoint warning] ${snapshot.error}`;
+				try {
+					return await runtime.collectCell(
+						cellId,
+						options.yield_time_ms,
+						options.max_output_tokens,
+						false,
+						signal,
+					);
+				} catch (error) {
+					if (signal?.aborted) runtime.cells.cancel(cellId);
+					throw error;
+				} finally {
+					observing = false;
 				}
-				const formatted = await runtime.formatResult(result);
+			},
+		};
+	}
+
+	waitToolDefinition(): ToolDefinition<typeof IPythonWaitSchema, IPythonToolDetails> {
+		return {
+			...IPYTHON_WAIT_TOOL_METADATA,
+			execute: async (_id, params, signal) =>
+				this.collectCell(
+					params.cell_id,
+					params.yield_time_ms ?? 10000,
+					params.max_tokens ?? 2000,
+					params.terminate ?? false,
+					signal,
+				),
+		};
+	}
+
+	private async collectCell(
+		cellId: string,
+		yieldMs: number,
+		maxTokens: number,
+		terminate: boolean,
+		signal?: AbortSignal,
+	) {
+		if (!Number.isInteger(maxTokens) || maxTokens < 256 || maxTokens > 16384)
+			throw new Error("max_tokens must be an integer from 256 to 16384");
+		const outcome = await this.cells.poll(
+			cellId,
+			yieldMs,
+			terminate,
+			signal,
+			async (result, running, cell: PythonCell) => {
+				const formatted = await this.formatResult(result, maxTokens, running);
 				const status = formatted.error && result.status === "ok" ? "error" : result.status;
-				const outcome = {
-					content: formatted.content,
+				const header = running
+					? `Script running with cell ID ${cellId}. Continue with ipython_wait; do not rerun.`
+					: `Cell ${cellId} ${status}.`;
+				return {
+					content: formatted.content.map((part, index) =>
+						index === 0 && part.type === "text" ? { ...part, text: `${header}\n${part.text}` } : part,
+					),
 					details: {
-						status,
-						startedAt,
+						...cell.details,
+						status: running ? ("running" as const) : status,
+						cellId,
 						durationMs: result.durationMs,
 						...(result.captureTruncated ? { captureTruncated: result.captureTruncated } : {}),
 						...(result.error
@@ -1419,23 +1504,26 @@ export class RiemannRuntime {
 						...(formatted.moreRef ? { moreRef: formatted.moreRef } : {}),
 						...(formatted.diagnosticRef ? { diagnosticRef: formatted.diagnosticRef } : {}),
 						...(formatted.media ? { media: formatted.media } : {}),
-						...(activities.length > 0 ? { activities } : {}),
 					},
 				};
-				if (status !== "ok") throw new AgentToolExecutionError(outcome);
-				return outcome;
 			},
-		};
+		);
+		if (outcome.details.status !== "ok" && outcome.details.status !== "running")
+			throw new AgentToolExecutionError(outcome);
+		return outcome;
 	}
 
 	private asChildRuntime(): ChildRiemannRuntime {
 		return {
 			tool: this.toolDefinition(),
+			waitTool: this.waitToolDefinition(),
 			systemPrompt: this.systemPrompt("child"),
 			initialCodexContext: () => this.initialCodexContext(),
 			compact: (preparation, customInstructions, signal, context) =>
 				this.compact(preparation, customInstructions, signal, context),
 			snapshot: async () => {
+				if (this.cells.active)
+					throw new Error("Child returned before collecting its Python cell with ipython_wait");
 				await this.snapshot();
 			},
 			close: () => this.close(),
@@ -1443,12 +1531,17 @@ export class RiemannRuntime {
 	}
 
 	async snapshot(): Promise<void> {
-		if (this.kernel) await this.kernel.snapshot();
+		if (this.kernel && !this.cells.active) {
+			const result = await this.kernel.snapshot();
+			if (result.error || result.skipped.length > 0)
+				this.pendingRestoreNotice = `[Checkpoint warning] ${JSON.stringify(result)}`;
+		}
 	}
 
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
+		await this.cells.close();
 		if (this.root) await this.shared.supervisor.close();
 		const startingKernel = await this.kernelStartup?.catch(() => undefined);
 		const kernel = this.kernel ?? startingKernel;

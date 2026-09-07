@@ -144,6 +144,8 @@ export type KernelHostRequestUpdate = (update: JsonValue) => void;
 export interface KernelExecuteOptions {
 	signal?: AbortSignal;
 	internal?: boolean;
+	/** Keep explicit output in arrival order so yielded reads have a stable prefix. */
+	outputOrder?: "arrival";
 	onHostRequest?: KernelHostRequestObserver;
 }
 

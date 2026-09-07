@@ -146,7 +146,11 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private shouldUseIPythonRenderer(): boolean {
-		return this.toolName === "ipython" && !this.toolDefinition?.renderCall && !this.toolDefinition?.renderResult;
+		return (
+			(this.toolName === "ipython" || this.toolName === "ipython_wait") &&
+			!this.toolDefinition?.renderCall &&
+			!this.toolDefinition?.renderResult
+		);
 	}
 
 	private getRenderContext(lastComponent: Component | undefined): ToolRenderContext {
@@ -329,6 +333,7 @@ export class ToolExecutionComponent extends Container {
 		if (this.hasSpecializedRenderer() && this.shouldUseIPythonRenderer()) {
 			const state = {
 				code: getIPythonCodeFromArgs(this.args),
+				wait: this.toolName === "ipython_wait",
 				content: this.result?.content,
 				details: this.result?.details,
 				isPartial: this.isPartial,

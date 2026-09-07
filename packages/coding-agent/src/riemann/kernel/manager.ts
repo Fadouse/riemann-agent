@@ -52,6 +52,7 @@ interface ActiveExecution {
 	abort?: () => void;
 	hostControllers: Set<AbortController>;
 	onHostRequest?: KernelExecuteOptions["onHostRequest"];
+	outputOrder?: "arrival";
 	nextHostSequence: number;
 	hostModelContent: Array<{ sequence: number; content: KernelModelContent[] }>;
 	hostNotificationQueue: Promise<void>;
@@ -571,9 +572,10 @@ export class IPythonKernelManager {
 				: {}),
 			result: execution.result,
 			displays: execution.displays,
-			modelContent: execution.hostModelContent
-				.sort((left, right) => left.sequence - right.sequence)
-				.flatMap((entry) => entry.content),
+			modelContent: (execution.outputOrder === "arrival"
+				? execution.hostModelContent
+				: execution.hostModelContent.slice().sort((left, right) => left.sequence - right.sequence)
+			).flatMap((entry) => entry.content),
 			error: execution.error,
 			executionCount: execution.executionCount,
 			durationMs: Date.now() - execution.startedAt,
@@ -797,6 +799,7 @@ export class IPythonKernelManager {
 			resolve: resolveExecution,
 			hostControllers: new Set(),
 			onHostRequest: options.onHostRequest,
+			outputOrder: options.outputOrder,
 			nextHostSequence: 0,
 			hostModelContent: [],
 			hostNotificationQueue: Promise.resolve(),
@@ -820,6 +823,20 @@ export class IPythonKernelManager {
 			if (options.signal.aborted) onAbort();
 		}
 		return promise;
+	}
+
+	/** Retained output only; no execution or automatic representation of user variables. */
+	peek(): KernelExecuteResult | undefined {
+		const execution = this.execution;
+		if (!execution) return undefined;
+		return {
+			status: execution.status,
+			stdout: execution.stdout,
+			stderr: execution.stderr,
+			displays: [...execution.displays],
+			modelContent: execution.hostModelContent.flatMap((entry) => entry.content),
+			durationMs: Date.now() - execution.startedAt,
+		};
 	}
 
 	async interrupt(): Promise<void> {
@@ -952,6 +969,8 @@ def _riemann_restore_snapshot(path, namespace):
                     return {"restored": [], "skipped": [], "incompatible": True, "error": "Incompatible checkpoint contract; original file retained. Archive it before creating a new checkpoint."}
                 values = dill.load(file)
             for name, value in values.items():
+                if name == "riemann_code_state" and "_riemann_restore_code_state" in namespace:
+                    value = namespace["_riemann_restore_code_state"](value)
                 namespace[name] = value
                 restored["restored"].append(name)
         except Exception as error:
@@ -1000,6 +1019,9 @@ def _riemann_write_snapshot(path, namespace):
     for name, value in list(namespace.items()):
         if name.startswith("_") or name in reserved or isinstance(value, type(builtins)):
             continue
+        if name == "riemann_code_state" and "_riemann_snapshot_code_state" in namespace:
+            value, code_skipped = namespace["_riemann_snapshot_code_state"](value)
+            skipped.extend(code_skipped)
         candidates[name] = value
     fd, temporary = tempfile.mkstemp(dir=str(snapshot_path.parent), prefix=".snapshot-", suffix=".tmp")
     try:
