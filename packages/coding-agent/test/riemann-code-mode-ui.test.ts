@@ -28,7 +28,7 @@ test.each([false, true])("exec and wait hide protocol IDs but retain output refe
 		const component = new ToolExecutionComponent(
 			name,
 			"tool-call",
-			name === "ipython" ? { code: "print(42)" } : { cell_id: "c1234abcd" },
+			name === "ipython" ? { code: "print(42)" } : { id: "c1234abcd" },
 			{ requestAnimationFrames: false },
 			undefined,
 			{ requestRender: () => {} } as unknown as TUI,
@@ -36,18 +36,22 @@ test.each([false, true])("exec and wait hide protocol IDs but retain output refe
 		);
 		component.setExpanded(expanded);
 		for (const status of ["running", "ok", "error"]) {
-			const header = status === "running" ? "running cell_id=c1234abcd; use ipython_wait; do not rerun" : status;
+			const header = status === "running" ? "running id=c1234abcd; use ipython_wait; do not rerun" : status;
 			component.updateResult({
-				content: [{ type: "text", text: `${header}\nselected output\n[more r7]` }],
+				content: [
+					{ type: "text", text: `${header}\nProcessHandle(id='p1')\nselected output\n[more r7]\nfinal result` },
+				],
 				details: { status, cellId: "c1234abcd", moreRef: "r7" },
 				isError: status === "error",
 			});
 			const rendered = component.render(100).map(stripAnsi).join("\n");
 			expect(rendered).not.toContain("c1234abcd");
 			expect(rendered).not.toContain("cell_id");
+			expect(rendered).not.toContain("id='p1'");
 			expect(rendered).not.toContain("yield_time_ms");
 			expect(rendered).not.toContain("Script running");
 			expect(rendered).toContain("selected output");
+			expect(rendered).toContain("final result");
 			expect(rendered.match(/\[more r7\]/g)).toHaveLength(1);
 		}
 		component.updateResult({

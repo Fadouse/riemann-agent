@@ -6,10 +6,12 @@ import { Type } from "typebox";
 import { signalProcessGroup, spawnProcess, waitForChildProcess } from "../../utils/child-process.ts";
 import { getShellConfig } from "../../utils/shell.ts";
 import { assertReadable, type FileAccessPolicy } from "../access-policy.ts";
+import { RiemannActivityTracker } from "../activity.ts";
+import { PythonCells } from "../code-mode.ts";
 import { RiemannHostError } from "../errors.ts";
+import { remainingExecutionMs } from "../execution.ts";
 import { resolveSandboxExecutable, type SandboxedCommand, sandboxedKernelCommand } from "../kernel/sandbox.ts";
-import type { JsonValue } from "../kernel/types.ts";
-import { utf8Prefix } from "../output.ts";
+import type { JsonValue, KernelExecuteResult } from "../kernel/types.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
 import type { FunctionDefinition, FunctionUpdateCallback } from "./registry.ts";
 
@@ -33,15 +35,15 @@ const ArtifactSchema = Type.Object(
 		size: Type.Integer({ minimum: 0 }),
 		name: Type.Union([Type.String(), Type.Null()]),
 	},
-	{ additionalProperties: false },
+	{ additionalProperties: false, $id: "Ref" },
 );
 
 const ProcessResultSchema = Type.Object(
 	{
 		$riemann: Type.Literal("process_result"),
 		exit_code: Type.Union([Type.Integer(), Type.Null()]),
-		stdout: Type.String(),
-		stderr: Type.String(),
+		stdout: ArtifactSchema,
+		stderr: ArtifactSchema,
 		duration_ms: Type.Integer({ minimum: 0 }),
 		termination: Type.Union([
 			Type.Literal("exited"),
@@ -49,14 +51,14 @@ const ProcessResultSchema = Type.Object(
 			Type.Literal("cancelled"),
 			Type.Literal("signal"),
 		]),
-		stdout_truncated: Type.Boolean(),
-		stderr_truncated: Type.Boolean(),
 		stdout_capture_truncated: Type.Boolean(),
 		stderr_capture_truncated: Type.Boolean(),
-		stdout_artifact: Type.Union([ArtifactSchema, Type.Null()]),
-		stderr_artifact: Type.Union([ArtifactSchema, Type.Null()]),
 	},
-	{ additionalProperties: false },
+	{ additionalProperties: false, $id: "ProcessResult" },
+);
+const ProcessHandleSchema = Type.Object(
+	{ $riemann: Type.Literal("process_handle"), id: Type.String() },
+	{ additionalProperties: false, $id: "ProcessHandle" },
 );
 
 function requiredString(args: Record<string, JsonValue>, name: string): string {
@@ -81,13 +83,12 @@ function parseEnvironment(value: JsonValue | undefined): Record<string, string> 
 export class ShellFunctions {
 	private readonly policy: FileAccessPolicy;
 	private readonly artifacts: ArtifactStore;
-	private readonly previewBytes: number;
+	readonly tasks = new PythonCells("p", true);
 	private readonly networkAllowed: boolean;
 
-	constructor(policy: FileAccessPolicy, artifacts: ArtifactStore, previewBytes: number, networkAllowed: boolean) {
+	constructor(policy: FileAccessPolicy, artifacts: ArtifactStore, networkAllowed: boolean) {
 		this.policy = policy;
 		this.artifacts = artifacts;
-		this.previewBytes = previewBytes;
 		this.networkAllowed = networkAllowed;
 	}
 
@@ -130,20 +131,15 @@ export class ShellFunctions {
 		);
 		if (!executable) {
 			const stderr = `${command.executable}: command not found\n`;
-			const truncated = Buffer.byteLength(stderr) > this.previewBytes;
 			return {
 				$riemann: "process_result",
 				exit_code: 127,
-				stdout: "",
-				stderr: utf8Prefix(stderr, this.previewBytes),
+				stdout: await this.artifacts.putText("", { name: "stdout" }),
+				stderr: await this.artifacts.putText(stderr, { name: "stderr" }),
 				duration_ms: Date.now() - started,
 				termination: "exited",
-				stdout_truncated: false,
-				stderr_truncated: truncated,
 				stdout_capture_truncated: false,
 				stderr_capture_truncated: false,
-				stdout_artifact: null,
-				stderr_artifact: truncated ? await this.artifacts.putText(stderr, { name: "stderr.txt" }) : null,
 			};
 		}
 		const sandboxDir = await mkdtemp(join(tmpdir(), "riemann-shell-"));
@@ -175,10 +171,6 @@ export class ShellFunctions {
 			child.stdin.on("error", () => {});
 			child.stdin.end(command.stdin);
 		}
-		const stdout: Buffer[] = [];
-		const stderr: Buffer[] = [];
-		let stdoutSeenBytes = 0;
-		let stderrSeenBytes = 0;
 		let pendingUpdates: PendingStreamUpdate[] = [];
 		let pendingUpdateBytes = 0;
 		let updateTimer: NodeJS.Timeout | undefined;
@@ -240,16 +232,10 @@ export class ShellFunctions {
 		};
 		const onAbort = () => terminate(options.signal.reason?.name === "TimeoutError" ? "timeout" : "cancelled");
 		options.signal.addEventListener("abort", onAbort, { once: true });
-		const previewBytes = this.previewBytes;
 		async function* capture(stream: Readable | null, kind: StreamKind): AsyncGenerator<Uint8Array> {
 			if (!stream) return;
 			for await (const value of stream) {
 				const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value as Uint8Array);
-				const seen = kind === "stdout" ? stdoutSeenBytes : stderrSeenBytes;
-				const preview = kind === "stdout" ? stdout : stderr;
-				if (seen < previewBytes) preview.push(chunk.subarray(0, previewBytes - seen));
-				if (kind === "stdout") stdoutSeenBytes += chunk.length;
-				else stderrSeenBytes += chunk.length;
 				queueUpdate(kind, chunk);
 				yield chunk;
 			}
@@ -306,18 +292,6 @@ export class ShellFunctions {
 				),
 			});
 		}
-		const stdoutData = Buffer.concat(stdout);
-		const stderrData = Buffer.concat(stderr);
-		const stdoutText = new TextDecoder("utf-8", { ignoreBOM: true }).decode(stdoutData, {
-			stream: stdoutSeenBytes > stdoutData.length,
-		});
-		const stderrText = new TextDecoder("utf-8", { ignoreBOM: true }).decode(stderrData, {
-			stream: stderrSeenBytes > stderrData.length,
-		});
-		const stdoutPreview = utf8Prefix(stdoutText, this.previewBytes);
-		const stderrPreview = utf8Prefix(stderrText, this.previewBytes);
-		const stdoutTruncated = stdoutSeenBytes > stdoutData.length || stdoutPreview.length < stdoutText.length;
-		const stderrTruncated = stderrSeenBytes > stderrData.length || stderrPreview.length < stderrText.length;
 		const stdoutArtifact = streams[0].status === "fulfilled" ? streams[0].value : null;
 		const stderrArtifact = streams[1].status === "fulfilled" ? streams[1].value : null;
 
@@ -325,16 +299,12 @@ export class ShellFunctions {
 		return {
 			$riemann: "process_result",
 			exit_code: exitCode,
-			stdout: stdoutPreview,
-			stderr: stderrPreview,
+			stdout: stdoutArtifact,
+			stderr: stderrArtifact,
 			duration_ms: Date.now() - started,
 			termination,
-			stdout_truncated: stdoutTruncated,
-			stderr_truncated: stderrTruncated,
 			stdout_capture_truncated: false,
 			stderr_capture_truncated: false,
-			stdout_artifact: stdoutArtifact,
-			stderr_artifact: stderrArtifact,
 		};
 	}
 
@@ -348,6 +318,12 @@ export class ShellFunctions {
 				description: "Run a shell script and return a structured ProcessResult.",
 				inputSchema: Type.Object(
 					{
+						background: Type.Optional(
+							Type.Boolean({
+								default: false,
+								description: "Return a background process handle without occupying the Python cell",
+							}),
+						),
 						script: Type.String({
 							minLength: 1,
 							description: "Shell script source",
@@ -365,7 +341,7 @@ export class ShellFunctions {
 					},
 					{ additionalProperties: false },
 				),
-				outputSchema: ProcessResultSchema,
+				outputSchema: Type.Union([ProcessResultSchema, ProcessHandleSchema]),
 				updateSchema: Type.Object(
 					{
 						sequence: Type.Integer({ minimum: 0 }),
@@ -375,7 +351,7 @@ export class ShellFunctions {
 					},
 					{ additionalProperties: false },
 				),
-				pythonReturnType: "ProcessResult",
+				pythonReturnType: "ProcessResult | ProcessHandle",
 				errors: [
 					{
 						code: "limit_exceeded",
@@ -407,8 +383,7 @@ export class ShellFunctions {
 				visibility: "public",
 				prompt: {
 					inventory: "Run a shell script; pipes, redirection, and compound syntax are supported.",
-					example:
-						"result = await shell.run(script='pwd'); output.show(value=result, fields=['exit_code', 'stdout', 'stderr'])",
+					example: "result = await shell.run(script='pwd'); print(result)",
 					guidelines: ["Use shell.run for the target project's own builds, tests, and one-shot pipelines."],
 				},
 				capability: "shell.run",
@@ -420,14 +395,110 @@ export class ShellFunctions {
 					const environment = parseEnvironment(args.env);
 					const shell = getShellConfig();
 					const fromStdin = shell.commandTransport === "stdin";
-					return this.run(
-						{
-							executable: shell.shell,
-							args: fromStdin ? shell.args : [...shell.args, script],
-							...(fromStdin ? { stdin: script } : {}),
-						},
-						{ cwd, env: environment, signal, onUpdate },
-					);
+					const command = {
+						executable: shell.shell,
+						args: fromStdin ? shell.args : [...shell.args, script],
+						...(fromStdin ? { stdin: script } : {}),
+					};
+					if (args.background !== true) return this.run(command, { cwd, env: environment, signal, onUpdate });
+					const id = this.tasks.start({ timeout_ms: remainingExecutionMs(signal) }, async (cell) => {
+						const tracker = new RiemannActivityTracker(cwd, () => undefined);
+						const request = { requestId: cell.id, operation: "shell.run", arguments: { script, cwd } };
+						const result: KernelExecuteResult = {
+							status: "ok",
+							stdout: "",
+							stderr: "",
+							displays: [],
+							modelContent: [],
+							durationMs: 0,
+						};
+						cell.peek = () => ({ ...result, modelContent: [...result.modelContent] });
+						let updates = Promise.resolve();
+						let updateError: unknown;
+						cell.details = {
+							status: "running",
+							startedAt: Date.now(),
+							cellId: cell.id,
+							activities: await tracker.observe({
+								phase: "start",
+								requestId: cell.id,
+								request,
+								startedAt: Date.now(),
+							}),
+						};
+						const value = await this.run(command, {
+							cwd,
+							env: environment,
+							signal: cell.signal,
+							onUpdate: (update) => {
+								updates = updates
+									.then(async () => {
+										cell.details.activities = await tracker.observe({
+											phase: "update",
+											requestId: cell.id,
+											request,
+											update,
+										});
+										if (
+											update &&
+											typeof update === "object" &&
+											!Array.isArray(update) &&
+											typeof update.value === "string"
+										) {
+											const text =
+												update.value +
+												(update.truncated
+													? "\n[stream preview omitted; full output retained in result]\n"
+													: "");
+											if (text) {
+												const retained = await this.artifacts.putText(text, { name: "process-progress" });
+												if (
+													retained &&
+													typeof retained === "object" &&
+													!Array.isArray(retained) &&
+													typeof retained.handle === "string"
+												)
+													result.modelContent.push({
+														type: "output_ref",
+														handle: retained.handle,
+														separator: update.kind === "stderr" ? "\n[stderr]\n" : "",
+													});
+											}
+										}
+										cell.notify();
+									})
+									.catch((error: unknown) => {
+										updateError ??= error;
+									});
+							},
+						});
+						await updates;
+						cell.details.activities = await tracker.observe({
+							phase: "end",
+							requestId: cell.id,
+							request,
+							durationMs: Date.now() - (cell.details.startedAt ?? Date.now()),
+							result: value,
+						});
+						if (value && typeof value === "object" && !Array.isArray(value)) {
+							result.durationMs = typeof value.duration_ms === "number" ? value.duration_ms : 0;
+							if (value.termination === "cancelled" || value.termination === "timeout")
+								result.status = value.termination;
+							const ref = await this.artifacts.putResult(
+								value,
+								JSON.parse(JSON.stringify(ProcessResultSchema)) as JsonValue,
+								"ProcessResult",
+								"shell.run",
+							);
+							result.modelContent.push({
+								type: "text",
+								text: `exit_code=${value.exit_code}; termination=${value.termination} [result shell.run ${ref}]`,
+							});
+						}
+						if (updateError) throw updateError;
+						return result;
+					});
+					return { $riemann: "process_handle", id };
 				},
 			},
 		];

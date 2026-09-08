@@ -24,7 +24,7 @@ test("resolves only owned child names from durable state in each cell, including
 		runtime = await RiemannRuntime.createRoot(context);
 		const internal = runtime as unknown as {
 			shared: { store: RiemannStore };
-			ensureKernel(): Promise<Pick<IPythonKernelManager, "execute" | "snapshot">>;
+			ensureKernel(): Promise<Pick<IPythonKernelManager, "execute" | "snapshot" | "peek">>;
 		};
 		const store = internal.shared.store;
 		const childInput = {
@@ -53,6 +53,7 @@ test("resolves only owned child names from durable state in each cell, including
 		const targets = [child.id, otherParent.id, foreign.id, "missing", child.id, child.id];
 		let cell = 0;
 		vi.spyOn(internal, "ensureKernel").mockResolvedValue({
+			peek: () => undefined,
 			execute: async (_code: string, options: KernelExecuteOptions = {}): Promise<KernelExecuteResult> => {
 				const agentId = targets[cell++];
 				const operation = cell === 5 ? "agents.release" : "agents.info";

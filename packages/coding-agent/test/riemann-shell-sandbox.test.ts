@@ -25,6 +25,10 @@ function record(value: JsonValue): Record<string, JsonValue> {
 	return value;
 }
 
+async function streamText(artifacts: ArtifactStore, value: JsonValue): Promise<string> {
+	return (await artifacts.readBuffer(String(record(value).handle))).toString("utf8");
+}
+
 function processExists(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
@@ -57,15 +61,15 @@ async function shellDefinition(
 ) {
 	const store = new RiemannStore(join(root, "agent"));
 	const run = store.openRun("shell-test", workspace);
+	const artifacts = new ArtifactStore(store, run.id);
 	const shell = new ShellFunctions(
 		fileAccessPolicy(workspace, { read, readExclude, write, writeExclude }),
-		new ArtifactStore(store, run.id),
-		100_000,
+		artifacts,
 		false,
 	);
 	const definition = shell.definitions().find((item) => item.name === "run");
 	if (!definition) throw new Error("shell.run is unavailable");
-	return { definition, store };
+	return { definition, store, artifacts };
 }
 
 describe("Riemann shell argument validation", () => {
@@ -121,31 +125,30 @@ describe("Riemann shell argument validation", () => {
 		const { definition, store } = await shellDefinition(workspace, root, [workspace], []);
 		try {
 			expect(definition).toMatchObject({
-				pythonReturnType: "ProcessResult",
+				pythonReturnType: "ProcessResult | ProcessHandle",
 				idempotency: "non-idempotent",
 				visibility: "public",
 				inputSchema: { type: "object", additionalProperties: false },
-				outputSchema: { type: "object", additionalProperties: false },
+				outputSchema: { anyOf: expect.any(Array) },
 			});
 			expect(definition).not.toHaveProperty("parameters");
 			expect(definition).not.toHaveProperty("returns");
 			expect(definition.prompt.example).not.toMatch(/npm test|tail/);
-			expect(definition.prompt.example).toContain("output.show");
+			expect(definition.prompt.example).toContain("print(result)");
 			expect(definition.outputSchema).toMatchObject({
-				properties: {
-					$riemann: {},
-					exit_code: {},
-					stdout: {},
-					stderr: {},
-					duration_ms: {},
-					termination: {},
-					stdout_truncated: {},
-					stderr_truncated: {},
-					stdout_capture_truncated: {},
-					stderr_capture_truncated: {},
-					stdout_artifact: {},
-					stderr_artifact: {},
-				},
+				anyOf: [
+					{
+						properties: {
+							stdout: { type: "object" },
+							stderr: { type: "object" },
+							exit_code: {},
+							termination: {},
+							stdout_capture_truncated: {},
+							stderr_capture_truncated: {},
+						},
+					},
+					{ $id: "ProcessHandle" },
+				],
 			});
 		} finally {
 			store.close();
@@ -160,38 +163,33 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		const store = new RiemannStore(join(root, "agent"));
 		const run = store.openRun("shell-artifact-parts", root);
 		const artifacts = new ArtifactStore(store, run.id);
-		const shell = new ShellFunctions(fileAccessPolicy(root, FULL_FILESYSTEM), artifacts, 4, false);
+		const shell = new ShellFunctions(fileAccessPolicy(root, FULL_FILESYSTEM), artifacts, false);
 		const definition = shell.definitions().find((item) => item.name === "run");
 		if (!definition) throw new Error("shell.run is unavailable");
 		const putText = vi.spyOn(artifacts, "putText");
 		const script = "printf '完整😀stdout'; printf 'stderr😀完整' >&2";
 		try {
 			const result = record(await definition.handler({ script }, new AbortController().signal));
-			expect(result).toMatchObject({ exit_code: 0, stdout_truncated: true, stderr_truncated: true });
 			expect(result).toMatchObject({
-				stdout: "完",
-				stderr: "stde",
+				exit_code: 0,
 				stdout_capture_truncated: false,
 				stderr_capture_truncated: false,
 			});
-			const stdoutArtifact = record(result.stdout_artifact);
-			const stderrArtifact = record(result.stderr_artifact);
+			const stdoutArtifact = record(result.stdout);
+			const stderrArtifact = record(result.stderr);
 			expect(await artifacts.readBuffer(String(stdoutArtifact.handle))).toEqual(Buffer.from("完整😀stdout"));
 			expect(await artifacts.readBuffer(String(stderrArtifact.handle))).toEqual(Buffer.from("stderr😀完整"));
 			expect(stdoutArtifact.handle).toMatch(/^r[0-9a-z]+$/);
 			expect(stderrArtifact.handle).toMatch(/^r[0-9a-z]+$/);
 			expect(stdoutArtifact.mime_type).toBe("text/plain; charset=utf-8");
 			expect(stderrArtifact.mime_type).toBe("text/plain; charset=utf-8");
-			const stdoutBytes = await artifacts.readBuffer(String(stdoutArtifact.handle));
-			expect(stdoutBytes.subarray(Buffer.byteLength(String(result.stdout))).toString("utf8")).toBe("整😀stdout");
 			const binary = record(
 				await definition.handler(
 					{ script: `${process.execPath} -e "process.stdout.write(Buffer.from([255,97,98,99,100]))"` },
 					new AbortController().signal,
 				),
 			);
-			expect(binary).toMatchObject({ stdout: "�a", stdout_truncated: true, stdout_capture_truncated: false });
-			const binaryArtifact = record(binary.stdout_artifact);
+			const binaryArtifact = record(binary.stdout);
 			expect(binaryArtifact.mime_type).toBe("application/octet-stream");
 			expect(await artifacts.readBuffer(String(binaryArtifact.handle))).toEqual(Buffer.from([255, 97, 98, 99, 100]));
 			expect(putText).not.toHaveBeenCalled();
@@ -208,12 +206,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		const run = store.openRun("capture", root);
 		const artifacts = new ArtifactStore(store, run.id);
 		const cap = 16 * 1024 * 1024;
-		const definition = new ShellFunctions(
-			fileAccessPolicy(root, FULL_FILESYSTEM),
-			artifacts,
-			cap + 100,
-			false,
-		).definitions()[0];
+		const definition = new ShellFunctions(fileAccessPolicy(root, FULL_FILESYSTEM), artifacts, false).definitions()[0];
 		try {
 			const result = record(
 				await definition.handler(
@@ -224,20 +217,15 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 				),
 			);
 			expect(result).toMatchObject({
-				stdout_truncated: false,
 				stdout_capture_truncated: false,
-				stderr: "err",
-				stderr_truncated: false,
 				stderr_capture_truncated: false,
-				stderr_artifact: expect.objectContaining({ handle: expect.any(String) }),
+				stderr: expect.objectContaining({ handle: expect.any(String) }),
 				termination: "exited",
 				exit_code: 0,
 			});
-			expect(String(result.stdout)).toHaveLength(cap + 1);
+			expect(await streamText(artifacts, result.stdout)).toHaveLength(cap + 1);
 			expect(
-				(await artifacts.readBuffer(String(record(result.stdout_artifact).handle))).equals(
-					Buffer.alloc(cap + 1, "x"),
-				),
+				(await artifacts.readBuffer(String(record(result.stdout).handle))).equals(Buffer.alloc(cap + 1, "x")),
 			).toBe(true);
 		} finally {
 			store.close();
@@ -252,12 +240,8 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		const store = new RiemannStore(join(root, "agent"));
 		try {
 			const run = store.openRun("shell-missing", workspace);
-			const shell = new ShellFunctions(
-				fileAccessPolicy(workspace, FULL_FILESYSTEM),
-				new ArtifactStore(store, run.id),
-				100_000,
-				false,
-			);
+			const artifacts = new ArtifactStore(store, run.id);
+			const shell = new ShellFunctions(fileAccessPolicy(workspace, FULL_FILESYSTEM), artifacts, false);
 			const definition = shell.definitions().find((item) => item.name === "run");
 			if (!definition) throw new Error("shell.run is unavailable");
 			const result = record(
@@ -266,18 +250,14 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 			expect(result).toEqual({
 				$riemann: "process_result",
 				exit_code: 127,
-				stdout: "",
-				stderr: expect.stringContaining("command not found"),
 				duration_ms: expect.any(Number),
 				termination: "exited",
-				stdout_truncated: false,
-				stderr_truncated: false,
 				stdout_capture_truncated: false,
 				stderr_capture_truncated: false,
-				stdout_artifact: expect.objectContaining({ handle: expect.any(String) }),
-				stderr_artifact: expect.objectContaining({ handle: expect.any(String) }),
+				stdout: expect.objectContaining({ handle: expect.any(String) }),
+				stderr: expect.objectContaining({ handle: expect.any(String) }),
 			});
-			expect(String(result.stderr)).toContain("command not found");
+			expect(await streamText(artifacts, result.stderr)).toContain("command not found");
 		} finally {
 			store.close();
 		}
@@ -291,7 +271,7 @@ describe.skipIf(!systemSandboxAvailable)("Riemann shell system sandbox", () => {
 		await mkdir(workspace);
 		await writeFile(join(workspace, "inside.txt"), "inside");
 		await writeFile(outside, "secret");
-		const { definition, store } = await shellDefinition(workspace, root, [workspace], []);
+		const { definition, store, artifacts } = await shellDefinition(workspace, root, [workspace], []);
 		try {
 			process.env.RIEMANN_HOST_SECRET_TEST = "hidden";
 			const script = `${process.execPath} - <<'PROBE'
@@ -301,7 +281,10 @@ PROBE`;
 				await definition.handler({ script, env: { EXPLICIT_VALUE: "visible" } }, new AbortController().signal),
 			);
 			expect(result.exit_code).toBe(0);
-			const output = JSON.parse(String(result.stdout).trim()) as Record<string, string | null>;
+			const output = JSON.parse((await streamText(artifacts, result.stdout)).trim()) as Record<
+				string,
+				string | null
+			>;
 			expect(output).toMatchObject({
 				inside: "inside",
 				hostSecret: null,
@@ -325,12 +308,13 @@ PROBE`;
 		const executable = join(bin, "path-probe");
 		await writeFile(executable, "#!/bin/sh\nprintf 'path-ok\\n'\n");
 		await chmod(executable, 0o755);
-		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
+		const { definition, store, artifacts } = await shellDefinition(workspace, root, ["/"], ["/"]);
 		try {
 			const result = record(
 				await definition.handler({ script: "path-probe", env: { PATH: bin } }, new AbortController().signal),
 			);
-			expect(result).toMatchObject({ exit_code: 0, stdout: "path-ok\n" });
+			expect(result.exit_code).toBe(0);
+			expect(await streamText(artifacts, result.stdout)).toBe("path-ok\n");
 		} finally {
 			store.close();
 		}
@@ -340,7 +324,7 @@ PROBE`;
 		roots.push(root);
 		const workspace = join(root, "workspace");
 		await mkdir(workspace);
-		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
+		const { definition, store, artifacts } = await shellDefinition(workspace, root, ["/"], ["/"]);
 		try {
 			const script = `${process.execPath} - <<'PROBE'
 console.log(JSON.stringify({ cwdMatches: process.cwd().endsWith(${JSON.stringify(workspace)}), value: process.env.RIEMANN_TEST_VALUE, home: process.env.HOME ?? null, tmp: process.env.TMPDIR ?? null }));
@@ -349,7 +333,7 @@ PROBE`;
 				await definition.handler({ script, env: { RIEMANN_TEST_VALUE: "visible" } }, new AbortController().signal),
 			);
 			expect(result.exit_code).toBe(0);
-			expect(JSON.parse(String(result.stdout).trim())).toEqual({
+			expect(JSON.parse((await streamText(artifacts, result.stdout)).trim())).toEqual({
 				cwdMatches: true,
 				value: "visible",
 				home: process.env.HOME ?? null,
@@ -366,12 +350,12 @@ PROBE`;
 			const root = await mkdtemp(join(tmpdir(), "riemann-shell-runtime-carve-"));
 			roots.push(root);
 			const workspace = process.cwd();
-			const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"], [tmpdir()]);
+			const { definition, store, artifacts } = await shellDefinition(workspace, root, ["/"], ["/"], [tmpdir()]);
 			try {
 				const result = record(await definition.handler({ script: "pwd" }, new AbortController().signal));
+				expect(await streamText(artifacts, result.stdout)).toBe(`${workspace}\n`);
 				expect(result).toMatchObject({
 					exit_code: 0,
-					stdout: `${workspace}\n`,
 				});
 			} finally {
 				store.close();
@@ -392,6 +376,7 @@ PROBE`;
 		const store = new RiemannStore(agentDir);
 		try {
 			const run = store.openRun("shell-nested-state", root);
+			const artifacts = new ArtifactStore(store, run.id);
 			const shell = new ShellFunctions(
 				fileAccessPolicy(root, {
 					read: ["/"],
@@ -399,8 +384,7 @@ PROBE`;
 					write: ["/"],
 					writeExclude: [],
 				}),
-				new ArtifactStore(store, run.id),
-				100_000,
+				artifacts,
 				false,
 			);
 			const definition = shell.definitions().find((item) => item.name === "run");
@@ -410,7 +394,7 @@ const fs=require("node:fs");const out={visible:fs.readFileSync("visible.txt","ut
 PROBE`;
 			const result = record(await definition.handler({ script }, new AbortController().signal));
 			expect(result.exit_code).toBe(0);
-			const output = JSON.parse(String(result.stdout).trim()) as Record<string, string>;
+			const output = JSON.parse((await streamText(artifacts, result.stdout)).trim()) as Record<string, string>;
 			expect(output.visible).toBe("visible");
 			expect(output.state).not.toBe("allowed");
 		} finally {
@@ -497,7 +481,7 @@ setInterval(() => {}, 1000);
 		const outside = join(outsideDirectory, "secret.txt");
 		await Promise.all([mkdir(workspace), mkdir(outsideDirectory)]);
 		await writeFile(outside, "secret");
-		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
+		const { definition, store, artifacts } = await shellDefinition(workspace, root, ["/"], ["/"]);
 		try {
 			const script = `${process.execPath} - <<'PROBE'
 const fs=require("node:fs");fs.writeFileSync("created.txt","created");console.log(fs.readFileSync("secret.txt","utf8"))
@@ -506,7 +490,7 @@ PROBE`;
 				await definition.handler({ script, cwd: outsideDirectory }, new AbortController().signal),
 			);
 			expect(result.exit_code).toBe(0);
-			expect(String(result.stdout).trim()).toBe("secret");
+			expect((await streamText(artifacts, result.stdout)).trim()).toBe("secret");
 			expect(await readFile(join(outsideDirectory, "created.txt"), "utf8")).toBe("created");
 		} finally {
 			store.close();
@@ -518,7 +502,7 @@ PROBE`;
 		roots.push(root);
 		const workspace = join(root, "workspace");
 		await mkdir(workspace);
-		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
+		const { definition, store, artifacts } = await shellDefinition(workspace, root, ["/"], ["/"]);
 		try {
 			const updates: Array<Record<string, JsonValue>> = [];
 			const script = `${process.execPath} -e "process.stdout.write('x'.repeat(70000))"`;
@@ -528,10 +512,9 @@ PROBE`;
 				}),
 			);
 			expect(result).toMatchObject({
-				stdout_truncated: false,
 				termination: "exited",
 			});
-			expect(String(result.stdout)).toHaveLength(70_000);
+			expect(await streamText(artifacts, result.stdout)).toHaveLength(70_000);
 			expect(updates.some((update) => update.kind === "stdout" && update.truncated === true)).toBe(true);
 		} finally {
 			store.close();
@@ -543,7 +526,7 @@ PROBE`;
 		roots.push(root);
 		const workspace = join(root, "workspace");
 		await mkdir(workspace);
-		const { definition, store } = await shellDefinition(workspace, root, ["/"], ["/"]);
+		const { definition, store, artifacts } = await shellDefinition(workspace, root, ["/"], ["/"]);
 		try {
 			const updates: Array<Record<string, JsonValue>> = [];
 			const script = `${process.execPath} - <<'PROBE'
@@ -556,10 +539,10 @@ PROBE`;
 			);
 			expect(result).toMatchObject({
 				exit_code: 0,
-				stdout: "😀",
-				stderr: "�",
 				termination: "exited",
 			});
+			expect(await streamText(artifacts, result.stdout)).toBe("😀");
+			expect(await artifacts.readBuffer(String(record(result.stderr).handle))).toEqual(Buffer.from([0xf0, 0x9f]));
 			expect(updates.map((update) => update.sequence)).toEqual(updates.map((_, index) => index));
 			expect(updates.every((update) => typeof update.truncated === "boolean")).toBe(true);
 			expect(definition.updateSchema).toBeDefined();

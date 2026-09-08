@@ -142,6 +142,7 @@ export type KernelHostRequestObserver = (event: KernelHostRequestEvent) => void 
 export type KernelHostRequestUpdate = (update: JsonValue) => void;
 
 export interface KernelExecuteOptions {
+	onOutput?: () => void;
 	signal?: AbortSignal;
 	internal?: boolean;
 	/** Keep explicit output in arrival order so yielded reads have a stable prefix. */
@@ -173,6 +174,8 @@ export interface KernelManagerOptions {
 	sandbox: KernelSandboxConfiguration | false;
 	hostRequest: KernelHostRequestHandler;
 	snapshotPath?: string;
+	/** Permit the explicit selective-state migration, retaining the original checkpoint. */
+	migrateCodeState?: boolean;
 	startupTimeoutMs?: number;
 	/** Persist user output before it becomes visible to a yielded collector. */
 	retainOutput?: (

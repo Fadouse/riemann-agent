@@ -74,6 +74,7 @@ function visiblePythonOutput(text: string, details: IPythonDetails): string {
 		(text.startsWith(`Script running with cell ID ${details.cellId}`) ||
 			text.startsWith(`Cell ${details.cellId} `) ||
 			text.startsWith(`running cell_id=${details.cellId};`) ||
+			text.startsWith(`running id=${details.cellId};`) ||
 			text === details.status ||
 			(details.status !== undefined && text.startsWith(`${details.status}\n`)))
 	) {
@@ -81,8 +82,9 @@ function visiblePythonOutput(text: string, details: IPythonDetails): string {
 		text = newline === -1 ? "" : text.slice(newline + 1);
 	}
 	text = text
+		.replace(/ProcessHandle\(id=['"][^'"]+['"]\)/g, "Background process started")
 		.replace(
-			/^(?:ipython(?:_wait)? \[\w+\]: )?Unknown or already collected Python cell: \S+$/m,
+			/^(?:ipython(?:_wait)? \[\w+\]: )?Unknown or already collected (?:Python cell|task): \S+$/m,
 			"Python cell is unavailable or already collected.",
 		)
 		.replace(

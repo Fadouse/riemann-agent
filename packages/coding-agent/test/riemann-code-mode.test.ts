@@ -42,6 +42,7 @@ function pendingCell() {
 		finish: (value: KernelExecuteResult) => finish(value),
 		setOutput: (value: KernelExecuteResult) => {
 			output = value;
+			active.notify();
 		},
 	};
 }
@@ -62,17 +63,17 @@ describe("Python code mode", () => {
 	});
 
 	test("parses only a first-line pragma and rejects unknown or out-of-range controls", () => {
-		expect(parsePythonExec('# @exec: {"persist": true, "timeout_ms": 300000}\r\nprint(1)')).toMatchObject({
-			persist: true,
+		expect(parsePythonExec('# @exec: {"timeout_ms": 300000}\r\nprint(1)')).toMatchObject({
 			timeout_ms: 300000,
 		});
-		expect(parsePythonExec('print(1)\n# @exec: {"persist": true}').persist).toBe(false);
+		expect(parsePythonExec('print(1)\n# @exec: {"persist": true}')).toEqual({ timeout_ms: 300000 });
 		for (const source of [
 			"",
 			"# @exec: []",
 			'# @exec: {"yield_time_ms": -1}',
 			'# @exec: {"max_output_tokens": 1}',
 			'# @exec: {"persist": 1}',
+			'# @exec: {"persist": true}',
 			'# @exec: {"timeout": 10}',
 		]) {
 			expect(() => parsePythonExec(source)).toThrow();
@@ -81,7 +82,7 @@ describe("Python code mode", () => {
 
 	test("yield keeps the producer alive, reads only new output, and closes the final cell", async () => {
 		const fixture = pendingCell();
-		expect(fixture.id).toMatch(/^c[0-9a-f]{8}$/);
+		expect(fixture.id).toMatch(/^c[0-9a-z]+$/);
 		expect(fixture.cells.pending).toEqual({ cell_id: fixture.id, status: "running", next_tool: "ipython_wait" });
 		const consume = async (result: KernelExecuteResult, running: boolean) => ({ result, running });
 		expect(await fixture.cells.poll(fixture.id, 0, false, undefined, consume)).toMatchObject({
@@ -90,8 +91,9 @@ describe("Python code mode", () => {
 		});
 		expect(fixture.active.signal.aborted).toBe(false);
 		expect(() => fixture.cells.start(parsePythonExec("pass"), async () => execution())).toThrow("Collect cell");
+		const waiting = fixture.cells.poll(fixture.id, undefined, false, undefined, consume);
 		fixture.setOutput({ ...execution("first\nsecond\n"), modelContent: [{ type: "text", text: "selected" }] });
-		expect(await fixture.cells.poll(fixture.id, 0, false, undefined, consume)).toMatchObject({
+		expect(await waiting).toMatchObject({
 			running: true,
 			result: { stdout: "second\n", modelContent: [{ text: "selected" }] },
 		});
@@ -112,8 +114,13 @@ describe("Python code mode", () => {
 			await new Promise<void>((resolve) => setTimeout(resolve, 0));
 		});
 		expect(fixture.cells.active).toBe(true);
+		expect(fixture.cells.executing).toBe(false);
+		const next = fixture.cells.start(parsePythonExec("pass"), async () => execution("independent"));
 		const result = await fixture.cells.poll(fixture.id, 100, false, undefined, async (result) => result);
 		expect(result.stdout).toBe("last\n");
+		expect(await fixture.cells.poll(next, 100, false, undefined, async (result) => result.stdout)).toBe(
+			"independent",
+		);
 	});
 
 	test("does not consume output on formatting failure or allow concurrent waits", async () => {
@@ -165,7 +172,7 @@ describe("Python code mode", () => {
 		expect(() => fixture.cells.start(parsePythonExec("pass"), async () => execution())).toThrow("closed");
 	});
 
-	test("fresh namespaces, explicit JSON state, optional persistence, output, and task cleanup", async () => {
+	test("fresh namespaces, selective state and function globals, deletion, and task cleanup", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-code-mode-python-"));
 		try {
 			const script = join(root, "check.py");
@@ -174,18 +181,19 @@ describe("Python code mode", () => {
 				`import asyncio as _asyncio, inspect as _inspect, json as _json, sys, types, contextlib, io
 sys.modules["IPython.display"] = types.SimpleNamespace(display=lambda *args, **kwargs: None)
 _RIEMANN_PROTECTED = set()
+_riemann_print = print
 ${PYTHON_CODE_MODE_BOOTSTRAP}
 async def check():
     await _riemann_exec_source("temporary = 42")
     await _riemann_exec_source("assert 'temporary' not in globals()")
-    await _riemann_exec_source("store('value', {'items': [1]})")
-    await _riemann_exec_source("copy = load('value'); copy['items'].append(2); assert load('value') == {'items': [1]}")
-    await _riemann_exec_source("durable = 42", True)
-    await _riemann_exec_source("assert durable == 42", True)
-    await _riemann_exec_source("def current(): return durable", True)
-    await _riemann_exec_source("durable = 43; assert current() == 43", True)
-    await _riemann_exec_source("del durable", True)
-    await _riemann_exec_source("assert 'durable' not in globals()", True)
+    await _riemann_exec_source("persist.value = {'items': [1]}")
+    await _riemann_exec_source("persist.value['items'].append(2); assert persist.value == {'items': [1, 2]}")
+    await _riemann_exec_source("temporary = 99; persist.durable = 42")
+    await _riemann_exec_source("@persist\\ndef current(): return persist.durable")
+    await _riemann_exec_source("persist.durable = 43; assert persist.current() == 43")
+    await _riemann_exec_source("assert 'temporary' not in persist.current.__globals__")
+    await _riemann_exec_source("del persist.durable")
+    await _riemann_exec_source("assert 'durable' not in vars(persist)")
     await _riemann_exec_source("assert 'durable' not in globals()")
     await _riemann_exec_source("import asyncio; asyncio.create_task(asyncio.sleep(100))")
     assert len(_asyncio.all_tasks()) == 1
@@ -195,12 +203,6 @@ async def check():
         assert capture.getvalue() == ""
         await _riemann_exec_source("print('selected')")
     assert capture.getvalue() == "selected\\n"
-    try:
-        store("bad", object())
-    except TypeError:
-        pass
-    else:
-        raise AssertionError("store accepted non-JSON state")
 _asyncio.run(check())
 print("passed")
 `,

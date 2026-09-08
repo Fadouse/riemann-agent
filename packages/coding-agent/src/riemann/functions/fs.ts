@@ -34,7 +34,7 @@ const artifactSchema = Type.Object(
 		size: Type.Integer({ minimum: 0 }),
 		name: Type.Union([Type.String(), Type.Null()]),
 	},
-	{ additionalProperties: false, $id: "Artifact" },
+	{ additionalProperties: false, $id: "Ref" },
 );
 
 const pathEntrySchema = Type.Object(
@@ -572,7 +572,7 @@ export class FileFunctions {
 				visibility: "public",
 				prompt: {
 					inventory: "Find readable file and directory entries without reading file contents.",
-					example: 'entries = await fs.glob(pattern="src/*"); output.show(value=entries, fields=["path", "kind"])',
+					example: 'entries = await fs.glob(pattern="src/*"); print(entries)',
 				},
 				capability: "fs.read",
 				handler: async (args) => {
@@ -668,7 +668,7 @@ export class FileFunctions {
 				visibility: "public",
 				prompt: {
 					inventory: "Search file text with canonical paths and line numbers.",
-					example: 'matches = await fs.search(query="needle", glob="src/**/*.ts"); output.show(value=matches)',
+					example: 'matches = await fs.search(query="needle", glob="src/**/*.ts"); print(matches)',
 				},
 				capability: "fs.read",
 				handler: async (args) => {

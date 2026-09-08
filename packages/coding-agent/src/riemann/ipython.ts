@@ -1,16 +1,11 @@
 import { type Static, Type } from "typebox";
 import type { KernelExecuteStatus } from "./kernel/types.ts";
 
-export const IPYTHON_TOOL_DESCRIPTION = `Execute Python code with top-level await and the documented Python APIs.
-- On grammar-capable transports, send raw Python source, not JSON, quoted strings, or markdown fences. On JSON-only transports, put the same source in code.
-- Each call starts with a fresh user namespace. Use store(key, value) / load(key, default=None) for explicit cross-call state, or persist=true to reuse a dedicated namespace. This is namespace isolation, not process or security isolation.
-- Emit only the needed output with print(...) or await output.show(value=..., fields=...). Bare expressions do not automatically display results. Images use the documented view methods.
-- Optional first line: # @exec: {"timeout_ms": 300000, "persist": false}
-- timeout_ms (1..86400000, default 300000) is the only execution deadline, covering the cell and its nested operations. Execution automatically yields while still running; waiting does not reset the deadline.
-- Each return contains at most 50 KB (51200 UTF-8 bytes) of text, including status and reference notices. Complete output is retained; read the remaining content with await output.more(ref="...").
-- A yielded call returns "running cell_id=...". Continue it with ipython_wait; do not rerun its producer. Only one uncollected cell per agent is allowed.
-- ipython_wait returns new output only. terminate=true cancels the cell and its host operations; prior filesystem/network side effects are not rolled back.
-- Await every operation. Tasks created by a cell are cancelled when it finishes. Runtime state may be lost after forced termination; retained checkpoints and artifact handles are the recovery path.`;
+export const IPYTHON_TOOL_DESCRIPTION = `Execute raw Python with top-level await and fresh locals. Display with print; reuse retained results with refs[id]; preserve selected variables with persist.name and functions with @persist.
+Optional first line: # @exec: {"timeout_ms": 300000}; this is the sole deadline and covers nested/background work.
+Running cells yield an id for ipython_wait. shell.run(background=True) returns an independent process ID without occupying the kernel.
+Each text return totals at most 16384 UTF-8 bytes. Oversized display keeps head/tail; print(refs["r1"]) reads omitted content. Use await refs["r1"].read(span=[start,end]) to compute on a reference-relative byte slice.
+Await operations. Only marked state persists; temporary locals do not. Persistent functions must not depend on temporary globals. Side effects are not rolled back by cancellation.`;
 
 export const IPYTHON_TOOL_PROMPT_SNIPPET = "Execute raw Python; explicit output and optional state, yield with cell ID";
 
@@ -36,7 +31,7 @@ export const IPYTHON_TOOL_METADATA = {
 
 export const IPythonWaitSchema = Type.Object(
 	{
-		cell_id: Type.String({ minLength: 1, description: "Running cell ID returned by ipython" }),
+		id: Type.String({ minLength: 1, description: "Cell or background process ID returned by the runtime" }),
 		terminate: Type.Optional(Type.Boolean({ default: false })),
 	},
 	{ additionalProperties: false },
@@ -46,7 +41,7 @@ export const IPYTHON_WAIT_TOOL_METADATA = {
 	name: "ipython_wait",
 	label: "Python wait",
 	description:
-		"Wait on a yielded ipython cell. Use only a returned cell_id. Returns new output or final completion and closes the completed cell. Waiting does not reset its execution deadline. terminate=true cancels it; false or omitted waits. Unknown or already collected IDs are errors; never rerun the producer merely to retrieve output. Each return is at most 50 KB of text; remaining output is retained and readable by reference.",
+		"Wait on a returned cell or background process id. Returns new output or completion. terminate=true cancels that task; waiting never resets its deadline. Already collected or unknown IDs are errors; retained results remain readable through refs. Text returns share the 16384-byte head/tail display bound. Do not rerun producers to retrieve output.",
 	parameters: IPythonWaitSchema,
 	executionMode: "sequential",
 } as const;

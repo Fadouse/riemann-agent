@@ -68,11 +68,13 @@ import { renderRiemannPrompt } from "./prompts.ts";
 import { ensureManagedPython } from "./python/runtime.ts";
 import { ArtifactStore } from "./state/artifacts.ts";
 import { PageStore, pageSchema } from "./state/pages.ts";
+import { OUTPUT_VIEW_MIME, RESULT_MIME } from "./state/references.ts";
 import type { RetentionReport } from "./state/retention.ts";
 import { RiemannStore, type StoredAgent, type StoredRun } from "./state/store.ts";
 
 const MAX_MODEL_IMAGES = 8;
 const MAX_MODEL_IMAGE_BYTES = 20 * 1024 * 1024;
+type RuntimeUpdate = Parameters<ToolDefinition<typeof IPythonWaitSchema, IPythonToolDetails>["execute"]>[3];
 
 interface SharedRun {
 	config: RiemannConfig;
@@ -201,6 +203,7 @@ export class RiemannRuntime {
 	private readonly artifacts: ArtifactStore;
 	private readonly outputViews: OutputViews;
 	private readonly cells = new PythonCells();
+	private readonly shell: ShellFunctions;
 	private kernel?: IPythonKernelManager;
 	private kernelStartup?: Promise<IPythonKernelManager>;
 	private pendingRestoreNotice?: string;
@@ -221,12 +224,8 @@ export class RiemannRuntime {
 		this.outputViews = new OutputViews(this.artifacts);
 		this.pages = new PageStore(this.artifacts, agent.id);
 		const files = new FileFunctions(policy, shared.run.id, shared.store, this.artifacts, this.pages);
-		const shell = new ShellFunctions(
-			policy,
-			this.artifacts,
-			shared.config.limits.maxPreviewBytes,
-			agent.network === "allow",
-		);
+		const shell = new ShellFunctions(policy, this.artifacts, agent.network === "allow");
+		this.shell = shell;
 		this.web = new WebFunctions(
 			shared.config.web.searchBackend === "exa" ? exaApiKey : undefined,
 			this.artifacts,
@@ -386,17 +385,8 @@ export class RiemannRuntime {
 				size: Type.Integer({ minimum: 0 }),
 				name: Type.Union([Type.String(), Type.Null()]),
 			},
-			{ additionalProperties: false },
+			{ additionalProperties: false, $id: "Ref" },
 		);
-		const artifactSliceProperties = {
-			$riemann: Type.Literal("artifact_slice"),
-			handle: Type.String(),
-			mime_type: Type.String(),
-			size: Type.Integer({ minimum: 0 }),
-			offset: Type.Integer({ minimum: 0 }),
-			next_offset: Type.Integer({ minimum: 0 }),
-			eof: Type.Boolean(),
-		};
 		const filesystemFieldSchema = Type.Union([Type.Array(Type.String()), Type.Literal("inherit")]);
 		const filesystemConfigSchema = Type.Object(
 			{
@@ -475,99 +465,6 @@ export class RiemannRuntime {
 						this.capabilities,
 						args.detail === "schema" ? "schema" : "usage",
 					);
-				},
-			},
-			{
-				name: "open",
-				namespace: "artifacts",
-				description:
-					"Resolve a durable artifact handle to an Artifact object with read, materialize, and view methods.",
-				inputSchema: Type.Object(
-					{ handle: Type.String({ minLength: 1, description: "Artifact handle" }) },
-					{ additionalProperties: false },
-				),
-				outputSchema: artifactSchema,
-				pythonReturnType: "Artifact",
-				errors: [{ code: "not_found", description: "The artifact handle does not exist.", retryable: false }],
-				effects: [{ kind: "read", resource: "artifact-metadata" }],
-				idempotency: "idempotent",
-				cancellation: noCancellation,
-				visibility: "public",
-				prompt: {
-					inventory: "Resolve a durable artifact handle.",
-					example: 'artifact = await artifacts.open(handle="r1")',
-				},
-				handler: async (args) => {
-					if (typeof args.handle !== "string") {
-						throw new RiemannHostError("invalid_arguments", "handle must be a string");
-					}
-					return this.artifacts.open(args.handle);
-				},
-			},
-			{
-				name: "get",
-				namespace: "artifacts",
-				description: "Read a byte or text slice from a durable artifact handle.",
-				inputSchema: Type.Object(
-					{
-						handle: Type.String({ minLength: 1, description: "Artifact handle" }),
-						span: Type.Optional(
-							Type.Tuple(
-								[
-									Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-									Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-								],
-								{
-									description:
-										"Requested half-open byte interval [start, end). Omit to read the artifact. Text boundaries must align with UTF-8 code points; this selects data, not a display budget.",
-								},
-							),
-						),
-					},
-					{ additionalProperties: false },
-				),
-				outputSchema: Type.Union([
-					Type.Object(
-						{ ...artifactSliceProperties, kind: Type.Literal("text"), text: Type.String() },
-						{ additionalProperties: false },
-					),
-					Type.Object(
-						{ ...artifactSliceProperties, kind: Type.Literal("binary"), base64: Type.String() },
-						{ additionalProperties: false },
-					),
-				]),
-				pythonReturnType: "ArtifactSlice",
-				errors: [{ code: "not_found", description: "The artifact handle does not exist.", retryable: false }],
-				effects: [{ kind: "read", resource: "artifact-store" }],
-				idempotency: "idempotent",
-				cancellation: noCancellation,
-				visibility: "handle-method",
-				prompt: {
-					inventory: "Read a slice of a durable artifact.",
-					example: "await artifact.read(span=[0, 4096])",
-				},
-				handler: async (args) => {
-					if (typeof args.handle !== "string")
-						throw new RiemannHostError("invalid_arguments", "handle must be a string");
-					const span = args.span;
-					const offset = Array.isArray(span) && typeof span[0] === "number" ? span[0] : 0;
-					const end =
-						Array.isArray(span) && typeof span[1] === "number"
-							? span[1]
-							: this.artifacts.getMetadata(args.handle).size;
-					if (end < offset) throw new RiemannHostError("invalid_arguments", "span end must not precede start");
-					const limit = end - offset;
-					const slice = await this.artifacts.get(args.handle, { offset, limit });
-					if (
-						slice &&
-						typeof slice === "object" &&
-						!Array.isArray(slice) &&
-						slice.kind === "text" &&
-						slice.next_offset !== Math.min(end, this.artifacts.getMetadata(args.handle).size)
-					) {
-						throw new RiemannHostError("invalid_arguments", "span end must be a UTF-8 code-point boundary");
-					}
-					return slice;
 				},
 			},
 			{
@@ -680,7 +577,18 @@ export class RiemannRuntime {
 						throw new RiemannHostError("invalid_arguments", "handle and path must be strings");
 					}
 					const destination = await this.resolveArtifactDestination(args.path);
-					return this.artifacts.materialize(args.handle, destination);
+					let handle = args.handle;
+					const metadata = this.artifacts.getMetadata(handle);
+					if (metadata.mimeType === RESULT_MIME) handle = (await this.artifacts.readResult(handle)).value_ref;
+					else if (metadata.mimeType === OUTPUT_VIEW_MIME) {
+						const text = await this.outputViews.text(handle);
+						const retained = await this.artifacts.putText(text.text, { name: "materialized-output.txt" });
+						handle = artifactHandle(retained)!;
+					}
+					const result = await this.artifacts.materialize(handle, destination);
+					return typeof result === "object" && result !== null && !Array.isArray(result)
+						? { ...result, handle: args.handle }
+						: result;
 				},
 			},
 			{
@@ -721,80 +629,59 @@ export class RiemannRuntime {
 				},
 			},
 			{
-				name: "show",
-				namespace: "output",
+				name: "read",
+				namespace: "references",
 				description:
-					"Send selected fields to the model. Each tool return is at most 50 KB of text; read retained content with output.more without repeating producers.",
+					"Read a retained value into Python. Text spans are reference-relative UTF-8 byte intervals [start,end).",
 				inputSchema: Type.Object(
 					{
-						value: Type.Unknown(),
-						fields: Type.Optional(Type.Union([Type.Array(Type.String({ minLength: 1 })), Type.Null()])),
+						handle: Type.String({ minLength: 1 }),
+						span: Type.Optional(
+							Type.Tuple([
+								Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+								Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+							]),
+						),
 					},
 					{ additionalProperties: false },
 				),
-				outputSchema: Type.Null(),
-				pythonReturnType: "None",
-				errors: [
-					{
-						code: "invalid_arguments",
-						description: "A selected field or item count is invalid.",
-						retryable: false,
-					},
-				],
-				effects: [
-					{ kind: "write", resource: "model-context" },
-					{ kind: "write", resource: "artifact-store" },
-				],
+				outputSchema: Type.Unknown(),
+				pythonReturnType: "JSON",
+				errors: [{ code: "not_found", description: "Unknown reference", retryable: false }],
+				effects: [{ kind: "read", resource: "artifact-store" }],
 				idempotency: "idempotent",
 				cancellation: noCancellation,
-				visibility: "public",
-				prompt: {
-					inventory: "Send selected fields to the model without expanding intermediate data.",
-					example: 'await output.show(value=result, fields=["stdout", "stderr"])',
-					guidelines: [
-						"Built-in records use attributes; raw JSON and schemas remain dictionaries. Page iteration/indexing/len cover only the current page; await page.next() reads the next retained page. Use await output.more(ref=...) for a returned more reference; it never reruns the producer. Reuse snapshots when reading another slice of the same inspected file.",
-					],
-				},
-				handler: async (args) => {
-					return kernelHostResult(null, [await this.outputViews.prepare(args.value)]);
-				},
-			},
-			{
-				name: "more",
-				namespace: "output",
-				description:
-					"Read the next budgeted portion of retained output or a text diagnostic using its short reference. Does not rerun commands or requests.",
-				inputSchema: Type.Object(
-					{
-						ref: Type.String({
-							minLength: 1,
-							description:
-								"Short text/JSON reference: more continues output; result is a full return; source is original data; details is diagnostics.",
-						}),
-					},
-					{ additionalProperties: false },
-				),
-				outputSchema: Type.Null(),
-				pythonReturnType: "None",
-				errors: [
-					{
-						code: "unsupported_media_type",
-						description: "The reference is not retained text or an output view.",
-						retryable: false,
-					},
-				],
-				effects: [
-					{ kind: "read", resource: "artifact-store" },
-					{ kind: "write", resource: "model-context" },
-				],
-				idempotency: "idempotent",
-				cancellation: noCancellation,
-				visibility: "public",
-				prompt: { inventory: "Continue retained output.", example: 'await output.more(ref="r1")' },
-				handler: async (args) => {
-					if (typeof args.ref !== "string")
-						throw new RiemannHostError("invalid_arguments", "ref must be a short resource reference");
-					return kernelHostResult(null, [await this.outputViews.more(args.ref)]);
+				visibility: "handle-method",
+				prompt: { inventory: "Read a reference", example: 'value = await refs["r1"].read()' },
+				handler: async (args): Promise<JsonValue> => {
+					if (typeof args.handle !== "string")
+						throw new RiemannHostError("invalid_arguments", "Expected reference");
+					const span = Array.isArray(args.span) ? (args.span as [number, number]) : undefined;
+					const metadata = this.artifacts.getMetadata(args.handle);
+					if (metadata.mimeType === RESULT_MIME && !span) {
+						const retained = await this.artifacts.readResult(args.handle);
+						const value: JsonValue = JSON.parse(
+							(await this.artifacts.readBuffer(retained.value_ref)).toString("utf8"),
+						);
+						return { kind: "value", value, schema: retained.schema, return_type: retained.return_type };
+					}
+					if (
+						metadata.mimeType === OUTPUT_VIEW_MIME ||
+						metadata.mimeType === RESULT_MIME ||
+						metadata.mimeType.startsWith("text/") ||
+						metadata.mimeType.includes("json") ||
+						metadata.mimeType.includes("xml")
+					) {
+						return { kind: "text", ...(await this.outputViews.text(args.handle, span)) };
+					}
+					this.artifacts.assertPublic(args.handle);
+					const [start, end] = span ?? [0, metadata.size];
+					if (start > end || end > metadata.size)
+						throw new RiemannHostError("invalid_arguments", "span must be within the reference");
+					const slice = await this.artifacts.get(args.handle, { offset: start, limit: end - start });
+					if (!slice || typeof slice !== "object" || Array.isArray(slice) || typeof slice.base64 !== "string")
+						throw new RiemannHostError("artifact_error", "Invalid binary slice");
+					return { kind: "binary", base64: slice.base64 };
 				},
 			},
 			{
@@ -1236,8 +1123,15 @@ export class RiemannRuntime {
 						signal,
 						onUpdate,
 						async (value) => {
-							if (value !== null)
-								ref = artifactHandle(await this.artifacts.putJson(value, `${request.operation}-result.json`));
+							if (value !== null && request.operation !== "references.read") {
+								const definition = this.registry.get(request.operation)!;
+								ref = await this.artifacts.putResult(
+									value,
+									JSON.parse(JSON.stringify(definition.outputSchema)) as JsonValue,
+									definition.pythonReturnType,
+									request.operation,
+								);
+							}
 							return ref;
 						},
 					);
@@ -1248,6 +1142,7 @@ export class RiemannRuntime {
 					]);
 				},
 				snapshotPath: join(this.shared.store.snapshotsDir, this.agent.id, "kernel.dill"),
+				migrateCodeState: true,
 				sandbox: { policy: this.policy, networkAllowed: this.agent.network === "allow" },
 				retainOutput: async (output) => {
 					if ("stream" in output) {
@@ -1256,6 +1151,20 @@ export class RiemannRuntime {
 						if (!handle) throw new RiemannHostError("artifact_error", "Python output has no reference");
 						return [{ type: "output_ref", handle, separator: output.stream === "stderr" ? "\n[stderr]\n" : "" }];
 					}
+					if (output.data["application/vnd.riemann.migration+json"] !== undefined) {
+						const legacy = await this.artifacts.putJson(
+							output.data["application/vnd.riemann.migration+json"],
+							"legacy-store.json",
+						);
+						return [
+							{
+								type: "text",
+								text: `Previous store data retained at ${artifactHandle(legacy)}; read with refs.`,
+							},
+						];
+					}
+					if (output.data["application/vnd.riemann.print+json"] !== undefined)
+						return this.outputViews.print(output.data["application/vnd.riemann.print+json"]);
 					return retainDisplay(this.artifacts, output);
 				},
 				onRestore: (result) => {
@@ -1348,7 +1257,9 @@ export class RiemannRuntime {
 				selectedImageBytes + image.byteLength > MAX_MODEL_IMAGE_BYTES
 			) {
 				omittedImages += 1;
-				sections.push(`[image ${image.artifactHandle}; deferred, use Artifact.view()]`);
+				sections.push(
+					`[image ${image.artifactHandle}; deferred, use await refs["${image.artifactHandle}"].view()]`,
+				);
 				continue;
 			}
 			selectedImages.push(image);
@@ -1397,7 +1308,6 @@ export class RiemannRuntime {
 				} catch (error) {
 					return runtime.toolFailure(error, "ipython", "invalid_arguments");
 				}
-				let observing = true;
 				let cellId: string;
 				try {
 					cellId = runtime.cells.start(options, async (cell) => {
@@ -1419,42 +1329,29 @@ export class RiemannRuntime {
 						// through host updates and the final result; durationMs remains kernel-authoritative.
 						const startedAt = Date.now();
 						cell.details = { status: "running", startedAt, cellId: cell.id, activities };
-						if (observing) onUpdate?.({ content: [], details: { status: "running", startedAt, activities } });
-						const result = await kernel.execute(
-							`await _riemann_exec_source(${JSON.stringify(params.code)}, ${options.persist ? "True" : "False"})`,
-							{
-								signal: cell.signal,
-								outputOrder: "arrival",
-								onHostRequest: async (event) => {
-									const next = await activityTracker.observe(event);
-									if (!next) return;
-									activities = next;
-									cell.details.activities = activities;
-									if (observing)
-										onUpdate?.({
-											content: [],
-											details: {
-												status: "running",
-												startedAt,
-												durationMs: undefined,
-												activities,
-											},
-										});
-								},
+						cell.notify();
+						const result = await kernel.execute(`await _riemann_exec_source(${JSON.stringify(params.code)})`, {
+							signal: cell.signal,
+							outputOrder: "arrival",
+							onOutput: cell.notify,
+							onHostRequest: async (event) => {
+								const next = await activityTracker.observe(event);
+								if (!next) return;
+								activities = next;
+								cell.details.activities = activities;
+								cell.notify();
 							},
-						);
+						});
 						return result;
 					});
 				} catch (error) {
 					return runtime.toolFailure(error);
 				}
 				try {
-					return await runtime.collectCell(cellId, false, signal);
+					return await runtime.collectCell(cellId, false, signal, onUpdate, true);
 				} catch (error) {
 					if (signal?.aborted) runtime.cells.cancel(cellId);
 					return runtime.toolFailure(error);
-				} finally {
-					observing = false;
 				}
 			},
 		};
@@ -1463,8 +1360,8 @@ export class RiemannRuntime {
 	waitToolDefinition(): ToolDefinition<typeof IPythonWaitSchema, IPythonToolDetails> {
 		return {
 			...IPYTHON_WAIT_TOOL_METADATA,
-			execute: async (_id, params, signal) =>
-				this.collectCell(params.cell_id, params.terminate ?? false, signal).catch((error: unknown) =>
+			execute: async (_id, params, signal, onUpdate) =>
+				this.collectCell(params.id, params.terminate ?? false, signal, onUpdate).catch((error: unknown) =>
 					this.toolFailure(error, "ipython_wait"),
 				),
 		};
@@ -1510,38 +1407,55 @@ export class RiemannRuntime {
 		});
 	}
 
-	private async collectCell(cellId: string, terminate: boolean, signal?: AbortSignal) {
-		const outcome = await this.cells.poll(
-			cellId,
-			10000,
-			terminate,
-			signal,
-			async (result, running, cell: PythonCell) => {
-				const status = result.status;
-				const header = running ? `running cell_id=${cellId}; use ipython_wait; do not rerun` : status;
-				const formatted = await this.formatResult(result, header);
-				return {
-					content: formatted.content,
-					details: {
-						...cell.details,
-						status: running ? ("running" as const) : status,
-						cellId,
-						durationMs: result.durationMs,
-						...(result.captureTruncated ? { captureTruncated: result.captureTruncated } : {}),
-						...(result.error
-							? { errorName: result.error.ename, ...(result.error.code ? { errorCode: result.error.code } : {}) }
-							: {}),
-						...(result.executionCount === undefined ? {} : { executionCount: result.executionCount }),
-						...(formatted.moreRef ? { moreRef: formatted.moreRef } : {}),
-						...(formatted.diagnosticRef ? { diagnosticRef: formatted.diagnosticRef } : {}),
-						...(formatted.media ? { media: formatted.media } : {}),
-					},
-				};
-			},
+	private async collectCell(
+		cellId: string,
+		terminate: boolean,
+		signal?: AbortSignal,
+		onUpdate?: RuntimeUpdate,
+		initial = false,
+	) {
+		const tasks = this.cells.has(cellId) ? this.cells : this.shell.tasks;
+		const unobserve = tasks.observe(cellId, (details) =>
+			onUpdate?.({ content: [], details: { ...details, status: "running" } }),
 		);
-		if (outcome.details.status !== "ok" && outcome.details.status !== "running")
-			throw new AgentToolExecutionError(outcome);
-		return outcome;
+		try {
+			const outcome = await tasks.poll(
+				cellId,
+				initial ? 10000 : undefined,
+				terminate,
+				signal,
+				async (result, running, cell: PythonCell) => {
+					const status = result.status;
+					const header = running ? `running id=${cellId}; use ipython_wait; do not rerun` : status;
+					const formatted = await this.formatResult(result, header);
+					return {
+						content: formatted.content,
+						details: {
+							...cell.details,
+							status: running ? ("running" as const) : status,
+							cellId,
+							durationMs: result.durationMs,
+							...(result.captureTruncated ? { captureTruncated: result.captureTruncated } : {}),
+							...(result.error
+								? {
+										errorName: result.error.ename,
+										...(result.error.code ? { errorCode: result.error.code } : {}),
+									}
+								: {}),
+							...(result.executionCount === undefined ? {} : { executionCount: result.executionCount }),
+							...(formatted.moreRef ? { moreRef: formatted.moreRef } : {}),
+							...(formatted.diagnosticRef ? { diagnosticRef: formatted.diagnosticRef } : {}),
+							...(formatted.media ? { media: formatted.media } : {}),
+						},
+					};
+				},
+			);
+			if (outcome.details.status !== "ok" && outcome.details.status !== "running")
+				throw new AgentToolExecutionError(outcome);
+			return outcome;
+		} finally {
+			unobserve();
+		}
 	}
 
 	private asChildRuntime(): ChildRiemannRuntime {
@@ -1562,7 +1476,7 @@ export class RiemannRuntime {
 	}
 
 	async snapshot(): Promise<void> {
-		if (this.kernel && !this.cells.active) {
+		if (this.kernel && !this.cells.executing) {
 			const result = await this.kernel.snapshot();
 			if (result.error || result.skipped.length > 0)
 				this.pendingRestoreNotice = `[Checkpoint warning] ${JSON.stringify(result)}`;
@@ -1573,6 +1487,7 @@ export class RiemannRuntime {
 		if (this.closed) return;
 		this.closed = true;
 		await this.cells.close();
+		await this.shell.tasks.close();
 		if (this.root) await this.shared.supervisor.close();
 		const startingKernel = await this.kernelStartup?.catch(() => undefined);
 		const kernel = this.kernel ?? startingKernel;

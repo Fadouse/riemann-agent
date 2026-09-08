@@ -4,6 +4,7 @@ import type { RiemannDatabase } from "./database.ts";
 export const PAGE_MANIFEST_MIME = "application/vnd.riemann.page+json";
 export const PAGE_CURSOR_MIME = "application/vnd.riemann.page-cursor+json";
 export const OUTPUT_VIEW_MIME = "application/vnd.riemann.output+json";
+export const RESULT_MIME = "application/vnd.riemann.result+json";
 export type ResourceKind = "artifact" | "page_snapshot" | "page_cursor" | "internal";
 
 export interface StoredReference {
@@ -153,9 +154,9 @@ export class ReferenceStore {
 			// Display views and their public data can be handed off; query cursors remain owner-bound.
 			this.db
 				.prepare(
-					"INSERT INTO reference_grants(run_id, short_ref, agent_id) SELECT g.run_id, g.short_ref, ? FROM reference_grants g JOIN resource_references r ON r.run_id = g.run_id AND r.short_ref = g.short_ref JOIN artifacts a ON a.handle = r.resource_id WHERE g.run_id = ? AND g.agent_id = ? AND (r.kind = 'artifact' OR a.mime_type = ?) ON CONFLICT DO NOTHING",
+					"INSERT INTO reference_grants(run_id, short_ref, agent_id) SELECT g.run_id, g.short_ref, ? FROM reference_grants g JOIN resource_references r ON r.run_id = g.run_id AND r.short_ref = g.short_ref JOIN artifacts a ON a.handle = r.resource_id WHERE g.run_id = ? AND g.agent_id = ? AND (r.kind = 'artifact' OR a.mime_type IN (?, ?)) ON CONFLICT DO NOTHING",
 				)
-				.run(targetId, runId, sourceId, OUTPUT_VIEW_MIME);
+				.run(targetId, runId, sourceId, OUTPUT_VIEW_MIME, RESULT_MIME);
 		});
 	}
 }

@@ -115,9 +115,9 @@ export const COMMON_FUNCTION_ERRORS = [
 ] as const;
 
 const HANDLE_METHODS = new Map<string, { operation: string; bound: readonly string[] }>([
-	["Artifact.read", { operation: "artifacts.get", bound: ["handle"] }],
-	["Artifact.materialize", { operation: "artifacts.materialize", bound: ["handle"] }],
-	["Artifact.view", { operation: "artifacts.view", bound: ["handle"] }],
+	["Ref.read", { operation: "references.read", bound: ["handle"] }],
+	["Ref.materialize", { operation: "artifacts.materialize", bound: ["handle"] }],
+	["Ref.view", { operation: "artifacts.view", bound: ["handle"] }],
 	["ImageSnapshot.view", { operation: "artifacts.view", bound: ["handle"] }],
 	...["AgentTurnHandle", "AgentInfo", "AgentResult"].flatMap((typeName) =>
 		["info", "wait", "steer", "stop", "release"].map(
@@ -298,14 +298,11 @@ function parameterUsage(schema: FunctionDefinition["inputSchema"]): JsonValue[] 
 
 function consumptionExample(definition: FunctionDefinition): string {
 	const example = definition.prompt.example;
-	if (definition.pythonReturnType === "None") return example;
+	if (definition.pythonReturnType === "None" || /(?:print|\.view)\(/.test(example)) return example;
 	const assigned = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*await\s/.exec(example)?.[1];
 	if (!assigned && !example.startsWith("await ")) return example;
 	const variable = assigned ?? "result";
-	const call = assigned ? example : `${variable} = ${example}`;
-	return /^(Page|list)\[/.test(definition.pythonReturnType)
-		? `${call}\nfor item in ${variable}[:3]:\n    print(item)`
-		: `${call}\nprint(${variable})`;
+	return `${assigned ? example : `${variable} = ${example}`}\nprint(${variable})`;
 }
 
 function schemaDefaults(definition: FunctionDefinition): JsonValue {
@@ -736,7 +733,7 @@ export class FunctionRegistry {
 		}
 		const inventory = [...grouped].map(([namespace, items]) => `- \`${namespace}\`: ${items.join("; ")}`).join("\n");
 		const summary = returnTypes.size
-			? `${inventory}\n- Return types: ${[...returnTypes.values()].map((shape) => `\`${shape}\``).join("; ")}. Use \`output.show(value=..., fields=None)\` for explicit display.`
+			? `${inventory}\n- Return types: ${[...returnTypes.values()].map((shape) => `\`${shape}\``).join("; ")}. Display with \`print(value)\`. Read retained content with \`refs[id]\` and \`await refs[id].read(span=[start, end])\`.`
 			: inventory;
 		const contracts = visible.map((definition) =>
 			[

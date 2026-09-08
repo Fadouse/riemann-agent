@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
+import { open } from "node:fs/promises";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { RiemannHostError } from "./errors.ts";
 import type { JsonValue, KernelModelContent } from "./kernel/types.ts";
 import type { ArtifactStore } from "./state/artifacts.ts";
-import { OUTPUT_VIEW_MIME } from "./state/references.ts";
+import { OUTPUT_VIEW_MIME, RESULT_MIME } from "./state/references.ts";
 
 /** A UTF-8 byte budget must not split a code point or materialize the full encoded input. */
 export function utf8Prefix(text: string, bytes: number): string {
@@ -19,30 +20,15 @@ export function utf8Prefix(text: string, bytes: number): string {
 	return text.slice(0, end);
 }
 
-export const MODEL_TEXT_BYTES = 50 * 1024;
-const SourceSchema = Type.Object(
-	{
-		path: Type.Array(Type.String()),
-		handle: Type.String({ minLength: 1 }),
-		offset_bytes: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-		capture_truncated: Type.Boolean(),
-	},
-	{ additionalProperties: false },
-);
-const EnvelopeSchema = Type.Object(
-	{
-		$riemann: Type.Literal("output_view"),
-		value: Type.Unknown(),
-		sources: Type.Array(SourceSchema),
-	},
-	{ additionalProperties: false },
-);
+export const MODEL_TEXT_BYTES = 16_384;
 const SegmentSchema = Type.Object(
 	{
 		handle: Type.String({ minLength: 1 }),
 		offset_bytes: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 		prefix: Type.String(),
 		stop_after: Type.Boolean(),
+		end_bytes: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+		selected: Type.Optional(Type.Boolean()),
 	},
 	{ additionalProperties: false },
 );
@@ -82,6 +68,10 @@ export class OutputViews {
 
 	private async load(handle: string): Promise<Segment[]> {
 		const metadata = this.artifacts.getMetadata(handle);
+		if (metadata.mimeType === RESULT_MIME) {
+			const result = await this.artifacts.readResult(handle);
+			return this.load(result.value_ref);
+		}
 		if (metadata.mimeType !== OUTPUT_VIEW_MIME) {
 			// A diagnostic or retained text artifact can be read from its beginning.
 			this.artifacts.assertPublic(handle);
@@ -92,7 +82,7 @@ export class OutputViews {
 			) {
 				throw new RiemannHostError(
 					"unsupported_media_type",
-					"output.more reads retained text, not binary data; use Artifact.read in Python",
+					"Binary reference; use await refs[id].read() or its view() method",
 				);
 			}
 			return [{ handle, offset_bytes: 0, prefix: "", stop_after: false }];
@@ -111,71 +101,147 @@ export class OutputViews {
 		return value.segments;
 	}
 
-	async prepare(envelope: JsonValue): Promise<KernelModelContent> {
-		if (!Value.Check(EnvelopeSchema, envelope)) {
-			throw new RiemannHostError(
-				"invalid_arguments",
-				"Use output.show(value=..., fields=...) to construct an output view",
-			);
-		}
-		const preview = envelope.value;
-		const retained =
-			typeof preview === "string"
-				? await this.artifacts.putText(preview, { name: "output-text.txt" })
-				: await this.artifacts.putJson(preview as JsonValue, "output-value.json");
-		let visible = "";
-		const pending: Segment[] = [];
-		for (const source of envelope.sources) {
-			this.artifacts.assertPublic(source.handle);
-			const metadata = this.artifacts.getMetadata(source.handle);
-			const label = source.path.join(".") || "text";
-			if (source.capture_truncated) visible += `\n[${label}: capture incomplete; only retained bytes are available]`;
-			const text =
-				metadata.mimeType.startsWith("text/") ||
-				metadata.mimeType.includes("json") ||
-				metadata.mimeType.includes("xml");
-			if (!text) {
-				visible += `\n[${label}: binary resource ${source.handle}; read bytes with Artifact.read]`;
-				continue;
+	private extent(segment: Segment): number {
+		return segment.end_bytes ?? this.artifacts.getMetadata(segment.handle).size;
+	}
+
+	private size(segments: Segment[]): number {
+		return segments.reduce(
+			(total, segment) => total + Buffer.byteLength(segment.prefix) + this.extent(segment) - segment.offset_bytes,
+			0,
+		);
+	}
+
+	/** Read only the boundary byte, never the intervening output. */
+	private async boundary(segments: Segment[], offset: number, direction: -1 | 1): Promise<number> {
+		let position = 0;
+		for (const segment of segments) {
+			const prefix = Buffer.from(segment.prefix);
+			const length = prefix.length + this.extent(segment) - segment.offset_bytes;
+			if (offset < position + length) {
+				let local = offset - position;
+				if (local < prefix.length) {
+					while ((prefix[local] & 0xc0) === 0x80) local += direction;
+					return position + local;
+				}
+				const metadata = this.artifacts.assertPublic(segment.handle);
+				const file = await open(metadata.path, "r");
+				try {
+					const byte = Buffer.allocUnsafe(1);
+					while (local < length) {
+						const { bytesRead } = await file.read(byte, 0, 1, segment.offset_bytes + local - prefix.length);
+						if (bytesRead !== 1) throw new RiemannHostError("artifact_error", "Output source is incomplete");
+						if ((byte[0] & 0xc0) !== 0x80) break;
+						local += direction;
+						if (Math.abs(local - (offset - position)) > 3)
+							throw new RiemannHostError("unsupported_media_type", "Output boundary is not valid UTF-8");
+					}
+					return position + local;
+				} finally {
+					await file.close();
+				}
 			}
-			if (source.offset_bytes > metadata.size)
-				throw new RiemannHostError("invalid_arguments", "Output preview offset exceeds its retained source");
-			if (source.offset_bytes < metadata.size)
-				pending.push({
-					handle: source.handle,
-					offset_bytes: source.offset_bytes,
-					prefix: `\n${label} (continued):\n`,
-					stop_after: false,
-				});
+			position += length;
 		}
-		const initial: Segment = { handle: handleOf(retained), offset_bytes: 0, prefix: "", stop_after: false };
-		return {
-			type: "output_ref",
-			handle: await this.save([initial, ...(visible ? [await this.literal(visible)] : []), ...pending]),
-		};
+		return offset;
 	}
 
-	async more(ref: string): Promise<Extract<KernelModelContent, { type: "output_ref" }>> {
-		await this.load(ref); // Validate authorization and kind before accepting the operation.
-		return { type: "output_ref", handle: ref };
+	/** A slice is a manifest of existing bytes, not a new copy of the payload. */
+	private slice(segments: Segment[], start: number, end: number, selected = false): Segment[] {
+		const result: Segment[] = [];
+		let position = 0;
+		for (const segment of segments) {
+			const prefix = Buffer.from(segment.prefix);
+			const bodyStart = position + prefix.length;
+			const segmentEnd = bodyStart + this.extent(segment) - segment.offset_bytes;
+			if (start < segmentEnd && end > position) {
+				const offset = segment.offset_bytes + Math.max(0, start - bodyStart);
+				const stop = segment.offset_bytes + Math.max(0, Math.min(end, segmentEnd) - bodyStart);
+				result.push({
+					...segment,
+					prefix: prefix.subarray(Math.max(0, start - position), Math.max(0, end - position)).toString("utf8"),
+					offset_bytes: offset,
+					end_bytes: stop,
+					...(selected ? { selected: true } : {}),
+				});
+			}
+			position = segmentEnd;
+			if (position >= end) break;
+		}
+		return result;
 	}
 
-	async read(ref: string, maxBytes: number): Promise<{ text: string; next?: string }> {
+	async read(
+		ref: string,
+		span?: readonly [number, number],
+	): Promise<Extract<KernelModelContent, { type: "output_ref" }>> {
 		const segments = await this.load(ref);
+		if (span === undefined) return { type: "output_ref", handle: ref };
+		const [start, end] = span;
+		const size = this.size(segments);
+		if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > size)
+			throw new RiemannHostError("invalid_arguments", `span must satisfy 0 <= start <= end <= ${size} UTF-8 bytes`);
+		if ((await this.boundary(segments, start, 1)) !== start || (await this.boundary(segments, end, 1)) !== end)
+			throw new RiemannHostError("invalid_arguments", "span endpoints must be UTF-8 code-point boundaries");
+		return { type: "output_ref", handle: await this.save(this.slice(segments, start, end, true)) };
+	}
+
+	async text(ref: string, span?: readonly [number, number]): Promise<{ text: string; reference: string }> {
+		const selected = await this.read(ref, span);
+		const segments = await this.load(selected.handle);
+		const result = await this.readSegments(segments, this.size(segments));
+		return { text: result.text, reference: selected.handle };
+	}
+
+	async print(value: JsonValue): Promise<KernelModelContent[]> {
+		if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.parts))
+			throw new RiemannHostError("invalid_arguments", "Invalid print event");
+		const segments: Segment[] = [];
+		let literal = value.stderr === true ? "\n[stderr]\n" : "";
+		for (const part of value.parts) {
+			if (!part || typeof part !== "object" || Array.isArray(part))
+				throw new RiemannHostError("invalid_arguments", "Invalid print part");
+			if (typeof part.text === "string") literal += part.text;
+			else if (typeof part.ref === "string") {
+				const metadata = this.artifacts.getMetadata(part.ref);
+				if (
+					!metadata.mimeType.startsWith("text/") &&
+					!metadata.mimeType.includes("json") &&
+					!metadata.mimeType.includes("xml")
+				) {
+					this.artifacts.assertPublic(part.ref);
+					literal += `[binary ${part.ref}; use read() or view()]`;
+					continue;
+				}
+				if (literal) segments.push(await this.literal(literal));
+				literal = "";
+				segments.push(...(await this.load(part.ref)));
+			} else throw new RiemannHostError("invalid_arguments", "Print parts require text or ref");
+		}
+		if (literal) segments.push(await this.literal(literal));
+		return [{ type: "output_ref", handle: await this.save(segments), separator: "" }];
+	}
+
+	private async readSegments(segments: Segment[], maxBytes: number): Promise<{ text: string; remaining: Segment[] }> {
 		const parts: string[] = [];
 		let remaining = Math.max(0, maxBytes);
-		while (segments.length && remaining >= 4) {
+		while (segments.length && remaining > 0) {
 			const segment = segments[0];
 			if (segment.prefix) {
 				const prefix = utf8Prefix(segment.prefix, remaining);
 				parts.push(prefix);
 				remaining -= Buffer.byteLength(prefix);
 				segment.prefix = segment.prefix.slice(prefix.length);
-				if (segment.prefix || remaining < 4) break;
+				if (segment.prefix || remaining === 0) break;
+			}
+			const end = this.extent(segment);
+			if (segment.offset_bytes === end) {
+				segments.shift();
+				continue;
 			}
 			const slice = await this.artifacts.get(segment.handle, {
 				offset: segment.offset_bytes,
-				limit: Math.min(remaining, 1048576),
+				limit: Math.min(Math.max(remaining, 4), end - segment.offset_bytes, 1048576),
 			});
 			if (
 				typeof slice !== "object" ||
@@ -187,14 +253,41 @@ export class OutputViews {
 			) {
 				throw new RiemannHostError("unsupported_media_type", "Output source is not retained UTF-8 text");
 			}
-			parts.push(slice.text);
-			remaining -= Buffer.byteLength(slice.text);
-			segment.offset_bytes = slice.next_offset;
-			if (!slice.eof) break;
+			const text = utf8Prefix(slice.text, remaining);
+			parts.push(text);
+			const length = Buffer.byteLength(text);
+			remaining -= length;
+			segment.offset_bytes += length;
+			if (segment.offset_bytes < end) {
+				if (text !== slice.text || remaining < 4) break;
+				if (length === 0) throw new RiemannHostError("artifact_error", "Output source is incomplete");
+				continue;
+			}
 			segments.shift();
 			if (segment.stop_after) break;
 		}
-		return { text: parts.join(""), ...(segments.length ? { next: await this.save(segments) } : {}) };
+		return {
+			text: parts.join(""),
+			remaining: segments.filter((segment) => segment.prefix || segment.offset_bytes < this.extent(segment)),
+		};
+	}
+
+	async preview(ref: string): Promise<{ text: string; more?: string }> {
+		const segments = await this.load(ref);
+		const budget = MODEL_TEXT_BYTES - 128;
+		const size = this.size(segments);
+		if (size <= MODEL_TEXT_BYTES || segments.some((segment) => segment.selected)) {
+			const result = await this.readSegments(segments, size <= MODEL_TEXT_BYTES ? MODEL_TEXT_BYTES : budget);
+			if (!result.remaining.length) return { text: result.text };
+			const more = await this.save(result.remaining);
+			return { text: `${result.text}\n[more ${more}]`, more };
+		}
+		const headEnd = await this.boundary(segments, Math.floor(budget / 2), -1);
+		const tailStart = await this.boundary(segments, size - Math.ceil(budget / 2), 1);
+		const head = await this.readSegments(this.slice(segments, 0, headEnd), headEnd);
+		const tail = await this.readSegments(this.slice(segments, tailStart, size), size - tailStart);
+		const more = await this.save(this.slice(segments, headEnd, tailStart));
+		return { text: `${head.text}\n[more ${more}]\n${tail.text}`, more };
 	}
 
 	async combine(parts: OutputPart[]): Promise<string> {
@@ -220,9 +313,5 @@ export async function renderModelText(
 	// Persist the ordered output before publishing any continuation. Reading a
 	// cursor never consumes it, so a failed delivery or repeated read is safe.
 	const ref = await views.combine(parts);
-	const result = await views.read(ref, MODEL_TEXT_BYTES - 128);
-	return {
-		text: result.text + (result.next ? `\n[more ${result.next}]` : ""),
-		...(result.next ? { more: result.next } : {}),
-	};
+	return views.preview(ref);
 }

@@ -1,4 +1,4 @@
-/** Appended after the Python API prelude; no additional runtime/package assets. */
+/** Appended after the Python API prelude. User cells never own the persistent globals. */
 export const PYTHON_CODE_MODE_BOOTSTRAP = `
 import ast as _riemann_ast
 import builtins as _riemann_builtins
@@ -9,10 +9,46 @@ from IPython.display import display as _riemann_display
 _riemann_bridge_module = _riemann_types.ModuleType("_riemann_bridge")
 _riemann_sys.modules["_riemann_bridge"] = _riemann_bridge_module
 _riemann_user_module = _riemann_types.ModuleType("_riemann_user")
-riemann_code_state = {"store": {}, "namespace": _riemann_user_module.__dict__}
+_riemann_sys.modules["_riemann_user"] = _riemann_user_module
+
+class _PersistentState:
+    def __setattr__(self, name, value):
+        if isinstance(value, _riemann_types.FunctionType) and value.__globals__ is not _riemann_user_module.__dict__:
+            original = value
+            value = _riemann_types.FunctionType(original.__code__, _riemann_user_module.__dict__, original.__name__, original.__defaults__, original.__closure__)
+            value.__kwdefaults__ = original.__kwdefaults__
+            value.__annotations__ = dict(original.__annotations__)
+            value.__dict__.update(original.__dict__)
+            value.__module__ = "_riemann_user"
+            value.__qualname__ = original.__name__
+        self.__dict__[name] = value
+        _riemann_refresh_functions(self)
+
+    def __delattr__(self, name):
+        if name not in self.__dict__:
+            raise AttributeError(name)
+        del self.__dict__[name]
+        _riemann_refresh_functions(self)
+
+    def __call__(self, function):
+        if not isinstance(function, _riemann_types.FunctionType):
+            raise TypeError("@persist requires a Python function")
+        setattr(self, function.__name__, function)
+        return getattr(self, function.__name__)
+
+def _riemann_refresh_functions(state):
+    namespace = _riemann_user_module.__dict__
+    for name, value in list(namespace.items()):
+        if isinstance(value, _riemann_types.FunctionType) and value.__globals__ is namespace:
+            del namespace[name]
+    for value in vars(state).values():
+        if isinstance(value, _riemann_types.FunctionType) and value.__globals__ is namespace:
+            namespace[value.__name__] = value
+
+persist = _PersistentState()
+riemann_code_state = {"version": 2}
 
 def _riemann_publish_bridge_types():
-    # Serialize runtime definitions by reference, not their kernel globals.
     for name, value in list(globals().items()):
         if isinstance(value, (_riemann_types.FunctionType, type)) and getattr(value, "__module__", None) == "__main__":
             value.__module__ = "_riemann_bridge"
@@ -21,46 +57,61 @@ def _riemann_publish_bridge_types():
 def _riemann_snapshot_code_state(value):
     import dill, io
     _riemann_publish_bridge_types()
-    namespace = value["namespace"]
-    skipped, removed = [], {}
+    skipped, removed, api = [], {}, {}
     try:
+        namespace = _riemann_user_module.__dict__
+        for name, item in list(namespace.items()):
+            if name not in {"persist", "__name__", "__builtins__"} and not (isinstance(item, _riemann_types.FunctionType) and item.__globals__ is namespace):
+                api[name] = namespace.pop(name)
         buffer = io.BytesIO()
         try:
             dill.dump_module(buffer, module=_riemann_user_module, refimported=True)
         except Exception:
-            # Remove unsupported data before checking functions that reference it.
-            for name, item in sorted(list(namespace.items()), key=lambda entry: callable(entry[1])):
+            for name, item in sorted(list(vars(persist).items()), key=lambda entry: callable(entry[1])):
                 try:
                     dill.dumps(item)
                 except Exception as error:
-                    removed[name] = namespace.pop(name)
+                    removed[name] = item
+                    delattr(persist, name)
                     skipped.append({"name": f"persist.{name}", "reason": f"{type(error).__name__}: {error}"})
             buffer = io.BytesIO()
             dill.dump_module(buffer, module=_riemann_user_module, refimported=True)
-        return {"store": value["store"], "namespace": buffer.getvalue()}, skipped
+        return {"version": 2, "namespace": buffer.getvalue()}, skipped
     finally:
-        namespace.update(removed)
+        _riemann_user_module.__dict__.update(api)
+        for name, item in removed.items():
+            setattr(persist, name, item)
 
 def _riemann_restore_code_state(value):
     import dill, io
-    dill.load_module(io.BytesIO(value["namespace"]), module=_riemann_user_module)
-    return {"store": value["store"], "namespace": _riemann_user_module.__dict__}
+    if value.get("version") == 2:
+        dill.load_module(io.BytesIO(value["namespace"]), module=_riemann_user_module)
+        restored = _riemann_user_module.__dict__.get("persist")
+        if restored is not None and restored is not persist:
+            persist.__dict__.update(vars(restored))
+    elif value.get("version") in (None, 1):
+        legacy_namespace = value.get("namespace", {})
+        if isinstance(legacy_namespace, bytes):
+            legacy_module = _riemann_types.ModuleType("_riemann_user")
+            dill.load_module(io.BytesIO(legacy_namespace), module=legacy_module)
+            legacy_namespace = legacy_module.__dict__
+        for name, item in legacy_namespace.items():
+            if not name.startswith("_") and name not in _RIEMANN_PROTECTED:
+                setattr(persist, name, item)
+        legacy_store = value.get("store", {})
+        if legacy_store:
+            _riemann_display({"application/vnd.riemann.migration+json": legacy_store}, raw=True)
+    else:
+        raise ValueError("Unsupported persistent state version; original checkpoint retained")
+    _riemann_user_module.__dict__["persist"] = persist
+    _riemann_refresh_functions(persist)
+    return {"version": 2}
 
-def store(key, value):
-    if not isinstance(key, str) or not key:
-        raise ValueError("store key must be a non-empty string")
-    encoded = _json.dumps(value, allow_nan=False)
-    riemann_code_state["store"][key] = _json.loads(encoded)
-
-def load(key, default=None):
-    value = riemann_code_state["store"].get(key, default)
-    return _json.loads(_json.dumps(value, allow_nan=False))
-
-async def _riemann_exec_source(source, persist=False):
+async def _riemann_exec_source(source):
     api = {name: globals()[name] for name in _RIEMANN_PROTECTED if name in globals() and not name.startswith("_")}
-    api.update({"__builtins__": _riemann_builtins.__dict__, "__name__": "_riemann_user" if persist else "__main__", "store": store, "load": load, "display": _riemann_display})
-    namespace = riemann_code_state["namespace"] if persist else {}
-    namespace.update(api)
+    api.update({"__builtins__": _riemann_builtins.__dict__, "__name__": "__main__", "persist": persist, "print": _riemann_print, "display": _riemann_display})
+    _riemann_user_module.__dict__.update({**api, "__name__": "_riemann_user"})
+    namespace = dict(api)
     before = _asyncio.all_tasks()
     try:
         code = compile(source, "<python-cell>", "exec", flags=_riemann_ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
@@ -73,13 +124,8 @@ async def _riemann_exec_source(source, persist=False):
             task.cancel()
         if pending:
             await _asyncio.gather(*pending, return_exceptions=True)
-        if persist:
-            # Keep one dictionary so functions retain live cross-cell globals.
-            # Runtime API objects are reinstalled, not serialized in checkpoints.
-            for name in api:
-                if name not in {"__name__", "__builtins__"}:
-                    namespace.pop(name, None)
 
-_RIEMANN_PROTECTED.update({"store", "load"})
+_RIEMANN_PROTECTED.update({"persist", "refs"})
+_riemann_user_module.__dict__["persist"] = persist
 _riemann_publish_bridge_types()
 `;

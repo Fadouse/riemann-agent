@@ -5,7 +5,7 @@ import { basename, dirname, join } from "node:path";
 import { setImmediate as yieldLoop } from "node:timers/promises";
 import { RiemannHostError } from "../errors.ts";
 import type { JsonValue } from "../kernel/types.ts";
-import { resourceKind } from "./references.ts";
+import { RESULT_MIME, resourceKind } from "./references.ts";
 import type { RiemannStore, StoredArtifact } from "./store.ts";
 
 async function* jsonChunks(value: JsonValue, ancestors = new Set<object>()): AsyncGenerator<Uint8Array> {
@@ -107,6 +107,41 @@ export class ArtifactStore {
 
 	async putJson(value: JsonValue, name?: string, mimeType = "application/json"): Promise<JsonValue> {
 		return this.putStream(jsonChunks(value), { name, mimeType });
+	}
+
+	async putResult(value: JsonValue, schema: JsonValue, returnType: string, operation: string): Promise<string> {
+		const body = await this.putJson(value, `${operation}-result.json`);
+		if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.handle !== "string")
+			throw new RiemannHostError("artifact_error", "Result body has no reference");
+		const result = await this.putJson(
+			{ value_ref: body.handle, schema, return_type: returnType },
+			`${operation}-contract.json`,
+			RESULT_MIME,
+		);
+		if (!result || typeof result !== "object" || Array.isArray(result) || typeof result.handle !== "string")
+			throw new RiemannHostError("artifact_error", "Result contract has no reference");
+		return result.handle;
+	}
+
+	async readResult(handle: string): Promise<{ value_ref: string; schema: JsonValue; return_type: string }> {
+		const metadata = this.getMetadata(handle);
+		if (metadata.mimeType !== RESULT_MIME)
+			throw new RiemannHostError("invalid_arguments", "Not a typed result reference");
+		const bytes = await this.readBuffer(handle);
+		if (createHash("sha256").update(bytes).digest("hex") !== metadata.hash)
+			throw new RiemannHostError("artifact_error", "Result contract integrity check failed");
+		const value: JsonValue = JSON.parse(bytes.toString("utf8"));
+		if (
+			!value ||
+			typeof value !== "object" ||
+			Array.isArray(value) ||
+			typeof value.value_ref !== "string" ||
+			typeof value.return_type !== "string" ||
+			value.schema === undefined
+		)
+			throw new RiemannHostError("artifact_error", "Invalid result contract");
+		this.assertPublic(value.value_ref);
+		return { value_ref: value.value_ref, schema: value.schema, return_type: value.return_type };
 	}
 
 	async putBuffer(data: Buffer, options: { name?: string; mimeType: string }): Promise<JsonValue> {

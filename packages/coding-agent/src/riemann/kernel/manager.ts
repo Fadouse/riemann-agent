@@ -1,5 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import { copyFile, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -35,6 +36,7 @@ const INTERRUPT_GRACE_MS = 500;
 const HOST_COMM_TARGET = "riemann.host";
 
 interface ActiveExecution {
+	onOutput?: () => void;
 	id: string;
 	startedAt: number;
 	stdout: string;
@@ -192,9 +194,28 @@ export class IPythonKernelManager {
 
 	private async stageSnapshotForRestore(kernelPath: string): Promise<void> {
 		const durablePath = this.options.snapshotPath;
-		if (!durablePath || kernelPath === durablePath) return;
+		if (!durablePath) return;
 		try {
-			await copyFile(durablePath, kernelPath);
+			if (this.options.migrateCodeState) {
+				const file = await open(durablePath, "r");
+				let header: string;
+				try {
+					const bytes = Buffer.alloc(128);
+					const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+					header = bytes.subarray(0, bytesRead).toString("ascii").split("\n", 1)[0];
+				} finally {
+					await file.close();
+				}
+				if (header !== `RIEMANN-CHECKPOINT ${this.contractFingerprint}`) {
+					const digest = createHash("sha256").update(header).digest("hex");
+					await copyFile(durablePath, `${durablePath}.${digest}.original`, constants.COPYFILE_EXCL).catch(
+						(error: unknown) => {
+							if (errorCode(error) !== "EEXIST") throw error;
+						},
+					);
+				}
+			}
+			if (kernelPath !== durablePath) await copyFile(durablePath, kernelPath);
 		} catch (error) {
 			if (errorCode(error) !== "ENOENT") throw error;
 		}
@@ -456,7 +477,10 @@ export class IPythonKernelManager {
 			case "display_data": {
 				const display = parseDisplay(message);
 				if (!display) break;
-				if (!execution.internal && this.options.retainOutput) {
+				if (
+					(!execution.internal || display.data["application/vnd.riemann.migration+json"] !== undefined) &&
+					this.options.retainOutput
+				) {
 					await this.retainOutput(execution, display);
 				} else execution.displays.push(display);
 				break;
@@ -510,6 +534,7 @@ export class IPythonKernelManager {
 		try {
 			const content = await this.options.retainOutput!(output);
 			execution.hostModelContent.push({ sequence, content });
+			execution.onOutput?.();
 		} catch (error) {
 			execution.status = "error";
 			execution.richCaptureTruncated = true;
@@ -700,6 +725,7 @@ export class IPythonKernelManager {
 							});
 						} else this.lateModelContent.push(...result.modelContent);
 					} else execution.hostModelContent.push({ sequence, content: result.modelContent });
+					execution.onOutput?.();
 				}
 				reply = {
 					request_id: requestId,
@@ -784,6 +810,7 @@ export class IPythonKernelManager {
 			resolveExecution = resolve;
 		});
 		const execution: ActiveExecution = {
+			onOutput: options.onOutput,
 			id: request.id,
 			startedAt: Date.now(),
 			stdout: "",
@@ -957,7 +984,9 @@ export class IPythonKernelManager {
 		try {
 			await this.stageSnapshotForRestore(kernelPath);
 		} catch (error) {
+			this.incompatibleSnapshot = true;
 			this.options.onRestore?.({
+				incompatible: true,
 				restored: [],
 				skipped: [],
 				error: `Could not stage snapshot for restore: ${errorMessage(error)}`,
@@ -976,9 +1005,13 @@ def _riemann_restore_snapshot(path, namespace):
         try:
             with snapshot_path.open("rb") as file:
                 expected = ${JSON.stringify(`RIEMANN-CHECKPOINT ${this.contractFingerprint}\n`)}.encode("ascii")
-                if file.read(len(expected)) != expected:
+                actual = file.readline()
+                migrating = actual != expected
+                if migrating and not (${this.options.migrateCodeState ? "True" : "False"} and actual.startswith(b"RIEMANN-CHECKPOINT ")):
                     return {"restored": [], "skipped": [], "incompatible": True, "error": "Incompatible checkpoint contract; original file retained. Archive it before creating a new checkpoint."}
                 values = dill.load(file)
+            if migrating and (not isinstance(values, dict) or "riemann_code_state" not in values):
+                return {"restored": [], "skipped": [], "incompatible": True, "error": "Checkpoint has no migratable selective state; original retained."}
             for name, value in values.items():
                 if name == "riemann_code_state" and "_riemann_restore_code_state" in namespace:
                     value = namespace["_riemann_restore_code_state"](value)
@@ -986,6 +1019,7 @@ def _riemann_restore_snapshot(path, namespace):
                 restored["restored"].append(name)
         except Exception as error:
             restored["error"] = f"{type(error).__name__}: {error}"
+            restored["incompatible"] = True
     return restored
 try:
     print("__RIEMANN_SNAPSHOT__" + _riemann_json.dumps(_riemann_restore_snapshot(${escapedPath}, globals()), sort_keys=True))
@@ -994,6 +1028,7 @@ finally:
 			{ internal: true, signal: AbortSignal.timeout(30_000) },
 		);
 		const restored = this.parseSnapshotResult(result);
+		this.lateModelContent.push(...result.modelContent);
 		this.incompatibleSnapshot = restored.incompatible === true;
 		if (!this.incompatibleSnapshot) this.incompatibleSnapshotWarningEmitted = false;
 		this.options.onRestore?.(restored);
@@ -1028,6 +1063,8 @@ def _riemann_write_snapshot(path, namespace):
     candidates, values, skipped = {}, {}, []
     reserved = {"In", "Out", "get_ipython", "exit", "quit"} | set(namespace.get("_RIEMANN_PROTECTED", set()))
     for name, value in list(namespace.items()):
+        if "riemann_code_state" in namespace and name != "riemann_code_state":
+            continue
         if name.startswith("_") or name in reserved or isinstance(value, type(builtins)):
             continue
         if name == "riemann_code_state" and "_riemann_snapshot_code_state" in namespace:

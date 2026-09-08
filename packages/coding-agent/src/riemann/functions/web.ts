@@ -50,7 +50,7 @@ const ArtifactSchema = Type.Object(
 		size: Type.Integer({ minimum: 0 }),
 		name: Type.Union([Type.String(), Type.Null()]),
 	},
-	{ additionalProperties: false, $id: "Artifact" },
+	{ additionalProperties: false, $id: "Ref" },
 );
 
 const SearchHitSchema = Type.Object(
@@ -453,7 +453,7 @@ export class WebFunctions {
 				prompt: {
 					inventory: "Search the current web with excerpts and source URLs.",
 					example:
-						"hits = await web.search(query='Node.js sqlite DatabaseSync documentation', result_count=5); output.show(value=hits)",
+						"hits = await web.search(query='Node.js sqlite DatabaseSync documentation', result_count=5); print(hits)",
 				},
 				capability: "web.search",
 				handler: async (args, signal) => {
@@ -584,7 +584,7 @@ export class WebFunctions {
 				visibility: "public",
 				prompt: {
 					inventory: "Fetch an HTTP(S) resource; large and binary bodies become durable artifacts.",
-					example: "document = await web.fetch(url='https://example.com'); output.show(value=document)",
+					example: "document = await web.fetch(url='https://example.com'); print(document)",
 				},
 				capability: "web.fetch",
 				handler: async (args, signal) => {

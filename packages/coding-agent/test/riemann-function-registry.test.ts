@@ -92,8 +92,8 @@ function registerFixtureFunctions(registry: FunctionRegistry): void {
 	registry.register(readDefinition());
 	registry.register(editDefinition());
 	registry.register({
-		name: "get",
-		namespace: "artifacts",
+		name: "read",
+		namespace: "references",
 		description: "Read an artifact.",
 		inputSchema: Type.Object({ handle: Type.String() }, { additionalProperties: false }),
 		outputSchema: Type.String(),
@@ -398,9 +398,9 @@ describe("Riemann function registry", () => {
 	test("describes permission-filtered handle methods and schema-derived result types", () => {
 		const registry = new FunctionRegistry();
 		registerFixtureFunctions(registry);
-		expect(registry.describe("Artifact.read")).toMatchObject({
-			name: "Artifact.read",
-			signature: "Artifact.read() -> str",
+		expect(registry.describe("Ref.read")).toMatchObject({
+			name: "Ref.read",
+			signature: "Ref.read() -> str",
 		});
 		registry.register({
 			...readDefinition(),

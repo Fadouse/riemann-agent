@@ -49,25 +49,21 @@ describe("Riemann IPython activity tracking", () => {
 			result: {
 				$riemann: "process_result",
 				exit_code: 0,
-				stdout: "Tests 12 passed\n",
-				stderr: "",
+				stdout: { handle: "r1" },
+				stderr: { handle: "r2" },
 				duration_ms: 40,
 				termination: "exited",
-				stdout_truncated: true,
-				stderr_truncated: false,
 				stdout_capture_truncated: true,
 				stderr_capture_truncated: false,
-				stdout_artifact: { handle: "artifact://stdout" },
-				stderr_artifact: null,
 			},
 		});
 		expect(activities[0]).toMatchObject({
 			status: "ok",
 			exitCode: 0,
 			durationMs: 40,
-			stdoutTruncated: true,
+			stdout: "Tests 12 passed\n",
 			stdoutCaptureTruncated: true,
-			stdoutArtifactHandle: "artifact://stdout",
+			stdoutArtifactHandle: "r1",
 		});
 	});
 

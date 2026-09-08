@@ -112,12 +112,12 @@ describe("Riemann image routing", () => {
 			expect(stored.join("\n")).toContain("private internal frame");
 			expect(stored.join("\n")).toContain("native detail");
 			expect(stored.join("\n")).not.toContain("\x1b[");
-			let complete = rendered.replace(/\n\[more r[0-9a-z]+\]$/, "");
+			let complete = rendered;
 			let more = formatted.moreRef;
 			for (let i = 0; more && i < 50; i++) {
-				const next = await renderModelText(views, [await views.more(more)]);
+				const next = await renderModelText(views, [await views.read(more)]);
 				expect(Buffer.byteLength(next.text)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);
-				complete += next.more ? next.text.replace(/\n\[more r[0-9a-z]+\]$/, "") : next.text;
+				complete = complete.replace(`\n[more ${more}]\n`, () => next.text);
 				more = next.more;
 			}
 			expect(more).toBeUndefined();

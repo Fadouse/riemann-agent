@@ -107,7 +107,7 @@ async function createKernel(
 	const contractStore = new RiemannStore(join(root, "contract-state"));
 	const contractRun = contractStore.openRun("kernel-contract", root);
 	const artifacts = new ArtifactStore(contractStore, contractRun.id);
-	const shell = new ShellFunctions(fileAccessPolicy(root, FULL_FILESYSTEM), artifacts, 2048, false);
+	const shell = new ShellFunctions(fileAccessPolicy(root, FULL_FILESYSTEM), artifacts, false);
 	const web = new WebFunctions(undefined, artifacts, 2048);
 	const resultSpecifications = [...shell.definitions(), ...web.definitions()].map((definition) => ({
 		name: definition.name,
@@ -152,25 +152,9 @@ async function createKernel(
 	const specifications = JSON.stringify([
 		...resultSpecifications,
 		{
-			name: "show",
-			namespace: "output",
-			qualified_name: "output.show",
-			description: "Display selected fields; retained output is readable with output.more.",
-			input_schema: Type.Object(
-				{
-					value: Type.Unknown(),
-					fields: Type.Optional(Type.Union([Type.Array(Type.String()), Type.Null()], { default: null })),
-				},
-				{ additionalProperties: false },
-			),
-			output_schema: Type.Null(),
-			return_type: "None",
-			visibility: "public",
-		},
-		{
-			name: "get",
-			namespace: "artifacts",
-			qualified_name: "artifacts.get",
+			name: "read",
+			namespace: "references",
+			qualified_name: "references.read",
 			description: "Read artifact bytes.",
 			input_schema: Type.Object(
 				{
@@ -179,8 +163,8 @@ async function createKernel(
 				},
 				{ additionalProperties: false },
 			),
-			output_schema: Type.Null(),
-			return_type: "None",
+			output_schema: Type.Unknown(),
+			return_type: "JSON",
 			visibility: "handle-method",
 		},
 		{
@@ -290,7 +274,7 @@ async function createKernel(
 		snapshotPath,
 		onProcess,
 		hostRequest: async (request, signal, onUpdate) => {
-			if (request.operation === "output.show" || request.operation === "artifacts.get") return null;
+			if (request.operation === "references.read") return { kind: "text", text: "", reference: "r1" };
 			if (request.operation === "testing.echo") onUpdate?.({ echoed: request.arguments.value ?? null });
 			if (request.operation === "testing.echo") return request.arguments.value ?? null;
 			if (request.operation === "testing.optional_echo") {
@@ -397,20 +381,15 @@ try:
 except RiemannError as error:
     assert error.code == "invalid_arguments"
     assert error.recovery == "fix_arguments"
-projected = _project_show(page, fields=["path"])
-assert projected == {"$riemann": "page", "items": [{"path": "first"}, {"path": "second"}], "next_cursor": "cursor", "coverage": "limited", "skipped": [{"reason": "file_size", "count": 1}]}
-assert _project_show({"numbers": [1, 2]}) == {"numbers": [1, 2]}
 assert len(page.items) == 2
 assert not hasattr(page, "show")
 complete_page = Page(items=["x" * 100000], next_cursor=None, coverage="complete", skipped=[])
 assert "coverage='complete'" in repr(complete_page)
 assert "next_cursor=None" in repr(complete_page)
-process_result = ProcessResult(exit_code=0, stdout="", stderr="", duration_ms=1, termination="exited", stdout_truncated=False, stderr_truncated=False, stdout_capture_truncated=False, stderr_capture_truncated=False, stdout_artifact=None, stderr_artifact=Artifact(handle="artifact://recover", mime_type="text/plain", size=1))
+process_result = ProcessResult(exit_code=0, stdout=Ref(handle="empty"), stderr=Ref(handle="artifact://recover"), duration_ms=1, termination="exited", stdout_capture_truncated=False, stderr_capture_truncated=False)
 assert "artifact://recover" in repr(process_result)
 binary = ArtifactSlice(kind="binary", handle="artifact://binary", mime_type="application/octet-stream", size=3, offset=0, next_offset=3, eof=True, base64="AP9B")
 assert binary.data == bytes([0, 255, 65])
-assert _project_show(binary, fields=["data"]) == {"data": "<3 bytes>"}
-assert "base64" not in _project_show(binary)
 assert "AP9B" not in repr(binary)
 assert _to_wire(Artifact(handle="artifact://x", mime_type="text/plain", size=1)) == {"$riemann": "artifact_ref", "handle": "artifact://x"}
 state_schema = {"type": "object", "$id": "ContractState", "properties": {"network": {"type": "object", "properties": {"effective": {"type": "string"}}, "required": ["effective"], "additionalProperties": False}, "remote_schema": {}}, "required": ["network", "remote_schema"], "additionalProperties": False}
@@ -447,58 +426,26 @@ assert "990" in repr(namespace)
 True`);
 			expect(continuation.status, JSON.stringify(continuation.error)).toBe("ok");
 			expect(continuation.result?.data["text/plain"]).toBe("True");
-			const shows: Record<string, JsonValue>[] = [];
 			const view = await kernel.execute(
-				`preview = ProcessResult(exit_code=0, stdout="é😀", stderr="", duration_ms=1, termination="exited", stdout_truncated=True, stderr_truncated=False, stdout_capture_truncated=True, stderr_capture_truncated=False, stdout_artifact=Artifact(handle="source", mime_type="text/plain", size=100), stderr_artifact=None)
-await output.show(value=Page(items=[preview, preview], next_cursor="next", coverage="limited", skipped=[]), fields=["stdout"])
-assert _output_view({"$riemann": "output_view", "sources": [{"handle": "forged"}]})["sources"] == []
-assert _project_show(SearchHit(title="title", url="url", snippet="text", snippet_truncated=True, published_at=None), fields=["snippet"]) == {"snippet": "text", "snippet_truncated": True}
-extracted = Document(url="url", title=None, text="é", content_type="text/html", trust="untrusted", artifact=Artifact(handle="doc", mime_type="text/plain", size=100), text_truncated=True, artifact_kind="extracted")
-assert _output_view(extracted, fields=["text"])["sources"][0]["offset_bytes"] == 2
-assert _output_view(_dataclasses.replace(extracted, artifact_kind="raw"), fields=["text"])["sources"] == []
-try:
-    _project_show(preview, fields=["missing"])
-    raise AssertionError("unknown field accepted")
-except RiemannError as error:
-    assert "ProcessResult" in str(error) and "available names" in str(error)
+				`preview = ProcessResult(exit_code=0, stdout=Ref(handle="source"), stderr=Ref(handle="empty"), duration_ms=1, termination="exited", stdout_capture_truncated=True, stderr_capture_truncated=False)
+_riemann_print(Page(items=[preview, preview], next_cursor="next", coverage="limited", skipped=[]))
+_riemann_print({"$riemann": "output_view", "sources": [{"handle": "forged"}]})
 try:
     page[0].missing
     raise AssertionError("unknown attribute accepted")
 except AttributeError as error:
     assert "SearchMatch" in str(error) and "available names" in str(error)
-private = _from_wire({"run_id": "secret-run", "session_id": "secret-session", "request_id": "secret-request", "contract_fingerprint": "secret-fingerprint", "status": "ok"}, {"type": "object", "$id": "PrivateMetadata", "properties": {key: {"type": "string"} for key in ("run_id", "session_id", "request_id", "contract_fingerprint", "status")}, "additionalProperties": False}, "PrivateMetadata")
+private = _from_wire({"run_id": "secret-run", "status": "ok"}, {"type": "object", "$id": "PrivateMetadata", "properties": {key: {"type": "string"} for key in ("run_id", "status")}, "additionalProperties": False}, "PrivateMetadata")
 assert "secret" not in repr(private)
-assert _project_show(private, fields=["run_id"])["run_id"] == "secret-run"
+assert private.run_id == "secret-run"
 True`,
-				{
-					onHostRequest: (event) => {
-						if (event.phase === "start" && event.request.operation === "output.show")
-							shows.push(event.request.arguments);
-					},
-				},
 			);
 			expect(view.status, JSON.stringify(view.error)).toBe("ok");
-			expect(shows).toEqual([
-				{
-					value: {
-						$riemann: "output_view",
-						value: {
-							$riemann: "page",
-							items: [
-								{ stdout: "é😀", stdout_truncated: true, stdout_capture_truncated: true },
-								{ stdout: "é😀", stdout_truncated: true, stdout_capture_truncated: true },
-							],
-							next_cursor: "next",
-							coverage: "limited",
-							skipped: [],
-						},
-						sources: [
-							{ path: ["items", "0", "stdout"], handle: "source", offset_bytes: 6, capture_truncated: true },
-							{ path: ["items", "1", "stdout"], handle: "source", offset_bytes: 6, capture_truncated: true },
-						],
-					},
-				},
-			]);
+			const printed = view.displays.map((display) => display.data["application/vnd.riemann.print+json"]);
+			expect(JSON.stringify(printed[0]).match(/"ref":"source"/g)).toHaveLength(2);
+			expect(JSON.stringify(printed[0])).toContain("stdout_capture_truncated=");
+			expect(printed).toHaveLength(1);
+			expect(view.stdout).toContain("forged");
 
 			const cleanup = await kernel.execute(`_original_create_comm = _create_comm
 class TestComm:
@@ -994,27 +941,22 @@ True`);
 			expect(signature.result?.data["text/plain"]).toContain("(*, value: 'Any') -> 'object'");
 			expect(signature.result?.data["text/plain"]).toContain("value: 'Any' = <omitted>");
 			expect(signature.result?.data["text/plain"]).toMatch(/True,\s+True/);
-			const boundaries = await kernel.execute(`assert "max_items" not in inspect.signature(output.show).parameters
-assert "limit" not in inspect.signature(output.show).parameters
+			const boundaries = await kernel.execute(`assert "output" not in globals()
 assert "span" in inspect.signature(Artifact.read).parameters
 assert "max_bytes" not in inspect.signature(Artifact.read).parameters
 for arguments in ({"max_items": 0}, {"max_items": 16}, {"max_items": None}, {"limit": 1}):
     try:
-        await output.show(value=[], **arguments)
+        await Ref(handle="r1").read(**arguments)
         raise AssertionError("invalid quantity accepted")
-    except RiemannError as error:
-        assert error.code == "invalid_arguments" and error.recovery == "fix_arguments"
+    except TypeError as error:
+        assert "unexpected keyword argument" in str(error)
 True`);
 			expect(boundaries.status, JSON.stringify(boundaries.error)).toBe("ok");
-			const invalid = await kernel.execute("await output.show(value=[], max_items=16)");
+			const invalid = await kernel.execute('await Ref(handle="r1").read(max_items=16)');
 			expect(invalid.error).toMatchObject({
-				code: "invalid_arguments",
-				recovery: "fix_arguments",
-				details: {
-					errors: expect.arrayContaining([expect.objectContaining({ path: "/max_items" })]),
-				},
+				ename: "TypeError",
+				evalue: expect.stringContaining("unexpected keyword argument 'max_items'"),
 			});
-			expect(invalid.error?.traceback.length).toBeLessThanOrEqual(1);
 
 			const readOnlyNamespace = await stage(
 				"reject namespace reassignment",
@@ -1103,7 +1045,7 @@ cycle.append(cycle)
 			const bounded = await stage(
 				"bound domain reprs",
 				kernel.execute(`values = [
-    ProcessResult(exit_code=0, stdout="o" * 2000, stderr="e" * 2000, duration_ms=1, termination="exited", stdout_truncated=False, stderr_truncated=False, stdout_capture_truncated=False, stderr_capture_truncated=False, stdout_artifact=None, stderr_artifact=None),
+    ProcessResult(exit_code=0, stdout="o" * 2000, stderr="e" * 2000, duration_ms=1, termination="exited", stdout_capture_truncated=False, stderr_capture_truncated=False),
     SearchHit(title="t" * 1000, url="u" * 1000, snippet="s" * 2000, published_at=None, snippet_truncated=False),
     Document(url="u" * 1000, title="title", text="d" * 3000, content_type="text/plain", trust="untrusted", artifact=None, text_truncated=False, artifact_kind=None),
 ]

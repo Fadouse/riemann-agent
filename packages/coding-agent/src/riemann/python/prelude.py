@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio as _asyncio
+import builtins as _builtins
+import sys as _sys
 import base64 as _base64
 import hashlib as _hashlib
 import inspect as _inspect
@@ -98,14 +100,14 @@ _RIEMANN_CONTROL_FIELDS = {"run_id", "session_id", "request_id", "contract_finge
 
 _RIEMANN_PREVIEW = {"maxPreviewBytes": 2048, "maxPreviewItems": 10, "maxPreviewDepth": 4, "maxPreviewNodes": 200}
 
-# Presentation only: never apply these defaults to user dictionaries or output.show.
+# Presentation only: never apply these defaults to user dictionaries.
 _RIEMANN_PREVIEW_DEFAULTS = {
-    "Artifact": {"name": None},
+    "Ref": {"name": None},
     "TextSnapshot": {"kind": "text", "encoding": "utf-8"},
     "ImageSnapshot": {"kind": "image", "path": None, "width": None, "height": None},
     "ArtifactSlice": {"text": None, "base64": None},
     "Page": {"skipped": []},
-    "ProcessResult": {"stdout": "", "stderr": "", "termination": "exited", "stdout_truncated": False, "stderr_truncated": False, "stdout_capture_truncated": False, "stderr_capture_truncated": False, "stdout_artifact": None, "stderr_artifact": None},
+    "ProcessResult": {"termination": "exited", "stdout_capture_truncated": False, "stderr_capture_truncated": False},
     "SearchHit": {"published_at": None, "snippet_truncated": False},
     "Document": {"title": None, "text_truncated": False, "artifact_kind": None, "artifact": None},
     "AgentInfo": {"profile": None, "last_outcome": None, "output_preview": None},
@@ -132,7 +134,7 @@ def _preview_fields(item, depth):
         key = field.name
         if key.startswith("_") or key in _RIEMANN_CONTROL_FIELDS or key in hidden:
             continue
-        if isinstance(item, Artifact) and depth > 0 and key != "handle":
+        if isinstance(item, Ref) and depth > 0 and key != "handle":
             continue
         value = getattr(item, key)
         if key in defaults and type(value) is type(defaults[key]) and value == defaults[key]:
@@ -273,79 +275,6 @@ def _bounded_object_repr(value, limit: int | None = None) -> str:
     return "".join(parts)
 
 
-def _project_show(value, *, fields=None, _seen=None, _path=(), _sources=None):
-    if _seen is None:
-        _seen = set()
-    if _sources is None:
-        _sources = []
-    if isinstance(value, _RiemannRecord) or type(value) in (dict, list, tuple):
-        if id(value) in _seen:
-            raise TypeError("Cannot show a cyclic value")
-        _seen.add(id(value))
-        try:
-            if isinstance(value, Page):
-                return {"$riemann": "page", "items": [_project_show(item, fields=fields, _seen=_seen, _path=(*_path, "items", str(index)), _sources=_sources) for index, item in enumerate(value.items)],
-                        "next_cursor": value.next_cursor, "coverage": value.coverage,
-                        "skipped": [_project_show(item, _seen=_seen, _path=(*_path, "skipped", str(index)), _sources=_sources) for index, item in enumerate(value.skipped)]}
-            if type(value) in (list, tuple):
-                return [_project_show(item, fields=fields, _seen=_seen, _path=(*_path, str(index)), _sources=_sources) for index, item in enumerate(value)]
-            if isinstance(value, _RiemannRecord):
-                available = [field.name for field in _dataclasses.fields(value) if not field.name.startswith("_")]
-                names = list(fields) if fields is not None else list(available)
-                if isinstance(value, ArtifactSlice):
-                    available.append("data")
-                    if fields is None and value.kind == "binary":
-                        names = [name for name in names if name not in {"base64", "text"}] + ["data"]
-                unknown = [name for name in names if name not in available]
-                if unknown:
-                    raise RiemannError(f"{type(value).__name__}: unknown fields {', '.join(unknown)}; available names: {', '.join(available)}", code="invalid_arguments", operation="output.show", recovery="fix_arguments")
-                for name in list(names):
-                    for suffix in ("_truncated", "_capture_truncated"):
-                        companion = name + suffix
-                        if companion in available and companion not in names and getattr(value, companion):
-                            names.append(companion)
-                result = {}
-                for name in names:
-                    child = getattr(value, name)
-                    result[name] = f"<{value.next_offset - value.offset} bytes>" if isinstance(value, ArtifactSlice) and value.kind == "binary" and name in {"base64", "data"} else _project_show(child, _seen=_seen, _path=(*_path, name), _sources=_sources)
-                    artifact = None
-                    capture_truncated = False
-                    if type(value).__name__ == "ProcessResult" and name in ("stdout", "stderr"):
-                        artifact = getattr(value, name + "_artifact")
-                        capture_truncated = getattr(value, name + "_capture_truncated")
-                    elif type(value).__name__ == "Document" and name == "text" and value.artifact_kind == "extracted":
-                        artifact = value.artifact
-                    if isinstance(artifact, Artifact) and isinstance(child, str):
-                        _sources.append({"path": [*_path, name], "handle": artifact.handle, "offset_bytes": len(child.encode("utf-8")), "capture_truncated": capture_truncated})
-                return result
-            names = fields if fields is not None else value.keys()
-            unknown = [name for name in names if name not in value]
-            if unknown:
-                raise RiemannError(f"dict: unknown fields {', '.join(unknown)}; available names: {', '.join(str(key) for key in value)}", code="invalid_arguments", operation="output.show", recovery="fix_arguments")
-            return {name: _project_show(value[name], _seen=_seen, _path=(*_path, name), _sources=_sources) for name in names}
-        finally:
-            _seen.remove(id(value))
-    if type(value) is bytes:
-        return f"<{len(value)} bytes>"
-    if fields is not None:
-        raise RiemannError(f"{type(value).__name__} has no fields; omit fields to display this value", code="invalid_arguments", operation="output.show", recovery="fix_arguments")
-    return _to_wire(value)
-
-
-def _output_view(value, *, fields=None):
-    sources = []
-    projected = _project_show(value, fields=fields, _sources=sources)
-    return {"$riemann": "output_view", "value": projected, "sources": sources}
-
-
-async def _show(*, value, fields=_RIEMANN_MISSING, _extra=None):
-    arguments = {**(_extra or {}), "value": value}
-    if fields is not _RIEMANN_MISSING:
-        arguments["fields"] = fields
-    arguments = _validate_arguments("output.show", arguments)
-    return await _riemann_call("output.show", {"value": _output_view(value, fields=arguments.get("fields"))})
-
-
 class _RiemannRecord:
     def __repr__(self) -> str:
         return _bounded_object_repr(self)
@@ -355,23 +284,120 @@ class _RiemannRecord:
         raise AttributeError(f"{type(self).__name__} has no field {name!r}; available names: {available}")
 
 @_dataclasses.dataclass(frozen=True, repr=False, kw_only=True)
-class Artifact(_RiemannRecord):
+class Ref(_RiemannRecord):
     handle: str
-    mime_type: str
-    size: int
+    mime_type: str = ""
+    size: int = 0
     name: str | None = None
 
     async def read(self, *, span=_RIEMANN_MISSING):
         arguments = {"handle": self.handle}
         if span is not _RIEMANN_MISSING:
             arguments["span"] = span
-        return await _riemann_call("artifacts.get", arguments)
+        reply = await _riemann_call("references.read", arguments)
+        if reply["kind"] == "value":
+            return _from_wire(reply["value"], reply["schema"], reply["return_type"])
+        if reply["kind"] == "binary":
+            return _base64.b64decode(reply["base64"], validate=True)
+        value = _ReferencedText(reply["text"])
+        value._reference = reply["reference"]
+        return value
 
     async def materialize(self, *, path: str):
         return await _riemann_call("artifacts.materialize", {"handle": self.handle, "path": path})
 
     async def view(self):
         return await _riemann_call("artifacts.view", {"handle": self.handle})
+
+
+# Kept internally for historical checkpoint class references, never installed as a user API.
+Artifact = Ref
+
+
+class _References:
+    __slots__ = ()
+
+    def __getitem__(self, handle):
+        if not isinstance(handle, str) or not handle:
+            raise TypeError("refs requires a short reference string")
+        return Ref(handle=handle)
+
+
+class _ReferencedText(str):
+    pass
+
+
+refs = _References()
+_RIEMANN_STDOUT = _sys.stdout
+_RIEMANN_STDERR = _sys.stderr
+
+
+def _riemann_print(*values, sep=" ", end="\n", file=None, flush=False):
+    destination = _sys.stdout if file is None else file
+    if destination is not _RIEMANN_STDOUT and destination is not _RIEMANN_STDERR:
+        return _builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
+    if sep is not None and not isinstance(sep, str):
+        raise TypeError("sep must be None or a string")
+    if end is not None and not isinstance(end, str):
+        raise TypeError("end must be None or a string")
+    inspected = set()
+    def needs_rich(value):
+        if isinstance(value, (_RiemannRecord, _ReferencedText)):
+            return True
+        if type(value) not in (list, tuple, dict) or id(value) in inspected:
+            return False
+        inspected.add(id(value))
+        return any(needs_rich(item) for item in (value.values() if type(value) is dict else value))
+    if not any(needs_rich(value) for value in values):
+        return _builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
+    parts = []
+    seen = set()
+
+    def visit(value, nested=False):
+        if isinstance(value, Ref):
+            parts.append({"ref": value.handle})
+        elif isinstance(value, _ReferencedText):
+            parts.append({"ref": value._reference})
+        elif isinstance(value, _RiemannRecord) or type(value) in (list, tuple, dict):
+            if id(value) in seen:
+                parts.append({"text": "..."})
+                return
+            seen.add(id(value))
+            record = isinstance(value, _RiemannRecord)
+            if record:
+                fields = list(_preview_fields(value, 0))
+                parts.append({"text": type(value).__name__ + "("})
+                closing = ")"
+            elif type(value) is dict:
+                fields = list(value.items())
+                parts.append({"text": "{"})
+                closing = "}"
+            else:
+                fields = [(None, item) for item in value]
+                parts.append({"text": "[" if type(value) is list else "("})
+                closing = ",)" if type(value) is tuple and len(value) == 1 else ")" if type(value) is tuple else "]"
+            for index, (key, item) in enumerate(fields):
+                if index:
+                    parts.append({"text": ", "})
+                if key is not None or type(value) is dict:
+                    parts.append({"text": key + "=" if record else repr(key) + ": "})
+                visit(item, True)
+            parts.append({"text": closing})
+            seen.remove(id(value))
+        else:
+            parts.append({"text": repr(value) if nested else str(value)})
+
+    for index, value in enumerate(values):
+        if index:
+            parts.append({"text": " " if sep is None else sep})
+        visit(value)
+    parts.append({"text": "\n" if end is None else end})
+    # Flush native output before publishing a rich print event, preserving mixed output order.
+    _sys.stdout.flush()
+    _sys.stderr.flush()
+    get_ipython().display_pub.publish(data={"application/vnd.riemann.print+json": {"parts": parts, "stderr": file is _sys.stderr}}, metadata={})
+    if flush:
+        (file or _sys.stdout).flush()
 
 
 @_dataclasses.dataclass(frozen=True, repr=False, kw_only=True)
@@ -396,7 +422,7 @@ class TextSnapshot(_RiemannRecord):
 class ImageSnapshot(_RiemannRecord):
     kind: str
     path: str | None
-    artifact: Artifact
+    artifact: Ref
     mime_type: str
     source_size: int
     _capability: str | None
@@ -451,7 +477,7 @@ class McpResult(_RiemannRecord):
     content: list
     structured_content: _Any
     metadata: _Any
-    artifacts: list[Artifact]
+    artifacts: list[Ref]
     extensions: dict[str, _Any]
 
 
@@ -562,7 +588,7 @@ _ERROR_TYPES = {
 }
 
 _DOMAIN_TYPES = {
-    "artifact": Artifact,
+    "artifact": Ref,
     "artifact_slice": ArtifactSlice,
     "page": Page,
     "text_snapshot": TextSnapshot,
@@ -587,7 +613,7 @@ _RIEMANN_PROTECTED = {
     "RiemannTimeoutError",
     "CancelledError",
     "UnavailableError",
-    "Artifact",
+    "Ref",
     "ArtifactSlice",
     "Page",
     "TextSnapshot",
@@ -619,7 +645,7 @@ def _to_wire(value, *, _seen=None, _path="$", _key=_RIEMANN_MISSING):
         if value._capability is None:
             raise TypeError("ImageSnapshot is not backed by a file capability")
         return {"$riemann": "image_snapshot_ref", "capability": value._capability}
-    if isinstance(value, Artifact):
+    if isinstance(value, Ref):
         return {"$riemann": "artifact_ref", "handle": value.handle}
     if isinstance(value, AgentTurnHandle):
         return {"$riemann": "agent_turn_ref", "id": value.id, "turn_id": value.turn_id}
@@ -865,8 +891,8 @@ def _from_wire(value, schema=None, return_type=None):
                 return raw["value"]
             kwargs[key] = [unwrap(raw) for raw in item] if key == "content" else unwrap(item)
         elif cls is McpResult and key == "artifacts":
-            artifact_schema = _RIEMANN_RECORD_SCHEMAS.get("Artifact")
-            kwargs[key] = [_from_wire(raw, artifact_schema[1], "Artifact") if artifact_schema else raw for raw in item]
+            artifact_schema = _RIEMANN_RECORD_SCHEMAS.get("Ref")
+            kwargs[key] = [_from_wire(raw, artifact_schema[1], "Ref") if artifact_schema else raw for raw in item]
         else:
             kwargs[key] = _from_wire(item, child_schema, child_hint)
     result = cls(**kwargs)
@@ -1214,13 +1240,6 @@ def _make_function(namespace: _RiemannNamespace, spec: dict):
         f"    arguments = {{key: value for key, value in locals().items() if value is not _RIEMANN_MISSING}}\n"
         f"    return await _riemann_call({qualified_name!r}, arguments)"
     )
-    if qualified_name == "output.show":
-        scope["_show"] = _show
-        scope["_fields_default"] = properties["fields"].get("default", _RIEMANN_MISSING)
-        source = (
-            "async def show(*, value, fields=_fields_default, **_extra):\n"
-            "    return await _show(value=value, fields=fields, _extra=_extra)"
-        )
     exec(source, scope)
     function = scope[name]
     function.__module__ = "riemann"
@@ -1230,9 +1249,6 @@ def _make_function(namespace: _RiemannNamespace, spec: dict):
         **{parameter_name: _schema_python_type(schema) for parameter_name, schema in properties.items()},
         "return": return_type,
     }
-    if qualified_name == "output.show":
-        signature = _inspect.signature(function)
-        function.__signature__ = signature.replace(parameters=[parameter for parameter in signature.parameters.values() if parameter.name != "_extra"])
     description = spec.get("description") if isinstance(spec.get("description"), str) else ""
     argument_docs = [
         f"    {parameter_name}: {_input_expectation(schema)}. {schema.get('description', 'No description provided.')}"
@@ -1279,7 +1295,7 @@ def _install_functions(specifications: list[dict]):
         if spec.get("visibility", "public") == "public":
             installed[spec["qualified_name"]] = getattr(namespace, spec["name"])
         _RIEMANN_PROTECTED.add(namespace_name)
-    for cls, methods in ((Artifact, {"read": "artifacts.get", "materialize": "artifacts.materialize", "view": "artifacts.view"}), (Page, {"next": "pages.next"}), (AgentTurnHandle, {name: "agents." + name for name in ("info", "wait", "steer", "stop", "release")}), (_McpNamespace, {name: "mcp." + name for name in ("status", "refresh", "close")}), (ImageSnapshot, {"view": "artifacts.view"})):
+    for cls, methods in ((Ref, {"read": "references.read", "materialize": "artifacts.materialize", "view": "artifacts.view"}), (Page, {"next": "pages.next"}), (AgentTurnHandle, {name: "agents." + name for name in ("info", "wait", "steer", "stop", "release")}), (_McpNamespace, {name: "mcp." + name for name in ("status", "refresh", "close")}), (ImageSnapshot, {"view": "artifacts.view"})):
         for method_name, operation in methods.items():
             if operation not in _RIEMANN_INPUTS:
                 continue
