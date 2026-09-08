@@ -1,5 +1,6 @@
 import type { Component } from "@earendil-works/pi-tui";
 import type { IPythonActivity, IPythonExploreActivity, IPythonMcpActivity } from "../../../riemann/ipython.ts";
+import { compactOutputPreview } from "../../../riemann/output-format.ts";
 import { stripAnsi } from "../../../utils/ansi.ts";
 import { highlightCode, theme } from "../theme/theme.ts";
 import { IPythonActivityComponent } from "./ipython-activity.ts";
@@ -52,7 +53,8 @@ interface IPythonDetails {
 	durationMs?: number;
 	errorName?: string;
 	cellId?: string;
-	moreRef?: string;
+	resultRef?: string;
+	activityRefs?: string[];
 }
 
 function readDetails(value: unknown): IPythonDetails {
@@ -64,17 +66,28 @@ function readDetails(value: unknown): IPythonDetails {
 		durationMs: typeof record.durationMs === "number" ? record.durationMs : undefined,
 		errorName: typeof record.errorName === "string" ? record.errorName : undefined,
 		cellId: typeof record.cellId === "string" ? record.cellId : undefined,
-		moreRef: typeof record.moreRef === "string" ? record.moreRef : undefined,
+		resultRef: typeof record.resultRef === "string" ? record.resultRef : undefined,
+		activityRefs: Array.isArray(record.activities)
+			? record.activities.flatMap((activity: unknown) =>
+					activity &&
+					typeof activity === "object" &&
+					"resultRef" in activity &&
+					typeof activity.resultRef === "string"
+						? [activity.resultRef]
+						: [],
+				)
+			: undefined,
 	};
 }
 
-function visiblePythonOutput(text: string, details: IPythonDetails): string {
+function visiblePythonOutput(text: string, details: IPythonDetails, showReferences = true): string {
+	text = compactOutputPreview(text);
 	if (
 		details.cellId &&
 		(text.startsWith(`Script running with cell ID ${details.cellId}`) ||
 			text.startsWith(`Cell ${details.cellId} `) ||
 			text.startsWith(`running cell_id=${details.cellId};`) ||
-			text.startsWith(`running id=${details.cellId};`) ||
+			text.startsWith(`running id=${details.cellId}`) ||
 			text === details.status ||
 			(details.status !== undefined && text.startsWith(`${details.status}\n`)))
 	) {
@@ -84,18 +97,18 @@ function visiblePythonOutput(text: string, details: IPythonDetails): string {
 	text = text
 		.replace(/ProcessHandle\(id=['"][^'"]+['"]\)/g, "Background process started")
 		.replace(
-			/^(?:ipython(?:_wait)? \[\w+\]: )?Unknown or already collected (?:Python cell|task): \S+$/m,
+			/Unknown or already collected (?:Python cell|task): \S+/g,
 			"Python cell is unavailable or already collected.",
 		)
 		.replace(
-			/^(?:ipython(?:_wait)? \[\w+\]: )?Collect cell \S+ with ipython_wait before starting another cell$/m,
+			/Collect cell \S+ with ipython_wait before starting another cell/g,
 			"Collect the previous Python execution before starting another.",
 		)
-		.replace(
-			/^(?:ipython(?:_wait)? \[\w+\]: )?Python cell \S+ already has an active wait$/m,
-			"Python execution already has an active wait.",
-		);
-	return details.moreRef ? text.replaceAll(`[more ${details.moreRef}]`, "") : text;
+		.replace(/Python cell \S+ already has an active wait/g, "Python execution already has an active wait.");
+	for (const ref of [details.resultRef, ...(details.activityRefs ?? [])]) {
+		if (ref) text = text.replaceAll(`[ref ${ref}]`, "");
+	}
+	return showReferences ? text : text.replace(/\[ref r[0-9a-z]+\]/g, "");
 }
 
 interface LineSummary {
@@ -126,7 +139,7 @@ function summarizeLines(text: string): LineSummary {
 	}
 }
 
-type StatusKind = "error" | "aborted" | "running" | "queued" | "yielded" | "done";
+type StatusKind = "error" | "aborted" | "running" | "queued" | "done";
 
 /** Safely extract the cell source while tool-call arguments are still streaming. */
 export function getIPythonCodeFromArgs(args: unknown): string {
@@ -251,8 +264,7 @@ export class IPythonCellComponent implements Component {
 		// A completed host call does not mean the surrounding Python computation has ended.
 		const showWrapper =
 			this.state.expanded ||
-			details.moreRef !== undefined ||
-			status === "yielded" ||
+			details.resultRef !== undefined ||
 			failed ||
 			(this.state.activities?.length ?? 0) === 0 ||
 			(running && !hasRunningActivity);
@@ -302,11 +314,7 @@ export class IPythonCellComponent implements Component {
 
 	private summaryLabel(details: IPythonDetails): string {
 		const parts = [toolAction(this.state.wait ? "Python wait" : "Python")];
-		if (details.moreRef) parts.push(toolDim(`[more ${details.moreRef}]`));
-		if (this.statusKind(details) === "yielded") {
-			parts.push(toolDim("Yielded"));
-			return parts.join(" ");
-		}
+		if (this.state.expanded && details.resultRef) parts.push(toolDim(`[ref ${details.resultRef}]`));
 		if (!this.state.expanded) {
 			const status = this.statusKind(details);
 			if (details.status === "timeout") parts.push(theme.fg("toolStatusError", "Timed out"));
@@ -330,7 +338,7 @@ export class IPythonCellComponent implements Component {
 	private statusKind(details: IPythonDetails): StatusKind {
 		if (this.state.isError || details.status === "error" || details.status === "timeout") return "error";
 		if (details.status === "aborted" || details.status === "cancelled") return "aborted";
-		if (details.status === "running" && this.state.isPartial === false) return "yielded";
+		if (details.status === "running") return "running";
 		if (
 			this.state.isPartial === false ||
 			(!this.state.isPartial && (details.status !== undefined || (this.state.content?.length ?? 0) > 0))
@@ -346,8 +354,6 @@ export class IPythonCellComponent implements Component {
 				return theme.fg("toolStatusError", "•");
 			case "aborted":
 				return theme.fg("toolStatusWarning", "•");
-			case "yielded":
-				return toolDim("•");
 			case "done":
 				return theme.fg("success", "•");
 			case "running":
@@ -403,7 +409,7 @@ export class IPythonCellComponent implements Component {
 		const parts: string[] = [];
 		for (const block of this.state.content ?? []) {
 			if (block?.type === "text" && typeof block.text === "string")
-				parts.push(visiblePythonOutput(block.text, details));
+				parts.push(visiblePythonOutput(block.text, details, false));
 		}
 		const cached = this.compactOutputCache;
 		if (

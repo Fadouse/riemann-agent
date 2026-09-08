@@ -14,6 +14,7 @@ export class RiemannHostError extends Error {
 	readonly details?: JsonValue;
 	readonly retryable: boolean;
 	readonly recovery: ErrorRecovery;
+	resultRef?: string;
 
 	constructor(code: string, message: string, details?: JsonValue, retryable = false, recovery?: ErrorRecovery) {
 		super(message);

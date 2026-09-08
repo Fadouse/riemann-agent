@@ -37,6 +37,10 @@ const HOST_COMM_TARGET = "riemann.host";
 
 interface ActiveExecution {
 	onOutput?: () => void;
+	onYield?: () => void;
+	cellId?: string;
+	completed?: boolean;
+	forceClosed?: boolean;
 	id: string;
 	startedAt: number;
 	stdout: string;
@@ -162,6 +166,7 @@ export class IPythonKernelManager {
 	private iopub?: Subscriber;
 	private startup?: Promise<void>;
 	private execution?: ActiveExecution;
+	private readonly cells = new Map<string, ActiveExecution>();
 	private readonly lateModelContent: KernelModelContent[] = [];
 	private shellLoop?: Promise<void>;
 	private controlLoop?: Promise<void>;
@@ -347,21 +352,27 @@ export class IPythonKernelManager {
 		});
 		this.process = child;
 		this.options.onProcess?.(child);
-		let processStderr = "";
+		const processStderr: Buffer[] = [];
 		child.stderr?.on("data", (chunk: Buffer) => {
-			processStderr = (processStderr + chunk.toString("utf8")).slice(-16_384);
+			processStderr.push(chunk);
 		});
 		const exited = waitForChildProcess(child).then((exitCode) => {
 			if (!this.closed && this.process === child) {
 				this.kernelReady = false;
-				this.failActive(new Error(`IPython kernel exited with code ${exitCode}: ${processStderr.trim()}`));
+				this.failActive(
+					new Error(
+						`IPython kernel exited with code ${exitCode}: ${Buffer.concat(processStderr).toString("utf8").trim()}`,
+					),
+				);
 			}
 		});
 		const deadline = Date.now() + (this.options.startupTimeoutMs ?? 30_000);
 		while (Date.now() < deadline) {
 			if (child.exitCode !== null) {
 				await exited;
-				throw new Error(`IPython kernel exited during startup: ${processStderr.trim()}`);
+				throw new Error(
+					`IPython kernel exited during startup: ${Buffer.concat(processStderr).toString("utf8").trim()}`,
+				);
 			}
 			try {
 				const parsed: unknown = JSON.parse(await readFile(connectionPath, "utf8"));
@@ -436,10 +447,10 @@ export class IPythonKernelManager {
 			return;
 		}
 		if (message.header.msg_type === "comm_open" && stringField(message.content.target_name) === HOST_COMM_TARGET) {
-			const execution = this.execution?.id === stringField(message.parentHeader.msg_id) ? this.execution : undefined;
+			const execution = this.findExecution(stringField(message.parentHeader.msg_id));
 			const pending = this.handleHostRequest(channel, message).catch((error: unknown) => {
-				if (execution && this.execution === execution) {
-					this.failActive(error instanceof Error ? error : new Error(String(error)));
+				if (execution && !execution.settled) {
+					this.failExecution(execution, error instanceof Error ? error : new Error(String(error)));
 				}
 			});
 			execution?.hostRequests.add(pending);
@@ -449,8 +460,30 @@ export class IPythonKernelManager {
 			});
 			return;
 		}
-		const execution = this.execution;
-		if (!execution || message.parentHeader.msg_id !== execution.id) return;
+		const execution = this.findExecution(stringField(message.parentHeader.msg_id));
+		if (!execution) return;
+		const cellEvent = parseDisplay(message)?.data["application/vnd.riemann.cell+json"];
+		if (execution.cellId && cellEvent && typeof cellEvent === "object" && !Array.isArray(cellEvent)) {
+			if (cellEvent.event === "yield") execution.onYield?.();
+			else if (cellEvent.event === "completed") {
+				execution.completed = true;
+				if (execution.status === "ok") {
+					execution.status =
+						cellEvent.status === "cancelled" ? "cancelled" : cellEvent.status === "error" ? "error" : "ok";
+					const error = cellEvent.error;
+					if (error && typeof error === "object" && !Array.isArray(error)) {
+						execution.error = parseError({ ...message, content: error });
+						if (execution.error && typeof error.code === "string") {
+							execution.error.code = error.code;
+							if (typeof error.operation === "string") execution.error.operation = error.operation;
+							if (error.details !== undefined) execution.error.details = error.details;
+						}
+					}
+				}
+				this.settleIfComplete(execution);
+			}
+			return;
+		}
 		if (message.header.msg_type === "execute_result" || message.header.msg_type === "display_data") {
 			const error = parseStructuredError(message);
 			if (error) {
@@ -511,8 +544,10 @@ export class IPythonKernelManager {
 					execution.status = "error";
 					const error = parseError(message);
 					if (error) execution.error = { ...execution.error, ...error };
+					execution.completed = true;
 				} else if (message.content.status === "aborted" && execution.status === "ok") {
 					execution.status = "cancelled";
+					execution.completed = true;
 				}
 				this.settleIfComplete(execution);
 				break;
@@ -546,7 +581,7 @@ export class IPythonKernelManager {
 				traceback: [],
 				...(error instanceof RiemannHostError && error.details !== undefined ? { details: error.details } : {}),
 			};
-			void this.interrupt().catch(() => undefined);
+			void this.interruptExecution(execution).catch(() => undefined);
 		} finally {
 			execution.pendingOutput--;
 			this.settleIfComplete(execution);
@@ -568,11 +603,18 @@ export class IPythonKernelManager {
 
 	private settleIfComplete(execution: ActiveExecution): void {
 		if (execution.settled || !execution.replied || !execution.idle) return;
+		if (execution.cellId && !execution.completed) return;
 		this.abortHostRequests(execution, new Error("IPython cell finished"));
-		if (execution.pendingOutput > 0 || (execution.status === "ok" && execution.hostRequests.size > 0)) return;
+		if (
+			execution.pendingOutput > 0 ||
+			((execution.status === "ok" || (execution.cellId && !execution.forceClosed)) &&
+				execution.hostRequests.size > 0)
+		)
+			return;
 		execution.settled = true;
 		execution.abort?.();
 		if (this.execution === execution) this.execution = undefined;
+		this.cells.delete(execution.id);
 		execution.resolve({
 			status: execution.status,
 			stdout: execution.stdout,
@@ -679,7 +721,7 @@ export class IPythonKernelManager {
 			return;
 		}
 
-		const execution = this.execution;
+		const execution = this.findExecution(stringField(message.parentHeader.msg_id));
 		const sequence = execution?.nextHostSequence ?? 0;
 		if (execution) execution.nextHostSequence += 1;
 		const controller = new AbortController();
@@ -732,6 +774,9 @@ export class IPythonKernelManager {
 					operation,
 					status: "ok",
 					value,
+					...(isKernelHostResult(result) && typeof result.resultRef === "string"
+						? { result_ref: result.resultRef }
+						: {}),
 				};
 				await this.notifyHostRequest(execution, {
 					phase: "end",
@@ -739,8 +784,16 @@ export class IPythonKernelManager {
 					request,
 					durationMs: Date.now() - startedAt,
 					result: value,
+					...(isKernelHostResult(result) && typeof result.resultRef === "string"
+						? { resultRef: result.resultRef }
+						: {}),
 				});
 			} catch (error) {
+				if (error instanceof RiemannHostError && error.resultRef) {
+					const content: KernelModelContent[] = [{ type: "text", text: `[ref=${error.resultRef}]` }];
+					if (execution.settled) this.lateModelContent.push(...content);
+					else execution.hostModelContent.push({ sequence, content });
+				}
 				const details =
 					error instanceof Error && "details" in error ? (error as { details?: JsonValue }).details : undefined;
 				const requestError: KernelHostRequestError = {
@@ -764,6 +817,7 @@ export class IPythonKernelManager {
 					request_id: requestId,
 					operation,
 					status: "error",
+					...(error instanceof RiemannHostError && error.resultRef ? { result_ref: error.resultRef } : {}),
 					error: {
 						code: requestError.code,
 						message: requestError.message,
@@ -778,6 +832,7 @@ export class IPythonKernelManager {
 					request,
 					durationMs: Date.now() - startedAt,
 					error: requestError,
+					...(error instanceof RiemannHostError && error.resultRef ? { resultRef: error.resultRef } : {}),
 				});
 			} finally {
 				execution.hostControllers.delete(controller);
@@ -790,11 +845,13 @@ export class IPythonKernelManager {
 		if (!options.internal) await this.start();
 		if (!this.shell || !this.connection) throw new Error("IPython kernel is unavailable");
 		if (this.execution) throw new Error("IPython kernel is already executing a cell");
+		if (!options.cellId && this.cells.size)
+			throw new Error("IPython cells are running; internal execution requires an idle kernel");
 		if (options.signal?.aborted) throw options.signal.reason ?? new Error("Operation aborted");
 		const request = encodeJupyterMessage({
 			type: "execute_request",
 			content: {
-				code,
+				code: options.cellId ? `_riemann_start_cell(${JSON.stringify(code)})` : code,
 				silent: false,
 				store_history: !options.internal,
 				user_expressions: {},
@@ -811,6 +868,8 @@ export class IPythonKernelManager {
 		});
 		const execution: ActiveExecution = {
 			onOutput: options.onOutput,
+			onYield: options.onYield,
+			cellId: options.cellId,
 			id: request.id,
 			startedAt: Date.now(),
 			stdout: "",
@@ -835,7 +894,8 @@ export class IPythonKernelManager {
 			hostNotificationQueue: Promise.resolve(),
 			richCaptureTruncated: false,
 		};
-		this.execution = execution;
+		if (options.cellId) this.cells.set(request.id, execution);
+		else this.execution = execution;
 		if (!execution.internal && this.lateModelContent.length > 0) {
 			execution.hostModelContent.push({
 				sequence: execution.nextHostSequence++,
@@ -845,13 +905,13 @@ export class IPythonKernelManager {
 		try {
 			await this.shell.send(request.frames);
 		} catch (error) {
-			this.failActive(error instanceof Error ? error : new Error(String(error)));
+			this.failExecution(execution, error instanceof Error ? error : new Error(String(error)));
 		}
 		if (options.signal && !execution.settled) {
 			const onAbort = () => {
 				const reason = options.signal?.reason;
 				execution.status = reason instanceof Error && reason.name === "TimeoutError" ? "timeout" : "cancelled";
-				void this.interrupt().catch(() => undefined);
+				void this.interruptExecution(execution).catch(() => undefined);
 			};
 			options.signal.addEventListener("abort", onAbort, { once: true });
 			execution.abort = () => options.signal?.removeEventListener("abort", onAbort);
@@ -861,8 +921,8 @@ export class IPythonKernelManager {
 	}
 
 	/** Retained output only; no execution or automatic representation of user variables. */
-	peek(): KernelExecuteResult | undefined {
-		const execution = this.execution;
+	peek(cellId?: string): KernelExecuteResult | undefined {
+		const execution = cellId ? [...this.cells.values()].find((cell) => cell.cellId === cellId) : this.execution;
 		if (!execution) return undefined;
 		return {
 			status: execution.status,
@@ -875,8 +935,19 @@ export class IPythonKernelManager {
 	}
 
 	async interrupt(): Promise<void> {
-		const execution = this.execution;
-		if (!execution) return;
+		await Promise.all(
+			[...(this.execution ? [this.execution] : []), ...this.cells.values()].map((execution) =>
+				this.interruptExecution(execution),
+			),
+		);
+	}
+
+	private findExecution(id: string | undefined): ActiveExecution | undefined {
+		return id === undefined ? undefined : this.execution?.id === id ? this.execution : this.cells.get(id);
+	}
+
+	private async interruptExecution(execution: ActiveExecution): Promise<void> {
+		if (execution.settled) return;
 		if (execution.status === "ok") execution.status = "cancelled";
 		this.abortHostRequests(
 			execution,
@@ -884,7 +955,10 @@ export class IPythonKernelManager {
 		);
 		if (this.control && this.connection) {
 			const request = encodeJupyterMessage({
-				type: "interrupt_request",
+				type: execution.cellId ? "comm_open" : "interrupt_request",
+				...(execution.cellId
+					? { content: { comm_id: randomUUID(), target_name: "riemann.cells", data: { id: execution.id } } }
+					: {}),
 				session: this.session,
 				username: this.options.sessionId,
 				key: this.connection.key,
@@ -892,7 +966,9 @@ export class IPythonKernelManager {
 			await this.control.send(request.frames).catch(() => undefined);
 		}
 		await delay(INTERRUPT_GRACE_MS);
-		if (this.execution !== execution || execution.settled) return;
+		// A stopped coroutine may still be archiving its host results. Do not kill
+		// other cells merely because cancellation/output cleanup takes longer.
+		if (execution.settled || execution.completed) return;
 		this.kernelReady = false;
 		const process = this.process;
 		if (process) {
@@ -900,20 +976,24 @@ export class IPythonKernelManager {
 			await delay(INTERRUPT_GRACE_MS);
 			this.signalKernelProcess(process, "SIGKILL");
 		}
-		execution.replied = true;
-		execution.idle = true;
-		this.settleIfComplete(execution);
+		this.failActive(new Error("Shared Python kernel stopped: a cell did not respond to cancellation"));
 	}
 
 	private failActive(error: Error): void {
-		const execution = this.execution;
-		if (!execution || execution.settled) return;
+		for (const execution of [...(this.execution ? [this.execution] : []), ...this.cells.values()])
+			this.failExecution(execution, error);
+	}
+
+	private failExecution(execution: ActiveExecution, error: Error): void {
+		if (execution.settled) return;
 		if (execution.status !== "cancelled" && execution.status !== "timeout") {
 			execution.error = { ename: error.name, evalue: error.message, traceback: [] };
 			execution.status = "error";
 		}
 		execution.replied = true;
 		execution.idle = true;
+		execution.completed = true;
+		execution.forceClosed = true;
 		this.settleIfComplete(execution);
 	}
 
@@ -1051,7 +1131,7 @@ finally:
 		}
 		if (!this.kernelReady || this.process?.exitCode !== null)
 			return { restored: [], skipped: [], error: "Cannot snapshot while an IPython kernel restart is pending" };
-		if (this.execution)
+		if (this.execution || this.cells.size)
 			return { restored: [], skipped: [], error: "Cannot snapshot while an IPython cell is running" };
 		const escapedPath = JSON.stringify(kernelPath);
 		const code = `import json as _riemann_json

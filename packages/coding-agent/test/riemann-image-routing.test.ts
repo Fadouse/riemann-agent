@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { KernelExecuteResult } from "../src/riemann/kernel/types.ts";
-import { MODEL_TEXT_BYTES, OutputViews, renderModelText } from "../src/riemann/output.ts";
+import { MODEL_TEXT_BYTES, OutputViews } from "../src/riemann/output.ts";
 import { RiemannRuntime } from "../src/riemann/runtime.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
@@ -100,27 +100,19 @@ describe("Riemann image routing", () => {
 			this: typeof fakeThis,
 			result: KernelExecuteResult,
 			header: string,
-		) => Promise<{ content: Array<{ type: string; text?: string }>; moreRef?: string; error?: string }>;
+		) => Promise<{ content: Array<{ type: string; text?: string }>; resultRef: string; error?: string }>;
 		try {
 			const formatted = await formatResult.call(fakeThis, result, "Cell c1 error.");
 			const rendered = formatted.content[0]?.text ?? "";
 			expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);
 			expect(rendered).toContain("ValueError: bad argument");
-			expect(rendered).not.toContain("private internal frame");
+			expect(rendered).toContain("private internal frame");
 			expect(rendered).not.toContain("artifact://");
 			expect(rendered).not.toContain("�");
 			expect(stored.join("\n")).toContain("private internal frame");
 			expect(stored.join("\n")).toContain("native detail");
 			expect(stored.join("\n")).not.toContain("\x1b[");
-			let complete = rendered;
-			let more = formatted.moreRef;
-			for (let i = 0; more && i < 50; i++) {
-				const next = await renderModelText(views, [await views.read(more)]);
-				expect(Buffer.byteLength(next.text)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);
-				complete = complete.replace(`\n[more ${more}]\n`, () => next.text);
-				more = next.more;
-			}
-			expect(more).toBeUndefined();
+			const complete = (await views.text(formatted.resultRef)).text;
 			expect(complete).toContain(result.stdout);
 			expect(complete).toContain(result.stderr);
 			const putParts = vi.spyOn(artifacts, "putTextParts").mockRejectedValueOnce(new Error("disk full"));

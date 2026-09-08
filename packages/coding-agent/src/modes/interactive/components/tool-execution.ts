@@ -13,6 +13,8 @@ import {
 } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext, ToolRenderResultOptions } from "../../../core/extensions/types.ts";
 import { getTextOutput as getRenderedTextOutput, splitDisplayLines } from "../../../core/tools/render-utils.ts";
+import type { IPythonToolDetails } from "../../../riemann/ipython.ts";
+import { compactOutputPreview } from "../../../riemann/output-format.ts";
 import { convertToPng } from "../../../utils/image-convert.ts";
 import { type Theme, theme } from "../theme/theme.ts";
 import { getIPythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.ts";
@@ -38,6 +40,10 @@ export interface ToolRenderers {
 }
 
 const FALLBACK_PREVIEW_LINES = 10;
+
+// Presentation ownership only. Tool messages and model context remain untouched.
+// Weak owners cannot keep removed session views alive. Terminal tasks are removed.
+const pythonTasks = new WeakMap<TUI, Map<string, WeakRef<ToolExecutionComponent>>>();
 
 export interface ToolExecutionOptions {
 	showImages?: boolean;
@@ -83,6 +89,10 @@ export class ToolExecutionComponent extends Container {
 	};
 	private convertedImages: Map<number, { data: string; mimeType: string }> = new Map();
 	private hideComponent = false;
+	private pythonContinuation = false;
+	private pythonTaskKey?: string;
+	private pythonOutputs: NonNullable<ToolExecutionComponent["result"]>["content"] = [];
+	private readonly pythonDeliveries = new Set<string>();
 
 	constructor(
 		toolName: string,
@@ -227,10 +237,71 @@ export class ToolExecutionComponent extends Container {
 		},
 		isPartial = false,
 	): void {
+		if (this.shouldUseIPythonRenderer() && result.details && typeof result.details === "object") {
+			const details = result.details as IPythonToolDetails;
+			if (typeof details.taskKey === "string") {
+				let tasks = pythonTasks.get(this.ui);
+				if (!tasks) {
+					tasks = new Map();
+					pythonTasks.set(this.ui, tasks);
+				}
+				const previous = tasks.get(details.taskKey)?.deref();
+				const owner = this.toolName === "ipython_wait" && previous ? previous : this;
+				this.pythonContinuation = owner !== this;
+				this.pythonTaskKey = details.taskKey;
+				if (!previous || this.toolName !== "ipython_wait") tasks.set(details.taskKey, new WeakRef(owner));
+				owner.updatePythonResult(result, details, this.toolCallId, isPartial);
+				if (!isPartial && details.status !== "running") tasks.delete(details.taskKey);
+				return;
+			}
+		}
+		this.pythonContinuation = false;
 		this.result = result;
 		this.isPartial = isPartial;
 		this.updateDisplay();
 		this.maybeConvertImagesForKitty();
+	}
+
+	private updatePythonResult(
+		result: NonNullable<ToolExecutionComponent["result"]>,
+		details: IPythonToolDetails,
+		callId: string,
+		isPartial: boolean,
+	): void {
+		let addedOutput = false;
+		if (!isPartial && !this.pythonDeliveries.has(callId)) {
+			this.pythonDeliveries.add(callId);
+			for (const block of result.content) {
+				if (block.type === "text" && typeof block.text === "string") {
+					const text = compactOutputPreview(block.text)
+						.replace(/\n*\[ref r[0-9a-z]+\]$/, "")
+						.replace(/^(?:running id=\S+|ok|error|cancelled|timeout)(?:;[^\n]*)?(?:\n|$)/, "");
+					if (!text) continue;
+					this.pythonOutputs.push({ ...block, text });
+				} else this.pythonOutputs.push(block);
+				addedOutput = true;
+			}
+		}
+		const previous = this.result?.details as IPythonToolDetails | undefined;
+		if (
+			!addedOutput &&
+			previous &&
+			previous.status === details.status &&
+			previous.activities === details.activities &&
+			previous.startedAt === details.startedAt &&
+			previous.truncated === details.truncated &&
+			previous.errorName === details.errorName &&
+			this.result?.isError === result.isError
+		)
+			return;
+		// A stable array on empty waits keeps the cell's content/layout caches valid.
+		if (addedOutput) this.pythonOutputs = this.pythonOutputs.slice();
+		this.result = { ...result, content: this.pythonOutputs, details: { ...details, cellId: undefined } };
+		this.isPartial = details.status === "running";
+		this.executionStarted = true;
+		this.startedAt ??= details.startedAt ?? Date.now();
+		this.updateDisplay();
+		if (addedOutput) this.maybeConvertImagesForKitty();
 	}
 
 	private maybeConvertImagesForKitty(): void {
@@ -277,6 +348,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override render(width: number): string[] {
+		if (this.pythonContinuation || (this.toolName === "ipython_wait" && !this.result)) return [];
 		if (this.hideComponent) {
 			return [];
 		}
@@ -322,6 +394,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private updateDisplay(): void {
+		if (this.pythonContinuation || (this.toolName === "ipython_wait" && !this.result)) return;
 		const bgFn = this.isPartial
 			? (text: string) => theme.bg("toolPendingBg", text)
 			: this.result?.isError
@@ -333,7 +406,7 @@ export class ToolExecutionComponent extends Container {
 		if (this.hasSpecializedRenderer() && this.shouldUseIPythonRenderer()) {
 			const state = {
 				code: getIPythonCodeFromArgs(this.args),
-				wait: this.toolName === "ipython_wait",
+				wait: this.toolName === "ipython_wait" && !this.pythonTaskKey,
 				content: this.result?.content,
 				details: this.result?.details,
 				isPartial: this.isPartial,

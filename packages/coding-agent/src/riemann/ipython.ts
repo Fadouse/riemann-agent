@@ -2,9 +2,9 @@ import { type Static, Type } from "typebox";
 import type { KernelExecuteStatus } from "./kernel/types.ts";
 
 export const IPYTHON_TOOL_DESCRIPTION = `Execute raw Python with top-level await and fresh locals. Display with print; reuse retained results with refs[id]; preserve selected variables with persist.name and functions with @persist.
-Optional first line: # @exec: {"timeout_ms": 300000}; this is the sole deadline and covers nested/background work.
-Running cells yield an id for ipython_wait. shell.run(background=True) returns an independent process ID without occupying the kernel.
-Each text return totals at most 16384 UTF-8 bytes. Oversized display keeps head/tail; print(refs["r1"]) reads omitted content. Use await refs["r1"].read(span=[start,end]) to compute on a reference-relative byte slice.
+Optional first line: # @exec: {"yield_time_ms": 10000, "timeout_ms": 300000}. yield_time_ms (0..60000) bounds this wait only; timeout_ms is the sole execution deadline, including nested/background work.
+Running cells yield an id for ipython_wait and continue independently while awaiting tools. await yield_control() returns accumulated output immediately without ending the cell. Other cells may run meanwhile; synchronous Python still blocks the shared interpreter. shell.run(background=True) returns an independent process ID.
+Each text return totals at most 16384 UTF-8 bytes. Each call has a unique [ref=r1] for its complete result, even on failure or empty output. Oversized output shows a continuous tail and reports omitted bytes before it. print(refs["r1"]) displays the saved result; await refs["r1"].read() restores its full value. read(span=[start,end]) selects UTF-8 bytes [start,end) of the full display text, never an omitted fragment; selected ranges display from their beginning. Reads never rerun producers.
 Await operations. Only marked state persists; temporary locals do not. Persistent functions must not depend on temporary globals. Side effects are not rolled back by cancellation.`;
 
 export const IPYTHON_TOOL_PROMPT_SNIPPET = "Execute raw Python; explicit output and optional state, yield with cell ID";
@@ -32,6 +32,14 @@ export const IPYTHON_TOOL_METADATA = {
 export const IPythonWaitSchema = Type.Object(
 	{
 		id: Type.String({ minLength: 1, description: "Cell or background process ID returned by the runtime" }),
+		yield_time_ms: Type.Optional(
+			Type.Integer({
+				minimum: 0,
+				maximum: 60000,
+				default: 10000,
+				description: "Maximum wait for new output or completion; does not stop the task. 0 checks immediately.",
+			}),
+		),
 		terminate: Type.Optional(Type.Boolean({ default: false })),
 	},
 	{ additionalProperties: false },
@@ -41,7 +49,7 @@ export const IPYTHON_WAIT_TOOL_METADATA = {
 	name: "ipython_wait",
 	label: "Python wait",
 	description:
-		"Wait on a returned cell or background process id. Returns new output or completion. terminate=true cancels that task; waiting never resets its deadline. Already collected or unknown IDs are errors; retained results remain readable through refs. Text returns share the 16384-byte head/tail display bound. Do not rerun producers to retrieve output.",
+		"Wait on a returned cell or background process id. Returns new output or completion. terminate=true cancels that task; waiting never resets its deadline. Each wait has a unique reference to its complete returned increment, not the whole cell history. Text returns share the 16384-byte tail display bound. Use refs for saved results; do not rerun producers.",
 	parameters: IPythonWaitSchema,
 	executionMode: "sequential",
 } as const;
@@ -60,6 +68,7 @@ interface IPythonActivityBase {
 	startedAt?: number;
 	durationMs?: number;
 	error?: string;
+	resultRef?: string;
 }
 
 export interface IPythonShellActivity extends IPythonActivityBase {
@@ -123,7 +132,7 @@ export interface IPythonMcpActivity extends IPythonActivityBase {
 	kind: "mcp";
 	/** Registered qualified Python operation, not a guessed server namespace. */
 	operation: string;
-	/** Bounded host-event previews; omitted tails are marked [truncated]. */
+	/** Bounded TUI previews; resultRef points to the complete call result. */
 	input?: string;
 	output?: string;
 }
@@ -139,14 +148,16 @@ export type IPythonActivity =
 export interface IPythonToolDetails {
 	status: "running" | KernelExecuteStatus;
 	cellId?: string;
+	/** Internal task identity for live/replayed UI grouping; never rendered or sent to the model. */
+	taskKey?: string;
 	/** Cell dispatch time after kernel initialization, in epoch milliseconds. */
 	startedAt?: number;
 	durationMs?: number;
 	errorName?: string;
 	errorCode?: string;
 	executionCount?: number;
-	moreRef?: string;
-	diagnosticRef?: string;
+	resultRef?: string;
+	truncated?: boolean;
 	captureTruncated?: { stdout: boolean; stderr: boolean; rich: boolean };
 	media?: Array<{
 		type: "image";

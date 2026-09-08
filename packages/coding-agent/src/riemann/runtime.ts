@@ -63,7 +63,7 @@ import {
 } from "./kernel/types.ts";
 import { RiemannMcpManager } from "./mcp/manager.ts";
 import { createRiemannOpenAICompaction } from "./openai-compaction.ts";
-import { type OutputPart, OutputViews, renderModelText, utf8Prefix } from "./output.ts";
+import { type OutputPart, OutputViews, renderModelText } from "./output.ts";
 import { renderRiemannPrompt } from "./prompts.ts";
 import { ensureManagedPython } from "./python/runtime.ts";
 import { ArtifactStore } from "./state/artifacts.ts";
@@ -229,7 +229,6 @@ export class RiemannRuntime {
 		this.web = new WebFunctions(
 			shared.config.web.searchBackend === "exa" ? exaApiKey : undefined,
 			this.artifacts,
-			shared.config.limits.maxPreviewBytes,
 			undefined,
 			undefined,
 			this.pages,
@@ -663,6 +662,7 @@ export class RiemannRuntime {
 						const value: JsonValue = JSON.parse(
 							(await this.artifacts.readBuffer(retained.value_ref)).toString("utf8"),
 						);
+						if (retained.encoding === "base64") return { kind: "binary", base64: value };
 						return { kind: "value", value, schema: retained.schema, return_type: retained.return_type };
 					}
 					if (
@@ -961,7 +961,7 @@ export class RiemannRuntime {
 				patch_handle: accessibleReference(agent.patchHandle),
 			})),
 			pending_agent_events: pendingEvents.map((event) => event.id),
-			python_cell: this.cells.pending,
+			python_tasks: [...this.cells.pending, ...this.shell.tasks.pending],
 			compaction: {
 				configured: compaction.configured,
 				effective: compaction.effective,
@@ -1103,7 +1103,7 @@ export class RiemannRuntime {
 			const { python, environment } = await ensureManagedPython();
 			const prelude = await readFile(preludePath(), "utf8");
 			const specifications = JSON.stringify(this.registry.pythonSpecifications(undefined, this.capabilities));
-			const bootstrapCode = `${prelude}\n\n_configure_runtime(_json.loads(${JSON.stringify(JSON.stringify(this.shared.config.limits))}))\n_install_functions(_json.loads(${JSON.stringify(specifications)}))\n${PYTHON_CODE_MODE_BOOTSTRAP}`;
+			const bootstrapCode = `${prelude}\n\n_configure_runtime(_json.loads(${JSON.stringify(JSON.stringify(this.shared.config.limits))}))\n_install_functions(_json.loads(${JSON.stringify(specifications)}))\n${PYTHON_CODE_MODE_BOOTSTRAP}\n_riemann_install_cell_dispatch()`;
 			const kernel = new IPythonKernelManager({
 				python,
 				env: environment,
@@ -1116,30 +1116,72 @@ export class RiemannRuntime {
 					.update(PYTHON_CODE_MODE_BOOTSTRAP)
 					.digest("hex"),
 				hostRequest: async (request, signal, onUpdate) => {
-					let ref: string | undefined;
-					const result = await this.registry.dispatch(
-						request,
-						this.capabilities,
-						signal,
-						onUpdate,
-						async (value) => {
-							if (value !== null && request.operation !== "references.read") {
-								const definition = this.registry.get(request.operation)!;
-								ref = await this.artifacts.putResult(
-									value,
-									JSON.parse(JSON.stringify(definition.outputSchema)) as JsonValue,
-									definition.pythonReturnType,
-									request.operation,
-								);
+					let captured: JsonValue | undefined;
+					try {
+						const result = await this.registry.dispatch(
+							request,
+							this.capabilities,
+							signal,
+							onUpdate,
+							async (value) => {
+								captured = value;
+								return undefined;
+							},
+						);
+						const value = isKernelHostResult(result) ? result.value : result;
+						const content = isKernelHostResult(result) ? result.modelContent : [];
+						const definition = this.registry.get(request.operation)!;
+						let saved = value;
+						let schema = JSON.parse(JSON.stringify(definition.outputSchema)) as JsonValue;
+						let returnType = definition.pythonReturnType;
+						let displayRef: string | undefined;
+						let encoding: "base64" | undefined;
+						if (
+							request.operation === "references.read" &&
+							value &&
+							typeof value === "object" &&
+							!Array.isArray(value)
+						) {
+							if (value.kind === "value") {
+								saved = value.value;
+								schema = value.schema;
+								returnType = String(value.return_type);
+							} else if (value.kind === "text") {
+								saved = value.text;
+								schema = { type: "string" };
+								returnType = "str";
+								displayRef = String(value.reference);
+							} else if (value.kind === "binary") {
+								saved = value.base64;
+								encoding = "base64";
 							}
-							return ref;
-						},
-					);
-					if (!ref) return result;
-					return kernelHostResult(isKernelHostResult(result) ? result.value : result, [
-						...(isKernelHostResult(result) ? result.modelContent : []),
-						{ type: "text", text: `[result ${request.operation} ${ref}]` },
-					]);
+						}
+						const ref = await this.artifacts.putResult(saved, schema, returnType, request.operation, {
+							displayRef,
+							encoding,
+							content: content as JsonValue,
+						});
+						return kernelHostResult(value, [...content, { type: "text", text: `[ref=${ref}]\n` }], ref);
+					} catch (error) {
+						const failure =
+							error instanceof RiemannHostError ? error : new RiemannHostError("internal_error", String(error));
+						failure.resultRef = await this.artifacts.putResult(
+							{
+								error: {
+									code: failure.code,
+									message: failure.message,
+									details: failure.details ?? null,
+									recovery: failure.recovery,
+									retryable: failure.retryable,
+								},
+								...(captured === undefined ? {} : { result: captured }),
+							},
+							{},
+							"JSON",
+							request.operation,
+						);
+						throw failure;
+					}
 				},
 				snapshotPath: join(this.shared.store.snapshotsDir, this.agent.id, "kernel.dill"),
 				migrateCodeState: true,
@@ -1189,11 +1231,11 @@ export class RiemannRuntime {
 	private async formatResult(
 		result: KernelExecuteResult,
 		header: string,
+		operation = "ipython",
 	): Promise<{
 		content: Array<TextContent | ImageContent>;
-		moreRef?: string;
-		diagnosticRef?: string;
-		error?: string;
+		resultRef: string;
+		truncated: boolean;
 		media?: IPythonToolDetails["media"];
 	}> {
 		const sections: OutputPart[] = [];
@@ -1202,7 +1244,7 @@ export class RiemannRuntime {
 			const streams = Object.entries(result.captureTruncated)
 				.filter(([, truncated]) => truncated)
 				.map(([kind]) => kind);
-			sections.push(`[Capture incomplete: ${streams.join(", ")}; recovery contains retained output only]`);
+			if (streams.length) header += `; capture incomplete: ${streams.join(", ")}`;
 		}
 		if (this.pendingRestoreNotice) {
 			sections.push(this.pendingRestoreNotice);
@@ -1231,7 +1273,6 @@ export class RiemannRuntime {
 					`Image content [${content.mimeType}; reference ${content.artifactHandle}; not displayed in child Agent context]`,
 				);
 		}
-		let diagnosticRef: string | undefined;
 		if (result.error) {
 			const prefix = result.error.code
 				? `${result.error.operation ?? "ipython"} [${result.error.code}]: `
@@ -1241,9 +1282,7 @@ export class RiemannRuntime {
 			const location = [...traceback.matchAll(/File ["']?<python-cell>["']?(?::|, line )(\d+)/g)].at(-1)?.[1];
 			const repair = `${location && !summary.includes("<python-cell>") ? `\nAt <python-cell>:${location}` : ""}${result.error.repairCode ? `\nUse: ${result.error.repairCode}` : ""}`;
 			const diagnostic = `${summary}${repair}\n${traceback}${result.error.details === undefined ? "" : `\nHost details:\n${JSON.stringify(result.error.details)}`}`;
-			const formatted = await this.errorOutput(summary, diagnostic, repair);
-			diagnosticRef = formatted.ref;
-			sections.unshift(formatted.text);
+			sections.push(diagnostic);
 		}
 		const selectedImages: KernelImageReference[] = [];
 		const seenImages = new Set<string>();
@@ -1266,7 +1305,18 @@ export class RiemannRuntime {
 			selectedImageBytes += image.byteLength;
 		}
 		if (omittedImages > 0) sections.push(`[${omittedImages} image(s) omitted by model-context budget]`);
-		const rendered = await renderModelText(this.outputViews, [sections.length ? `${header}\n` : header, ...sections]);
+		const rendered = await renderModelText(this.outputViews, sections, {
+			header,
+			operation,
+			value: JSON.parse(
+				JSON.stringify({
+					...result,
+					status: header.startsWith("running") ? "running" : result.status,
+					header,
+					modelContent,
+				}),
+			) as JsonValue,
+		});
 		const text = rendered.text;
 		const content: Array<TextContent | ImageContent> = [{ type: "text", text }];
 		for (const image of selectedImages) {
@@ -1280,9 +1330,8 @@ export class RiemannRuntime {
 		}
 		return {
 			content,
-			...(rendered.more ? { moreRef: rendered.more } : {}),
-			...(diagnosticRef ? { diagnosticRef } : {}),
-			...(rendered.error ? { error: rendered.error } : {}),
+			resultRef: rendered.ref,
+			truncated: rendered.truncated,
 			...(selectedImages.length > 0
 				? {
 						media: selectedImages.map((image) => ({
@@ -1301,7 +1350,8 @@ export class RiemannRuntime {
 		return {
 			...IPYTHON_TOOL_METADATA,
 			async execute(_toolCallId, params, signal, onUpdate) {
-				if (signal?.aborted) throw signal.reason;
+				if (signal?.aborted)
+					return runtime.toolFailure(new RiemannHostError("cancelled", "Call cancelled before execution"));
 				let options: ReturnType<typeof parsePythonExec>;
 				try {
 					options = parsePythonExec(params.code);
@@ -1312,7 +1362,7 @@ export class RiemannRuntime {
 				try {
 					cellId = runtime.cells.start(options, async (cell) => {
 						const kernel = await raceWithAbortSignal(runtime.ensureKernel(), cell.signal);
-						cell.peek = () => kernel.peek();
+						cell.peek = () => kernel.peek(cell.id);
 						const activityTracker = new RiemannActivityTracker(
 							runtime.agent.workspace,
 							(capability) => runtime.shared.store.getFileCapability(runtime.shared.run.id, capability)?.path,
@@ -1328,12 +1378,14 @@ export class RiemannRuntime {
 						// Exclude managed-Python/kernel startup. Keep the same dispatch timestamp
 						// through host updates and the final result; durationMs remains kernel-authoritative.
 						const startedAt = Date.now();
-						cell.details = { status: "running", startedAt, cellId: cell.id, activities };
+						cell.details = { ...cell.details, status: "running", startedAt, cellId: cell.id, activities };
 						cell.notify();
-						const result = await kernel.execute(`await _riemann_exec_source(${JSON.stringify(params.code)})`, {
+						const result = await kernel.execute(params.code, {
+							cellId: cell.id,
 							signal: cell.signal,
 							outputOrder: "arrival",
 							onOutput: cell.notify,
+							onYield: cell.yield,
 							onHostRequest: async (event) => {
 								const next = await activityTracker.observe(event);
 								if (!next) return;
@@ -1348,9 +1400,8 @@ export class RiemannRuntime {
 					return runtime.toolFailure(error);
 				}
 				try {
-					return await runtime.collectCell(cellId, false, signal, onUpdate, true);
+					return await runtime.collectCell(cellId, false, signal, onUpdate, options.yield_time_ms, false);
 				} catch (error) {
-					if (signal?.aborted) runtime.cells.cancel(cellId);
 					return runtime.toolFailure(error);
 				}
 			},
@@ -1361,29 +1412,10 @@ export class RiemannRuntime {
 		return {
 			...IPYTHON_WAIT_TOOL_METADATA,
 			execute: async (_id, params, signal, onUpdate) =>
-				this.collectCell(params.id, params.terminate ?? false, signal, onUpdate).catch((error: unknown) =>
-					this.toolFailure(error, "ipython_wait"),
+				this.collectCell(params.id, params.terminate ?? false, signal, onUpdate, params.yield_time_ms).catch(
+					(error: unknown) => this.toolFailure(error, "ipython_wait"),
 				),
 		};
-	}
-
-	private async errorOutput(
-		summary: string,
-		diagnostic: string,
-		repair = "",
-	): Promise<{ text: string; ref?: string }> {
-		try {
-			const ref = artifactHandle(await this.artifacts.putText(diagnostic, { name: "ipython-error.txt" }));
-			if (!ref) throw new Error("Diagnostic reference missing");
-			const firstLine = summary.split("\n", 1)[0];
-			const preview = utf8Prefix(firstLine, this.shared.config.limits.maxPreviewBytes);
-			return { text: `${preview}${preview === summary ? "" : "…"}${repair}\n[details=${ref}]`, ref };
-		} catch (error) {
-			// If archival fails, keep the original diagnostic in the final output path.
-			return {
-				text: `${diagnostic}\n[Diagnostic unavailable: ${error instanceof Error ? error.message : String(error)}]`,
-			};
-		}
 	}
 
 	private async toolFailure(error: unknown, operation = "ipython", code = "runtime_error"): Promise<never> {
@@ -1395,14 +1427,21 @@ export class RiemannRuntime {
 					? `${operation} [${code}]: ${error.name === "Error" ? "" : `${error.name}: `}${error.message}`
 					: `${operation} [${code}]: ${String(error)}`;
 		const diagnostic = `${summary}\n${error instanceof Error ? (error.stack ?? "") : ""}${error instanceof RiemannHostError && error.details !== undefined ? `\nHost details:\n${JSON.stringify(error.details)}` : ""}`;
-		const formatted = await this.errorOutput(summary, diagnostic);
-		const rendered = await renderModelText(this.outputViews, [formatted.text]);
+		const status =
+			error instanceof RiemannHostError && (error.code === "cancelled" || error.code === "timeout")
+				? error.code
+				: "error";
+		const rendered = await renderModelText(this.outputViews, [diagnostic], {
+			header: status,
+			operation,
+			value: { status, error: diagnostic },
+		});
 		throw new AgentToolExecutionError({
 			content: [{ type: "text", text: rendered.text }],
 			details: {
-				status: "error",
-				...(formatted.ref ? { diagnosticRef: formatted.ref } : {}),
-				...(rendered.more ? { moreRef: rendered.more } : {}),
+				status,
+				resultRef: rendered.ref,
+				truncated: rendered.truncated,
 			},
 		});
 	}
@@ -1412,7 +1451,8 @@ export class RiemannRuntime {
 		terminate: boolean,
 		signal?: AbortSignal,
 		onUpdate?: RuntimeUpdate,
-		initial = false,
+		yieldMs = 10000,
+		waitForOutput = true,
 	) {
 		const tasks = this.cells.has(cellId) ? this.cells : this.shell.tasks;
 		const unobserve = tasks.observe(cellId, (details) =>
@@ -1421,13 +1461,13 @@ export class RiemannRuntime {
 		try {
 			const outcome = await tasks.poll(
 				cellId,
-				initial ? 10000 : undefined,
+				yieldMs,
 				terminate,
 				signal,
 				async (result, running, cell: PythonCell) => {
 					const status = result.status;
-					const header = running ? `running id=${cellId}; use ipython_wait; do not rerun` : status;
-					const formatted = await this.formatResult(result, header);
+					const header = running ? `running id=${cellId}` : status;
+					const formatted = await this.formatResult(result, header, waitForOutput ? "ipython_wait" : "ipython");
 					return {
 						content: formatted.content,
 						details: {
@@ -1443,12 +1483,13 @@ export class RiemannRuntime {
 									}
 								: {}),
 							...(result.executionCount === undefined ? {} : { executionCount: result.executionCount }),
-							...(formatted.moreRef ? { moreRef: formatted.moreRef } : {}),
-							...(formatted.diagnosticRef ? { diagnosticRef: formatted.diagnosticRef } : {}),
+							resultRef: formatted.resultRef,
+							truncated: formatted.truncated,
 							...(formatted.media ? { media: formatted.media } : {}),
 						},
 					};
 				},
+				waitForOutput,
 			);
 			if (outcome.details.status !== "ok" && outcome.details.status !== "running")
 				throw new AgentToolExecutionError(outcome);

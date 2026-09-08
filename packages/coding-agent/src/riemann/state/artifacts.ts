@@ -109,12 +109,27 @@ export class ArtifactStore {
 		return this.putStream(jsonChunks(value), { name, mimeType });
 	}
 
-	async putResult(value: JsonValue, schema: JsonValue, returnType: string, operation: string): Promise<string> {
+	async putResult(
+		value: JsonValue,
+		schema: JsonValue,
+		returnType: string,
+		operation: string,
+		options: { displayRef?: string; content?: JsonValue; encoding?: "base64" } = {},
+	): Promise<string> {
 		const body = await this.putJson(value, `${operation}-result.json`);
 		if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.handle !== "string")
 			throw new RiemannHostError("artifact_error", "Result body has no reference");
 		const result = await this.putJson(
-			{ value_ref: body.handle, schema, return_type: returnType },
+			{
+				call_id: randomUUID(),
+				operation,
+				value_ref: body.handle,
+				schema,
+				return_type: returnType,
+				...(options.displayRef ? { display_ref: options.displayRef } : {}),
+				...(options.content ? { content: options.content } : {}),
+				...(options.encoding ? { encoding: options.encoding } : {}),
+			},
 			`${operation}-contract.json`,
 			RESULT_MIME,
 		);
@@ -123,7 +138,14 @@ export class ArtifactStore {
 		return result.handle;
 	}
 
-	async readResult(handle: string): Promise<{ value_ref: string; schema: JsonValue; return_type: string }> {
+	async readResult(handle: string): Promise<{
+		value_ref: string;
+		schema: JsonValue;
+		return_type: string;
+		display_ref?: string;
+		encoding?: "base64";
+		content?: JsonValue;
+	}> {
 		const metadata = this.getMetadata(handle);
 		if (metadata.mimeType !== RESULT_MIME)
 			throw new RiemannHostError("invalid_arguments", "Not a typed result reference");
@@ -141,7 +163,14 @@ export class ArtifactStore {
 		)
 			throw new RiemannHostError("artifact_error", "Invalid result contract");
 		this.assertPublic(value.value_ref);
-		return { value_ref: value.value_ref, schema: value.schema, return_type: value.return_type };
+		return {
+			value_ref: value.value_ref,
+			schema: value.schema,
+			return_type: value.return_type,
+			...(typeof value.display_ref === "string" ? { display_ref: value.display_ref } : {}),
+			...(value.encoding === "base64" ? { encoding: "base64" as const } : {}),
+			...(value.content === undefined ? {} : { content: value.content }),
+		};
 	}
 
 	async putBuffer(data: Buffer, options: { name?: string; mimeType: string }): Promise<JsonValue> {

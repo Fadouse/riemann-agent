@@ -9,7 +9,6 @@ import { Agent, fetch as undiciFetch } from "undici";
 import { graphemeSafePrefix } from "../../utils/text.ts";
 import { RiemannHostError } from "../errors.ts";
 import { type JsonValue, kernelHostResult } from "../kernel/types.ts";
-import { utf8Prefix } from "../output.ts";
 import type { ArtifactStore } from "../state/artifacts.ts";
 import { PageStore, pageSchema } from "../state/pages.ts";
 import type { FunctionDefinition } from "./registry.ts";
@@ -256,7 +255,6 @@ async function requestWithNormalizedErrors<T>(
 export class WebFunctions {
 	private readonly exaApiKey: string | undefined;
 	private readonly artifacts: ArtifactStore;
-	private readonly previewBytes: number;
 	private readonly resolveHostname: ResolveHostname;
 	private readonly dispatcher: Agent | undefined;
 	private readonly fetcher: Fetcher;
@@ -265,7 +263,6 @@ export class WebFunctions {
 	constructor(
 		exaApiKey: string | undefined,
 		artifacts: ArtifactStore,
-		previewBytes: number,
 		resolveHostname: ResolveHostname = async (hostname) =>
 			(await lookup(hostname, { all: true, verbatim: true })).map(({ address }) => address),
 		fetcher?: Fetcher,
@@ -274,7 +271,6 @@ export class WebFunctions {
 		this.pages = pages ?? new PageStore(artifacts, randomUUID());
 		this.exaApiKey = exaApiKey;
 		this.artifacts = artifacts;
-		this.previewBytes = previewBytes;
 		this.resolveHostname = resolveHostname;
 		if (fetcher) {
 			this.fetcher = fetcher;
@@ -653,20 +649,17 @@ export class WebFunctions {
 					} catch (error) {
 						throw new RiemannHostError("parse_error", `Response retained at ${ref}: ${String(error)}`, { ref });
 					}
-					const textTruncated = Buffer.byteLength(extracted.text) > this.previewBytes;
-					const artifact = textTruncated
-						? await this.artifacts.putText(extracted.text, {
-								name: "web-fetch.txt",
-								mimeType: "text/plain; charset=utf-8",
-							})
-						: null;
+					const artifact = await this.artifacts.putText(extracted.text, {
+						name: "web-fetch.txt",
+						mimeType: "text/plain; charset=utf-8",
+					});
 					return kernelHostResult(
 						{
 							$riemann: "document",
 							url: finalUrl,
 							title: extracted.title,
-							text: utf8Prefix(extracted.text, this.previewBytes),
-							text_truncated: textTruncated,
+							text: extracted.text,
+							text_truncated: false,
 							artifact_kind: artifact ? "extracted" : null,
 							content_type: contentType,
 							artifact,

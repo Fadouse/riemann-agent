@@ -30,12 +30,36 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 						throw new Error(JSON.stringify(error.result.content), { cause: error });
 					throw error;
 				});
-		const wait = (id: string, terminate = false) =>
-			runtime!.waitToolDefinition().execute("wait", { id, terminate }, undefined, undefined, context);
+		const wait = (id: string, terminate = false, yield_time_ms?: number) =>
+			runtime!.waitToolDefinition().execute("wait", { id, terminate, yield_time_ms }, undefined, undefined, context);
 		const warmup = await execute(
 			'assert "output" not in globals() and "store" not in globals() and "load" not in globals()\npersist.answer = 42',
 		);
 		expect(warmup.details.status).toBe("ok");
+		const empty = await execute("pass");
+		expect(empty.details.resultRef).not.toBe(warmup.details.resultRef);
+		const errorRefs: string[] = [];
+		for (let i = 0; i < 2; i++) {
+			try {
+				await runtime
+					.toolDefinition()
+					.execute("missing", { code: 'await fs.read(path="missing-file")' }, undefined, undefined, context);
+				throw new Error("Expected missing-file error");
+			} catch (error) {
+				if (!(error instanceof AgentToolExecutionError)) throw error;
+				const text = error.result.content
+					.filter((item) => item.type === "text")
+					.map((item) => item.text)
+					.join("");
+				const refs = [...text.matchAll(/\[ref=(r[0-9a-z]+)/g)].map((match) => match[1]);
+				expect(refs).toHaveLength(2);
+				errorRefs.push(...refs);
+				await execute(
+					`saved = await refs["${refs[0]}"].read()\nassert saved["error"]["code"] == "not_found"\nouter = await refs["${refs[1]}"].read()\nassert outer["status"] == "error"`,
+				);
+			}
+		}
+		expect(new Set(errorRefs).size).toBe(4);
 		await execute(
 			[
 				"import builtins, contextlib, io",
@@ -67,7 +91,9 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 		expect(compactText).toContain("exit_code=7");
 		expect(compactText).toContain("payload");
 		expect(compactText).toContain("problem");
-		const resultRef = compactText.match(/\[result shell.run (r[0-9a-z]+)\]/)![1];
+		const resultRef = compactText.match(/\[ref=(r[0-9a-z]+)\]/)![1];
+		const scalarRef = [...compactText.matchAll(/\[ref=(r[0-9a-z]+)\]/g)][2][1];
+		await execute(`assert await refs["${scalarRef}"].read() == "problem"`);
 		await execute(
 			`result = await refs["${resultRef}"].read()\nassert result.exit_code == 7\nassert await result.stdout.read() == "payload"\nassert len(persist.large) == 20000\nawait refs["${resultRef}"].materialize(path="result.json")\nawait result.stdout.materialize(path="stdout.txt")`,
 		);
@@ -78,35 +104,36 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 		);
 		expect(JSON.stringify(range.content)).toContain("output");
 		expect(JSON.stringify(range.content)).not.toContain("range-output");
-		let page = await execute('print("中😀" * 70000, end="END")');
-		const middleRef = page.details.moreRef!;
+		const page = await execute('print("中😀" * 70000, end="END")');
+		const fullRef = page.details.resultRef!;
 		await execute(
-			`middle = await refs["${middleRef}"].read()\nawait refs["${middleRef}"].materialize(path="middle.txt")\nassert open("middle.txt").read() == middle`,
+			`value = await refs["${fullRef}"].read()\nassert value["status"] == "ok"\nawait refs["${fullRef}"].materialize(path="full.json")`,
 		);
+		expect(JSON.parse(await readFile(join(root, "full.json"), "utf8"))).toMatchObject({ status: "ok" });
+		const expected = `${"中😀".repeat(70000)}END`;
 		let recovered = "";
-		let previousRef: string | undefined;
-		for (let count = 0; count < 50; count++) {
-			const text = page.content
+		for (let offset = 0; offset < Buffer.byteLength(expected); offset += 14000) {
+			const end = Math.min(offset + 14000, Buffer.byteLength(expected));
+			const chunk = await execute(`print(await refs["${fullRef}"].read(span=[${offset}, ${end}]), end="")`);
+			const text = chunk.content
 				.filter((item) => item.type === "text")
 				.map((item) => item.text)
 				.join("");
 			expect(Buffer.byteLength(text)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);
 			expect(text).not.toContain("�");
-			const body = text.replace(/^ok\n*/, "");
-			recovered = previousRef ? recovered.replace(`\n[more ${previousRef}]\n`, () => body) : body;
-			if (!page.details.moreRef) break;
-			previousRef = page.details.moreRef;
-			page = await execute(`print(refs[${JSON.stringify(page.details.moreRef)}], end="")`);
+			recovered += text.replace(/^ok\n\n(?:\[ref=r[0-9a-z]+\]\n*)?/, "").replace(/\n\n\[ref=r[0-9a-z]+\]$/, "");
 		}
-		expect(page.details.moreRef).toBeUndefined();
-		expect(recovered).toBe(`${"中😀".repeat(70000)}END`);
+		expect(recovered === expected).toBe(true);
 		const first = await execute(
-			'import asyncio\ntransient = 1\nprint("before-sleep")\nawait asyncio.sleep(10.2)\nprint("after-sleep", flush=True)',
+			'import asyncio\ntransient = 1\nprint("before-sleep")\nawait yield_control()\nawait asyncio.sleep(0.4)\nprint("after-sleep", flush=True)',
 		);
 		expect(first.details.status).toBe("running");
 		const id = first.details.cellId!;
 		const parts = [JSON.stringify(first.content)];
 		expect(parts[0]).toContain("before-sleep");
+		const independent = await execute('print("independent-while-awaiting")\nassert "transient" not in globals()');
+		expect(independent.details.status).toBe("ok");
+		expect(JSON.stringify(independent.content)).not.toContain("after-sleep");
 		let completed = await wait(id);
 		parts.push(JSON.stringify(completed.content));
 		while (completed.details.status === "running") {
@@ -116,6 +143,7 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 		expect(completed.details.status).toBe("ok");
 		expect(parts.join(" ").match(/before-sleep/g)).toHaveLength(1);
 		expect(parts.join(" ").match(/after-sleep/g)).toHaveLength(1);
+		expect(parts.join(" ")).not.toContain("independent-while-awaiting");
 		await expect(wait(id)).rejects.toBeInstanceOf(AgentToolExecutionError);
 		expect((await execute('assert "transient" not in globals(); print(persist.answer)')).content).toEqual(
 			expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining("42") })]),
@@ -192,7 +220,7 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 				expect(error).toBeInstanceOf(AgentToolExecutionError);
 				if (!(error instanceof AgentToolExecutionError)) throw error;
 				expect(error.result.details).toMatchObject({ status: termination });
-				const reference = JSON.stringify(error.result.content).match(/\[result shell.run (r[0-9a-z]+)\]/)![1];
+				const reference = JSON.stringify(error.result.content).match(/\[ref=(r[0-9a-z]+)\]/)![1];
 				await execute(
 					`result = await refs["${reference}"].read()\nassert result.termination == "${termination}"\nassert await result.stdout.read() == "retained-before-stop"`,
 				);
@@ -200,20 +228,48 @@ test("real Python cell yields explicit output, completes once, isolates locals a
 		}
 
 		const long = await execute(
-			'await shell.run(script="printf started > started.txt; sleep 30; printf finished > finished.txt")',
+			'# @exec: {"yield_time_ms": 100}\nawait shell.run(script="printf started > started.txt; sleep 30; printf finished > finished.txt")',
 		);
 		const longId = long.details.cellId!;
 		expect(long.details.status).toBe("running");
 		expect(await readFile(join(root, "started.txt"), "utf8")).toBe("started");
+		const survivor = await execute(
+			'import asyncio\npersist.release = asyncio.Event()\nchild = asyncio.create_task(persist.release.wait())\nawait yield_control()\nawait child\nprint("survived-other-cancellation")',
+		);
+		expect(survivor.details.status).toBe("running");
 		try {
 			await wait(longId, true);
 			throw new Error("expected cancellation");
 		} catch (error) {
 			expect(error).toBeInstanceOf(AgentToolExecutionError);
-			if (error instanceof AgentToolExecutionError)
+			if (error instanceof AgentToolExecutionError) {
 				expect(error.result.details).toMatchObject({ status: "cancelled" });
+				expect(JSON.stringify(error.result.content)).toContain("[ref=");
+			}
 		}
 		await expect(readFile(join(root, "finished.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+		await execute("persist.release.set()\ndel persist.release");
+		let survived = await wait(survivor.details.cellId!);
+		let survivorOutput = JSON.stringify(survived.content);
+		while (survived.details.status === "running") {
+			survived = await wait(survivor.details.cellId!);
+			survivorOutput += JSON.stringify(survived.content);
+		}
+		expect(survived.details.status).toBe("ok");
+		expect(survivorOutput.match(/survived-other-cancellation/g)).toHaveLength(1);
+		const immediate = await execute(
+			'# @exec: {"yield_time_ms": 0}\nimport asyncio\nawait asyncio.sleep(0.2)\nprint("zero-wait")',
+		);
+		expect(immediate.details.status).toBe("running");
+		const checked = await wait(immediate.details.cellId!, false, 0);
+		expect(checked.details.status).toBe("running");
+		let zeroResult = await wait(immediate.details.cellId!);
+		let zeroOutput = JSON.stringify(zeroResult.content);
+		while (zeroResult.details.status === "running") {
+			zeroResult = await wait(immediate.details.cellId!);
+			zeroOutput += JSON.stringify(zeroResult.content);
+		}
+		expect(zeroOutput.match(/zero-wait/g)).toHaveLength(1);
 		expect((await execute('print("usable")')).details.status).toBe("ok");
 		const internals = runtime as unknown as {
 			kernel: IPythonKernelManager;

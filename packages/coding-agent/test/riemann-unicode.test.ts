@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { truncateLine, truncateTail } from "../src/core/tools/truncate.ts";
 import { WebFunctions } from "../src/riemann/functions/web.ts";
+import { isKernelHostResult } from "../src/riemann/kernel/types.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
 import { sanitizeBinaryOutput } from "../src/utils/shell.ts";
@@ -51,7 +52,6 @@ describe("Riemann web decoding", () => {
 			const web = new WebFunctions(
 				undefined,
 				new ArtifactStore(store, run.id),
-				10_000,
 				async () => ["93.184.216.34"],
 				(input, init) => globalThis.fetch(input, init),
 			);
@@ -73,14 +73,16 @@ describe("Riemann web decoding", () => {
 				);
 			vi.stubGlobal("fetch", fetchMock);
 
-			const windowsResult = await definition.handler(
+			const windowsReply = await definition.handler(
 				{ url: "https://example.test/windows" },
 				new AbortController().signal,
 			);
-			const fallbackResult = await definition.handler(
+			const fallbackReply = await definition.handler(
 				{ url: "https://example.test/fallback" },
 				new AbortController().signal,
 			);
+			const windowsResult = isKernelHostResult(windowsReply) ? windowsReply.value : windowsReply;
+			const fallbackResult = isKernelHostResult(fallbackReply) ? fallbackReply.value : fallbackReply;
 			expect(windowsResult).toMatchObject({ text: "café", trust: "untrusted" });
 			expect(fallbackResult).toMatchObject({
 				text: "snowman: ☃",

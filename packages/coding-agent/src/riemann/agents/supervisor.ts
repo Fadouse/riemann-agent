@@ -627,6 +627,7 @@ export class AgentSupervisor {
 			last_turn_id: agent.lastTurnId,
 			last_outcome: agent.lastOutcome,
 			output_preview: outputPreview(latestOutput),
+			output: latestOutput,
 			created_at: agent.createdAt,
 			updated_at: agent.updatedAt,
 		};
@@ -1819,6 +1820,7 @@ export class AgentSupervisor {
 				last_turn_id: Type.String(),
 				last_outcome: Type.Union([outcomeSchema, Type.Null()]),
 				output_preview: Type.Union([Type.String(), Type.Null()]),
+				output: Type.String({ description: "Complete output snapshot at the time of this call" }),
 				created_at: Type.String(),
 				updated_at: Type.String(),
 			},

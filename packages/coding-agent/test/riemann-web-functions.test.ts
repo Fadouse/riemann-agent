@@ -25,7 +25,6 @@ function record(value: JsonValue): Record<string, JsonValue> {
 
 async function webDefinitions(
 	apiKey = "exa-test-key",
-	previewChars = 10_000,
 	resolveHostname: (hostname: string) => Promise<string[]> = async () => ["93.184.216.34"],
 ) {
 	const root = await mkdtemp(join(tmpdir(), "riemann-web-functions-"));
@@ -37,7 +36,6 @@ async function webDefinitions(
 	const definitions = new WebFunctions(
 		apiKey,
 		artifacts,
-		previewChars,
 		resolveHostname,
 		(input, init) => globalThis.fetch(input, init),
 		pages,
@@ -299,7 +297,12 @@ describe("Riemann web fetch", () => {
 			const result = record(
 				await fetchDefinition.handler({ url: "https://example.test/html" }, new AbortController().signal),
 			);
-			expect(result).toMatchObject({ title: "Page", text: expected, artifact: null, trust: "untrusted" });
+			expect(result).toMatchObject({
+				title: "Page",
+				text: expected,
+				artifact_kind: "extracted",
+				trust: "untrusted",
+			});
 			// A separate NBSP replacement creates an avoidable full-text intermediate string.
 			const separateNbspPasses = replace.mock.calls.filter(
 				([pattern], index) =>
@@ -373,8 +376,8 @@ describe("Riemann web fetch", () => {
 				title: null,
 				text: "plain body",
 				content_type: "text/plain",
-				artifact: null,
-				artifact_kind: null,
+				artifact: expect.objectContaining({ handle: expect.stringMatching(/^r[0-9a-z]+$/) }),
+				artifact_kind: "extracted",
 				text_truncated: false,
 				trust: "untrusted",
 			});
@@ -383,22 +386,28 @@ describe("Riemann web fetch", () => {
 		}
 	});
 
-	test("keeps document previews marker-free and labels extracted artifacts", async () => {
-		const { fetchDefinition, artifacts, store } = await webDefinitions("exa-test-key", 4);
+	test("retains full extracted text before display budgeting", async () => {
+		const { fetchDefinition, artifacts, store } = await webDefinitions();
 		vi.stubGlobal(
 			"fetch",
 			vi
 				.fn<typeof fetch>()
-				.mockResolvedValue(new Response("完整😀abcdef", { headers: { "content-type": "text/plain" } })),
+				.mockResolvedValue(
+					new Response("完整😀abcdef".repeat(10000), { headers: { "content-type": "text/plain" } }),
+				),
 		);
 		try {
 			const result = record(
 				await fetchDefinition.handler({ url: "https://example.com" }, new AbortController().signal),
 			);
-			expect(result).toMatchObject({ text: "完", text_truncated: true, artifact_kind: "extracted" });
+			expect(result).toMatchObject({
+				text: "完整😀abcdef".repeat(10000),
+				text_truncated: false,
+				artifact_kind: "extracted",
+			});
 			expect(record(result.artifact).handle).toMatch(/^r[0-9a-z]+$/);
 			expect(await artifacts.readBuffer(String(record(result.artifact).handle))).toEqual(
-				Buffer.from("完整😀abcdef"),
+				Buffer.from("完整😀abcdef".repeat(10000)),
 			);
 			expect(Value.Check(fetchDefinition.outputSchema, result)).toBe(true);
 		} finally {
@@ -458,7 +467,7 @@ describe("Riemann web fetch", () => {
 		}
 	});
 	test("blocks private destinations before making a request", async () => {
-		const { fetchDefinition, store } = await webDefinitions("exa-test-key", 10_000, async () => ["127.0.0.1"]);
+		const { fetchDefinition, store } = await webDefinitions("exa-test-key", async () => ["127.0.0.1"]);
 		const fetchMock = vi.fn<typeof fetch>();
 		vi.stubGlobal("fetch", fetchMock);
 		try {

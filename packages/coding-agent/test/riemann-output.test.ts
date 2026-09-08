@@ -1,10 +1,11 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { FULL_FILESYSTEM } from "../src/riemann/access-policy.ts";
 import type { JsonValue } from "../src/riemann/kernel/types.ts";
 import { MODEL_TEXT_BYTES, OutputViews, renderModelText } from "../src/riemann/output.ts";
+import { compactOutputPreview } from "../src/riemann/output-format.ts";
 import { ArtifactStore } from "../src/riemann/state/artifacts.ts";
 import { RiemannStore } from "../src/riemann/state/store.ts";
 
@@ -45,71 +46,56 @@ function ref(value: JsonValue): string {
 	return value.handle;
 }
 
-test("shows head and tail while retaining an immutable, lossless middle reference", async () => {
+function body(text: string): string {
+	return text.replace(/\n\n\[ref=r[0-9a-z]+[^\]]*\]$/, "");
+}
+
+test("shows a continuous tail and retains unique, complete, repeatable results", async () => {
 	const { artifacts, views } = await fixture();
-	const rows = Array.from({ length: 8 }, (_, i) => ({ path: `row-${i}`, text: "中文😀".repeat(8) }));
-	const [prepared] = await views.print({ parts: [{ text: JSON.stringify(rows) }] });
-	expect(prepared.type).toBe("output_ref");
-	if (prepared.type !== "output_ref") throw new Error("Expected deferred view");
-	const first = await renderModelText(views, ["header".repeat(10000), { ...prepared, separator: "\n\n" }]);
-	expect(Buffer.byteLength(first.text)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);
-	expect(first.text).toContain("row-0");
-	expect(first.text).toMatch(/^header/);
-	expect(first.text.endsWith(JSON.stringify(rows))).toBe(true);
-	const halves = first.text.split(`\n[more ${first.more}]\n`);
-	expect(halves).toHaveLength(2);
-	expect(Buffer.byteLength(halves[0])).toBe((MODEL_TEXT_BYTES - 128) / 2);
-	expect(Buffer.byteLength(halves[1])).toBeGreaterThanOrEqual((MODEL_TEXT_BYTES - 128) / 2 - 3);
-	expect(first.more).toMatch(/^r[0-9a-z]+$/);
-	let cursor = first.more;
-	let combined = first.text;
+	const full = `HEAD${"中文😀".repeat(10000)}END`;
+	const first = await renderModelText(views, [full]);
+	expect(Buffer.byteLength(first.text)).toBeLessThanOrEqual(16384);
+	expect(first.text).not.toContain("HEAD");
+	expect(first.text).not.toContain("�");
+	expect(body(first.text)).toMatch(/END$/);
+	expect(full.endsWith(body(first.text))).toBe(true);
+	expect(first.text).toContain(
+		`${Buffer.byteLength(full) - Buffer.byteLength(body(first.text))} UTF-8 bytes omitted before; partial line]`,
+	);
+	expect(compactOutputPreview(first.text)).toContain(`[ref ${first.ref}]`);
 	const restored = new OutputViews(artifacts);
-	const repeated = await renderModelText(restored, [await restored.read(first.more!)]);
-	const repeatedAgain = await renderModelText(restored, [await restored.read(first.more!)]);
-	expect(repeatedAgain).toEqual(repeated);
-	for (let steps = 0; cursor && steps < 100; steps++) {
-		const next = await renderModelText(restored, [await restored.read(cursor)]);
-		expect(Buffer.byteLength(next.text)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);
-		expect(next.text).not.toContain("�");
-		combined = combined.replace(`\n[more ${cursor}]\n`, () => next.text);
-		cursor = next.more;
+	for (let i = 0; i < 2; i++) {
+		expect((await restored.text(first.ref)).text).toBe(full);
+		const repeated = await renderModelText(restored, [await restored.read(first.ref)]);
+		expect(repeated.ref).not.toBe(first.ref);
+		expect(body(repeated.text)).toBe(body(first.text));
 	}
-	expect(cursor).toBeUndefined();
-	for (const row of rows) expect(combined.match(new RegExp(row.path, "g"))).toHaveLength(1);
-	expect(combined).not.toContain("artifact://");
-	expect(combined).toBe(`${"header".repeat(10000)}\n\n${JSON.stringify(rows)}`);
-	for (const size of [MODEL_TEXT_BYTES - 1, MODEL_TEXT_BYTES, MODEL_TEXT_BYTES + 1]) {
-		const rendered = await renderModelText(views, ["a".repeat(size)]);
-		expect(Buffer.byteLength(rendered.text)).toBeLessThanOrEqual(16_384);
-		if (size <= MODEL_TEXT_BYTES) expect(rendered).toEqual({ text: "a".repeat(size) });
-		else expect(rendered.more).toBeDefined();
+	const ids = new Set<string>();
+	for (const value of [null, "", "same", "same"]) {
+		const result = await renderModelText(views, [], { value });
+		ids.add(result.ref);
+		const contract = await artifacts.readResult(result.ref);
+		expect(JSON.parse((await artifacts.readBuffer(contract.value_ref)).toString())).toEqual(value);
+	}
+	expect(ids.size).toBe(4);
+	for (const size of [MODEL_TEXT_BYTES - 100, MODEL_TEXT_BYTES - 1, MODEL_TEXT_BYTES, MODEL_TEXT_BYTES + 1]) {
+		const rendered = await renderModelText(views, ["a".repeat(size)], { header: "ok" });
+		expect(Buffer.byteLength(rendered.text)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);
+		expect(rendered.text.startsWith("ok\n\n")).toBe(true);
+		expect((await views.text(rendered.ref)).text).toBe("a".repeat(size));
 	}
 });
 
-test("continues retained stdout without losing capture status and transfers authorized views", async () => {
+test("retains capture failure details and transfers only authorized full views", async () => {
 	const { parent, child, system, artifacts } = await fixture();
-	const childArtifacts = system.forAgent(child.id);
-	const childViews = new OutputViews(childArtifacts);
-	const full = `α😀${"BODY".repeat(18000)}END`;
-	const source = await childArtifacts.putText(full);
-	const [prepared] = await childViews.print({ parts: [{ text: "capture incomplete\n" }, { ref: ref(source) }] });
-	if (prepared.type !== "output_ref") throw new Error("Expected view");
+	const childViews = new OutputViews(system.forAgent(child.id));
+	const full = `capture incomplete\nα😀${"BODY".repeat(18000)}END`;
+	const result = await renderModelText(childViews, [full]);
 	const parentViews = new OutputViews(artifacts);
-	await expect(parentViews.read(prepared.handle)).rejects.toMatchObject({ code: "permission_denied" });
+	await expect(parentViews.read(result.ref)).rejects.toMatchObject({ code: "permission_denied" });
 	system.grantFromAgent(child.id, parent.id);
-	let cursor: string | undefined = prepared.handle;
-	let output = `\n[more ${cursor}]\n`;
-	for (let steps = 0; cursor && steps < 100; steps++) {
-		const next = await renderModelText(parentViews, [await parentViews.read(cursor)]);
-		output = output.replace(`\n[more ${cursor}]\n`, () => next.text);
-		cursor = next.more;
-	}
-	expect(cursor).toBeUndefined();
-	expect(output).toContain("capture incomplete");
-	expect(output.match(/α😀/g)).toHaveLength(1);
-	expect(output.match(/END/g)).toHaveLength(1);
-	expect(output.match(/BODY/g)).toHaveLength(18000);
-	await expect(artifacts.get(prepared.handle)).rejects.toMatchObject({ code: "permission_denied" });
+	expect((await parentViews.text(result.ref)).text).toBe(full);
+	await expect(artifacts.get(result.ref)).rejects.toMatchObject({ code: "permission_denied" });
 });
 
 test("does not reinterpret user text or send binary content to the model", async () => {
@@ -124,31 +110,36 @@ test("does not reinterpret user text or send binary content to the model", async
 	expect(rendered.text).not.toContain("/wBB");
 	await expect(views.read(ref(data))).rejects.toMatchObject({ code: "unsupported_media_type" });
 	await expect(views.read(ref(data), [0, 1])).rejects.toMatchObject({ code: "unsupported_media_type" });
+	const binaryResult = await artifacts.putResult("/wBB", {}, "bytes", "references.read", { encoding: "base64" });
+	expect((await views.text(binaryResult)).text).toContain(`binary ${binaryResult}`);
+	expect((await views.text(binaryResult)).text).not.toContain("/wBB");
+	const fullResult = await artifacts.putResult({ text: literal }, {}, "JSON", "web.fetch", {
+		content: [{ type: "text", text: `[source web.fetch ${ref(data)}]` }],
+	});
+	expect((await views.text(fullResult)).text).toContain(`[source web.fetch ${ref(data)}]`);
 });
 
-test("selects exact reference-relative UTF-8 spans across segments and pages them in order", async () => {
+test("selects full-display-relative UTF-8 ranges across segments in order", async () => {
 	const { artifacts, views, system, child } = await fixture();
-	const body = `α😀${"0123456789".repeat(5000)}尾`;
-	const source = ref(await artifacts.putText(body));
-	const combined = await views.combine(["HEAD", { type: "output_ref", handle: source }, "TAIL"]);
-	const full = `HEAD\n\n${body}\n\nTAIL`;
+	const text = `α😀${"0123456789".repeat(5000)}尾`;
+	const source = ref(await artifacts.putText(text));
+	const rendered = await renderModelText(views, ["HEAD", { type: "output_ref", handle: source }, "TAIL"]);
+	const full = `HEAD\n\n${text}\n\nTAIL`;
 	const bytes = Buffer.from(full);
-	const selected = await views.read(combined, [2, bytes.length - 2]);
-	let rendered = await renderModelText(views, [selected]);
+	const selected = await renderModelText(views, [await views.read(rendered.ref, [2, bytes.length - 2])]);
+	expect(body(selected.text).startsWith("AD\n\nα😀")).toBe(true);
+	expect(selected.text).toContain("UTF-8 bytes omitted after");
+	expect((await views.text(selected.ref)).text).toBe(full.slice(2, -2));
 	let recovered = "";
-	for (let steps = 0; steps < 10; steps++) {
-		expect(Buffer.byteLength(rendered.text)).toBeLessThanOrEqual(16_384);
-		expect(rendered.text).not.toContain("�");
-		recovered += rendered.more ? rendered.text.replace(/\n\[more r[0-9a-z]+\]$/, "") : rendered.text;
-		if (!rendered.more) break;
-		expect(rendered.text.endsWith(`\n[more ${rendered.more}]`)).toBe(true);
-		rendered = await renderModelText(views, [await views.read(rendered.more)]);
+	for (let start = 0; start < bytes.length; start += 8000) {
+		const end = Math.min(start + 8000, bytes.length);
+		const page = await renderModelText(views, [await views.read(rendered.ref, [start, end])]);
+		expect(page.truncated).toBe(false);
+		recovered += body(page.text);
 	}
-	expect(rendered.more).toBeUndefined();
-	expect(recovered).toBe(bytes.subarray(2, bytes.length - 2).toString("utf8"));
-	expect((await renderModelText(views, [await views.read(source, [0, 6])])).text).toBe("α😀");
-	expect((await renderModelText(views, [await views.read(combined, [4, 6])])).text).toBe("\n\n");
-	expect((await renderModelText(views, [await views.read(source, [6, 6])])).text).toBe("");
+	expect(recovered).toBe(full);
+	expect(body((await renderModelText(views, [await views.read(source, [0, 6])])).text)).toBe("α😀");
+	expect(body((await renderModelText(views, [await views.read(source, [6, 6])])).text)).toBe("");
 	for (const span of [
 		[0, 1],
 		[1, 6],
@@ -159,6 +150,32 @@ test("selects exact reference-relative UTF-8 spans across segments and pages the
 	] as const)
 		await expect(views.read(source, span)).rejects.toMatchObject({ code: "invalid_arguments" });
 	const childViews = new OutputViews(system.forAgent(child.id));
-	await expect(childViews.read(source, [0, 6])).rejects.toMatchObject({ code: "permission_denied" });
-	await expect(childViews.read(combined, [0, 6])).rejects.toMatchObject({ code: "permission_denied" });
+	await expect(childViews.read(rendered.ref, [0, 6])).rejects.toMatchObject({ code: "permission_denied" });
+});
+
+test("keeps complete CRLF tail lines across segments and only reads the preview window", async () => {
+	const { artifacts, views } = await fixture();
+	const source = Array.from(
+		{ length: 2000 },
+		(_, i) => `${i.toString().padStart(4, "0")}: ${"指令😀".repeat(5)}\r\n`,
+	).join("");
+	const split = source.indexOf("\n") + 1;
+	const first = ref(await artifacts.putText(source.slice(0, split)));
+	const last = ref(await artifacts.putText(source.slice(split)));
+	const [prepared] = await views.print({ parts: [{ ref: first }, { ref: last }] });
+	if (prepared.type !== "output_ref") throw new Error("Expected view");
+	const reads = vi.spyOn(artifacts, "get");
+	const rendered = await renderModelText(views, [prepared]);
+	expect(Buffer.byteLength(rendered.text)).toBeLessThanOrEqual(MODEL_TEXT_BYTES);
+	expect(rendered.text).not.toContain("partial line");
+	expect(reads.mock.calls.reduce((sum, [, options]) => sum + (options?.limit ?? 0), 0)).toBeLessThanOrEqual(
+		MODEL_TEXT_BYTES,
+	);
+	const tail = body(rendered.text);
+	expect(tail).toMatch(/^\d{4}: /);
+	expect(tail).toMatch(/\r\n$/);
+	expect(source.endsWith(tail)).toBe(true);
+	expect(Buffer.byteLength(tail)).toBeGreaterThan(MODEL_TEXT_BYTES - 512);
+	expect(rendered.text).toContain(`${Buffer.byteLength(source) - Buffer.byteLength(tail)} UTF-8 bytes omitted before`);
+	expect((await views.text(rendered.ref)).text).toBe(source);
 });

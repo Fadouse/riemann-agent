@@ -67,6 +67,7 @@ describe("Python code mode", () => {
 			timeout_ms: 300000,
 		});
 		expect(parsePythonExec('print(1)\n# @exec: {"persist": true}')).toEqual({ timeout_ms: 300000 });
+		expect(parsePythonExec('# @exec: {"yield_time_ms": 0}\npass')).toEqual({ timeout_ms: 300000, yield_time_ms: 0 });
 		for (const source of [
 			"",
 			"# @exec: []",
@@ -83,14 +84,23 @@ describe("Python code mode", () => {
 	test("yield keeps the producer alive, reads only new output, and closes the final cell", async () => {
 		const fixture = pendingCell();
 		expect(fixture.id).toMatch(/^c[0-9a-z]+$/);
-		expect(fixture.cells.pending).toEqual({ cell_id: fixture.id, status: "running", next_tool: "ipython_wait" });
+		expect(fixture.cells.pending).toEqual([{ cell_id: fixture.id, status: "running", next_tool: "ipython_wait" }]);
 		const consume = async (result: KernelExecuteResult, running: boolean) => ({ result, running });
 		expect(await fixture.cells.poll(fixture.id, 0, false, undefined, consume)).toMatchObject({
 			running: true,
 			result: { stdout: "first\n" },
 		});
 		expect(fixture.active.signal.aborted).toBe(false);
-		expect(() => fixture.cells.start(parsePythonExec("pass"), async () => execution())).toThrow("Collect cell");
+		const peek = fixture.active.peek;
+		fixture.active.peek = () => undefined;
+		expect(await fixture.cells.poll(fixture.id, 0, false, undefined, consume)).toMatchObject({
+			result: { stdout: "" },
+		});
+		fixture.active.peek = peek;
+		const other = fixture.cells.start(parsePythonExec("pass"), async () => execution("independent"));
+		expect(await fixture.cells.poll(other, 100, false, undefined, async (result) => result.stdout)).toBe(
+			"independent",
+		);
 		const waiting = fixture.cells.poll(fixture.id, undefined, false, undefined, consume);
 		fixture.setOutput({ ...execution("first\nsecond\n"), modelContent: [{ type: "text", text: "selected" }] });
 		expect(await waiting).toMatchObject({
@@ -103,7 +113,7 @@ describe("Python code mode", () => {
 			result: { stdout: "last\n", modelContent: [] },
 		});
 		expect(fixture.cells.active).toBe(false);
-		expect(fixture.cells.pending).toBeNull();
+		expect(fixture.cells.pending).toEqual([]);
 		await expect(fixture.cells.poll(fixture.id, 0, false, undefined, consume)).rejects.toThrow("already collected");
 	});
 
@@ -130,7 +140,7 @@ describe("Python code mode", () => {
 				throw new Error("format failed");
 			}),
 		).rejects.toThrow("format failed");
-		const waiting = fixture.cells.poll(fixture.id, 20, false, undefined, async (result) => result);
+		const waiting = fixture.cells.poll(fixture.id, 20, false, undefined, async (result) => result, false);
 		await expect(fixture.cells.poll(fixture.id, 0, false, undefined, async () => null)).rejects.toThrow(
 			"active wait",
 		);

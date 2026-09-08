@@ -15,10 +15,10 @@ import type { JsonValue, KernelHostRequestError, KernelHostRequestEvent } from "
 
 const MAX_STREAM_CHARS = 20_000;
 const MAX_PREVIEW_CHARS = 20_000;
-const TRUNCATED_PREVIEW = "\n[truncated]";
+const TRUNCATED_PREVIEW = "…";
 const MAX_DIFF_INPUT_CHARS = 1_000_000;
 const MAX_DIFF_CHARS = 40_000;
-const OMITTED_OUTPUT = "[earlier output omitted]\n";
+const OMITTED_OUTPUT = "…\n";
 
 type FileCapabilityPathResolver = (capability: string) => string | undefined;
 
@@ -76,7 +76,6 @@ function diffDetails(before: string, after: string): DiffDetails {
 		preview.push(line);
 		consumed += line.length + 1;
 	}
-	preview.push("     ... diff truncated");
 	return { diff: preview.join("\n"), additions, removals, diffTruncated: true };
 }
 
@@ -197,6 +196,7 @@ export class RiemannActivityTracker {
 				const tracked = this.tracked.get(event.requestId);
 				if (!tracked) return undefined;
 				this.finish(tracked, event.result, event.error, event.durationMs);
+				tracked.activity.resultRef = event.resultRef;
 				return this.snapshot();
 			}
 		}

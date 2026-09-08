@@ -497,7 +497,7 @@ PROBE`;
 		}
 	}, 30_000);
 
-	test("marks stream updates when the update window drops bytes", async () => {
+	test("retains every stream update beyond the former update window cap", async () => {
 		const root = await mkdtemp(join(tmpdir(), "riemann-shell-stream-limit-"));
 		roots.push(root);
 		const workspace = join(root, "workspace");
@@ -515,7 +515,13 @@ PROBE`;
 				termination: "exited",
 			});
 			expect(await streamText(artifacts, result.stdout)).toHaveLength(70_000);
-			expect(updates.some((update) => update.kind === "stdout" && update.truncated === true)).toBe(true);
+			expect(updates.some((update) => update.truncated === true)).toBe(false);
+			expect(
+				updates
+					.filter((update) => update.kind === "stdout")
+					.map((update) => update.value)
+					.join(""),
+			).toBe("x".repeat(70_000));
 		} finally {
 			store.close();
 		}

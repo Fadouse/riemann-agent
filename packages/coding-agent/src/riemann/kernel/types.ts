@@ -27,8 +27,12 @@ export type KernelHostResult = {
 	modelContent: KernelModelContent[];
 };
 
-export function kernelHostResult(value: JsonValue, modelContent: KernelModelContent[] = []): KernelHostResult {
-	return { [KERNEL_HOST_RESULT]: true, value, modelContent };
+export function kernelHostResult(
+	value: JsonValue,
+	modelContent: KernelModelContent[] = [],
+	resultRef?: string,
+): KernelHostResult {
+	return { [KERNEL_HOST_RESULT]: true, value, modelContent, ...(resultRef ? { resultRef } : {}) };
 }
 
 export function isKernelHostResult(value: JsonValue | KernelHostResult): value is KernelHostResult {
@@ -135,6 +139,7 @@ export type KernelHostRequestEvent =
 			request: KernelHostRequest;
 			durationMs: number;
 			result?: JsonValue;
+			resultRef?: string;
 			error?: KernelHostRequestError;
 	  };
 
@@ -143,6 +148,9 @@ export type KernelHostRequestUpdate = (update: JsonValue) => void;
 
 export interface KernelExecuteOptions {
 	onOutput?: () => void;
+	onYield?: () => void;
+	/** Schedule a code-mode coroutine under this short ID instead of occupying execute_request. */
+	cellId?: string;
 	signal?: AbortSignal;
 	internal?: boolean;
 	/** Keep explicit output in arrival order so yielded reads have a stable prefix. */

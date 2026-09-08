@@ -4,6 +4,7 @@ import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { RiemannHostError } from "./errors.ts";
 import type { JsonValue, KernelModelContent } from "./kernel/types.ts";
+import { outputReferenceFooter } from "./output-format.ts";
 import type { ArtifactStore } from "./state/artifacts.ts";
 import { OUTPUT_VIEW_MIME, RESULT_MIME } from "./state/references.ts";
 
@@ -70,7 +71,14 @@ export class OutputViews {
 		const metadata = this.artifacts.getMetadata(handle);
 		if (metadata.mimeType === RESULT_MIME) {
 			const result = await this.artifacts.readResult(handle);
-			return this.load(result.value_ref);
+			if (result.display_ref) return this.load(result.display_ref);
+			const segments =
+				result.encoding === "base64"
+					? [await this.literal(`[binary ${handle}; use read()]`)]
+					: await this.load(result.value_ref);
+			if (Array.isArray(result.content) && result.content.length)
+				segments.push(await this.literal(`\n\n${JSON.stringify(result.content)}`));
+			return segments;
 		}
 		if (metadata.mimeType !== OUTPUT_VIEW_MIME) {
 			// A diagnostic or retained text artifact can be read from its beginning.
@@ -272,22 +280,47 @@ export class OutputViews {
 		};
 	}
 
-	async preview(ref: string): Promise<{ text: string; more?: string }> {
+	async retainCall(view: string, value?: JsonValue, operation = "ipython"): Promise<string> {
+		return this.artifacts.putResult(value === undefined ? { output_ref: view } : value, {}, "JSON", operation, {
+			displayRef: view,
+		});
+	}
+
+	async preview(ref: string, header = ""): Promise<{ text: string; ref: string; truncated: boolean }> {
 		const segments = await this.load(ref);
-		const budget = MODEL_TEXT_BYTES - 128;
 		const size = this.size(segments);
-		if (size <= MODEL_TEXT_BYTES || segments.some((segment) => segment.selected)) {
-			const result = await this.readSegments(segments, size <= MODEL_TEXT_BYTES ? MODEL_TEXT_BYTES : budget);
-			if (!result.remaining.length) return { text: result.text };
-			const more = await this.save(result.remaining);
-			return { text: `${result.text}\n[more ${more}]`, more };
-		}
-		const headEnd = await this.boundary(segments, Math.floor(budget / 2), -1);
-		const tailStart = await this.boundary(segments, size - Math.ceil(budget / 2), 1);
-		const head = await this.readSegments(this.slice(segments, 0, headEnd), headEnd);
-		const tail = await this.readSegments(this.slice(segments, tailStart, size), size - tailStart);
-		const more = await this.save(this.slice(segments, headEnd, tailStart));
-		return { text: `${head.text}\n[more ${more}]\n${tail.text}`, more };
+		const selected = segments.some((segment) => segment.selected || segment.stop_after);
+		const prefix = header ? `${header}\n\n` : "";
+		const suffix = `\n\n${outputReferenceFooter(ref)}`;
+		const complete = size + Buffer.byteLength(prefix + suffix) <= MODEL_TEXT_BYTES;
+		const budget = complete
+			? size
+			: MODEL_TEXT_BYTES -
+				Buffer.byteLength(`${prefix}\n\n${outputReferenceFooter(ref, size, selected ? "after" : "before", true)}`);
+		if (budget < 0) throw new RiemannHostError("invalid_output", "Output status exceeds the text return budget");
+		let start = complete || selected ? 0 : await this.boundary(segments, size - budget, 1);
+		const end = complete || !selected ? size : await this.boundary(segments, budget, -1);
+		const probe = start > 0 ? await this.boundary(segments, start - 1, -1) : 0;
+		const result = await this.readSegments(this.slice(segments, probe, end), end - probe);
+		let text = result.text;
+		let partial = false;
+		if (start > 0) {
+			const bytes = Buffer.from(text);
+			let skip = start - probe;
+			if (bytes[skip - 1] !== 10) {
+				const newline = bytes.indexOf(10, skip);
+				if (newline >= 0 && newline + 1 < bytes.length) skip = newline + 1;
+				else partial = true;
+			}
+			start = probe + skip;
+			text = bytes.subarray(skip).toString("utf8");
+		} else if (end < size) partial = !text.endsWith("\n");
+		const omitted = size - Buffer.byteLength(text);
+		return {
+			text: `${prefix}${text}\n\n${outputReferenceFooter(ref, omitted, selected ? "after" : "before", partial)}`,
+			ref,
+			truncated: omitted > 0,
+		};
 	}
 
 	async combine(parts: OutputPart[]): Promise<string> {
@@ -309,9 +342,11 @@ export class OutputViews {
 export async function renderModelText(
 	views: OutputViews,
 	parts: OutputPart[],
-): Promise<{ text: string; more?: string; error?: string }> {
-	// Persist the ordered output before publishing any continuation. Reading a
-	// cursor never consumes it, so a failed delivery or repeated read is safe.
-	const ref = await views.combine(parts);
-	return views.preview(ref);
+	options: { header?: string; value?: JsonValue; operation?: string } = {},
+): Promise<{ text: string; ref: string; truncated: boolean }> {
+	// Persist the complete ordered output before publishing its bounded display.
+	// Reads never consume it, so a failed delivery or repeated read is safe.
+	const view = await views.combine(parts);
+	const ref = await views.retainCall(view, options.value, options.operation);
+	return views.preview(ref, options.header);
 }

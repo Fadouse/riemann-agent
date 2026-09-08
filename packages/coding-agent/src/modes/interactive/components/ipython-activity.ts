@@ -172,6 +172,8 @@ export class IPythonActivityComponent implements Component {
 		const durationMs = running ? Math.max(0, this.clockNow - startedAt) : activity.durationMs;
 		const styledLabel = label.replace(/\r/g, "\\r").replace(/\n/g, "\\n");
 		metadata = metadata?.replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+		if (this.expanded && activity.resultRef)
+			metadata = [metadata, toolDim(`[ref ${activity.resultRef}]`)].filter(Boolean).join(" ");
 		if (running) {
 			this.runningHeader = {
 				row: 0,
@@ -222,11 +224,8 @@ export class IPythonActivityComponent implements Component {
 			const captured = activity[`${stream}CaptureTruncated`];
 			if (!captured && !activity[`${stream}Truncated`]) continue;
 			const handle = activity[`${stream}ArtifactHandle`];
-			parts.push(
-				toolDim(
-					`[${stream} ${captured ? "capture incomplete" : "preview omitted"}${this.expanded && handle ? `; ${handle}` : ""}]`,
-				),
-			);
+			if (captured) parts.push(toolDim(`[${stream} capture incomplete]`));
+			if (this.expanded && !activity.resultRef && handle) parts.push(toolDim(`[ref ${handle}]`));
 		}
 		if (activity.status === "ok" && !failed && !parts.some((part) => stripAnsi(part).trim())) {
 			parts.push(toolDim("(no output)"));
@@ -340,7 +339,7 @@ export class IPythonActivityComponent implements Component {
 		const stats: string[] = [];
 		if (activity.additions) stats.push(theme.fg("toolDiffAdded", `+${activity.additions}`));
 		if (activity.removals) stats.push(theme.fg("toolDiffRemoved", `-${activity.removals}`));
-		if (activity.diffTruncated) stats.push(toolDim("diff truncated"));
+		if (activity.diffTruncated && !activity.resultRef) stats.push(toolDim("…"));
 		return stats.length > 0 ? stats.join(" ") : undefined;
 	}
 

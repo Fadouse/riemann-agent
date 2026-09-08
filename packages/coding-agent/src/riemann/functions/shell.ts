@@ -16,7 +16,6 @@ import type { ArtifactStore } from "../state/artifacts.ts";
 import type { FunctionDefinition, FunctionUpdateCallback } from "./registry.ts";
 
 const STREAM_UPDATE_INTERVAL_MS = 80;
-const MAX_STREAM_UPDATE_BYTES = 64 * 1024;
 
 type StreamKind = "stdout" | "stderr";
 type ProcessTermination = "exited" | "timeout" | "cancelled" | "signal";
@@ -24,7 +23,6 @@ type ProcessTermination = "exited" | "timeout" | "cancelled" | "signal";
 interface PendingStreamUpdate {
 	kind: StreamKind;
 	chunks: Buffer[];
-	truncated: boolean;
 }
 
 const ArtifactSchema = Type.Object(
@@ -83,7 +81,7 @@ function parseEnvironment(value: JsonValue | undefined): Record<string, string> 
 export class ShellFunctions {
 	private readonly policy: FileAccessPolicy;
 	private readonly artifacts: ArtifactStore;
-	readonly tasks = new PythonCells("p", true);
+	readonly tasks = new PythonCells("p");
 	private readonly networkAllowed: boolean;
 
 	constructor(policy: FileAccessPolicy, artifacts: ArtifactStore, networkAllowed: boolean) {
@@ -172,11 +170,10 @@ export class ShellFunctions {
 			child.stdin.end(command.stdin);
 		}
 		let pendingUpdates: PendingStreamUpdate[] = [];
-		let pendingUpdateBytes = 0;
 		let updateTimer: NodeJS.Timeout | undefined;
 		let updateSequence = 0;
-		let stdoutUpdateDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
-		let stderrUpdateDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
+		const stdoutUpdateDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
+		const stderrUpdateDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 		const emitUpdate = (kind: StreamKind, value: string, truncated: boolean): void => {
 			if (!options.onUpdate || (!value && !truncated)) return;
 			options.onUpdate({ sequence: updateSequence, kind, value, truncated });
@@ -186,16 +183,11 @@ export class ShellFunctions {
 			for (const update of pendingUpdates) {
 				const decoder = update.kind === "stdout" ? stdoutUpdateDecoder : stderrUpdateDecoder;
 				const value = decoder.decode(Buffer.concat(update.chunks), {
-					stream: !update.truncated,
+					stream: true,
 				});
-				emitUpdate(update.kind, value, update.truncated);
-				if (update.truncated) {
-					if (update.kind === "stdout") stdoutUpdateDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
-					else stderrUpdateDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
-				}
+				emitUpdate(update.kind, value, false);
 			}
 			pendingUpdates = [];
-			pendingUpdateBytes = 0;
 		};
 		const finishUpdates = (): void => {
 			flushUpdates();
@@ -213,14 +205,10 @@ export class ShellFunctions {
 			if (!options.onUpdate) return;
 			let update = pendingUpdates.at(-1);
 			if (!update || update.kind !== kind) {
-				update = { kind, chunks: [], truncated: false };
+				update = { kind, chunks: [] };
 				pendingUpdates.push(update);
 			}
-			const remaining = Math.max(0, MAX_STREAM_UPDATE_BYTES - pendingUpdateBytes);
-			const captured = Math.min(chunk.length, remaining);
-			if (captured > 0) update.chunks.push(captured === chunk.length ? chunk : chunk.subarray(0, captured));
-			update.truncated ||= captured < chunk.length;
-			pendingUpdateBytes += captured;
+			update.chunks.push(chunk);
 			scheduleUpdate();
 		};
 		let requestedTermination: "timeout" | "cancelled" | null = null;
@@ -416,6 +404,7 @@ export class ShellFunctions {
 						let updates = Promise.resolve();
 						let updateError: unknown;
 						cell.details = {
+							...cell.details,
 							status: "running",
 							startedAt: Date.now(),
 							cellId: cell.id,
@@ -445,11 +434,7 @@ export class ShellFunctions {
 											!Array.isArray(update) &&
 											typeof update.value === "string"
 										) {
-											const text =
-												update.value +
-												(update.truncated
-													? "\n[stream preview omitted; full output retained in result]\n"
-													: "");
+											const text = update.value;
 											if (text) {
 												const retained = await this.artifacts.putText(text, { name: "process-progress" });
 												if (
@@ -492,7 +477,7 @@ export class ShellFunctions {
 							);
 							result.modelContent.push({
 								type: "text",
-								text: `exit_code=${value.exit_code}; termination=${value.termination} [result shell.run ${ref}]`,
+								text: `exit_code=${value.exit_code}; termination=${value.termination} [ref=${ref}]`,
 							});
 						}
 						if (updateError) throw updateError;

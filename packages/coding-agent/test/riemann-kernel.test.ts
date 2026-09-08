@@ -62,6 +62,7 @@ function testAgentWire(agent: (typeof TEST_AGENTS)[number], status = "idle"): Re
 		last_turn_id: turnId,
 		last_outcome: status === "stopped" ? "cancelled" : "ok",
 		output_preview: status === "idle" ? `Completed ${agent.name}` : null,
+		output: status === "idle" ? `Completed ${agent.name}` : "",
 		created_at: TEST_AGENT_TIMESTAMP,
 		updated_at: TEST_AGENT_TIMESTAMP,
 	};
@@ -108,7 +109,7 @@ async function createKernel(
 	const contractRun = contractStore.openRun("kernel-contract", root);
 	const artifacts = new ArtifactStore(contractStore, contractRun.id);
 	const shell = new ShellFunctions(fileAccessPolicy(root, FULL_FILESYSTEM), artifacts, false);
-	const web = new WebFunctions(undefined, artifacts, 2048);
+	const web = new WebFunctions(undefined, artifacts);
 	const resultSpecifications = [...shell.definitions(), ...web.definitions()].map((definition) => ({
 		name: definition.name,
 		namespace: definition.namespace,

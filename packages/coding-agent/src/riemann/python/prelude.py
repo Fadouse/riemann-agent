@@ -277,7 +277,8 @@ def _bounded_object_repr(value, limit: int | None = None) -> str:
 
 class _RiemannRecord:
     def __repr__(self) -> str:
-        return _bounded_object_repr(self)
+        ref = vars(self).get("_riemann_result_ref")
+        return _bounded_object_repr(self) + (f" [ref={ref}; structured preview]" if ref else "")
 
     def __getattr__(self, name):
         available = ", ".join(field.name for field in _dataclasses.fields(self) if not field.name.startswith("_"))
@@ -294,13 +295,16 @@ class Ref(_RiemannRecord):
         arguments = {"handle": self.handle}
         if span is not _RIEMANN_MISSING:
             arguments["span"] = span
-        reply = await _riemann_call("references.read", arguments)
+        reply, result_ref = await _riemann_call("references.read", arguments, _with_reference=True)
         if reply["kind"] == "value":
-            return _from_wire(reply["value"], reply["schema"], reply["return_type"])
+            value = _from_wire(reply["value"], reply["schema"], reply["return_type"])
+            if result_ref and isinstance(value, (_RiemannRecord, _RiemannNamespace)):
+                object.__setattr__(value, "_riemann_result_ref", result_ref)
+            return value
         if reply["kind"] == "binary":
             return _base64.b64decode(reply["base64"], validate=True)
         value = _ReferencedText(reply["text"])
-        value._reference = reply["reference"]
+        value._reference = result_ref or reply["reference"]
         return value
 
     async def materialize(self, *, path: str):
@@ -518,6 +522,7 @@ class AgentInfo(AgentTurnHandle):
     last_turn_id: str
     last_outcome: str | None
     output_preview: str | None
+    output: str
     created_at: str
     updated_at: str
 
@@ -1031,7 +1036,7 @@ def _install_operation_formatter():
     shell.set_custom_exc((RiemannError, *previous_exceptions), show_error)
 
 
-async def _riemann_call(operation: str, arguments: dict, *, _result_contract=None):
+async def _riemann_call(operation: str, arguments: dict, *, _result_contract=None, _with_reference=False):
     if not isinstance(operation, str) or not operation:
         raise TypeError("operation must be a non-empty string")
     if not isinstance(arguments, dict):
@@ -1074,11 +1079,19 @@ async def _riemann_call(operation: str, arguments: dict, *, _result_contract=Non
                     raise protocol_error("Host returned a reply for a different operation")
                 status = reply.get("status")
                 common_fields = {"request_id", "operation", "status"}
+                result_ref = reply.get("result_ref")
+                if result_ref is not None:
+                    if not isinstance(result_ref, str):
+                        raise protocol_error("Host returned an invalid result reference")
+                    common_fields.add("result_ref")
                 if status == "ok":
                     if set(reply) != common_fields | {"value"}:
                         raise protocol_error("Host returned an invalid success reply shape")
                     schema, return_type = _result_contract or _RIEMANN_OUTPUTS.get(operation, (None, None))
-                    future.set_result(_from_wire(reply["value"], schema, return_type))
+                    value = _from_wire(reply["value"], schema, return_type)
+                    if result_ref and isinstance(value, (_RiemannRecord, _RiemannNamespace)):
+                        object.__setattr__(value, "_riemann_result_ref", result_ref)
+                    future.set_result((value, result_ref) if _with_reference else value)
                 elif status == "error":
                     if set(reply) != common_fields | {"error"}:
                         raise protocol_error("Host returned an invalid error reply shape")

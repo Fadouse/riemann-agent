@@ -240,13 +240,14 @@ describe("Riemann IPython activity tracking", () => {
 		expect(running?.kind).toBe("shell");
 		const runningStdout = running?.kind === "shell" ? running.stdout : undefined;
 		expect(Buffer.from(runningStdout ?? "", "utf8").toString("utf8")).toBe(runningStdout);
-		expect(runningStdout).toBe(`[earlier output omitted]\n${"x".repeat(19_999)}`);
+		expect(runningStdout).toBe(`…\n${"x".repeat(19_999)}`);
 
 		activities = await observe(tracker, {
 			phase: "end",
 			requestId: "shell-unicode",
 			request: shellRequest,
 			durationMs: 2,
+			resultRef: "r7",
 			error: {
 				code: "execution_error",
 				message: `${"x".repeat(1_999)}😀z`,
@@ -256,6 +257,7 @@ describe("Riemann IPython activity tracking", () => {
 			},
 		});
 		const finished = activities[0];
+		expect(finished.resultRef).toBe("r7");
 		expect(Buffer.from(finished?.error ?? "", "utf8").toString("utf8")).toBe(finished?.error);
 		expect(finished?.error).toBe("x".repeat(1_999));
 	});
